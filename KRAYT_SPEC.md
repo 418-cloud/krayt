@@ -87,6 +87,7 @@ thing that flows back is a reviewable text patch.
 | Secrets | Per-task **secrets file**, transferred over the control channel, never persisted to VM disk |
 | Task definition | **CLI flags + optional config file** (flags override file) |
 | Resource limits | Sensible defaults (e.g. 2 vCPU / 4 GB / 20 GB / 30 min), **fully configurable** |
+| Agent → human questions | Optional async `ask_human` via an MCP server + `krayt-ask` CLI over an agnostic question channel; **default `fail`** (autonomous), opt into `wait`; timeout → sentinel by default (§6.13) |
 
 ---
 
@@ -152,6 +153,7 @@ type RunSpec struct {
     SecretsPath  string            // path to per-task secrets file (may be empty)
     Network      NetworkPolicy     // mode + allowlist (mirrors the proto enum, §6.5)
     Resources    Resources         // CPUs, MemoryMiB, DiskGiB, Timeout
+    Questions    QuestionsPolicy   // mode + per-question timeout + on-timeout (§6.13)
     Detach       bool              // headless vs stream-to-terminal
 }
 
@@ -160,6 +162,12 @@ type Resources struct {
     MemoryMiB uint64
     DiskGiB   uint64
     Timeout   time.Duration       // wall-clock; expiry kills container then VM
+}
+
+type QuestionsPolicy struct {
+    Mode      string              // "fail" (default) | "wait"
+    Timeout   time.Duration       // per-question wait limit
+    OnTimeout string              // "sentinel" (default) | "abort"
 }
 ```
 
@@ -171,6 +179,8 @@ derives the `VMSpec` (§6.3) from `RunSpec.Resources` + the pinned base image.
 - Allocates a unique run ID per VM (and a vsock CID on the Firecracker backend only; §6.12).
 - Enforces optional max-concurrency and per-run resource budgets.
 - Drives the run lifecycle (§7) and guarantees VM teardown even on error/panic/signal.
+- Tracks run state including a **`waiting`** state when the agent has asked a question and
+  `mode: wait` is set (§6.13); waiting runs still own a live VM and count against concurrency.
 - Persists run metadata + artifacts under the project's `.krayt/runs/<id>/` (§8.4).
 
 ### 6.3 Provider interface (`internal/provider`)
@@ -261,6 +271,7 @@ service GuestAgent {
   rpc Start(StartRequest) returns (stream RunEvent);
 
   rpc CollectArtifacts(CollectRequest) returns (stream Chunk); // patch+report tar
+  rpc Answer(AnswerRequest) returns (Ack);          // host answers an agent question (§6.13)
   rpc Shutdown(ShutdownRequest) returns (Ack);
 }
 
@@ -281,12 +292,17 @@ message StartRequest  { string image_ref = 1; uint32 timeout_secs = 2; }
 
 message RunEvent {
   oneof kind {
-    LogLine log = 1;
-    Status  status = 2;            // terminal; last message on the stream
+    LogLine  log = 1;
+    Status   status = 2;          // terminal; last message on the stream
+    Question question = 3;        // agent paused to ask the human (§6.13); not terminal
   }
 }
 message LogLine { enum Stream { STDOUT = 0; STDERR = 1; } Stream stream = 1; bytes line = 2; int64 ts_unix_ms = 3; }
 message Status  { int32 exit_code = 1; bool timed_out = 2; string error = 3; }
+
+// Agent → human question (§6.13). Pushed on the Start stream; host replies via Answer().
+message Question      { string id = 1; string prompt = 2; repeated string choices = 3; uint32 timeout_secs = 4; }
+message AnswerRequest { string question_id = 1; string response = 2; bool no_answer = 3; } // no_answer = timeout/declined
 
 message CollectRequest  {}
 message Ack             { bool ok = 1; string error = 2; }
@@ -437,6 +453,62 @@ symmetric across the two backends, so the `Provider` hides the difference behind
 - **Security note:** the channel needs no TLS — a vsock link reaches exactly one VM and is
   not on any network. `insecure` transport credentials are correct here, not a shortcut.
 
+### 6.13 Agent → human questions (`ask_human`)
+An **optional, asynchronous** way for the agent to pause and ask the human a question, get
+an answer, and continue — without a terminal or attach session. Off by default, so batch
+stays batch; enabled per run. The design keeps the agnostic core intact and puts the
+agent-specific part in the adapter.
+
+**Three layers:**
+- **Question channel (agnostic core — `internal/guest/ask` + host):** the stable contract.
+  A small in-VM bridge accepts a question from inside the container (over a local unix
+  socket to the guest-agent), the guest-agent pushes it to the host as a
+  `RunEvent.Question` on the `Start` stream (§6.5), blocks until the host calls
+  `Answer(question_id, response)` (or the timeout fires), then returns the answer into the
+  container. Independent of which agent is running.
+- **Two front-ends onto the channel:**
+  - **`ask_human` MCP server:** a tiny MCP server krayt runs inside the VM exposing one
+    tool — `ask_human{ question, choices?, context? }` — bridged to the question channel.
+    Idiomatic for MCP-speaking agents; the tool *description* steers *when* to ask
+    ("only when genuinely blocked on a decision a human must make"). This is the premium path.
+  - **`krayt-ask` CLI:** a small binary in the base image, mounted into the container, that
+    any agent can shell out to (`krayt-ask [--choices a,b] "question"` → answer on stdout).
+    Universal lowest-common-denominator fallback. Same channel underneath.
+- **Registration (per-agent adapter, Phase 5):** wiring the agent's config to the MCP
+  server is agent-specific (Claude Code et al. each configure MCP differently), so it lives
+  in the optional adapter — **not** the agnostic core. The adapter registers the MCP server
+  / wires the CLI **only when `--on-question=wait`**.
+
+**Modes — `--on-question`, default `fail`:**
+- `fail` (default): neither front-end is wired → `ask_human` is absent and `krayt-ask`
+  returns a "no human" sentinel immediately → the agent proceeds autonomously. Unattended
+  runs never block. (This is why earlier phases are unaffected by the feature.)
+- `wait`: front-end(s) wired. A call pauses the agent; the run enters the **`waiting`**
+  state; the question is surfaced to the human; the answer flows back and the agent continues.
+
+**Timeout — `--question-timeout` (default e.g. 10m), `--on-question-timeout` = `sentinel`
+(default) | `abort`:**
+- Each question has a timeout. On expiry the default returns a **"no answer" sentinel**
+  (`AnswerRequest.no_answer = true`) so the agent can fall back gracefully (proceed
+  conservatively or abort itself); `abort` instead fails the whole run. The run's overall
+  wall-clock timeout still applies on top. The timeout also bounds how long a `waiting` VM
+  parks (it holds live resources).
+
+**Host UX:**
+- The run shows `waiting` in `krayt ls`, **and a system/desktop notification fires**
+  ("run `<id>` is waiting for input").
+- The human answers with `krayt answer <run-id> [<qid>] <response>` (or an interactive
+  one-line prompt; `choices[]` → tap/select). Multiple pending questions are answered FIFO by id.
+- Every Q&A pair is persisted to `.krayt/runs/<id>/questions/<qid>.json` and summarized in
+  `report.md` / `meta.json`, so the patch review shows what the agent asked and what it was told.
+
+**Concurrency & safety:**
+- A `waiting` run still owns a live VM, so it counts against max-concurrency; the timeout
+  prevents indefinite parking.
+- Question text comes from untrusted agent code → sanitize on display (strip terminal
+  escape sequences), label it clearly as agent-originated, and never auto-fill secrets into
+  an answer.
+
 ---
 
 ## 7. Run Lifecycle (Step by Step)
@@ -488,7 +560,13 @@ resources:
   disk: 20GiB
   timeout: 30m
 
-# optional orchestration adapter (otherwise the image entrypoint runs)
+questions:                      # agent → human questions (§6.13)
+  mode: fail                    # fail (default, autonomous) | wait (pause for input)
+  timeout: 10m                  # per-question wait limit
+  on_timeout: sentinel          # sentinel (default; agent decides) | abort (fail the run)
+
+# optional orchestration adapter (otherwise the image entrypoint runs).
+# The adapter also wires the ask_human MCP server / krayt-ask CLI when mode: wait (§6.13).
 agent:
   adapter: none                 # none | claude-code | gemini-cli
 ```
@@ -513,6 +591,7 @@ Every run produces a self-contained directory the human reviews from:
 ├── changes.patch     # git diff vs baseline (the deliverable; §6.7)
 ├── report.md         # human-readable summary (see below)
 ├── meta.json         # machine-readable run record (schema below)
+├── questions/        # one <qid>.json per agent question + its answer (§6.13), if any
 └── logs/
     ├── agent.log     # container stdout/stderr (merged, timestamped)
     └── events.jsonl  # one JSON object per RunEvent (optional, for tooling)
@@ -529,12 +608,16 @@ Every run produces a self-contained directory the human reviews from:
   "task_summary": "first 200 chars of the task prompt",
   "network": { "mode": "allowlist", "allow": ["api.anthropic.com"] },
   "resources": { "cpus": 2, "memory_mib": 4096, "disk_gib": 20, "timeout_secs": 1800 },
+  "questions_mode": "fail",
   "started_at": "2026-06-06T10:00:00Z",
   "ended_at":   "2026-06-06T10:07:42Z",
   "duration_secs": 462,
   "exit_code": 0,
   "timed_out": false,
   "patch": { "path": "changes.patch", "files_changed": 7, "insertions": 124, "deletions": 18 },
+  "questions": [
+    { "id": "q1", "prompt": "Target Postgres or SQLite?", "answer": "postgres", "answered_by": "human", "waited_secs": 35 }
+  ],
   "error": ""
 }
 ```
@@ -576,11 +659,14 @@ krayt/
 │   ├── guest/               # guest-agent (compiled to linux)
 │   │   ├── agent.go         # init/control server
 │   │   ├── proxy/           # egress allowlist proxy + firewall
+│   │   ├── ask/             # in-VM question bridge + ask_human MCP server (§6.13)
 │   │   └── runner/          # containerd Go client (single container per VM)
+│   ├── adapter/             # optional per-agent adapters (claude-code, gemini-cli); MCP/CLI wiring (§6.13)
 │   ├── task/                # config schema + parsing
 │   ├── patch/               # baseline snapshot + diff; host-side apply helpers
 │   ├── imagestore/          # host pull + OCI export + digest-keyed cache (§6.11)
 │   └── secrets/             # secrets loading + redaction
+├── cmd/krayt-ask/main.go    # tiny in-container CLI front-end for ask_human (§6.13)
 ├── images/                  # Nix-based VM image definition (kernel + rootfs)
 │   ├── flake.nix            # declarative base image; pins kernel, runtime, guest-agent
 │   ├── flake.lock           # pinned inputs (the update surface)
@@ -798,9 +884,11 @@ must produce and guarantee:
 krayt run     [--image] [--task] [--repo] [--config] [--secrets]
                  [--net allowlist|full|none] [--allow domain ...]
                  [--cpus] [--memory] [--disk] [--timeout] [--detach]
-krayt ls                       # list active/recent runs
+                 [--on-question wait|fail] [--question-timeout DUR] [--on-question-timeout sentinel|abort]
+krayt ls                       # list active/recent runs (shows `waiting` runs)
 krayt attach  <run-id>         # live-stream a running agent's logs
 krayt logs    <run-id>         # show persisted logs
+krayt answer  <run-id> [<qid>] <response>   # answer a waiting agent question (§6.13); FIFO if qid omitted
 krayt patch   <run-id>         # print/locate the run's changes.patch
 krayt apply   <run-id>         # helper: git apply the patch onto the host (after review)
 krayt stop    <run-id>         # stop + destroy a run's VM
@@ -900,15 +988,17 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - [ ] Orchestrator: multiple concurrent runs, per-VM socket device, state under `.krayt/`.
 - [ ] `ls`, `attach`, `logs`, `stop`, `rm`.
 - [ ] Live log streaming (`Start` stream) + headless detach.
+- [ ] Agent-question channel (§6.13): `RunEvent.Question` + `Answer` RPC, in-VM bridge, `waiting` state, `krayt answer`, desktop notification, Q&A persisted to `questions/`. Default `mode: fail` so it's inert unless opted in.
 - [ ] Config file + flag precedence; example configs.
-- [ ] **Done when:** N runs execute concurrently with isolated patches/logs, and `attach` shows live output of a chosen run.
+- [ ] **Done when:** N runs execute concurrently with isolated patches/logs, `attach` shows live output, and (with `--on-question=wait`) a stubbed agent question drives a `waiting` state that `krayt answer` resolves.
 
 ### Phase 5 — Polish & optional orchestration
-- [ ] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats; agent notes if the image writes `/output/report.md`).
-- [ ] Optional agent adapters (`claude-code`, `gemini-cli`).
+- [ ] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats, questions; agent notes if the image writes `/output/report.md`).
+- [ ] `ask_human` front-ends (§6.13): in-VM MCP server + `krayt-ask` CLI, both bridging to the Phase-4 question channel.
+- [ ] Optional agent adapters (`claude-code`, `gemini-cli`) — incl. registering the MCP server / wiring `krayt-ask` when `--on-question=wait`.
 - [ ] Warm-VM pool to amortize boot time (optional).
 - [ ] Patch safety lint (flag hooks/suspicious changes).
-- [ ] **Done when:** a real agent image completes a task and the run dir contains patch + report + meta. **[HUMAN: live API keys for the agent image]**
+- [ ] **Done when:** a real agent image completes a task and the run dir contains patch + report + meta; with the adapter + `--on-question=wait`, the agent's `ask_human` call round-trips to `krayt answer`. **[HUMAN: live API keys for the agent image]**
 
 ### Phase 6 — Linux backend (parity)
 - [ ] `firecracker` provider behind the same `Provider` interface (`CID`-based vsock).
@@ -926,8 +1016,8 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - **Image distribution** — *resolved:* **host pulls + pre-loads over vsock** (§6.11). The
   VM never needs registry egress; the host is the only registry-facing component.
 - **Dirty-tree fidelity** — exact semantics of including uncommitted/staged/untracked files.
-- **Multi-step / interactive tasks** — current model is one-shot; revisit if agents need
-  back-and-forth with the human mid-run.
+- **Mid-run human input** — *resolved:* async `ask_human` question channel (§6.13), not a
+  terminal. Full interactive/attached pairing remains intentionally out of scope.
 - **Artifact signing / provenance** — optionally sign run outputs for auditability.
 
 ---
@@ -938,6 +1028,9 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
   Virtualization.framework (macOS) and KVM/Firecracker (Linux).
 - **CoW rootfs** — copy-on-write clone of the base VM disk so each run is isolated and disposable.
 - **Egress proxy** — in-guest forward proxy enforcing the per-task domain allowlist.
+- **`ask_human` / question channel** — optional async path for the agent to pause and ask
+  the human a question mid-run (§6.13), exposed as an MCP tool + `krayt-ask` CLI over an
+  agent-agnostic channel; gated by `--on-question=wait`.
 - **Baseline commit** — the in-guest git commit of the injected snapshot, against which
   the agent's changes are diffed to produce the patch.
 - **Adapter** — optional orchestration glue that knows how to invoke a specific AI CLI;
