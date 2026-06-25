@@ -1,9 +1,8 @@
 version: "2"
 
-run:
-  # Build tags so the linter sees the darwin provider seam (§9.1 build constraints).
-  build-tags:
-    - darwin
+# OS-specific files (provider seams, doctor checks) are linted under their native GOOS
+# by running the CI lint job on both macOS and Linux — not via build-tags, which would
+# leave GOOS mismatched and break stdlib typechecking.
 
 linters:
   enable:

@@ -39,8 +39,12 @@ jobs:
       - run: GOOS=linux GOARCH=arm64 go build ./...
 
   lint:
-    name: golangci-lint
-    runs-on: ubuntu-latest
+    name: golangci-lint (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
