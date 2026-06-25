@@ -88,9 +88,21 @@
       # Raw ext4 rootfs containing the system closure. vfkit boots raw images only
       # (no qcow2, §12); the CoW clone is an APFS clonefile of this raw image (§6.3).
       # callPackage auto-supplies pkgs/lib/e2fsprogs/… that make-ext4-fs.nix expects.
+      #
+      # make-ext4-fs copies only the /nix/store closure, so populateImageCommands must
+      # create the root skeleton: the mountpoints systemd-initrd needs for the
+      # initrd→rootfs handoff (notably /run, mounted before the root is remounted rw) and
+      # the system profile symlink so initrd-find-nixos-closure can resolve the closure.
       rootfs = pkgs.callPackage "${nixpkgs}/nixos/lib/make-ext4-fs.nix" {
         storePaths = [ nixos.config.system.build.toplevel ];
         volumeLabel = "krayt-root";
+        populateImageCommands = ''
+          mkdir -p ./files/proc ./files/sys ./files/dev ./files/run ./files/tmp \
+                   ./files/var ./files/etc ./files/root ./files/mnt ./files/sbin \
+                   ./files/nix/var/nix/profiles ./files/nix/var/nix/gcroots
+          ln -s ${nixos.config.system.build.toplevel} ./files/nix/var/nix/profiles/system
+          ln -s ${nixos.config.system.build.toplevel}/init ./files/sbin/init
+        '';
       };
     in
     {
