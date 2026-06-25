@@ -1,6 +1,6 @@
 module github.com/418-cloud/krayt
 
-go 1.26.4
+go 1.26
 
 require (
 	github.com/coreos/go-systemd/v22 v22.6.0
