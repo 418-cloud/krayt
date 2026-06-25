@@ -20,6 +20,8 @@ import (
 type VMSpec struct {
 	ID        string
 	Kernel    string // path to vmlinuz (or EFI image)
+	Initrd    string // path to initramfs for the Linux bootloader; empty for EFI boot
+	Cmdline   string // kernel command line (e.g. "console=hvc0 root=/dev/vda")
 	RootFS    string // path to the BASE rootfs image; provider makes a CoW clone per run
 	CID       uint32 // vsock guest CID — Firecracker only; ignored by the vz/vfkit providers (§6.12)
 	CPUs      int

@@ -1,0 +1,94 @@
+name: vm-image
+
+# Builds the base micro-VM image on a native arm64 Linux runner (§11.5).
+#
+# Two jobs, so you never have to merge to main to drive the Phase 1 handoffs:
+#   build   — runs on every PR touching the image/guest sources (and on tags / manual).
+#             Use it to read the guest-agent vendorHash from the build log, then to
+#             confirm the image builds. No registry credentials, nothing published.
+#   publish — runs only when you push a `v*` tag (the tag can point at a branch commit,
+#             so no merge needed). Pushes the OCI artifact to GHCR and prints the digest
+#             to pin in internal/vmimage/pinned.go.
+on:
+  pull_request:
+    paths:
+      - "images/**"
+      - "go.mod"
+      - "go.sum"
+      - "internal/**"
+      - "cmd/krayt-agent/**"
+      - ".github/workflows/image.yml"
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Also push the built image to GHCR"
+        type: boolean
+        default: false
+
+# Cancel superseded runs on the same ref to avoid piling up slow image builds.
+concurrency:
+  group: vm-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm # native aarch64-linux, no QEMU emulation (§11.5)
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # determinate-nix-action pins the installed Nix version (nix-installer-action
+      # always grabs the newest Nix even when the action is pinned).
+      - uses: DeterminateSystems/determinate-nix-action@629b284231c2a82554b724e357e47fc6020833c8 # v3.21.2
+
+      - name: Build VM image
+        run: nix build ./images#vmImage --print-build-logs
+
+      # First run with vendorHash = lib.fakeHash fails here on a hash mismatch — that is
+      # expected and how you obtain the real hash.
+      - name: vendorHash hint
+        if: failure()
+        run: |
+          echo "::notice title=vendorHash::If the build failed with a hash mismatch, copy the 'got: sha256-…' value into images/flake.nix (vendorHash), commit, and push again."
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: DeterminateSystems/determinate-nix-action@629b284231c2a82554b724e357e47fc6020833c8 # v3.21.2
+
+      - name: Build VM image
+        run: nix build ./images#vmImage --print-build-logs
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install oras
+        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
+
+      - name: Push OCI artifact + record digest
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && tag="manual-${GITHUB_SHA::12}"
+          ref="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage:${tag}"
+          cd result
+          oras push "$ref" \
+            vmlinuz:application/vnd.krayt.kernel \
+            initrd:application/vnd.krayt.initrd \
+            rootfs.img:application/vnd.krayt.rootfs
+          digest="$(oras manifest fetch "$ref" --descriptor | jq -r .digest)"
+          echo "::notice title=krayt-vmimage::Pin in internal/vmimage/pinned.go -> PinnedRef=$ref  PinnedDigest=$digest"

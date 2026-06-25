@@ -8,6 +8,11 @@
 *.so
 *.dylib
 
+# Built command binaries (from `go build ./cmd/...` or `make krayt`)
+/krayt
+/krayt-agent
+/bin/
+
 # Test binary, built with `go test -c`
 *.test
 

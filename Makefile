@@ -1,4 +1,6 @@
-.PHONY: proto build test lint tidy
+.PHONY: proto build krayt test lint tidy clean
+
+BIN := bin
 
 # Regenerate the gRPC control protocol from internal/protocol/krayt.proto into
 # internal/protocol/pb (§9.2). Wraps the pinned Nix codegen target so plugin/version
@@ -10,6 +12,10 @@ proto:
 build:
 	go build ./...
 
+# Build the krayt CLI binary into ./bin (host OS/arch).
+krayt:
+	go build -o $(BIN)/krayt ./cmd/krayt
+
 test:
 	go test ./...
 
@@ -18,3 +24,6 @@ lint:
 
 tidy:
 	go mod tidy
+
+clean:
+	rm -rf $(BIN)
