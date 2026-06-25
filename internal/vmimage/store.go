@@ -17,6 +17,9 @@ import (
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
+	"oras.land/oras-go/v2/registry/remote/retry"
 )
 
 // Artifact file names, carried as org.opencontainers.image.title annotations on the OCI
@@ -44,12 +47,24 @@ type Image struct {
 }
 
 // Open builds a read-only OCI target for a registry reference (e.g.
-// ghcr.io/418-cloud/krayt-vmimage:v1). Used in production; tests pass an in-memory or
-// oci-layout target to Pull instead.
+// ghcr.io/418-cloud/krayt-vmimage:v1). It authenticates using the Docker credential
+// store (~/.docker/config.json + native keychain helpers), so a prior
+// `docker login ghcr.io` / `oras login ghcr.io` lets it pull from private registries;
+// with no stored credentials it falls back to anonymous (fine for public artifacts).
+// Used in production; tests pass an in-memory or oci-layout target to Pull instead.
 func Open(ref string) (oras.ReadOnlyTarget, error) {
 	repo, err := remote.NewRepository(ref)
 	if err != nil {
 		return nil, fmt.Errorf("vmimage: open %q: %w", ref, err)
+	}
+	store, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("vmimage: load docker credentials: %w", err)
+	}
+	repo.Client = &auth.Client{
+		Client:     retry.DefaultClient,
+		Cache:      auth.NewCache(),
+		Credential: credentials.Credential(store),
 	}
 	return repo, nil
 }

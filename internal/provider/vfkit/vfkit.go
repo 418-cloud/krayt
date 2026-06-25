@@ -65,24 +65,61 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 		return nil, fmt.Errorf("vfkit: clone rootfs: %w", err)
 	}
 
-	ctrlSock := filepath.Join(dir, "control.sock")
-	restSock := filepath.Join(dir, "rest.sock")
+	// Unix-socket paths are capped at 104 bytes (sockaddr_un.sun_path) on macOS, and the
+	// run dir (under $TMPDIR or .krayt) can exceed that. Keep the control + REST sockets
+	// in a short dir so both vfkit's bind and our dial stay under the limit (§6.12).
+	sockDir, err := newSockDir()
+	if err != nil {
+		return nil, err
+	}
+	ctrlSock := filepath.Join(sockDir, "control.sock")
+	restSock := filepath.Join(sockDir, "rest.sock")
 
 	vmConfig, err := buildConfig(spec, clone, ctrlSock)
 	if err != nil {
 		return nil, err
 	}
 
+	// Capture the guest serial console (kernel `console=hvc0`) to a file so boot failures
+	// are diagnosable without an attached terminal.
+	consoleLog := filepath.Join(dir, "console.log")
+	serial, err := config.VirtioSerialNew(consoleLog)
+	if err != nil {
+		return nil, fmt.Errorf("vfkit: virtio-serial: %w", err)
+	}
+	if err := vmConfig.AddDevice(serial); err != nil {
+		return nil, fmt.Errorf("vfkit: add serial: %w", err)
+	}
+
 	return &vm{
-		id:       spec.ID,
-		binary:   binary,
-		dir:      dir,
-		clone:    clone,
-		ctrlSock: ctrlSock,
-		restSock: restSock,
-		config:   vmConfig,
-		rest:     newRESTClient(restSock),
+		id:         spec.ID,
+		binary:     binary,
+		dir:        dir,
+		sockDir:    sockDir,
+		clone:      clone,
+		ctrlSock:   ctrlSock,
+		restSock:   restSock,
+		consoleLog: consoleLog,
+		config:     vmConfig,
+		rest:       newRESTClient(restSock),
 	}, nil
+}
+
+// sockRoot is a short base directory for per-VM unix sockets. /tmp is short on macOS (a
+// symlink to /private/tmp), unlike $TMPDIR, keeping socket paths under the 104-byte
+// sockaddr_un limit.
+const sockRoot = "/tmp/krayt"
+
+// newSockDir creates a unique short-pathed directory for a VM's control + REST sockets.
+func newSockDir() (string, error) {
+	if err := os.MkdirAll(sockRoot, 0o700); err != nil {
+		return "", fmt.Errorf("vfkit: create socket root: %w", err)
+	}
+	d, err := os.MkdirTemp(sockRoot, "vm-")
+	if err != nil {
+		return "", fmt.Errorf("vfkit: create socket dir: %w", err)
+	}
+	return d, nil
 }
 
 // buildConfig assembles the vfkit VirtualMachine: Linux bootloader (kernel+initrd+
@@ -113,16 +150,23 @@ func buildConfig(spec provider.VMSpec, rootfs, ctrlSock string) (*config.Virtual
 }
 
 type vm struct {
-	id       string
-	binary   string
-	dir      string
-	clone    string
-	ctrlSock string
-	restSock string
-	config   *config.VirtualMachine
-	rest     *restClient
+	id         string
+	binary     string
+	dir        string
+	sockDir    string
+	clone      string
+	ctrlSock   string
+	restSock   string
+	consoleLog string
+	config     *config.VirtualMachine
+	rest       *restClient
 
 	cmd *exec.Cmd
+}
+
+// LogPaths returns the vfkit and guest-console log file paths, for diagnostics.
+func (v *vm) LogPaths() (vfkitLog, consoleLog string) {
+	return filepath.Join(v.dir, "vfkit.log"), v.consoleLog
 }
 
 // Start launches the vfkit subprocess with the assembled config plus a RESTful control
@@ -192,12 +236,15 @@ func (v *vm) wait(ctx context.Context) error {
 	}
 }
 
-// Destroy stops the VM and removes its working dir (CoW clone + sockets).
+// Destroy stops the VM and removes its working dir (CoW clone) and socket dir.
 func (v *vm) Destroy(ctx context.Context) error {
 	if v.cmd != nil {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		_ = v.Stop(stopCtx)
 		cancel()
+	}
+	if v.sockDir != "" {
+		_ = os.RemoveAll(v.sockDir)
 	}
 	if err := os.RemoveAll(v.dir); err != nil {
 		return fmt.Errorf("vfkit: remove run dir: %w", err)
