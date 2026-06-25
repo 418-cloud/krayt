@@ -16,19 +16,18 @@
     let
       system = "aarch64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
-      lib = nixpkgs.lib;
 
       # The guest-agent, pinned end-to-end via buildGoModule (§11.1). vendorHash is the
-      # hash of the Go module dependencies (NOT the nixpkgs narHash). Leave it as
-      # lib.fakeHash; the first build fails with `got: sha256-…` — paste that value here.
-      # The build must run on aarch64-linux (CI, or a Mac linux-builder; §11.3). See
-      # HUMAN_TODO.md "[Phase 1] Fill guest-agent vendorHash".
+      # hash of the Go module dependencies (NOT the nixpkgs narHash). To regenerate after
+      # changing dependencies, set it to lib.fakeHash, build, and paste the `got: sha256-…`
+      # value the mismatch reports. Build runs on aarch64-linux (CI, or a Mac
+      # linux-builder; §11.3).
       guest-agent = pkgs.buildGoModule {
         pname = "krayt-agent";
         version = "0.0.0-dev";
         src = ../.; # repo root (go.mod, internal/, cmd/)
         subPackages = [ "cmd/krayt-agent" ];
-        vendorHash = lib.fakeHash;
+        vendorHash = "sha256-JNdn1OQB/IhnG+NAmgmwn/2PztEwE4zL7C4nIGOMXs8=";
         env.CGO_ENABLED = "0";
       };
 

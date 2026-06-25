@@ -36,24 +36,12 @@ registry credentials, and real Apple-Silicon hardware — the last one is the ph
 - Verify success by: `krayt doctor` shows `[ok] vfkit installed + runnable`.
 - Blocking: no — only needed for the boot test below.
 
-## [Phase 1] Fill guest-agent vendorHash in images/flake.nix
-- Needed: replace `vendorHash = lib.fakeHash;` with the real Go-module dependency hash.
-  This is NOT the nixpkgs narHash from the flake.lock message — it is the hash buildGoModule
-  reports for the vendored deps.
-- Why the agent can't: the hash is produced by a Nix build on aarch64-linux, which needs a
-  Linux builder + the Nix binary cache (unavailable in the sandbox).
-- Exact steps/commands: the package is aarch64-linux only, so address it explicitly (the
-  short `#guest-agent` resolves to the host system, e.g. aarch64-darwin on a Mac, and 404s):
-  ```
-  nix build ./images#packages.aarch64-linux.guest-agent
-  ```
-  Nix prints `error: hash mismatch … got: sha256-…` — paste that `got:` value into
-  `images/flake.nix`. This runs on CI's arm64 Linux runner as-is; on a Mac it needs an
-  aarch64-linux builder — see `docs/macos-linux-builder.md` for setup (Determinate native
-  builder or nix-darwin `linux-builder`), otherwise let CI compute it (the image workflow's
-  first run surfaces the same mismatch).
-- Verify success by: `nix build ./images#packages.aarch64-linux.guest-agent` succeeds.
-- Blocking: yes — the VM image can't build until this is set. Precedes the image build.
+## [Phase 1] Fill guest-agent vendorHash in images/flake.nix — DONE
+- Resolved: `vendorHash` is set to `sha256-JNdn1OQB/IhnG+NAmgmwn/2PztEwE4zL7C4nIGOMXs8=`
+  (the `got:` value from the CI build's hash mismatch). The `go-modules` derivation now
+  builds. To regenerate after changing Go deps: set it back to `lib.fakeHash`, build, and
+  paste the new `got:` hash. Build runs on aarch64-linux — see `docs/macos-linux-builder.md`
+  for a local builder, or let CI compute it.
 
 ## [Phase 1] Build + publish the VM image via CI (no merge to main needed)
 - Needed: drive the `vm-image` workflow (`.github/workflows/image.yml`) entirely from the
