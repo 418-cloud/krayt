@@ -1,0 +1,59 @@
+syntax = "proto3";
+package krayt.v1;
+option go_package = "github.com/418-cloud/krayt/internal/protocol/pb";
+
+service GuestAgent {
+  // Handshake + version negotiation.
+  rpc Hello(HelloRequest) returns (HelloResponse);
+
+  // Incremental image transfer (§6.11): host asks which blobs the guest already has,
+  // then streams only the missing ones.
+  rpc QueryImageBlobs(BlobQuery) returns (BlobPresence);
+  rpc PushImage(stream Chunk) returns (Ack);        // OCI archive, client-streaming
+
+  rpc PushCode(stream Chunk) returns (Ack);         // repo tarball, client-streaming
+  rpc PushTask(TaskSpec) returns (Ack);
+  rpc PushSecrets(SecretsBundle) returns (Ack);     // held in memory only (§6.8)
+  rpc SetNetworkPolicy(NetworkPolicy) returns (Ack);
+
+  // Start the container and stream events until it exits. The final RunEvent carries
+  // the terminal Status (exit code); the stream then closes.
+  rpc Start(StartRequest) returns (stream RunEvent);
+
+  rpc CollectArtifacts(CollectRequest) returns (stream Chunk); // patch+report tar
+  rpc Answer(AnswerRequest) returns (Ack);          // host answers an agent question (§6.13)
+  rpc Shutdown(ShutdownRequest) returns (Ack);
+}
+
+message HelloRequest  { string client_version = 1; }
+message HelloResponse { string agent_version = 1; string containerd_version = 2; }
+
+message BlobQuery     { repeated string digests = 1; } // sha256: of image layers/config
+message BlobPresence  { repeated string missing_digests = 1; }
+
+message Chunk { bytes data = 1; string digest = 2; bool last = 3; } // digest set on blob/stream boundaries
+
+message TaskSpec      { bytes prompt = 1; map<string, string> env = 2; } // env = non-secret
+message SecretsBundle { map<string, string> values = 1; }               // tmpfs at /run/secrets
+message NetworkPolicy { enum Mode { ALLOWLIST = 0; FULL = 1; NONE = 2; }
+                        Mode mode = 1; repeated string allow = 2; }
+
+message StartRequest  { string image_ref = 1; uint32 timeout_secs = 2; }
+
+message RunEvent {
+  oneof kind {
+    LogLine  log = 1;
+    Status   status = 2;          // terminal; last message on the stream
+    Question question = 3;        // agent paused to ask the human (§6.13); not terminal
+  }
+}
+message LogLine { enum Stream { STDOUT = 0; STDERR = 1; } Stream stream = 1; bytes line = 2; int64 ts_unix_ms = 3; }
+message Status  { int32 exit_code = 1; bool timed_out = 2; string error = 3; }
+
+// Agent → human question (§6.13). Pushed on the Start stream; host replies via Answer().
+message Question      { string id = 1; string prompt = 2; repeated string choices = 3; uint32 timeout_secs = 4; }
+message AnswerRequest { string question_id = 1; string response = 2; bool no_answer = 3; } // no_answer = timeout/declined
+
+message CollectRequest  {}
+message Ack             { bool ok = 1; string error = 2; }
+message ShutdownRequest {}
