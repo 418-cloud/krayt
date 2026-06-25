@@ -77,7 +77,7 @@ thing that flows back is a reviewable text patch.
 |---|---|
 | Language | Go |
 | Primary OS | macOS (Apple Silicon) |
-| macOS VM backend | Native `Code-Hex/vz` (Virtualization.framework) from day one |
+| macOS VM backend | **vfkit** (`crc-org/vfkit`) for v1 — drives Virtualization.framework via a tested, pre-signed subprocess; direct `Code-Hex/vz` embedding is the documented swap-in fallback, both behind the `Provider` seam (§6.3) |
 | Linux VM backend (future) | Firecracker or Cloud Hypervisor via the same `Provider` interface |
 | Tool ↔ agent | Convention-first contract + optional orchestration adapters |
 | Networking | Per-task policy; **default allowlist** enforced by an in-guest egress proxy |
@@ -103,7 +103,8 @@ thing that flows back is a reviewable text patch.
 │        │                                                                               │
 │        ▼                                                                               │
 │   Provider (interface)                                                                 │
-│     ├── vz provider          (macOS, Virtualization.framework)   ← v1                 │
+│     ├── vfkit provider       (macOS, Virtualization.framework)   ← v1                 │
+│     ├── vz provider          (macOS, direct Code-Hex/vz)         ← fallback           │
 │     └── firecracker provider (Linux, KVM)                        ← later              │
 │        │                                                                               │
 │        │  boots                                                                        │
@@ -214,13 +215,20 @@ type VM interface {
 }
 ```
 
-- **`internal/provider/vz`** (v1): wraps `Code-Hex/vz/v3`. Boots a Linux kernel +
-  CoW-cloned rootfs, attaches a NAT network device and a `VZVirtioSocketDevice`.
-  - **CoW clone:** `Create` clones the base rootfs image with APFS `clonefile(2)` (or
-    `cp -c`) — instant and space-shared. Each run boots from its own writable clone;
-    `Destroy` deletes it. The base image is never mutated.
-  - **vsock:** there is no global CID namespace to manage — each VM owns its own socket
-    device object, which *is* the per-run isolation handle (see §6.12).
+- **`internal/provider/vfkit`** (v1): drives `crc-org/vfkit`, which itself wraps
+  `Code-Hex/vz/v3`. `Create` builds the VM config via vfkit's `pkg/config` Go API and
+  launches the signed vfkit binary as a subprocess; lifecycle is controlled over vfkit's
+  REST API (unix socket). vfkit is used in production by podman/minikube/crc.
+  - **CoW clone:** `Create` clones the base **raw** rootfs image with APFS `clonefile(2)`
+    (vfkit needs raw/ISO, not qcow2); vfkit boots from the clone via its Linux bootloader
+    (kernel + initrd + rootfs) or EFI. `Destroy` kills the vfkit process and deletes the clone.
+  - **vsock:** vfkit exposes the guest vsock port as a **host unix socket**
+    (`--device virtio-vsock,port=1024,socketURL=…`); `DialControl` is a plain unix-socket
+    dial (see §6.12). No `CID` needed.
+  - **Signing:** the entitlement lives on the vfkit binary, not krayt — see §12.
+- **`internal/provider/vz`** (fallback, not built in v1): embeds `Code-Hex/vz/v3` directly
+  in-process for a zero-runtime-dependency, fully-controllable path. Swap target if vfkit's
+  API ever becomes a control ceiling. Same `Provider`/`VM` interface — no other code changes.
 - **`internal/provider/firecracker`** (later): same interface over `firecracker-go-sdk`;
   here `CID` is meaningful and the host connects via `AF_VSOCK` to that CID.
 
@@ -437,19 +445,20 @@ symmetric across the two backends, so the `Provider` hides the difference behind
 - **Guest side (identical on both backends):** the guest-agent listens on a **fixed vsock
   port** (e.g. `1024`) using `github.com/mdlayher/vsock` — `vsock.Listen(1024, nil)`
   returns a `net.Listener`, which is handed straight to `grpc.NewServer().Serve(lis)`.
-- **Host side — vz (macOS):** there is **no `AF_VSOCK` on the host**. The host connects
-  through the per-VM `VZVirtioSocketDevice` (exposed by `Code-Hex/vz/v3`): call
-  `device.Connect(1024)`, which yields a connection that satisfies `net.Conn`. That conn
-  is the gRPC transport. `Provider.DialControl` wraps this and the gRPC client uses it via
-  `grpc.WithContextDialer(func(ctx, _) (net.Conn, error) { return vm.DialControl(ctx, 1024) })`
-  plus `grpc.WithTransportCredentials(insecure.NewCredentials())` (the link is already
-  isolated to this VM).
+- **Host side — vfkit (macOS, v1):** there is **no `AF_VSOCK` on a macOS host**, so vfkit
+  bridges the guest vsock port to a **host unix socket** (started with
+  `--device virtio-vsock,port=1024,socketURL=/…/ctrl.sock`). `Provider.DialControl` is then
+  a plain `net.Dial("unix", socketURL)`, and the gRPC client uses it via
+  `grpc.WithContextDialer(...)` + `grpc.WithTransportCredentials(insecure.NewCredentials())`
+  (the link is isolated to this VM). This is simpler than the direct-vz path below.
+- **Host side — direct vz (macOS fallback):** if embedding `Code-Hex/vz/v3`, the host
+  connects through the per-VM `VZVirtioSocketDevice` (`device.Connect(1024)` → `net.Conn`)
+  instead of a unix socket. Same `DialControl` contract, different innards.
 - **Host side — Firecracker (Linux):** the host *does* use `AF_VSOCK`, connecting to the
-  guest `CID` from `VMSpec`. Same `DialControl` signature, different innards.
-- **Why no CID management on vz:** isolation between concurrent runs comes from each VM
-  owning its **own** `VZVirtioSocketDevice` instance — the host already holds a distinct
-  device handle per VM, so there is no shared CID namespace to allocate or collide on.
-  The `CID` field in `VMSpec` is therefore Firecracker-only.
+  guest `CID` from `VMSpec`. Same `DialControl` signature again.
+- **Why no CID management on macOS:** with vfkit each VM has its own `socketURL`, and with
+  direct vz each VM owns its own `VZVirtioSocketDevice` — either way there is no shared CID
+  namespace to allocate. The `CID` field in `VMSpec` is Firecracker-only.
 - **Security note:** the channel needs no TLS — a vsock link reaches exactly one VM and is
   not on any network. `insecure` transport credentials are correct here, not a shortcut.
 
@@ -653,8 +662,9 @@ krayt/
 │   ├── orchestrator/        # run lifecycle, concurrency, teardown, state
 │   ├── provider/
 │   │   ├── provider.go      # Provider/VM interfaces (OS-agnostic)
-│   │   ├── vz/              # macOS (Code-Hex/vz)            ← v1
-│   │   └── firecracker/     # Linux (firecracker-go-sdk)    ← later
+│   │   ├── vfkit/           # macOS via crc-org/vfkit subprocess   ← v1
+│   │   ├── vz/              # macOS via direct Code-Hex/vz          ← fallback
+│   │   └── firecracker/     # Linux (firecracker-go-sdk)           ← later
 │   ├── protocol/            # vsock control protocol (shared host+guest)
 │   ├── guest/               # guest-agent (compiled to linux)
 │   │   ├── agent.go         # init/control server
@@ -682,7 +692,8 @@ at implementation time; major versions shown where they matter.)
 
 | Concern | Module | Notes |
 |---|---|---|
-| macOS VM backend | `github.com/Code-Hex/vz/v3` | Virtualization.framework; cgo, macOS-only build tag |
+| macOS VM backend (v1) | `github.com/crc-org/vfkit` (`pkg/config` + REST) | drives a signed vfkit subprocess; pure-Go host (no cgo); pin version |
+| macOS VM backend (fallback) | `github.com/Code-Hex/vz/v3` | direct in-process embedding; cgo + macOS SDK; used only if the vz provider is built |
 | Guest vsock listener | `github.com/mdlayher/vsock` | `vsock.Listen` → `net.Listener` for gRPC (guest, linux) |
 | Linux VM backend (Phase 6) | `github.com/firecracker-microvm/firecracker-go-sdk` | host `AF_VSOCK` to guest CID |
 | gRPC | `google.golang.org/grpc` + `google.golang.org/protobuf` | control protocol (§6.5) |
@@ -694,10 +705,12 @@ at implementation time; major versions shown where they matter.)
 | CLI | `github.com/spf13/cobra` (+ `spf13/pflag`) | command surface (§13) |
 | Config | `gopkg.in/yaml.v3` | task config file (§8.1) |
 
-Build constraints: `internal/provider/vz` is `//go:build darwin` (cgo); `internal/guest`
+Build constraints: `internal/provider/vfkit` and `internal/provider/vz` are
+`//go:build darwin` (vfkit is pure-Go host-side; the vz fallback adds cgo). `internal/guest`
 and its children are `//go:build linux` and cross-compiled to `linux/arm64`. Keep the
 OS-agnostic core (orchestrator, protocol, task, imagestore host side, patch) free of
-build tags so it compiles on both.
+build tags so it compiles on both. Runtime: the vfkit provider requires the `vfkit` binary
+installed (brew); `krayt doctor` checks for it (§13).
 
 ### 9.2 Code generation
 The `.proto` (§6.5) lives at `internal/protocol/krayt.proto`; generated Go lands in
@@ -852,29 +865,39 @@ must produce and guarantee:
 - **Closure contents (and nothing else):** kernel, systemd, containerd + `runc`/`crun`,
   nftables, the static guest-agent binary, CA certificates, busybox-equivalent coreutils.
   No editors, no shells beyond what systemd needs, no package manager.
-- **Output artifacts:** `vmlinuz` (or EFI image) + `rootfs.img`, both `aarch64-linux`,
-  packaged as the OCI artifact in §11.5.
-- **Boot contract (what the host relies on):** within N seconds of `VM.Start`, the
-  guest-agent is listening on vsock port `1024` and answers `Hello`. The host treats a
-  successful `Hello` as "VM ready"; failure within a timeout → abort + `Destroy`.
+- **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — vfkit boots
+  raw/ISO, not qcow2), all `aarch64-linux`, packaged as the OCI artifact in §11.5. vfkit
+  boots them via its Linux bootloader (kernel + initrd + cmdline) or EFI.
+- **Boot contract (what the host relies on):** within N seconds of `VM.Start` (vfkit
+  process up + VM booted), the guest-agent is listening on vsock port `1024` (bridged to the
+  host `socketURL`) and answers `Hello`. The host treats a successful `Hello` as "VM ready";
+  failure within a timeout → abort + `Destroy`.
 
 > Practical ownership: have Claude Code author `flake.nix` and the systemd units, but make
-> the boot-test (vz boots the image → `Hello` round-trips) a human/CI checkpoint, since the
-> agent's sandbox can't build or boot the Linux image.
+> the boot-test (vfkit boots the image → `Hello` round-trips) a human/CI checkpoint, since
+> the agent's sandbox can't build or boot the Linux image.
 
 ---
 
 ## 12. macOS Specifics & Gotchas
 
-- **Entitlement required:** the binary needs `com.apple.security.virtualization`
-  (and possibly `com.apple.vm.networking` for NAT). The binary must be **code-signed**
-  with this entitlement or VM creation fails. Document signing in the build.
-- **Apple Silicon:** ensure kernel/rootfs are `arm64`. Guest-agent and user images
-  must match the VM architecture (arm64) unless emulating (avoid).
-- **vsock:** exposed via Virtualization.framework's socket device; `Code-Hex/vz`
-  wraps it. Confirm CID assignment strategy for concurrent VMs.
-- **NAT networking:** Virtualization.framework provides NAT; domain filtering is *our*
-  responsibility (the egress proxy), as the framework does not filter by domain.
+- **Entitlement / signing — handled by vfkit (v1):** the `com.apple.security.virtualization`
+  entitlement is carried by the **vfkit** binary, which ships signed (installed via brew),
+  so **krayt itself does not need the virtualization entitlement or special code-signing**.
+  This removes the signing handoff that the direct-vz path would require. `krayt doctor`
+  verifies vfkit is installed and runnable. *(If you ever switch to the direct `vz`
+  provider, the entitlement + signing requirement moves onto the krayt binary — that becomes
+  a `[HUMAN: signing identity]` step again.)*
+- **Runtime dependency:** the vfkit provider needs the `vfkit` binary present (brew, pinned
+  version). `doctor` checks presence + version; document the install in the README.
+- **Image format:** vfkit boots **raw**/ISO images only (no qcow2). Keep `rootfs.img` raw;
+  CoW clone via APFS `clonefile` works on raw images.
+- **Apple Silicon:** ensure kernel/rootfs are `arm64`. Guest-agent and user images must
+  match the VM architecture (arm64) unless emulating (avoid).
+- **vsock:** no host `AF_VSOCK` on macOS — vfkit bridges the guest vsock port to a host
+  unix socket (`socketURL`); the control channel dials that socket (§6.12).
+- **NAT networking:** vfkit provides NAT; domain filtering is *our* responsibility (the
+  in-guest egress proxy, §6.6), as neither vfkit nor the framework filters by domain.
 
 ---
 
@@ -893,7 +916,7 @@ krayt patch   <run-id>         # print/locate the run's changes.patch
 krayt apply   <run-id>         # helper: git apply the patch onto the host (after review)
 krayt stop    <run-id>         # stop + destroy a run's VM
 krayt rm      <run-id>         # remove run artifacts
-krayt doctor                   # check host prereqs (entitlement, signing, /dev/kvm on linux)
+krayt doctor                   # check host prereqs (vfkit installed+runnable on macOS; /dev/kvm on linux)
 ```
 
 `run` is headless/detached-capable; default streams logs to the terminal but the VM
@@ -934,7 +957,8 @@ image digests, no "boot succeeded" without a real boot. An honestly-blocked step
 correct; a faked one is a defect.
 
 **Categories that require a human:**
-- Apple Developer signing identity / notarization (entitlement build, §12).
+- Apple Developer signing identity / notarization — **only if** you switch to the direct
+  `vz` provider; the v1 vfkit path needs no krayt signing (§12). vfkit install is trivial.
 - A Linux builder or CI run to build/boot the Nix image (§11.3, §11.6).
 - Registry or other credentials/secrets (publishing the OCI artifact, §11.5).
 - Real-hardware checks: vz boot on a Mac, `/dev/kvm` on Linux (Phase 1 / 6 "Done when").
@@ -961,12 +985,12 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - [ ] **Done when:** `go test ./...` passes on macOS and Linux; a `Hello` RPC round-trips over the fake provider.
 
 ### Phase 1 — Boot a VM on macOS
-- [ ] `vz` provider: boot kernel + CoW-cloned rootfs (`clonefile`); attach NAT + vsock device.
-- [ ] Code-signing + `com.apple.security.virtualization` entitlement in the build (§12). **[HUMAN: signing identity]** — agent writes `entitlements.plist` + the `codesign` command; human signs with their Apple Developer identity.
-- [ ] `images/flake.nix`: NixOS + systemd image per §11.6; build in CI on arm64 Linux runner; publish OCI artifact (§11.5). **[HUMAN: Linux builder/CI + registry creds]** — agent writes the flake + CI workflow; human runs CI / provides registry credentials.
+- [ ] `vfkit` provider: build VM config via vfkit `pkg/config`, launch the signed vfkit subprocess, control via its REST API; CoW-clone the raw rootfs (`clonefile`); NAT + vsock (`socketURL`) devices.
+- [ ] No krayt code-signing needed (entitlement lives on vfkit, §12). `doctor` checks vfkit is installed + runnable; README documents `brew install vfkit`. **[HUMAN: install vfkit]** — trivial, scriptable; not a signing identity.
+- [ ] `images/flake.nix`: NixOS + systemd image per §11.6 (raw `rootfs.img` + kernel + initrd); build in CI on arm64 Linux runner; publish OCI artifact (§11.5). **[HUMAN: Linux builder/CI + registry creds]** — agent writes the flake + CI workflow; human runs CI / provides registry credentials.
 - [ ] `krayt image pull` + digest verification before first run.
-- [ ] `DialControl` (vz `VZVirtioSocketDevice.Connect`) + gRPC client wiring (§6.12).
-- [ ] **Done when:** on a real Mac, `krayt` boots the published image and a `Hello` RPC round-trips host↔guest over vsock. **[HUMAN: boot test on real hardware]**
+- [ ] `DialControl` = `net.Dial("unix", socketURL)` to vfkit's vsock bridge + gRPC client wiring (§6.12).
+- [ ] **Done when:** on a real Mac (with vfkit installed), `krayt` boots the published image and a `Hello` RPC round-trips host↔guest over the vfkit vsock socket. **[HUMAN: boot test on real hardware]**
 
 ### Phase 2 — End-to-end single run (happy path)
 - [ ] Host: pull user OCI image + export OCI archive; digest-keyed cache (`imagestore`).
@@ -1026,6 +1050,9 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 
 - **vsock** — virtio sockets; host↔guest comms channel that works under both
   Virtualization.framework (macOS) and KVM/Firecracker (Linux).
+- **vfkit** — `crc-org/vfkit`, a macOS CLI/REST hypervisor over Virtualization.framework
+  (itself built on `Code-Hex/vz`), used by podman/minikube/crc. krayt's v1 macOS provider
+  drives it as a subprocess; the entitlement lives on vfkit, not krayt.
 - **CoW rootfs** — copy-on-write clone of the base VM disk so each run is isolated and disposable.
 - **Egress proxy** — in-guest forward proxy enforcing the per-task domain allowlist.
 - **`ask_human` / question channel** — optional async path for the agent to pause and ask
