@@ -88,8 +88,8 @@
 
       # Raw ext4 rootfs containing the system closure. vfkit boots raw images only
       # (no qcow2, §12); the CoW clone is an APFS clonefile of this raw image (§6.3).
-      rootfs = import "${nixpkgs}/nixos/lib/make-ext4-fs.nix" {
-        inherit pkgs;
+      # callPackage auto-supplies pkgs/lib/e2fsprogs/… that make-ext4-fs.nix expects.
+      rootfs = pkgs.callPackage "${nixpkgs}/nixos/lib/make-ext4-fs.nix" {
         storePaths = [ nixos.config.system.build.toplevel ];
         volumeLabel = "krayt-root";
       };
@@ -101,8 +101,8 @@
 
         vmImage = pkgs.runCommand "krayt-vmimage" { } ''
           mkdir -p $out
-          # arm64 kernel image is named Image (not bzImage).
-          cp ${nixos.config.system.build.kernel}/Image $out/vmlinuz
+          # kernelFile is "Image" on aarch64 (vs "bzImage" on x86_64).
+          cp ${nixos.config.system.build.kernel}/${nixos.config.system.boot.loader.kernelFile} $out/vmlinuz
           cp ${nixos.config.system.build.initialRamdisk}/initrd $out/initrd
           cp ${rootfs} $out/rootfs.img
           printf 'init=%s/init console=hvc0 root=/dev/vda' \
