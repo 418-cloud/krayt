@@ -682,6 +682,8 @@ krayt/
 │   ├── flake.lock           # pinned inputs (the update surface)
 │   └── microvm.nix          # Linux backend (firecracker/cloud-hypervisor)  ← later
 ├── configs/                 # example krayt.yaml, default allowlist
+├── flake.nix                # dev shell (protoc/buf/oras pinned) + codegen target (§9.2)
+├── Makefile                 # `make proto`, build, test targets
 ├── docs/
 └── README.md
 ```
@@ -714,9 +716,29 @@ installed (brew); `krayt doctor` checks for it (§13).
 
 ### 9.2 Code generation
 The `.proto` (§6.5) lives at `internal/protocol/krayt.proto`; generated Go lands in
-`internal/protocol/pb`. Generate via a `nix run`/`Makefile` target (so toolchain versions
-are pinned) and check the generated code in, so neither the host build nor Claude Code
-needs `protoc` present to compile.
+`internal/protocol/pb`. **The generated code is checked into the repo**, so building or
+running krayt — and Claude Code compiling it — needs **no `protoc`**. Only *regenerating*
+after editing the `.proto` needs the codegen toolchain.
+
+Regeneration runs behind a single pinned target so plugin/version skew never produces noisy
+diffs:
+
+```
+make proto        # wraps `nix run .#proto` (or buf); pins protoc + protoc-gen-go + protoc-gen-go-grpc
+```
+
+This gives three prerequisite tiers (mirrored in the README):
+- **Build/run krayt:** Go + vfkit + git. No protoc (generated code is committed).
+- **Regenerate protocol:** Nix (or `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc`, or
+  `buf`) — only when the `.proto` changes.
+- **Build the VM image (CI):** arm64 Linux runner + Nix + `oras` + registry creds (§11.5).
+
+> Guest-side runtime deps (`containerd`, `runc`/`crun`, `nftables`) live **inside** the
+> Nix-built VM image, not on the dev machine — the flake owns them (§11.1/§11.6).
+
+A root `flake.nix` `devShell` provides the codegen + image tools (`protoc`,
+`protoc-gen-go`, `protoc-gen-go-grpc`, `buf`, `oras`) at pinned versions, so `nix develop`
+is all a contributor needs for tiers 2–3 — no per-tool installs. `make proto` runs inside it.
 
 ---
 
@@ -978,6 +1000,7 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 
 ### Phase 0 — Foundations
 - [ ] Repo scaffold, Go module, CI, lint, build tags (§9.1).
+- [ ] Root `flake.nix` dev shell (protoc/buf/oras pinned) + `Makefile` with `make proto` (§9.2).
 - [ ] Define `Provider`/`VM` interfaces and `RunSpec`/`VMSpec` types.
 - [ ] Author `krayt.proto` (§6.5); generate + check in `internal/protocol/pb` (§9.2).
 - [ ] `fakeProvider` + in-process gRPC loopback for tests.
