@@ -76,6 +76,8 @@ func (v *vm) DialControl(ctx context.Context, _ uint32) (net.Conn, error) {
 	return lis.DialContext(ctx)
 }
 
+// Stop shuts the guest server down and releases the listener, leaving the VM in a
+// clean stopped state (Start may be called again, and DialControl fails until it is).
 func (v *vm) Stop(_ context.Context) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -83,20 +85,16 @@ func (v *vm) Stop(_ context.Context) error {
 		v.server.GracefulStop()
 		v.server = nil
 	}
-	return nil
-}
-
-func (v *vm) Destroy(ctx context.Context) error {
-	if err := v.Stop(ctx); err != nil {
-		return err
-	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	if v.lis != nil {
 		_ = v.lis.Close()
 		v.lis = nil
 	}
 	return nil
+}
+
+// Destroy tears the fake VM down. There is no CoW clone to remove, so it is just Stop.
+func (v *vm) Destroy(ctx context.Context) error {
+	return v.Stop(ctx)
 }
 
 func (v *vm) ID() string { return v.id }

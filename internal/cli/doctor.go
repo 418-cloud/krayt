@@ -16,6 +16,8 @@ type checkResult struct {
 
 // hostChecks returns the platform-specific prerequisite checks; it is implemented per
 // OS in doctor_darwin.go / doctor_linux.go / doctor_other.go.
+
+// newDoctorCmd builds the `doctor` command (§13).
 func newDoctorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
