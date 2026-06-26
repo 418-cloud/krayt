@@ -38,6 +38,11 @@
             # ---- minimal boot: no bootloader; vfkit supplies kernel+initrd+cmdline ----
             boot.loader.grub.enable = false;
             boot.loader.systemd-boot.enable = false;
+            # Use the classic scripted stage-1 (not systemd-in-initrd): it simply mounts
+            # root and switch_roots into $closure/init, which is the proven pairing with
+            # make-ext4-fs rootfs images (sd-image style) and avoids the systemd-initrd
+            # find-nixos-closure machinery that our hand-built rootfs trips over.
+            boot.initrd.systemd.enable = false;
             # virtio + vsock + overlay must be available early to mount root and serve
             # the control channel (§11.6).
             boot.initrd.availableKernelModules = [
