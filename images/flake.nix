@@ -106,6 +106,9 @@
                    ./files/var ./files/etc ./files/root ./files/mnt ./files/sbin \
                    ./files/nix/var/nix/profiles ./files/nix/var/nix/gcroots
           ln -s ${nixos.config.system.build.toplevel} ./files/nix/var/nix/profiles/system
+          # /init is the scripted initrd's default stage-2 target (no init= needed on the
+          # cmdline), so the image boots self-contained with a generic `root=/dev/vda`.
+          ln -s ${nixos.config.system.build.toplevel}/init ./files/init
           ln -s ${nixos.config.system.build.toplevel}/init ./files/sbin/init
         '';
       };
