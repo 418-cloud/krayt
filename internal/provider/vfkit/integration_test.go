@@ -66,6 +66,7 @@ func TestBootHello(t *testing.T) {
 	// Boot contract: the guest-agent must answer Hello within N seconds of Start (§11.6).
 	resp, err := c.WaitReady(ctx, 60*time.Second, 500*time.Millisecond)
 	if err != nil {
+		dumpDiagnostics(t, vm)
 		t.Fatalf("WaitReady (boot + Hello): %v", err)
 	}
 	if resp.GetAgentVersion() == "" {
@@ -73,4 +74,23 @@ func TestBootHello(t *testing.T) {
 	}
 	t.Logf("guest-agent ready: version=%s containerd=%s",
 		resp.GetAgentVersion(), resp.GetContainerdVersion())
+}
+
+// dumpDiagnostics prints the vfkit + guest-console logs to the test output so a boot
+// failure is visible even though Destroy (t.Cleanup) later removes the run dir.
+func dumpDiagnostics(t *testing.T, machine provider.VM) {
+	t.Helper()
+	lp, ok := machine.(interface{ LogPaths() (string, string) })
+	if !ok {
+		return
+	}
+	vfkitLog, consoleLog := lp.LogPaths()
+	for label, path := range map[string]string{"vfkit.log": vfkitLog, "console.log": consoleLog} {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Logf("--- %s: unavailable (%v) ---", label, err)
+			continue
+		}
+		t.Logf("--- %s (%d bytes) ---\n%s", label, len(b), b)
+	}
 }

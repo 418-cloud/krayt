@@ -155,7 +155,7 @@ Built phase by phase per `KRAYT_SPEC.md` §14.
 
 - **Phase 0 — Foundations:** done. Provider/protocol/types scaffold, `fakeProvider`
   loopback, `krayt doctor`; `Hello` round-trips over the fake provider.
-- **Phase 1 — Boot a VM on macOS:** code complete (vfkit provider, host control client +
+- **Phase 1 — Boot a VM on macOS:** done. vfkit provider, host control client +
   boot-readiness, base-image pull + digest verify, `krayt-agent` vsock binary, Nix image
-  flake, CI). The real boot test on Apple-Silicon hardware and the CI image
-  build/publish are pending human/CI steps — see `HUMAN_TODO.md`.
+  flake, and CI. Verified on real Apple-Silicon hardware: `krayt` boots the published
+  image and a `Hello` RPC round-trips host↔guest over the vfkit vsock socket.

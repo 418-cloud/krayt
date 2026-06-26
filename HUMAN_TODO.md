@@ -43,45 +43,24 @@ registry credentials, and real Apple-Silicon hardware — the last one is the ph
   paste the new `got:` hash. Build runs on aarch64-linux — see `docs/macos-linux-builder.md`
   for a local builder, or let CI compute it.
 
-## [Phase 1] Build + publish the VM image via CI (no merge to main needed)
-- Needed: drive the `vm-image` workflow (`.github/workflows/image.yml`) entirely from the
-  feature branch. The `build` job runs on any PR touching the image/guest sources; the
-  `publish` job runs when you push a `v*` tag (tags can point at a branch commit, so main
-  is never touched). Confirm repo Settings → Actions → Workflow permissions allow
-  `packages: write` (the publish job uses `secrets.GITHUB_TOKEN`).
-- Why the agent can't: building a NixOS aarch64 image needs a Linux runner + Nix binary
-  cache (§11.3); publishing needs registry write. The sandbox has neither.
-- Exact steps/commands: see the step-by-step in this file's sibling note below, or just:
-  1. push the branch + open a (draft) PR → read the `vendorHash` from the failed build;
-  2. paste it into `images/flake.nix`, push → build goes green;
-  3. `git tag v0.0.0-rc1 && git push origin v0.0.0-rc1` → `publish` pushes to GHCR.
-  Commit `images/flake.lock` too (already generated).
-- Verify success by: the publish job's `::notice title=krayt-vmimage::` prints
-  `PinnedRef=…` and `PinnedDigest=…`.
-- Blocking: yes — the boot test needs a published image.
+## [Phase 1] Build + publish the VM image via CI — DONE
+- Resolved: the `vm-image` workflow built and published `v0.0.0-rc1` to GHCR
+  (`ghcr.io/418-cloud/krayt-vmimage:v0.0.0-rc1`,
+  digest `sha256:9a8e78ccfcd19464fbdfc9578253981e154014746a3efe15a6877ef179b49a44`).
+  Commit `images/flake.lock` if not already.
+- Note: confirm the GHCR package is set **public** (or that the boot-test host can
+  authenticate) so `krayt image pull` can fetch it.
 
-## [Phase 1] Pin the published image digest in internal/vmimage/pinned.go
-- Needed: set `PinnedDigest` (and `PinnedRef` if the registry/owner differs) to the
-  digest printed by the image workflow.
-- Why the agent can't: the digest doesn't exist until CI builds + pushes the image.
-- Exact steps/commands: edit `internal/vmimage/pinned.go`:
-  `PinnedDigest digest.Digest = "sha256:<from CI>"`
-- Verify success by: `krayt doctor` shows the base image as pinned; `krayt image pull`
-  pulls and verifies it without the "no pinned digest" warning.
-- Blocking: yes — without the pin, `image pull` runs unverified.
+## [Phase 1] Pin the published image digest in internal/vmimage/pinned.go — DONE
+- Resolved: `PinnedRef = ghcr.io/418-cloud/krayt-vmimage:v0.0.0-rc1` and `PinnedDigest =
+  sha256:9a8e78cc…b49a44`. `krayt doctor` now reports the image as pinned (cached after
+  `krayt image pull`).
 
-## [Phase 1] Boot test on real Apple-Silicon hardware (the "Done when")
-- Needed: on a Mac with vfkit installed and the image pulled, run the gated integration
-  test; confirm the VM boots and a `Hello` RPC round-trips host↔guest over the vfkit
-  vsock socket (§14 Phase 1).
-- Why the agent can't: needs real virtualization hardware (no nested virt / vfkit boot
-  in a cloud agent) and a built VM image.
-- Exact steps/commands:
-  ```
-  krayt image pull
-  # locate the cached files (krayt doctor / the pull output), then:
-  KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img \
-    go test -tags 'integration darwin' -run TestBootHello -v ./internal/provider/vfkit/
-  ```
-- Verify success by: `TestBootHello` passes and logs `guest-agent ready: version=…`.
-- Blocking: yes — this IS the Phase 1 completion criterion. Work pauses here.
+## [Phase 1] Boot test on real Apple-Silicon hardware (the "Done when") — DONE ✅
+- Resolved: on a real Apple-Silicon Mac with vfkit, `TestBootHello` passed — the VM
+  (image v0.0.0-rc5, digest `sha256:97da098e…74dad`) booted and a `Hello` RPC
+  round-tripped host↔guest over the vfkit vsock socket in ~11s
+  (`guest-agent ready: version=0.0.0-dev`). **Phase 1 "Done when" met.**
+- Getting here took several image iterations (all in `images/flake.nix`): short socket
+  paths (macOS 104-byte limit), rootfs skeleton + `/nix/var/nix/profiles/system`, scripted
+  initrd instead of systemd-initrd, and a `/init` symlink for the scripted stage-2 target.
