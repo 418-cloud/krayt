@@ -151,5 +151,11 @@ See `CLAUDE.md` for the full working agreement.
 
 ## Status
 
-Pre-implementation. The spec is complete; code is being built phase by phase per
-`KRAYT_SPEC.md` §14.
+Built phase by phase per `KRAYT_SPEC.md` §14.
+
+- **Phase 0 — Foundations:** done. Provider/protocol/types scaffold, `fakeProvider`
+  loopback, `krayt doctor`; `Hello` round-trips over the fake provider.
+- **Phase 1 — Boot a VM on macOS:** done. vfkit provider, host control client +
+  boot-readiness, base-image pull + digest verify, `krayt-agent` vsock binary, Nix image
+  flake, and CI. Verified on real Apple-Silicon hardware: `krayt` boots the published
+  image and a `Hello` RPC round-trips host↔guest over the vfkit vsock socket.

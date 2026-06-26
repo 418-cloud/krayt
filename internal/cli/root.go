@@ -19,5 +19,6 @@ func NewRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.AddCommand(newDoctorCmd())
+	root.AddCommand(newImageCmd())
 	return root
 }
