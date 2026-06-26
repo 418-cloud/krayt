@@ -6,8 +6,9 @@ import "github.com/opencontainers/go-digest"
 // on an arm64 Linux runner, pushes it as an OCI artifact, and records the resulting
 // digest; that digest is pinned here and verified on `krayt image pull` (§11.4/§11.5).
 //
-// To bump: build + publish via the vm-image workflow (push a new tag), then update both
-// PinnedRef (tag) and PinnedDigest to the values from its `::notice` output.
+// To bump: build + publish via the vm-image workflow (push a new tag), then set both
+// PinnedRef (the name@sha256:… digest reference) and PinnedDigest to the digest from its
+// `::notice` output.
 const (
 	// PinnedRef is the default registry reference, pinned by digest so it resolves to
 	// exactly the boot-tested image regardless of tag. The registry is interchangeable;

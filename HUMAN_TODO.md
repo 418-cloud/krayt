@@ -44,16 +44,18 @@ registry credentials, and real Apple-Silicon hardware — the last one is the ph
   for a local builder, or let CI compute it.
 
 ## [Phase 1] Build + publish the VM image via CI — DONE
-- Resolved: the `vm-image` workflow built and published `v0.0.0-rc1` to GHCR
-  (`ghcr.io/418-cloud/krayt-vmimage:v0.0.0-rc1`,
-  digest `sha256:9a8e78ccfcd19464fbdfc9578253981e154014746a3efe15a6877ef179b49a44`).
+- Resolved: the `vm-image` workflow builds and publishes to GHCR
+  (`ghcr.io/418-cloud/krayt-vmimage`). The boot-tested image is `v0.0.0-rc5`,
+  digest `sha256:97da098e67af271bab29721cdbbaf9f03e6d604d3271983c689792c21e474dad`
+  (rc1–rc4 were earlier iterations while debugging the boot — see the boot-test entry).
   Commit `images/flake.lock` if not already.
 - Note: confirm the GHCR package is set **public** (or that the boot-test host can
   authenticate) so `krayt image pull` can fetch it.
 
 ## [Phase 1] Pin the published image digest in internal/vmimage/pinned.go — DONE
-- Resolved: `PinnedRef = ghcr.io/418-cloud/krayt-vmimage:v0.0.0-rc1` and `PinnedDigest =
-  sha256:9a8e78cc…b49a44`. `krayt doctor` now reports the image as pinned (cached after
+- Resolved: pinned by digest to the boot-tested image (v0.0.0-rc5) —
+  `PinnedRef = ghcr.io/418-cloud/krayt-vmimage@sha256:97da098e…74dad` and
+  `PinnedDigest = sha256:97da098e…74dad`. `krayt doctor` reports it pinned (cached after
   `krayt image pull`).
 
 ## [Phase 1] Boot test on real Apple-Silicon hardware (the "Done when") — DONE ✅

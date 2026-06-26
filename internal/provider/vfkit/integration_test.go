@@ -27,8 +27,9 @@ import (
 
 func TestBootHello(t *testing.T) {
 	kernel := os.Getenv("KRAYT_KERNEL")
+	initrd := os.Getenv("KRAYT_INITRD")
 	rootfs := os.Getenv("KRAYT_ROOTFS")
-	if kernel == "" || rootfs == "" {
+	if kernel == "" || initrd == "" || rootfs == "" {
 		t.Skip("set KRAYT_KERNEL, KRAYT_INITRD, KRAYT_ROOTFS to a built base image to run")
 	}
 	cmdline := os.Getenv("KRAYT_CMDLINE")
@@ -43,7 +44,7 @@ func TestBootHello(t *testing.T) {
 	vm, err := p.Create(ctx, provider.VMSpec{
 		ID:        "run_integration",
 		Kernel:    kernel,
-		Initrd:    os.Getenv("KRAYT_INITRD"),
+		Initrd:    initrd,
 		Cmdline:   cmdline,
 		RootFS:    rootfs,
 		CPUs:      2,

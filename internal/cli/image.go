@@ -36,6 +36,9 @@ func newImagePullCmd() *cobra.Command {
 			want := vmimage.PinnedDigest
 			if dig != "" {
 				want = digest.Digest(dig)
+				if err := want.Validate(); err != nil {
+					return fmt.Errorf("invalid --digest %q: %w", dig, err)
+				}
 			}
 			return runImagePull(cmd, ref, want)
 		},
@@ -107,9 +110,12 @@ func baseImageCheck() checkResult {
 		c.detail = err.Error()
 		return c
 	}
-	if _, err := os.Stat(filepath.Join(dir, vmimage.FileRootFS)); err != nil {
-		c.detail = "pinned " + vmimage.PinnedDigest.String() + " not cached — run `krayt image pull`"
-		return c
+	// A boot needs all three artifacts, so a partial cache is not "cached".
+	for _, f := range []string{vmimage.FileKernel, vmimage.FileInitrd, vmimage.FileRootFS} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			c.detail = "pinned " + vmimage.PinnedDigest.String() + " not cached — run `krayt image pull`"
+			return c
+		}
 	}
 	c.ok = true
 	c.detail = "cached " + vmimage.PinnedDigest.String()

@@ -59,6 +59,19 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 		return nil, fmt.Errorf("vfkit: create run dir: %w", err)
 	}
 
+	// Clean up the run dir (incl. the multi-GB CoW clone) and socket dir if any step
+	// below fails, so a partial Create never leaks disk state. Cleared on success.
+	sockDir := ""
+	success := false
+	defer func() {
+		if !success {
+			_ = os.RemoveAll(dir)
+			if sockDir != "" {
+				_ = os.RemoveAll(sockDir)
+			}
+		}
+	}()
+
 	// CoW clone of the raw rootfs so the run never mutates the shared base image.
 	clone := filepath.Join(dir, "rootfs.img")
 	if err := cloneFile(spec.RootFS, clone); err != nil {
@@ -68,7 +81,7 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 	// Unix-socket paths are capped at 104 bytes (sockaddr_un.sun_path) on macOS, and the
 	// run dir (under $TMPDIR or .krayt) can exceed that. Keep the control + REST sockets
 	// in a short dir so both vfkit's bind and our dial stay under the limit (§6.12).
-	sockDir, err := newSockDir()
+	sockDir, err = newSockDir()
 	if err != nil {
 		return nil, err
 	}
@@ -91,6 +104,7 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 		return nil, fmt.Errorf("vfkit: add serial: %w", err)
 	}
 
+	success = true
 	return &vm{
 		id:         spec.ID,
 		binary:     binary,
@@ -194,6 +208,9 @@ func (v *vm) Start(_ context.Context) error {
 		_ = logf.Close()
 		return fmt.Errorf("vfkit: start subprocess: %w", err)
 	}
+	// The child inherited the log FD at Start; close the parent's copy so it isn't
+	// leaked across runs (exec.Cmd only closes files it created itself).
+	_ = logf.Close()
 	v.cmd = cmd
 	return nil
 }
@@ -254,10 +271,17 @@ func (v *vm) Destroy(ctx context.Context) error {
 
 func (v *vm) ID() string { return v.id }
 
-// isExpectedExit treats a killed/stopped vfkit as a clean teardown rather than an error.
+// isExpectedExit reports whether a finished vfkit process exited the way teardown
+// expects: terminated by a signal (our Process.Kill). A graceful REST stop exits 0 (so
+// err is nil and this isn't consulted); a non-zero, non-signal exit is a real vfkit
+// failure (crash, bad config) and must surface rather than be swallowed by wait().
 func isExpectedExit(err error) bool {
 	var exitErr *exec.ExitError
-	return errors.As(err, &exitErr)
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	// ExitCode() is -1 only when the process was terminated by a signal.
+	return exitErr.ExitCode() == -1
 }
 
 var (

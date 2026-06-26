@@ -14,6 +14,7 @@ build:
 
 # Build the krayt CLI binary into ./bin (host OS/arch).
 krayt:
+	mkdir -p $(BIN)
 	go build -o $(BIN)/krayt ./cmd/krayt
 
 test:
