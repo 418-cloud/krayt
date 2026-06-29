@@ -88,6 +88,7 @@ thing that flows back is a reviewable text patch.
 | Task definition | **CLI flags + optional config file** (flags override file) |
 | Resource limits | Sensible defaults (e.g. 2 vCPU / 4 GB / 20 GB / 30 min), **fully configurable** |
 | Agent → human questions | Optional async `ask_human` via an MCP server + `krayt-ask` CLI over an agnostic question channel; **default `fail`** (autonomous), opt into `wait`; timeout → sentinel by default (§6.13) |
+| Agent authentication | Credential injected via the per-task secrets file (§6.8); scoped **API key** is the default, `CLAUDE_CODE_OAUTH_TOKEN` for subscription auth; the per-agent adapter enforces **exactly-one** credential; API key recommended for untrusted/concurrent runs (§6.14) |
 
 ---
 
@@ -359,6 +360,9 @@ is the simplest correct choice. Enforcement layers:
   the AI endpoints (`api.anthropic.com`, `generativelanguage.googleapis.com`) + registries
   the task needs; `full` — nftables policy switched to accept (explicit opt-in); `none` —
   proxy denies everything (usable because image acquisition is off the VM net path, §6.11).
+  The agent's **auth/refresh** endpoints must be allowlisted alongside the inference endpoint
+  (§6.14); an OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key,
+  so it can need a wider list than the seed above.
 
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 **Robust baseline approach (avoids host `.git`/worktree pitfalls):**
@@ -378,6 +382,10 @@ This yields a portable patch independent of how the host repo's git internals ar
 - Mounted in the container on **tmpfs** at `/run/secrets/` (and/or injected as env).
 - **Never** written to the VM's persistent disk image; **never** logged (redacted in logs).
 - Destroyed with the VM.
+
+Agent model-provider credentials (e.g. Claude Code's `ANTHROPIC_API_KEY` or
+`CLAUDE_CODE_OAUTH_TOKEN`) ride this same mechanism — see agent authentication (§6.14) for
+how a credential maps to the right env var and the exactly-one rule the adapter enforces.
 
 ### 6.9 Logging & streaming (`internal/orchestrator` + guest)
 - Container stdout/stderr → guest → vsock `Logs` stream → host.
@@ -518,6 +526,69 @@ agent-specific part in the adapter.
   escape sequences), label it clearly as agent-originated, and never auto-fill secrets into
   an answer.
 
+### 6.14 Agent authentication
+An agent in the sandbox needs a credential to reach its model provider, and krayt treats
+that credential as **just another secret**: it rides the per-task secrets file (§6.8), lands
+on tmpfs at `/run/secrets`, is never written to the VM disk, and is redacted from logs. The
+agnostic core needs **no** change to support agent auth — it only transports the secrets
+bundle. Everything agent-specific (which env var a credential maps to, and enforcing that
+exactly one is set) lives in the optional **per-agent adapter** — the same place the
+`ask_human` MCP registration lives (§6.13, Phase 5), **not** the core. Claude Code is the
+worked example; its specifics below track the official auth docs
+(`code.claude.com/docs/en/authentication`).
+
+**Two credential shapes, one delivery path.** Claude Code accepts either:
+- `ANTHROPIC_API_KEY` — a Console API key, billed pay-per-token; scoped and independently
+  revocable.
+- `CLAUDE_CODE_OAUTH_TOKEN` — a ~1-year OAuth token produced by running `claude setup-token`
+  on a machine with a browser (the command walks the OAuth flow, prints the token, and saves
+  it nowhere). It authenticates against a Pro/Max/Team/Enterprise subscription and is scoped
+  to inference only.
+
+Either way the user lists one credential in the secrets file, krayt streams it in
+`SecretsBundle` (§6.5), and the adapter exports it into the container environment. No core
+code knows it is an auth credential rather than any other secret.
+
+**Exactly-one rule.** Claude Code resolves credentials in a fixed precedence — cloud-provider
+creds (`CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`/`_FOUNDRY`) → `ANTHROPIC_AUTH_TOKEN` →
+`ANTHROPIC_API_KEY` → `apiKeyHelper` → `CLAUDE_CODE_OAUTH_TOKEN` → interactive `/login`
+(unusable headless). So when both `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are
+present the API key silently wins and the subscription is bypassed (billed as API usage); in
+print mode (`claude -p`) the key is always used when present, with no prompt. To avoid
+silently billing the wrong account, the **Claude Code adapter MUST enforce that exactly one
+auth credential is set**, failing fast (or at minimum warning) when both appear. This is
+adapter logic, not core logic.
+
+**Caveats to weigh per task:**
+- **Headless billing.** Reports suggest `claude -p` with a subscription OAuth token may still
+  draw API credits in some versions; confirm before assuming a sandboxed run is covered by
+  the plan *(verify current)*. Relatedly, Bare mode (`--bare`) does not read
+  `CLAUDE_CODE_OAUTH_TOKEN` at all — a bare-mode invocation must use `ANTHROPIC_API_KEY` or an
+  `apiKeyHelper`.
+- **Concurrency tension** (touches the concurrent-runs model, §4): subscription auth suits
+  roughly 1–3 steady agents; for many concurrent or overnight runs prefer an API key, since
+  subscription plans carry weekly rate caps *(verify current)*.
+- **Blast radius.** A subscription token is tied to a personal/seat plan; though scoped to
+  inference, it is less granularly revocable than a scoped API key and exposes that seat's
+  consumption and rate budget to whatever runs in the VM. For krayt's untrusted-codebase use
+  case, prefer a scoped, independently-revocable API key (§10).
+- **Lifetime / rotation.** The subscription token lasts ~1 year; regenerate it with
+  `claude setup-token` on a browser machine, or supply an `apiKeyHelper` — a script that
+  prints a token, re-invoked after 5 minutes or on HTTP 401 (interval via
+  `CLAUDE_CODE_API_KEY_HELPER_TTL_MS`) — for short-lived or rotating credentials.
+- **Non-root.** Run the agent as a **non-root** uid; Claude Code refuses uid 0 and any
+  non-root uid satisfies it. This is part of the container contract (§8.2) *(verify current)*.
+- **Egress.** The auth/refresh and inference endpoints must be on the allowlist (§6.6); an
+  OAuth/refresh flow may touch more endpoints than a single static API key, so it can need a
+  wider allow list.
+
+**Recommended default.** krayt supports both shapes through the one secrets mechanism, and
+the choice is **per task**. Untrusted code or many concurrent agents → **API key** (safer
+blast radius, fits the concurrency model, predictable billing). Trusted, low-concurrency runs
+where you want to spend your own seat → `CLAUDE_CODE_OAUTH_TOKEN`. The safe default — a scoped
+API key — matches krayt's headline use case (an agent working over an untrusted codebase), so
+the docs and examples lead with it.
+
 ---
 
 ## 7. Run Lifecycle (Step by Step)
@@ -584,8 +655,13 @@ agent:
 Injected by the tool, regardless of adapter:
 - `/workspace` — the repo snapshot (agent's working dir).
 - `/task/prompt.md` — the task description.
-- `/run/secrets/*` — secrets (tmpfs).
+- `/run/secrets/*` — secrets (tmpfs), **including any agent auth credential** (e.g.
+  `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`); the adapter exports it into the
+  environment from there (§6.14).
 - `/output/` — agent/guest writes `changes.patch` + `report.md` here (or guest generates the patch).
+
+Run the container as a **non-root** uid: some agents (Claude Code among them) refuse to run
+as uid 0, and any non-root uid satisfies them *(verify current)*.
 
 Completion = container process exit. Exit code is surfaced in `meta.json`.
 
@@ -762,6 +838,10 @@ exposed.
 - Malicious patch content (e.g. `.git/hooks`, build scripts) — reviewing the diff
   before apply is the control; consider a `--strip-hooks` / lint pass on patches later.
 - Resource exhaustion — bounded by per-VM CPU/mem/disk + wall-clock timeout.
+- Auth-credential blast radius — a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) is tied to
+  a personal/seat plan and is less granularly revocable than a scoped API key; exposing one
+  to untrusted code risks that seat's consumption and rate budget. Prefer a scoped,
+  independently-revocable API key for untrusted runs (§6.14).
 
 ---
 
@@ -1043,6 +1123,7 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - [ ] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats, questions; agent notes if the image writes `/output/report.md`).
 - [ ] `ask_human` front-ends (§6.13): in-VM MCP server + `krayt-ask` CLI, both bridging to the Phase-4 question channel.
 - [ ] Optional agent adapters (`claude-code`, `gemini-cli`) — incl. registering the MCP server / wiring `krayt-ask` when `--on-question=wait`.
+- [ ] Claude Code adapter maps the provided credential to the correct env var (`ANTHROPIC_API_KEY` vs `CLAUDE_CODE_OAUTH_TOKEN`) and enforces exactly-one auth, failing fast if both are set (§6.14).
 - [ ] Warm-VM pool to amortize boot time (optional).
 - [ ] Patch safety lint (flag hooks/suspicious changes).
 - [ ] **Done when:** a real agent image completes a task and the run dir contains patch + report + meta; with the adapter + `--on-question=wait`, the agent's `ask_human` call round-trips to `krayt answer`. **[HUMAN: live API keys for the agent image]**
@@ -1085,3 +1166,8 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
   the agent's changes are diffed to produce the patch.
 - **Adapter** — optional orchestration glue that knows how to invoke a specific AI CLI;
   not required thanks to the convention-based contract.
+- **`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`** — the two credential shapes Claude Code
+  accepts, both delivered through the per-task secrets file (§6.8, §6.14). The API key is a
+  scoped, pay-per-token Console key; `CLAUDE_CODE_OAUTH_TOKEN` is a ~1-year, inference-scoped
+  subscription token minted by **`claude setup-token`** on a browser machine. The adapter
+  enforces exactly one of them; krayt defaults to the API key for untrusted/concurrent runs.
