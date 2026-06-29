@@ -35,7 +35,7 @@ thing that flows back is a reviewable text patch.
 
 ### Goals
 - One disposable VM **per agent run**, with **multiple concurrent runs** supported.
-- Host repo isolation: **no live shared folder**; input via tar snapshot, output via patch.
+- Host repo isolation: **no live shared folder**; input via git bundle, output via patch.
 - **User-supplied Docker image** is the unit of capability — `krayt` knows nothing
   about which AI or tools are inside.
 - A **minimal VM** whose only job is to run a single container + a small guest agent. Nothing else.
@@ -113,7 +113,7 @@ thing that flows back is a reviewable text patch.
 │   ┌──────────────── MICRO-VM (minimal Linux) ─────────────────┐                        │
 │   │                                                            │                        │
 │   │   guest-agent (Go, static linux binary)                   │                        │
-│   │     ├── vsock control server  ◄──── host control channel ─┼── tar in / logs+patch out
+│   │     ├── vsock control server  ◄──── host control channel ─┼── bundle in / logs+patch out
 │   │     ├── egress proxy (allowlist) + default-deny firewall  │                        │
 │   │     └── containerd (Go client) + egress proxy + nftables       │                        │
 │   │            │                                              │                        │
@@ -148,8 +148,9 @@ defaults already merged). It lives in `internal/task`:
 type RunSpec struct {
     ID           string            // assigned by the orchestrator
     ImageRef     string            // user OCI image (tag or digest)
-    RepoPath     string            // host repo to snapshot (default: cwd)
-    IncludeDirty bool              // include uncommitted changes over HEAD baseline
+    RepoPath     string            // host repo to bundle (default: cwd)
+    IncludeDirty bool              // include uncommitted changes via non-mutating capture (§6.7)
+    BundleDepth  int               // forward-bundle shallow depth (§6.7); default 1, 0 = full history
     TaskPrompt   []byte            // contents of the task (file or inline)
     Env          map[string]string // non-secret env for the container
     SecretsPath  string            // path to per-task secrets file (may be empty)
@@ -242,7 +243,7 @@ NixOS + systemd (see §11.1/§11.6); systemd owns init, mounts, and service orde
 guest-agent stays a plain service rather than a hand-rolled PID 1.
 Responsibilities:
 - Run the **gRPC control server** on a fixed vsock port (§6.5, §6.12).
-- Receive the **image archive**, **repo tarball**, **task**, **secrets**, and **network policy**.
+- Receive the **image archive**, **repo bundle**, **task**, **secrets**, and **network policy**.
 - Bring up the **egress proxy + nftables firewall** (default-deny except the proxy; §6.6).
 - Drive **containerd** (via its native Go client) to import + run the user's OCI image as a
   single container with the right mounts/env (see §6.10).
@@ -270,7 +271,7 @@ service GuestAgent {
   rpc QueryImageBlobs(BlobQuery) returns (BlobPresence);
   rpc PushImage(stream Chunk) returns (Ack);        // OCI archive, client-streaming
 
-  rpc PushCode(stream Chunk) returns (Ack);         // repo tarball, client-streaming
+  rpc PushCode(stream Chunk) returns (Ack);         // git bundle stream, client-streaming (§6.7)
   rpc PushTask(TaskSpec) returns (Ack);
   rpc PushSecrets(SecretsBundle) returns (Ack);     // held in memory only (§6.8)
   rpc SetNetworkPolicy(NetworkPolicy) returns (Ack);
@@ -279,7 +280,7 @@ service GuestAgent {
   // the terminal Status (exit code); the stream then closes.
   rpc Start(StartRequest) returns (stream RunEvent);
 
-  rpc CollectArtifacts(CollectRequest) returns (stream Chunk); // patch+report tar
+  rpc CollectArtifacts(CollectRequest) returns (stream Chunk); // patch+report tar (+ optional commits.bundle, §6.7)
   rpc Answer(AnswerRequest) returns (Ack);          // host answers an agent question (§6.13)
   rpc Shutdown(ShutdownRequest) returns (Ack);
 }
@@ -365,16 +366,87 @@ is the simplest correct choice. Enforcement layers:
   so it can need a wider list than the seed above.
 
 ### 6.7 Code transfer & patch generation (`internal/patch`)
-**Robust baseline approach (avoids host `.git`/worktree pitfalls):**
-- **Host:** create a clean snapshot of the repo state to send. Default: `git archive HEAD`
-  (clean tree). Optionally include uncommitted working changes as an overlay.
-- **Guest:** extract into `/workspace`, then `git init -q && git add -A && git commit -m baseline`.
-- **Agent works** in `/workspace`.
-- **On finish:** `git add -A && git diff baseline > /output/changes.patch`.
-- **Host:** writes `changes.patch` to the run dir. User applies with
-  `git apply changes.patch` (or `git apply --3way`) onto the real worktree after review.
+The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
+real git objects — and is **cloned** into `/workspace` as a real repository. Unlike a flat
+`git archive` snapshot, a bundle gives the guest a genuine HEAD and history, so there is **no
+synthetic baseline commit**: the baseline is simply the imported HEAD. This yields cleaner
+3-way patch application (a real merge-base) and lets multi-commit agent output survive the
+round-trip. A bundle also preserves git's object model exactly — file modes, executable bits,
+symlinks — which the tar/`git archive` path did not guarantee.
 
-This yields a portable patch independent of how the host repo's git internals are laid out.
+**The forward bundle must be self-contained (host → guest).** The guest clones into an
+*empty* VM, so the inbound bundle must carry **no prerequisites**. A range bundle (e.g.
+`HEAD~1..HEAD`) records prerequisite commit IDs in its header, and a clone into an empty repo
+then fails with a "does not have … prerequisite commits" error — so the forward direction
+**must not** use a range. `git bundle create` has **no `--depth` flag**, so there is no native
+way to emit a self-contained shallow slice in one step. To stay lean *and* self-contained,
+krayt **shallow-clones-then-bundles** on the host *(verify current)*:
+
+```
+git clone --depth <bundle_depth> file://$REPO $TMP/src         # shallow working copy
+git -C $TMP/src bundle create $TMP/repo.bundle HEAD <branch>   # inherits the shallow boundary
+```
+
+The bundle inherits the shallow clone's boundary, so it has no prerequisites and clones
+cleanly into the empty guest (it must name at least one ref so `git clone` has something to
+check out). `bundle_depth` is configurable (§6.1/§8.1), default shallow (`1`); raise it — or
+take full history — when the agent needs deeper context.
+
+**Non-mutating dirty capture (`include_dirty`).** A bundle carries only *committed* objects,
+so uncommitted work needs explicit handling — and the capture **must never mutate the user's
+repo** (no `git add`/`git commit` against their real index, worktree, or refs). krayt builds a
+throwaway commit from a **temporary index**, honoring `.gitignore` so ignored junk
+(`node_modules`, build output, secrets) is not shipped *(verify current)*:
+
+```
+export GIT_INDEX_FILE=$TMP/idx
+git read-tree HEAD             # seed the temp index from HEAD (skip if unborn HEAD)
+git add -A                     # overlay tracked + new (non-ignored) changes
+TREE=$(git write-tree)
+DIRTY=$(git commit-tree $TREE -p HEAD -m "krayt: dirty worktree")   # drop -p if unborn HEAD
+```
+
+The user's index, working tree, and refs stay untouched; `$DIRTY` is bundled as the imported
+HEAD and simply disappears when the final diff is computed against the recorded baseline.
+(`git stash create` is a simpler alternative, but its untracked-file handling is
+version-dependent — verify before relying on it.) The **no-commits-yet** repo (unborn HEAD)
+is handled by skipping `read-tree`/`-p` and committing the temp-index tree as a root commit.
+
+**Guest-side ingest (order matters):**
+- You **cannot** `git clone` from a pipe, so the guest first streams the bundle bytes to a
+  **temp file** (`/tmp/repo.bundle`), then clones from that file.
+- `git bundle verify /tmp/repo.bundle` runs **before** cloning — it catches
+  truncation/corruption and surfaces any unexpected prerequisites early with a clear error.
+- Configure a **krayt bot git identity** (`user.name`/`user.email`) in the guest **before**
+  any commit, or commits/stash fail in a fresh container.
+- `git clone /tmp/repo.bundle /workspace`, then **record the baseline immediately** —
+  `git -C /workspace rev-parse HEAD`, tagged `krayt-baseline` — *before* the agent runs. The
+  final diff is computed against this recorded baseline, not `HEAD~1`.
+- Optionally drop the `origin` remote (it points at the now-deleted temp bundle file).
+
+**Patch out (primary) + optional commit bundle.** On completion the deliverable is, as
+before, a reviewable patch: `git diff krayt-baseline..HEAD` against the *true* recorded
+baseline (cleaner apply via the real merge-base), written to `/output/changes.patch`; the host
+saves it to the run dir and the human applies it with `git apply` (or `git apply --3way`)
+after review (§8.4). **Additionally**, because the guest now has real history, it **may** emit
+a **reverse range bundle** of just the new commits —
+`git bundle create /output/commits.bundle krayt-baseline..HEAD` — so multi-commit work applies
+faithfully on the host via `git fetch /output/commits.bundle`. A range bundle is correct here
+(unlike the forward direction) because the host already has the baseline, so the
+`krayt-baseline..HEAD` prerequisites are satisfiable. The commit bundle is **optional and
+additive**: `changes.patch` stays the primary human-review artifact and the review ergonomics
+are unchanged.
+
+**Integrity.** The bundle is a single artifact, hashable and checkable (`git bundle verify`
+plus a digest), consistent with the digest discipline already used for the OCI artifact
+(§6.11) and secrets (§6.8).
+
+**Known limitations (v1):**
+- **git-LFS:** a bundle carries LFS *pointer* files, not the large objects (which live on an
+  LFS server). LFS-tracked content is therefore **not** transferred; fetching it would need
+  network egress to the LFS endpoint, conflicting with the isolation model. Out of scope for v1.
+- **Submodules:** a superproject bundle includes the gitlink but **not** submodule contents,
+  so repos with submodules won't have submodule working trees in the guest. Out of scope for v1.
 
 ### 6.8 Secrets (`internal/secrets`)
 - Read from a **per-task secrets file** (e.g. `secrets.env` or `secrets.yaml`).
@@ -595,17 +667,19 @@ the docs and examples lead with it.
 
 1. **Resolve spec** — merge flags + config file into a `RunSpec` (image, task, repo,
    network policy, secrets file, resources, env).
-2. **Snapshot code** — `git archive HEAD` (+ optional dirty overlay) → tarball.
+2. **Bundle code** — create a self-contained git bundle (shallow-clone-then-bundle at
+   `bundle_depth`; non-mutating temp-index capture if `include_dirty`) → byte stream (§6.7).
 3. **Acquire image (host)** — resolve + pull the user's OCI image into the host store and
    export an OCI archive; reuse the digest-keyed cache to skip if already present (§6.11).
 4. **Provision VM** — `Provider.Create` makes a CoW copy of the base rootfs, assigns a CID;
    `VM.Start` boots it.
 5. **Connect** — host dials the guest-agent over vsock; handshake.
-6. **Push inputs** — image archive (incremental: only missing blobs), code tarball, task,
+6. **Push inputs** — image archive (incremental: only missing blobs), code bundle, task,
    secrets, network policy.
 7. **Start** — guest imports the image into containerd, brings up firewall+proxy, runs the container with mounts/env.
 8. **Stream** — logs flow to host (and disk). Wall-clock timeout armed.
-9. **Complete** — container exits (or timeout kills it). Guest builds the patch + report.
+9. **Complete** — container exits (or timeout kills it). Guest diffs against the recorded
+   `krayt-baseline` for `changes.patch` (+ optional `commits.bundle`) and writes the report (§6.7).
 10. **Collect** — host pulls the artifact bundle → `.krayt/runs/<id>/`
     (`changes.patch`, `report.md`, `logs/`, `meta.json`).
 11. **Destroy** — `VM.Destroy` tears down the VM and deletes the CoW disk. Guaranteed via defer/signal handling.
@@ -619,8 +693,9 @@ the docs and examples lead with it.
 ```yaml
 image: my-agent:latest          # required (flag or file)
 task: ./task.md                 # path to task prompt (or inline `task_text:`)
-repo: .                         # repo to snapshot (default: cwd)
-include_dirty: true             # include uncommitted changes over HEAD baseline
+repo: .                         # repo to bundle (default: cwd)
+include_dirty: true             # include uncommitted changes (non-mutating capture, §6.7)
+bundle_depth: 1                 # forward-bundle shallow depth; 0 = full history (§6.7)
 
 network:
   mode: allowlist               # allowlist | full | none
@@ -673,7 +748,8 @@ Every run produces a self-contained directory the human reviews from:
 
 ```
 .krayt/runs/<id>/
-├── changes.patch     # git diff vs baseline (the deliverable; §6.7)
+├── changes.patch     # git diff vs the recorded krayt-baseline (primary deliverable; §6.7)
+├── commits.bundle    # optional: reverse range bundle of the agent's commits (§6.7), if returned
 ├── report.md         # human-readable summary (see below)
 ├── meta.json         # machine-readable run record (schema below)
 ├── questions/        # one <qid>.json per agent question + its answer (§6.13), if any
@@ -749,7 +825,7 @@ krayt/
 │   │   └── runner/          # containerd Go client (single container per VM)
 │   ├── adapter/             # optional per-agent adapters (claude-code, gemini-cli); MCP/CLI wiring (§6.13)
 │   ├── task/                # config schema + parsing
-│   ├── patch/               # baseline snapshot + diff; host-side apply helpers
+│   ├── patch/               # git bundle create/verify/clone/diff (+ optional reverse bundle); non-mutating dirty capture; host-side apply helpers (§6.7)
 │   ├── imagestore/          # host pull + OCI export + digest-keyed cache (§6.11)
 │   └── secrets/             # secrets loading + redaction
 ├── cmd/krayt-ask/main.go    # tiny in-container CLI front-end for ask_human (§6.13)
@@ -827,7 +903,8 @@ exposed.
 | Surface | Control |
 |---|---|
 | Host kernel | Not shared — full VM boundary |
-| Host filesystem | No live mount; input via tar snapshot, output via reviewed patch |
+| Host filesystem | No live mount; input via git bundle, output via reviewed patch |
+| Repo ingest | git bundle cloned in-guest — source `.git/hooks` are never executed or imported, and the guest commits under a throwaway krayt bot identity (§6.7) |
 | Network egress | Default-deny + allowlist proxy; per-task opt-in to widen |
 | Secrets | tmpfs only, never on disk, redacted from logs, destroyed with VM |
 | Persistence | CoW disk destroyed on teardown; fresh VM per run |
@@ -1098,9 +1175,10 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 ### Phase 2 — End-to-end single run (happy path)
 - [ ] Host: pull user OCI image + export OCI archive; digest-keyed cache (`imagestore`).
 - [ ] `QueryImageBlobs` + `PushImage` (stream only missing blobs); guest imports into containerd.
-- [ ] `PushCode` + `git archive HEAD` snapshot + baseline commit in guest.
+- [ ] Host: create a **self-contained git bundle** (shallow-clone-then-bundle at `bundle_depth`); non-mutating temp-index capture when `include_dirty` (§6.7).
+- [ ] `PushCode` streams the bundle → guest writes it to a temp file, `git bundle verify`s it, clones into `/workspace`, sets the krayt bot git identity, and **records the baseline** (`krayt-baseline`) before the agent runs (§6.7).
 - [ ] `PushTask` injection at `/task/prompt.md`; `Start` runs the container entrypoint (agent-agnostic).
-- [ ] Patch generation (`git diff baseline`) + `CollectArtifacts` back to host.
+- [ ] Patch generation (`git diff krayt-baseline..HEAD`) + optional reverse range bundle (`commits.bundle`) + `CollectArtifacts` back to host (§6.7).
 - [ ] Guaranteed VM teardown (defer + signal handling).
 - [ ] **Done when:** `krayt run` against a trivial image that edits one file yields a correct `changes.patch` that `krayt apply` cleanly applies to the host repo.
 
@@ -1143,7 +1221,9 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
   `runc` vs `crun` left as a build-time toggle; either is acceptable.
 - **Image distribution** — *resolved:* **host pulls + pre-loads over vsock** (§6.11). The
   VM never needs registry egress; the host is the only registry-facing component.
-- **Dirty-tree fidelity** — exact semantics of including uncommitted/staged/untracked files.
+- **Dirty-tree fidelity** — *resolved:* non-mutating temp-index capture folds uncommitted
+  (non-ignored) changes into the inbound bundle, leaving the user's index/worktree/refs
+  untouched (§6.7).
 - **Mid-run human input** — *resolved:* async `ask_human` question channel (§6.13), not a
   terminal. Full interactive/attached pairing remains intentionally out of scope.
 - **Artifact signing / provenance** — optionally sign run outputs for auditability.
@@ -1162,8 +1242,15 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - **`ask_human` / question channel** — optional async path for the agent to pause and ask
   the human a question mid-run (§6.13), exposed as an MCP tool + `krayt-ask` CLI over an
   agent-agnostic channel; gated by `--on-question=wait`.
-- **Baseline commit** — the in-guest git commit of the injected snapshot, against which
-  the agent's changes are diffed to produce the patch.
+- **git bundle** — a single file packaging real git objects + refs; krayt ships the repo
+  into the VM as a bundle and clones a real repository from it (§6.7).
+- **Self-contained vs. range bundle** — a *self-contained* bundle has no prerequisites and
+  clones into an empty repo (used host→guest, produced via shallow-clone-then-bundle); a
+  *range* bundle (`<base>..HEAD`) records prerequisites and only unbundles where the base
+  already exists (used guest→host for the optional commits bundle) (§6.7).
+- **Baseline (`krayt-baseline`)** — the imported HEAD of the cloned bundle, recorded and
+  tagged in the guest before the agent runs; the agent's changes are diffed against it to
+  produce the patch (§6.7). No synthetic commit is fabricated.
 - **Adapter** — optional orchestration glue that knows how to invoke a specific AI CLI;
   not required thanks to the convention-based contract.
 - **`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`** — the two credential shapes Claude Code
