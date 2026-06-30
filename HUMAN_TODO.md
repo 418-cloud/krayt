@@ -67,62 +67,28 @@ registry credentials, and real Apple-Silicon hardware — the last one is the ph
   paths (macOS 104-byte limit), rootfs skeleton + `/nix/var/nix/profiles/system`, scripted
   initrd instead of systemd-initrd, and a `/init` symlink for the scripted stage-2 target.
 
-### Phase 2 — End-to-end single run (happy path)
-The host-side + OS-agnostic work is implemented and proven by an automated test: the Phase 2
-"Done when" is met in-process via the fakeProvider (`internal/orchestrator`
-`TestEndToEndRun`) — the real bundle→clone→baseline→diff→collect round-trip runs, a stand-in
-agent edits one file, and the resulting `changes.patch` applies cleanly with `krayt apply`.
-The container runtime (containerd) and the real boot are the only pieces that need
-hardware; those are the handoffs below. The first three **block** the real-VM confirmation
-(the last entry); the automated proof does not depend on them.
+### Phase 2 — End-to-end single run (happy path) — DONE ✅
+The Phase 2 "Done when" is met both ways: by the automated in-process proof
+(`internal/orchestrator` `TestEndToEndRun` over the fakeProvider) **and** on real
+Apple-Silicon hardware via the actual CLI path. On a real Mac,
+`krayt run --image docker.io/tjololo/test-krayt:rc0 --task task.md --repo /tmp/test`
+booted a micro-VM, imported the image into containerd on the per-run scratch disk, ran it,
+and produced `run_980ab3c8/changes.patch` (creates `greeting.txt` = `edited`); `git apply
+--check` passed and `krayt apply` landed it cleanly. **Phase 2 complete.**
 
-## [Phase 2] Regenerate guest-agent vendorHash — BLOCKING (image build)
-- Needed: a fresh `vendorHash` in `images/flake.nix` for the `krayt-agent` `buildGoModule`.
-- Why the agent can't: Phase 2 added `github.com/containerd/containerd/v2/client` (§6.10) to
-  the guest-agent's imports, changing its vendored module set. Computing the Nix vendor hash
-  needs Nix on aarch64-linux; it cannot be derived on macOS / in a cloud agent. `vendorHash`
-  is currently `lib.fakeHash` so the build fails fast with the correct hash.
-- Exact steps/commands: build on the arm64 Linux runner (or `nix build .#guest-agent`); copy
-  the `got: sha256-…` value from the hash-mismatch error into `vendorHash`.
-- Verify success by: `nix build .#guest-agent` succeeds on aarch64-linux.
-- Blocking: yes — the VM image cannot build until this is set.
+Getting the real run green took three image iterations, all now resolved:
+- **guest-agent vendorHash regenerated** — needed because Phase 2 added
+  `github.com/containerd/containerd/v2/client` (§6.10) to the guest-agent's imports; the
+  maintainer built on aarch64-linux and pasted the real hash into `images/flake.nix`.
+- **`git bundle verify` ran outside a repo** (`need a repository to verify a bundle`) — fixed
+  in `internal/patch` `verifyBundle` (runs from a throwaway bare repo); regression test
+  `TestIngestOutsideGitRepo`.
+- **`no space left on device` on image import** — the closure-sized rootfs had no room.
+  Fixed with a per-run sparse **scratch disk** (`/dev/vdb`, default 20 GiB, wires `DiskGiB`)
+  created by the vfkit provider and formatted + mounted at `/var/lib/containerd` by the new
+  `krayt-scratch` systemd unit before containerd; the guest-agent `TMPDIR` points there too
+  so the image tar + clone stay off RAM.
 
-## [Phase 2] Rebuild + republish the base VM image, then re-pin the digest — BLOCKING (real run)
-- Needed: a new base image build that includes (a) the containerd-wired guest-agent,
-  (b) `git` in the closure (`gitMinimal` on the `krayt-agent` service path, §6.7), and
-  (c) the new `krayt-scratch` service that formats + mounts the per-run scratch disk
-  (`/dev/vdb`) at `/var/lib/containerd` before containerd, with the guest-agent `TMPDIR`
-  pointed there (§6.10). Publish to GHCR and update `internal/vmimage/pinned.go`.
-- Why the agent can't: Linux builder/CI + registry credentials + real-hardware boot.
-- Note: `vendorHash` does NOT need regenerating for the scratch-disk / `patch.go` changes —
-  no Go dependency changed (only the earlier containerd addition required it, now done).
-- Exact steps/commands: run the `vm-image` workflow → capture the published digest → set
-  `PinnedRef`/`PinnedDigest` → `krayt image pull`.
-- Verify success by: `krayt doctor` shows the image pinned + cached; `TestBootHello` still
-  round-trips `Hello`; a `krayt run` against a trivial image imports it without
-  `no space left on device` and yields a non-empty `changes.patch`.
-- Blocking: yes — the real-VM e2e needs a guest that can import containers, run git, and has
-  disk space for the image.
-
-## [Phase 2] Provide a trivial user OCI image that edits one file — BLOCKING (real run)
-- Needed: a small `linux/arm64` OCI image whose entrypoint edits a file under `/workspace`
-  and exits 0 (the "trivial image that edits one file" of the Phase 2 "Done when").
-- Why the agent can't: building/publishing an image needs a registry + builder; krayt does
-  not build user images (Non-Goal §2).
-- Exact steps/commands: e.g. a Dockerfile whose CMD is
-  `sh -c 'echo edited >> /workspace/greeting.txt'`; push to a registry the host can pull.
-- Verify success by: `krayt run --image <ref> --task task.md --repo <repo>` yields a
-  non-empty `changes.patch`.
-- Blocking: yes — for the real-VM e2e only (the automated proof uses a fake runner instead).
-
-## [Phase 2] Real-VM end-to-end "Done when" on Apple-Silicon hardware
-- Needed: run `internal/orchestrator` `TestEndToEndRealVM` (build tag `integration,darwin`)
-  on a Mac with vfkit, the republished base image, and the trivial user image above.
-- Why the agent can't: needs virtualization hardware + a real containerd in the VM.
-- Exact steps/commands:
-  `KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img
-  KRAYT_IMAGE=<trivial-image-ref>
-  go test -tags 'integration darwin' -run TestEndToEndRealVM -v ./internal/orchestrator/`
-- Verify success by: the test passes (boot → run → `changes.patch` applies to the host repo).
-- Blocking: no for the phase's automated proof (already green); yes for the on-hardware
-  confirmation. Depends on the three entries above.
+The base image also gained `gitMinimal` in the closure (§6.7) — the one addition §11.6's
+closure list omits (flagged for the spec). The `integration,darwin` test
+`TestEndToEndRealVM` remains available to re-verify the path in CI/automation.
