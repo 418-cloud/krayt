@@ -20,5 +20,7 @@ func NewRootCmd() *cobra.Command {
 	}
 	root.AddCommand(newDoctorCmd())
 	root.AddCommand(newImageCmd())
+	root.AddCommand(newRunCmd())
+	root.AddCommand(newApplyCmd())
 	return root
 }

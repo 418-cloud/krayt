@@ -26,6 +26,11 @@ import (
 // DefaultBinary is the vfkit executable name resolved on PATH when no path is set.
 const DefaultBinary = "vfkit"
 
+// DefaultDiskGiB is the scratch-disk size used when VMSpec.DiskGiB is unset. The scratch
+// disk holds containerd's content store + snapshots and the guest-agent's working files
+// (image tar, bundle, workspace), keeping them off the closure-sized rootfs and out of RAM.
+const DefaultDiskGiB = 20
+
 // Provider creates vfkit-backed VMs.
 type Provider struct {
 	// Binary is the path to the vfkit executable (default: "vfkit" on PATH).
@@ -78,6 +83,20 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 		return nil, fmt.Errorf("vfkit: clone rootfs: %w", err)
 	}
 
+	// Per-run scratch disk (/dev/vdb in the guest): a sparse raw file sized to DiskGiB.
+	// The guest formats + mounts it at /var/lib/containerd (§6.10), so the image import
+	// and the agent's working files have room without bloating the rootfs or the base
+	// image artifact. Sparse on APFS, so it costs nothing until written, and it is removed
+	// with the run dir on Destroy.
+	diskGiB := spec.DiskGiB
+	if diskGiB == 0 {
+		diskGiB = DefaultDiskGiB
+	}
+	scratch := filepath.Join(dir, "scratch.img")
+	if err := createSparse(scratch, diskGiB<<30); err != nil {
+		return nil, fmt.Errorf("vfkit: create scratch disk: %w", err)
+	}
+
 	// Unix-socket paths are capped at 104 bytes (sockaddr_un.sun_path) on macOS, and the
 	// run dir (under $TMPDIR or .krayt) can exceed that. Keep the control + REST sockets
 	// in a short dir so both vfkit's bind and our dial stay under the limit (§6.12).
@@ -88,7 +107,7 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 	ctrlSock := filepath.Join(sockDir, "control.sock")
 	restSock := filepath.Join(sockDir, "rest.sock")
 
-	vmConfig, err := buildConfig(spec, clone, ctrlSock)
+	vmConfig, err := buildConfig(spec, clone, scratch, ctrlSock)
 	if err != nil {
 		return nil, err
 	}
@@ -137,15 +156,21 @@ func newSockDir() (string, error) {
 }
 
 // buildConfig assembles the vfkit VirtualMachine: Linux bootloader (kernel+initrd+
-// cmdline), the CoW rootfs as a virtio-blk disk, a NAT NIC, and a host→guest vsock
-// device bridged to ctrlSock on the host (§6.3, §6.6, §6.12).
-func buildConfig(spec provider.VMSpec, rootfs, ctrlSock string) (*config.VirtualMachine, error) {
+// cmdline), the CoW rootfs and the scratch disk as virtio-blk disks, a NAT NIC, and a
+// host→guest vsock device bridged to ctrlSock on the host (§6.3, §6.6, §6.12). The rootfs
+// is added first so it enumerates as /dev/vda (the cmdline's root=) and the scratch disk
+// as /dev/vdb (mounted by the guest at /var/lib/containerd, §6.10).
+func buildConfig(spec provider.VMSpec, rootfs, scratch, ctrlSock string) (*config.VirtualMachine, error) {
 	bootloader := config.NewLinuxBootloader(spec.Kernel, spec.Cmdline, spec.Initrd)
 	vmConfig := config.NewVirtualMachine(uint(spec.CPUs), spec.MemoryMiB, bootloader)
 
 	blk, err := config.VirtioBlkNew(rootfs)
 	if err != nil {
-		return nil, fmt.Errorf("vfkit: virtio-blk: %w", err)
+		return nil, fmt.Errorf("vfkit: virtio-blk (rootfs): %w", err)
+	}
+	scratchBlk, err := config.VirtioBlkNew(scratch)
+	if err != nil {
+		return nil, fmt.Errorf("vfkit: virtio-blk (scratch): %w", err)
 	}
 	nic, err := config.VirtioNetNew("") // NAT (VirtioNetNew sets Nat=true)
 	if err != nil {
@@ -157,10 +182,24 @@ func buildConfig(spec provider.VMSpec, rootfs, ctrlSock string) (*config.Virtual
 	if err != nil {
 		return nil, fmt.Errorf("vfkit: virtio-vsock: %w", err)
 	}
-	if err := vmConfig.AddDevices(blk, nic, vsockDev); err != nil {
+	if err := vmConfig.AddDevices(blk, scratchBlk, nic, vsockDev); err != nil {
 		return nil, fmt.Errorf("vfkit: add devices: %w", err)
 	}
 	return vmConfig, nil
+}
+
+// createSparse creates a sparse file of the given size in bytes (no blocks allocated until
+// written; APFS-backed). Used for the per-run scratch disk.
+func createSparse(path string, sizeBytes uint64) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(int64(sizeBytes)); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 type vm struct {

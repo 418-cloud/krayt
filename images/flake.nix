@@ -22,12 +22,17 @@
       # changing dependencies, set it to lib.fakeHash, build, and paste the `got: sha256-…`
       # value the mismatch reports. Build runs on aarch64-linux (CI, or a Mac
       # linux-builder; §11.3).
+      #
+      # Phase 2 changed the Go dependency set (the guest-agent now drives containerd via
+      # github.com/containerd/containerd/v2/client, §6.10), so vendorHash MUST be
+      # regenerated — it is set to fakeHash to force the mismatch that prints the new hash.
+      # See HUMAN_TODO.md "[Phase 2] Regenerate guest-agent vendorHash".
       guest-agent = pkgs.buildGoModule {
         pname = "krayt-agent";
         version = "0.0.0-dev";
         src = ../.; # repo root (go.mod, internal/, cmd/)
         subPackages = [ "cmd/krayt-agent" ];
-        vendorHash = "sha256-7MAD4FMPXKQN7DzGnXYzfmzokv1P9bMCnG++e9Ojz1I=";
+        vendorHash = "sha256-6l937L2Q8MCCJqApw7EW/ZI/Q9DjKXy57GFugFkn5nM=";
         env.CGO_ENABLED = "0";
       };
 
@@ -63,6 +68,33 @@
             };
             networking.nftables.enable = true; # per-task rules applied by the agent at run start
 
+            # ---- per-run scratch disk (§6.10) ----
+            # The provider attaches a sparse raw disk sized to DiskGiB as /dev/vdb. The
+            # closure-sized rootfs has no room for an imported image, so format + mount the
+            # scratch disk at /var/lib/containerd (containerd's content store + snapshots)
+            # before containerd starts. The disk is fresh every run (a new sparse file), so
+            # we format unconditionally — no detection needed. The guest-agent's TMPDIR is
+            # pointed at a subdir below, so the streamed image tar + repo clone also land on
+            # the scratch disk instead of /tmp (tmpfs/RAM).
+            systemd.services.krayt-scratch = {
+              description = "format + mount the per-run scratch disk for containerd";
+              requiredBy = [ "containerd.service" ];
+              before = [ "containerd.service" ];
+              after = [ "dev-vdb.device" ];
+              requires = [ "dev-vdb.device" ];
+              path = [ pkgs.e2fsprogs pkgs.util-linux ];
+              serviceConfig = {
+                Type = "oneshot";
+                RemainAfterExit = true;
+              };
+              script = ''
+                mkfs.ext4 -q -F -L krayt-scratch /dev/vdb
+                mkdir -p /var/lib/containerd
+                mount /dev/vdb /var/lib/containerd
+                mkdir -p /var/lib/containerd/tmp
+              '';
+            };
+
             # ---- container runtime (§6.10) ----
             virtualisation.containerd.enable = true;
 
@@ -73,6 +105,13 @@
               after = [ "containerd.service" "network-online.target" ];
               wants = [ "network-online.target" ];
               requires = [ "containerd.service" ];
+              # git is required in the guest for the bundle ingest + patch generation of
+              # §6.7 (bundle verify, clone, diff); gitMinimal keeps the closure small. This
+              # is the one closure addition §11.6's list omits — flagged for the spec.
+              path = [ pkgs.gitMinimal ];
+              # Route the agent's working files (image tar, repo bundle, /workspace clone)
+              # onto the scratch disk rather than tmpfs/RAM (§6.10).
+              environment.TMPDIR = "/var/lib/containerd/tmp";
               serviceConfig = {
                 Type = "notify";
                 ExecStart = "${guest-agent}/bin/krayt-agent";

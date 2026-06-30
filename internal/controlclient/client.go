@@ -7,6 +7,7 @@ package controlclient
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -16,6 +17,9 @@ import (
 	"github.com/418-cloud/krayt/internal/protocol/pb"
 	"github.com/418-cloud/krayt/internal/provider"
 )
+
+// chunkSize bounds each Chunk on the wire; matches the guest side (§6.5).
+const chunkSize = 1 << 20 // 1 MiB
 
 // ClientVersion is the host control-client version sent in the Hello handshake.
 const ClientVersion = "0.0.0-dev"
@@ -46,6 +50,81 @@ func Dial(vm provider.VM, port uint32) (*Client, error) {
 
 // Close releases the gRPC connection.
 func (c *Client) Close() error { return c.conn.Close() }
+
+// PushImage client-streams the OCI image archive from r to the guest (§6.11). r is
+// typically the host imagestore's archive of the blobs the guest is missing.
+func (c *Client) PushImage(ctx context.Context, r io.Reader) error {
+	stream, err := c.Agent.PushImage(ctx)
+	if err != nil {
+		return fmt.Errorf("controlclient: open PushImage: %w", err)
+	}
+	return sendChunks(stream, r)
+}
+
+// PushCode client-streams the git bundle from r to the guest (§6.7). A bundle is just a
+// byte stream — structurally identical to PushImage, just smaller.
+func (c *Client) PushCode(ctx context.Context, r io.Reader) error {
+	stream, err := c.Agent.PushCode(ctx)
+	if err != nil {
+		return fmt.Errorf("controlclient: open PushCode: %w", err)
+	}
+	return sendChunks(stream, r)
+}
+
+// CollectArtifacts reads the guest's artifact tar (patch + report + optional commits
+// bundle) into w (§6.7).
+func (c *Client) CollectArtifacts(ctx context.Context, w io.Writer) error {
+	stream, err := c.Agent.CollectArtifacts(ctx, &pb.CollectRequest{})
+	if err != nil {
+		return fmt.Errorf("controlclient: open CollectArtifacts: %w", err)
+	}
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("controlclient: recv artifact: %w", err)
+		}
+		if _, err := w.Write(chunk.GetData()); err != nil {
+			return err
+		}
+	}
+}
+
+// chunkSender is the shared shape of the PushImage/PushCode client streams.
+type chunkSender interface {
+	Send(*pb.Chunk) error
+	CloseAndRecv() (*pb.Ack, error)
+}
+
+// sendChunks streams r as ~1 MiB Chunks and closes the stream, never buffering the whole
+// payload in memory (§6.5).
+func sendChunks(stream chunkSender, r io.Reader) error {
+	buf := make([]byte, chunkSize)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if serr := stream.Send(&pb.Chunk{Data: buf[:n]}); serr != nil {
+				return serr
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	ack, err := stream.CloseAndRecv()
+	if err != nil {
+		return fmt.Errorf("controlclient: close stream: %w", err)
+	}
+	if !ack.GetOk() {
+		return fmt.Errorf("controlclient: guest rejected stream: %s", ack.GetError())
+	}
+	return nil
+}
 
 // WaitReady polls Hello until the guest-agent answers or the deadline passes, then
 // returns its HelloResponse. This is the host's "VM ready" signal: vfkit's process being
