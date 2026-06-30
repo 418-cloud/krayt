@@ -84,8 +84,8 @@ func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int) er
 // the recorded baseline commit. The bundle must already be a file on disk: you cannot
 // `git clone` from a pipe (§6.7).
 func Ingest(ctx context.Context, bundlePath, workspaceDir string, id Identity) (baseline string, err error) {
-	if _, err := runGit(ctx, "", "bundle", "verify", bundlePath); err != nil {
-		return "", fmt.Errorf("patch: bundle verify: %w", err)
+	if err := verifyBundle(ctx, bundlePath); err != nil {
+		return "", err
 	}
 	if _, err := runGit(ctx, "", "clone", "--quiet", bundlePath, workspaceDir); err != nil {
 		return "", fmt.Errorf("patch: clone bundle: %w", err)
@@ -160,6 +160,26 @@ func Apply(ctx context.Context, repoPath, patchPath string, threeWay bool) error
 	args = append(args, patchPath)
 	if _, err := runGit(ctx, repoPath, args...); err != nil {
 		return fmt.Errorf("patch: git apply: %w", err)
+	}
+	return nil
+}
+
+// verifyBundle runs `git bundle verify` to catch truncation/corruption and unexpected
+// prerequisites before cloning (§6.7). `git bundle verify` is a repository command — it
+// fails with "need a repository to verify a bundle" if run outside one — so we run it from
+// a throwaway bare repo rather than the guest-agent's cwd (which is not a repo). A
+// self-contained forward bundle has no prerequisites, so an empty repo satisfies the check.
+func verifyBundle(ctx context.Context, bundlePath string) error {
+	tmp, err := os.MkdirTemp("", "krayt-bundle-verify-")
+	if err != nil {
+		return fmt.Errorf("patch: verify temp dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	if _, err := runGit(ctx, "", "init", "--quiet", "--bare", tmp); err != nil {
+		return fmt.Errorf("patch: init verify repo: %w", err)
+	}
+	if _, err := runGit(ctx, tmp, "bundle", "verify", bundlePath); err != nil {
+		return fmt.Errorf("patch: bundle verify: %w", err)
 	}
 	return nil
 }

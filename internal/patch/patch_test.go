@@ -74,6 +74,35 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+// TestIngestOutsideGitRepo guards the regression where `git bundle verify` failed in the
+// guest with "need a repository to verify a bundle": it is a repository command, but the
+// guest-agent's cwd is not a repo. The other tests masked this by running inside the krayt
+// repo, so this one explicitly changes into a non-repo directory first (§6.7).
+func TestIngestOutsideGitRepo(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, src, bundle, 1); err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+
+	// Run the rest from a directory that is NOT a git repository, like the guest.
+	t.Chdir(t.TempDir())
+
+	ws := filepath.Join(t.TempDir(), "workspace")
+	baseline, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity)
+	if err != nil {
+		t.Fatalf("Ingest from non-repo cwd: %v", err)
+	}
+	if baseline == "" {
+		t.Fatal("empty baseline")
+	}
+	writeFile(t, filepath.Join(ws, "a.txt"), "2\n")
+	if got, err := patch.Diff(ctx, ws, patch.BaselineTag); err != nil || len(got) == 0 {
+		t.Fatalf("Diff from non-repo cwd: err=%v len=%d", err, len(got))
+	}
+}
+
 // TestBundleCommits covers the optional reverse bundle: present only when the agent
 // actually committed (§6.7).
 func TestBundleCommits(t *testing.T) {
