@@ -16,9 +16,13 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/418-cloud/krayt/internal/guest"
+	"github.com/418-cloud/krayt/internal/guest/runner"
 	"github.com/418-cloud/krayt/internal/protocol/pb"
 	"github.com/418-cloud/krayt/internal/provider"
 )
+
+// containerdSocket is where the in-VM containerd daemon listens (§11.6).
+const containerdSocket = "/run/containerd/containerd.sock"
 
 func main() {
 	if err := run(); err != nil {
@@ -35,8 +39,18 @@ func run() error {
 		return fmt.Errorf("listen vsock port %d: %w", provider.ControlPort, err)
 	}
 
+	// Wire the containerd Runner (§6.10). If containerd is not reachable yet, still serve
+	// so the host's boot-readiness Hello succeeds; Start then fails with a clear message
+	// rather than the VM appearing dead.
+	var opts []guest.Option
+	if r, err := runner.New(containerdSocket); err != nil {
+		log.Printf("containerd runner unavailable (%v): Start will fail until containerd is up", err)
+	} else {
+		opts = append(opts, guest.WithRunner(r))
+	}
+
 	srv := grpc.NewServer()
-	pb.RegisterGuestAgentServer(srv, guest.NewService())
+	pb.RegisterGuestAgentServer(srv, guest.NewService(opts...))
 
 	// The unit is Type=notify (§11.6): tell systemd we are ready once the vsock listener
 	// is up, so service ordering (and the host's boot-readiness wait) is accurate.

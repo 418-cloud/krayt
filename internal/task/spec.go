@@ -11,8 +11,9 @@ import "time"
 type RunSpec struct {
 	ID           string            // assigned by the orchestrator
 	ImageRef     string            // user OCI image (tag or digest)
-	RepoPath     string            // host repo to snapshot (default: cwd)
-	IncludeDirty bool              // include uncommitted changes over HEAD baseline
+	RepoPath     string            // host repo to bundle (default: cwd)
+	IncludeDirty bool              // include uncommitted changes via non-mutating capture (§6.7); wired in Phase 3
+	BundleDepth  int               // forward-bundle shallow depth (§6.7); default 1, 0 = full history
 	TaskPrompt   []byte            // contents of the task (file or inline)
 	Env          map[string]string // non-secret env for the container
 	SecretsPath  string            // path to per-task secrets file (may be empty)

@@ -22,12 +22,17 @@
       # changing dependencies, set it to lib.fakeHash, build, and paste the `got: sha256-…`
       # value the mismatch reports. Build runs on aarch64-linux (CI, or a Mac
       # linux-builder; §11.3).
+      #
+      # Phase 2 changed the Go dependency set (the guest-agent now drives containerd via
+      # github.com/containerd/containerd/v2/client, §6.10), so vendorHash MUST be
+      # regenerated — it is set to fakeHash to force the mismatch that prints the new hash.
+      # See HUMAN_TODO.md "[Phase 2] Regenerate guest-agent vendorHash".
       guest-agent = pkgs.buildGoModule {
         pname = "krayt-agent";
         version = "0.0.0-dev";
         src = ../.; # repo root (go.mod, internal/, cmd/)
         subPackages = [ "cmd/krayt-agent" ];
-        vendorHash = "sha256-7MAD4FMPXKQN7DzGnXYzfmzokv1P9bMCnG++e9Ojz1I=";
+        vendorHash = "sha256-6l937L2Q8MCCJqApw7EW/ZI/Q9DjKXy57GFugFkn5nM=";
         env.CGO_ENABLED = "0";
       };
 
@@ -73,6 +78,10 @@
               after = [ "containerd.service" "network-online.target" ];
               wants = [ "network-online.target" ];
               requires = [ "containerd.service" ];
+              # git is required in the guest for the bundle ingest + patch generation of
+              # §6.7 (bundle verify, clone, diff); gitMinimal keeps the closure small. This
+              # is the one closure addition §11.6's list omits — flagged for the spec.
+              path = [ pkgs.gitMinimal ];
               serviceConfig = {
                 Type = "notify";
                 ExecStart = "${guest-agent}/bin/krayt-agent";
