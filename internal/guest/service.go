@@ -322,6 +322,14 @@ func tarDir(dir string, w io.Writer) error {
 		if err != nil {
 			return err
 		}
+		// /output is written by untrusted agent code, so archive only directories and
+		// regular files; skip symlinks and other special files. A symlink would otherwise
+		// get a 0-byte symlink header while os.Open follows the link, and io.Copy of the
+		// target would fail the whole collection with ErrWriteTooLong (the tar writer
+		// rejects the body, so it cannot exfiltrate the target — but skipping is correct).
+		if !d.IsDir() && !info.Mode().IsRegular() {
+			return nil
+		}
 		hdr, err := tar.FileInfoHeader(info, "")
 		if err != nil {
 			return err

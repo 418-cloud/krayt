@@ -170,11 +170,11 @@ func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSp
 	}
 	defer func() { _ = os.RemoveAll(tmp) }()
 	bundle := filepath.Join(tmp, "repo.bundle")
-	depth := spec.BundleDepth
-	if depth == 0 {
-		depth = 1 // default shallow (§6.1)
-	}
-	if err := patch.CreateBundle(ctx, spec.RepoPath, bundle, depth); err != nil {
+	// Pass BundleDepth through literally: 0 = full history is the documented contract
+	// (§6.1/§8.1), and CreateBundle treats depth<=0 as full history. The default of 1 is
+	// applied at the CLI flag (and, in Phase 4, config resolution) — overriding 0 here would
+	// silently defeat an explicit `--bundle-depth 0` request for full history.
+	if err := patch.CreateBundle(ctx, spec.RepoPath, bundle, spec.BundleDepth); err != nil {
 		return err
 	}
 	f, err := os.Open(bundle)
