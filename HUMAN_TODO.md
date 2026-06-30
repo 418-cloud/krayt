@@ -88,15 +88,21 @@ hardware; those are the handoffs below. The first three **block** the real-VM co
 - Blocking: yes — the VM image cannot build until this is set.
 
 ## [Phase 2] Rebuild + republish the base VM image, then re-pin the digest — BLOCKING (real run)
-- Needed: a new base image build that includes (a) the containerd-wired guest-agent and
-  (b) `git` in the closure (added as `gitMinimal` on the `krayt-agent` service path, required
-  by §6.7); publish to GHCR and update `internal/vmimage/pinned.go` to the new digest.
+- Needed: a new base image build that includes (a) the containerd-wired guest-agent,
+  (b) `git` in the closure (`gitMinimal` on the `krayt-agent` service path, §6.7), and
+  (c) the new `krayt-scratch` service that formats + mounts the per-run scratch disk
+  (`/dev/vdb`) at `/var/lib/containerd` before containerd, with the guest-agent `TMPDIR`
+  pointed there (§6.10). Publish to GHCR and update `internal/vmimage/pinned.go`.
 - Why the agent can't: Linux builder/CI + registry credentials + real-hardware boot.
-- Exact steps/commands: run the `vm-image` workflow (after the vendorHash fix above) →
-  capture the published digest → set `PinnedRef`/`PinnedDigest` → `krayt image pull`.
-- Verify success by: `krayt doctor` shows the image pinned + cached; the boot test still
-  round-trips `Hello` (the Phase 1 `TestBootHello`).
-- Blocking: yes — the real-VM e2e needs an image whose guest can import containers + run git.
+- Note: `vendorHash` does NOT need regenerating for the scratch-disk / `patch.go` changes —
+  no Go dependency changed (only the earlier containerd addition required it, now done).
+- Exact steps/commands: run the `vm-image` workflow → capture the published digest → set
+  `PinnedRef`/`PinnedDigest` → `krayt image pull`.
+- Verify success by: `krayt doctor` shows the image pinned + cached; `TestBootHello` still
+  round-trips `Hello`; a `krayt run` against a trivial image imports it without
+  `no space left on device` and yields a non-empty `changes.patch`.
+- Blocking: yes — the real-VM e2e needs a guest that can import containers, run git, and has
+  disk space for the image.
 
 ## [Phase 2] Provide a trivial user OCI image that edits one file — BLOCKING (real run)
 - Needed: a small `linux/arm64` OCI image whose entrypoint edits a file under `/workspace`

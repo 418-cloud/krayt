@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -62,9 +63,10 @@ func TestBuildConfigDevices(t *testing.T) {
 		MemoryMiB: 4096,
 	}
 	clone := "/run/run_x/rootfs.img"
+	scratch := "/run/run_x/scratch.img"
 	ctrlSock := "/run/run_x/control.sock"
 
-	cfg, err := buildConfig(spec, clone, ctrlSock)
+	cfg, err := buildConfig(spec, clone, scratch, ctrlSock)
 	if err != nil {
 		t.Fatalf("buildConfig: %v", err)
 	}
@@ -77,6 +79,7 @@ func TestBuildConfigDevices(t *testing.T) {
 	for _, want := range []string{
 		spec.Kernel, spec.Initrd, // Linux bootloader
 		clone,          // virtio-blk uses the CoW clone, not the base image
+		scratch,        // second virtio-blk: the per-run scratch disk (/dev/vdb)
 		ctrlSock,       // vsock bridged to the host control socket
 		"virtio-vsock", // control channel device
 		"virtio-net",   // NAT NIC
@@ -89,6 +92,29 @@ func TestBuildConfigDevices(t *testing.T) {
 	// The base image must never be passed directly to vfkit.
 	if strings.Contains(line, spec.RootFS) {
 		t.Errorf("cmdline references base rootfs %q directly; should use the clone", spec.RootFS)
+	}
+}
+
+func TestCreateSparse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scratch.img")
+	const size = uint64(20) << 30 // 20 GiB
+	if err := createSparse(path, size); err != nil {
+		t.Fatalf("createSparse: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint64(fi.Size()) != size {
+		t.Errorf("logical size = %d, want %d", fi.Size(), size)
+	}
+	// It must be sparse: blocks actually allocated should be far below the logical size,
+	// or a 20 GiB file per run would be ruinous. st_blocks is in 512-byte units.
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		allocated := uint64(st.Blocks) * 512
+		if allocated > 16<<20 { // generous: a fresh empty file allocates ~nothing
+			t.Errorf("scratch file not sparse: %d bytes allocated for a %d-byte file", allocated, size)
+		}
 	}
 }
 
