@@ -1155,38 +1155,38 @@ correct; a faked one is a defect.
 
 Tasks marked **[HUMAN]** below are the expected handoff points.
 
-### Phase 0 — Foundations
-- [ ] Repo scaffold, Go module, CI, lint, build tags (§9.1).
-- [ ] Root `flake.nix` dev shell (protoc/buf/oras pinned) + `Makefile` with `make proto` (§9.2).
-- [ ] Define `Provider`/`VM` interfaces and `RunSpec`/`VMSpec` types.
-- [ ] Author `krayt.proto` (§6.5); generate + check in `internal/protocol/pb` (§9.2).
-- [ ] `fakeProvider` + in-process gRPC loopback for tests.
-- [ ] `krayt doctor` for host prereq checks.
-- [ ] **Done when:** `go test ./...` passes on macOS and Linux; a `Hello` RPC round-trips over the fake provider.
+### Phase 0 — Foundations ✅
+- [x] Repo scaffold, Go module, CI, lint, build tags (§9.1).
+- [x] Root `flake.nix` dev shell (protoc/buf/oras pinned) + `Makefile` with `make proto` (§9.2).
+- [x] Define `Provider`/`VM` interfaces and `RunSpec`/`VMSpec` types.
+- [x] Author `krayt.proto` (§6.5); generate + check in `internal/protocol/pb` (§9.2).
+- [x] `fakeProvider` + in-process gRPC loopback for tests.
+- [x] `krayt doctor` for host prereq checks.
+- [x] **Done when:** `go test ./...` passes on macOS and Linux; a `Hello` RPC round-trips over the fake provider.
 
-### Phase 1 — Boot a VM on macOS
-- [ ] `vfkit` provider: build VM config via vfkit `pkg/config`, launch the signed vfkit subprocess, control via its REST API; CoW-clone the raw rootfs (`clonefile`); NAT + vsock (`socketURL`) devices.
-- [ ] No krayt code-signing needed (entitlement lives on vfkit, §12). `doctor` checks vfkit is installed + runnable; README documents `brew install vfkit`. **[HUMAN: install vfkit]** — trivial, scriptable; not a signing identity.
-- [ ] `images/flake.nix`: NixOS + systemd image per §11.6 (raw `rootfs.img` + kernel + initrd); build in CI on arm64 Linux runner; publish OCI artifact (§11.5). **[HUMAN: Linux builder/CI + registry creds]** — agent writes the flake + CI workflow; human runs CI / provides registry credentials.
-- [ ] `krayt image pull` + digest verification before first run.
-- [ ] `DialControl` = `net.Dial("unix", socketURL)` to vfkit's vsock bridge + gRPC client wiring (§6.12).
-- [ ] **Done when:** on a real Mac (with vfkit installed), `krayt` boots the published image and a `Hello` RPC round-trips host↔guest over the vfkit vsock socket. **[HUMAN: boot test on real hardware]**
+### Phase 1 — Boot a VM on macOS ✅
+- [x] `vfkit` provider: build VM config via vfkit `pkg/config`, launch the signed vfkit subprocess, control via its REST API; CoW-clone the raw rootfs (`clonefile`); NAT + vsock (`socketURL`) devices.
+- [x] No krayt code-signing needed (entitlement lives on vfkit, §12). `doctor` checks vfkit is installed + runnable; README documents `brew install vfkit`. **[HUMAN: install vfkit]** — trivial, scriptable; not a signing identity.
+- [x] `images/flake.nix`: NixOS + systemd image per §11.6 (raw `rootfs.img` + kernel + initrd); build in CI on arm64 Linux runner; publish OCI artifact (§11.5). **[HUMAN: Linux builder/CI + registry creds]** — agent writes the flake + CI workflow; human runs CI / provides registry credentials.
+- [x] `krayt image pull` + digest verification before first run.
+- [x] `DialControl` = `net.Dial("unix", socketURL)` to vfkit's vsock bridge + gRPC client wiring (§6.12).
+- [x] **Done when:** on a real Mac (with vfkit installed), `krayt` boots the published image and a `Hello` RPC round-trips host↔guest over the vfkit vsock socket. **[HUMAN: boot test on real hardware]**
 
-### Phase 2 — End-to-end single run (happy path)
-- [ ] Host: pull user OCI image + export OCI archive; digest-keyed cache (`imagestore`).
-- [ ] `QueryImageBlobs` + `PushImage` (stream only missing blobs); guest imports into containerd.
-- [ ] Host: create a **self-contained git bundle** (shallow-clone-then-bundle at `bundle_depth`); non-mutating temp-index capture when `include_dirty` (§6.7).
-- [ ] `PushCode` streams the bundle → guest writes it to a temp file, `git bundle verify`s it, clones into `/workspace`, sets the krayt bot git identity, and **records the baseline** (`krayt-baseline`) before the agent runs (§6.7).
-- [ ] `PushTask` injection at `/task/prompt.md`; `Start` runs the container entrypoint (agent-agnostic).
-- [ ] Patch generation (`git diff krayt-baseline..HEAD`) + optional reverse range bundle (`commits.bundle`) + `CollectArtifacts` back to host (§6.7).
-- [ ] Guaranteed VM teardown (defer + signal handling).
-- [ ] **Done when:** `krayt run` against a trivial image that edits one file yields a correct `changes.patch` that `krayt apply` cleanly applies to the host repo.
+### Phase 2 — End-to-end single run (happy path) ✅
+- [x] Host: pull user OCI image + export OCI archive; digest-keyed cache (`imagestore`).
+- [x] `QueryImageBlobs` + `PushImage` (stream only missing blobs); guest imports into containerd.
+- [x] Host: create a **self-contained git bundle** (shallow-clone-then-bundle at `bundle_depth`) (§6.7). *(Non-mutating `include_dirty` capture is deferred to Phase 3.)*
+- [x] `PushCode` streams the bundle → guest writes it to a temp file, `git bundle verify`s it (from a throwaway repo — verify needs a repo context), clones into `/workspace`, sets the krayt bot git identity, and **records the baseline** (`krayt-baseline`) before the agent runs (§6.7).
+- [x] `PushTask` injection at `/task/prompt.md`; `Start` runs the container entrypoint (agent-agnostic).
+- [x] Patch generation (`git diff` vs the recorded `krayt-baseline`, staging all so uncommitted edits are captured) + optional reverse range bundle (`commits.bundle`) + `CollectArtifacts` back to host (§6.7).
+- [x] Guaranteed VM teardown (defer + signal handling).
+- [x] **Done when:** `krayt run` against a trivial image that edits one file yields a correct `changes.patch` that `krayt apply` cleanly applies to the host repo. *(Met both via the automated `fakeProvider` proof and a real-VM run on Apple Silicon — see HUMAN_TODO.md.)*
 
 ### Phase 3 — Security & capability controls
 - [ ] Egress proxy (uid `proxyd`) + nftables default-deny ruleset (§6.6); per-task allowlist.
 - [ ] Per-task secrets file → `SecretsBundle` → container tmpfs; log redaction.
-- [ ] Resource limits (cpu/mem/disk) + wall-clock timeout → kills container then VM.
-- [ ] Include-dirty overlay option for uncommitted changes.
+- [ ] Resource limits (cpu/mem/disk) + wall-clock timeout → kills container then VM. *(Disk: the per-run scratch disk sized to `DiskGiB` already landed early in the vfkit provider, Phase 2; cpu/mem are applied to the VM; remaining = wall-clock kill of container-then-VM.)*
+- [ ] Include-dirty: non-mutating temp-index capture (`GIT_INDEX_FILE` + `write-tree` + `commit-tree`) folded into the inbound bundle when `include_dirty` is set, leaving the user's repo untouched (§6.7). *(Moved here from Phase 2.)*
 - [ ] **Done when:** a container can reach an allowlisted host, is blocked from a non-allowlisted host and from a raw (non-proxied) socket, and secrets never appear in logs/artifacts (asserted by tests).
 
 ### Phase 4 — Concurrency & UX
