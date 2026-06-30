@@ -15,10 +15,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/418-cloud/krayt/internal/patch"
 	"github.com/418-cloud/krayt/internal/protocol/pb"
+	"github.com/418-cloud/krayt/internal/secrets"
 )
 
 // Version is the guest-agent version reported in the Hello handshake (§6.5).
@@ -40,14 +42,18 @@ const (
 type Service struct {
 	pb.UnimplementedGuestAgentServer
 
-	root   string // base dir for this run's workspace/task/output/bundle/image
-	runner Runner // nil until wired; Start fails clearly without it
+	root       string  // base dir for this run's workspace/task/output/bundle/image
+	secretsDir string  // where /run/secrets contents are materialized; tmpfs in the real guest
+	runner     Runner  // nil until wired; Start fails clearly without it
+	network    Network // nil in tests; the linux egress proxy + firewall controller (§6.6)
 
 	mu         sync.Mutex
 	bundlePath string // received git bundle (§6.7)
 	imagePath  string // received OCI archive (§6.11)
 	taskEnv    map[string]string
-	baseline   string // recorded baseline commit, set during Start (§6.7)
+	secrets    map[string]string // received secrets, held in memory only (§6.8)
+	netPolicy  NetworkPolicy     // received network policy (§6.6)
+	baseline   string            // recorded baseline commit, set during Start (§6.7)
 }
 
 // Option configures a Service.
@@ -60,6 +66,15 @@ func WithRunner(r Runner) Option { return func(s *Service) { s.runner = r } }
 // WithRoot sets the base directory for the run's working files. If unset, a temp dir is
 // created lazily on first use.
 func WithRoot(dir string) Option { return func(s *Service) { s.root = dir } }
+
+// WithSecretsDir sets where secret values are materialized for the /run/secrets mount. The
+// real guest points this at a tmpfs path so secrets never touch persistent disk (§6.8); if
+// unset they go under the run root (fine for tests).
+func WithSecretsDir(dir string) Option { return func(s *Service) { s.secretsDir = dir } }
+
+// WithNetwork sets the egress controller (the linux proxy+firewall in production; unset in
+// tests, where no real egress occurs).
+func WithNetwork(n Network) Option { return func(s *Service) { s.network = n } }
 
 // NewService returns a guest control service ready to register on a gRPC server.
 func NewService(opts ...Option) *Service {
@@ -139,6 +154,39 @@ func (s *Service) PushTask(_ context.Context, req *pb.TaskSpec) (*pb.Ack, error)
 	return &pb.Ack{Ok: true}, nil
 }
 
+// SetNetworkPolicy records the per-task egress policy (§6.6); it is applied at Start by the
+// Network controller (start the allowlist proxy + nftables lock).
+func (s *Service) SetNetworkPolicy(_ context.Context, req *pb.NetworkPolicy) (*pb.Ack, error) {
+	var mode string
+	switch req.GetMode() {
+	case pb.NetworkPolicy_FULL:
+		mode = NetFull
+	case pb.NetworkPolicy_NONE:
+		mode = NetNone
+	default:
+		mode = NetAllowlist
+	}
+	s.mu.Lock()
+	s.netPolicy = NetworkPolicy{Mode: mode, Allow: req.GetAllow()}
+	s.mu.Unlock()
+	return &pb.Ack{Ok: true}, nil
+}
+
+// PushSecrets receives the per-task secrets and holds them in memory only (§6.8). They are
+// materialized to the tmpfs secrets dir at Start and used to build the log redactor; they
+// are never written to persistent disk or the RunEvent stream.
+func (s *Service) PushSecrets(_ context.Context, req *pb.SecretsBundle) (*pb.Ack, error) {
+	for k := range req.GetValues() {
+		if k == "" || strings.ContainsAny(k, "/\\") || k == "." || k == ".." {
+			return nil, fmt.Errorf("guest: invalid secret key %q", k)
+		}
+	}
+	s.mu.Lock()
+	s.secrets = req.GetValues()
+	s.mu.Unlock()
+	return &pb.Ack{Ok: true}, nil
+}
+
 // Start is the run spine (§6.5): ingest the bundle into the workspace and record the
 // baseline (§6.7), run the user image via the Runner while streaming logs, then build the
 // patch (+ optional commits bundle) into the output dir. The final RunEvent carries the
@@ -146,7 +194,7 @@ func (s *Service) PushTask(_ context.Context, req *pb.TaskSpec) (*pb.Ack, error)
 func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) error {
 	ctx := stream.Context()
 	s.mu.Lock()
-	bundlePath, imagePath, env := s.bundlePath, s.imagePath, s.taskEnv
+	bundlePath, imagePath, env, secretVals, netPolicy := s.bundlePath, s.imagePath, s.taskEnv, s.secrets, s.netPolicy
 	s.mu.Unlock()
 
 	if s.runner == nil {
@@ -165,6 +213,13 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		return fmt.Errorf("guest: create output dir: %w", err)
 	}
 
+	// Materialize secrets to the (tmpfs) secrets dir and build the redactor (§6.8).
+	secretsDir, err := s.writeSecrets(secretVals)
+	if err != nil {
+		return err
+	}
+	redactor := secrets.NewRedactor(secrets.Values(secretVals))
+
 	// Ingest: verify + clone the bundle, set identity, record + tag the baseline (§6.7).
 	baseline, err := patch.Ingest(ctx, bundlePath, workspace, patch.DefaultIdentity)
 	if err != nil {
@@ -174,10 +229,23 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	s.baseline = baseline
 	s.mu.Unlock()
 
-	// Run the agent, streaming logs to the host as they arrive.
+	// Bring up the egress proxy + nftables lock and inject HTTP(S)_PROXY into the container
+	// (§6.6). The controller is linux-only; without it (tests) the container just inherits
+	// the task env.
+	runEnv := env
+	if s.network != nil {
+		proxyEnv, err := s.network.Apply(ctx, netPolicy)
+		if err != nil {
+			return fmt.Errorf("guest: apply network policy: %w", err)
+		}
+		runEnv = mergeEnv(env, proxyEnv)
+	}
+
+	// Run the agent, streaming logs to the host as they arrive — redacted in the guest so
+	// secret values never cross the wire in logs (§6.8).
 	log := func(strm pb.LogLine_Stream, line []byte, ts int64) {
 		_ = stream.Send(&pb.RunEvent{Kind: &pb.RunEvent_Log{Log: &pb.LogLine{
-			Stream: strm, Line: line, TsUnixMs: ts,
+			Stream: strm, Line: redactor.Redact(line), TsUnixMs: ts,
 		}}})
 	}
 	exitCode, runErr := s.runner.Run(ctx, RunConfig{
@@ -186,9 +254,14 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		WorkspaceDir:     workspace,
 		TaskPath:         filepath.Join(root, "task", "prompt.md"),
 		OutputDir:        outputDir,
-		Env:              env,
+		SecretsDir:       secretsDir,
+		Env:              runEnv,
 	}, log)
-	if runErr != nil {
+
+	// A canceled/expired context means the run hit its wall-clock timeout (§6.1): the
+	// runner kills the container, the host tears the VM down.
+	timedOut := ctx.Err() != nil
+	if runErr != nil && !timedOut {
 		// Infrastructure failure (import/create/start). Report it on the terminal Status.
 		return stream.Send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
 			ExitCode: -1, Error: runErr.Error(),
@@ -196,14 +269,48 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	}
 
 	// Build the patch + optional reverse bundle from the recorded baseline (§6.7).
-	if err := s.buildArtifacts(ctx, workspace, outputDir); err != nil {
+	if err := s.buildArtifacts(ctx, workspace, outputDir); err != nil && !timedOut {
 		return stream.Send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
 			ExitCode: int32(exitCode), Error: err.Error(),
 		}}})
 	}
 	return stream.Send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
-		ExitCode: int32(exitCode),
+		ExitCode: int32(exitCode), TimedOut: timedOut,
 	}}})
+}
+
+// writeSecrets materializes each secret as a file under the secrets dir (0600), so the
+// runner can bind-mount it at /run/secrets (§6.8). Returns the dir, or "" when there are no
+// secrets. The dir is tmpfs in the real guest (WithSecretsDir); under the run root in tests.
+func (s *Service) writeSecrets(vals map[string]string) (string, error) {
+	if len(vals) == 0 {
+		return "", nil
+	}
+	dir := s.secretsDir
+	if dir == "" {
+		dir = filepath.Join(s.root, "secrets")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("guest: create secrets dir: %w", err)
+	}
+	for k, v := range vals {
+		if err := os.WriteFile(filepath.Join(dir, k), []byte(v), 0o600); err != nil {
+			return "", fmt.Errorf("guest: write secret %s: %w", k, err)
+		}
+	}
+	return dir, nil
+}
+
+// mergeEnv overlays add onto a copy of base (proxy env wins over task env).
+func mergeEnv(base, add map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(add))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range add {
+		out[k] = v
+	}
+	return out
 }
 
 // buildArtifacts writes changes.patch and, if the agent committed, commits.bundle into the

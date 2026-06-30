@@ -24,7 +24,7 @@ func TestRoundTrip(t *testing.T) {
 	})
 
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1); err != nil {
+	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 
@@ -82,7 +82,7 @@ func TestIngestOutsideGitRepo(t *testing.T) {
 	ctx := context.Background()
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1); err != nil {
+	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 
@@ -109,7 +109,7 @@ func TestBundleCommits(t *testing.T) {
 	ctx := context.Background()
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1); err != nil {
+	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "workspace")
@@ -140,6 +140,99 @@ func TestBundleCommits(t *testing.T) {
 	}
 	if fi, err := os.Stat(out); err != nil || fi.Size() == 0 {
 		t.Fatalf("commits bundle missing/empty: err=%v", err)
+	}
+}
+
+// TestCreateBundleIncludeDirty captures uncommitted changes (modified, untracked, with
+// .gitignore honored) into the bundle baseline without mutating the user's repo (§6.7).
+func TestCreateBundleIncludeDirty(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t, map[string]string{
+		"greeting.txt": "hello\n",
+		".gitignore":   "ignored.txt\n",
+	})
+	writeFile(t, filepath.Join(src, "greeting.txt"), "hello dirty\n") // modified tracked
+	writeFile(t, filepath.Join(src, "new.txt"), "fresh\n")            // untracked
+	writeFile(t, filepath.Join(src, "ignored.txt"), "junk\n")         // gitignored
+
+	headBefore := git(t, src, "rev-parse", "HEAD")
+	refsBefore := git(t, src, "for-each-ref")
+	statusBefore := git(t, src, "status", "--porcelain")
+
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, src, bundle, 1, true); err != nil {
+		t.Fatalf("CreateBundle includeDirty: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if got := readFile(t, filepath.Join(ws, "greeting.txt")); got != "hello dirty\n" {
+		t.Errorf("greeting.txt = %q, want the uncommitted edit", got)
+	}
+	if got := readFile(t, filepath.Join(ws, "new.txt")); got != "fresh\n" {
+		t.Errorf("untracked new.txt = %q, want captured", got)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "ignored.txt")); !os.IsNotExist(err) {
+		t.Error("gitignored file leaked into the bundle")
+	}
+
+	// Non-mutating: the user's repo is untouched.
+	if git(t, src, "rev-parse", "HEAD") != headBefore {
+		t.Error("source HEAD changed")
+	}
+	if git(t, src, "for-each-ref") != refsBefore {
+		t.Error("source refs changed")
+	}
+	if git(t, src, "status", "--porcelain") != statusBefore {
+		t.Error("source index/worktree changed")
+	}
+}
+
+// TestCreateBundleNoDirtyIgnoresUncommitted confirms the default (clean) bundle carries
+// only committed state.
+func TestCreateBundleNoDirtyIgnoresUncommitted(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
+	writeFile(t, filepath.Join(src, "greeting.txt"), "hello dirty\n")
+	writeFile(t, filepath.Join(src, "new.txt"), "fresh\n")
+
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if got := readFile(t, filepath.Join(ws, "greeting.txt")); got != "hello\n" {
+		t.Errorf("greeting.txt = %q, want committed state", got)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "new.txt")); !os.IsNotExist(err) {
+		t.Error("uncommitted file present in a clean bundle")
+	}
+}
+
+// TestCreateBundleIncludeDirtyUnbornHead handles a repo with uncommitted files but no
+// commits yet: the working tree becomes a root commit (§6.7).
+func TestCreateBundleIncludeDirtyUnbornHead(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	git(t, dir, "init", "--quiet", "-b", "main")
+	git(t, dir, "config", "user.name", "tester")
+	git(t, dir, "config", "user.email", "tester@example.com")
+	writeFile(t, filepath.Join(dir, "a.txt"), "content\n")
+
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, dir, bundle, 1, true); err != nil {
+		t.Fatalf("CreateBundle includeDirty unborn: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if got := readFile(t, filepath.Join(ws, "a.txt")); got != "content\n" {
+		t.Errorf("a.txt = %q, want 'content'", got)
 	}
 }
 

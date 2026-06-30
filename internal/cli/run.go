@@ -27,15 +27,19 @@ type runDeps struct {
 // runFlags holds the Phase 2 `krayt run` flag set (a subset of §13; secrets, network, and
 // questions arrive in later phases).
 type runFlags struct {
-	image       string
-	taskFile    string
-	repo        string
-	bundleDepth int
-	cpus        int
-	memory      uint64
-	disk        uint64
-	timeout     time.Duration
-	detach      bool
+	image        string
+	taskFile     string
+	repo         string
+	secretsFile  string
+	includeDirty bool
+	netMode      string
+	allow        []string
+	bundleDepth  int
+	cpus         int
+	memory       uint64
+	disk         uint64
+	timeout      time.Duration
+	detach       bool
 }
 
 func newRunCmd() *cobra.Command {
@@ -52,6 +56,10 @@ func newRunCmd() *cobra.Command {
 	fl.StringVar(&f.image, "image", "", "user OCI image to run (required)")
 	fl.StringVar(&f.taskFile, "task", "", "path to the task prompt file (required)")
 	fl.StringVar(&f.repo, "repo", ".", "host repo to bundle")
+	fl.StringVar(&f.secretsFile, "secrets", "", "per-task secrets file (KEY=VALUE), mounted on tmpfs at /run/secrets")
+	fl.BoolVar(&f.includeDirty, "include-dirty", false, "include uncommitted working-tree changes in the bundle")
+	fl.StringVar(&f.netMode, "net", "allowlist", "egress policy: allowlist | full | none")
+	fl.StringArrayVar(&f.allow, "allow", nil, "allowlisted egress domain (repeatable); only with --net allowlist")
 	fl.IntVar(&f.bundleDepth, "bundle-depth", 1, "forward-bundle shallow depth (0 = full history)")
 	fl.IntVar(&f.cpus, "cpus", 2, "vCPUs")
 	fl.Uint64Var(&f.memory, "memory", 4096, "memory (MiB)")
@@ -78,13 +86,28 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	if err != nil {
 		return err
 	}
+	secretsPath := f.secretsFile
+	if secretsPath != "" {
+		if secretsPath, err = filepath.Abs(secretsPath); err != nil {
+			return err
+		}
+	}
+	netMode := task.NetworkMode(f.netMode)
+	switch netMode {
+	case task.NetworkAllowlist, task.NetworkFull, task.NetworkNone:
+	default:
+		return fmt.Errorf("--net must be allowlist, full, or none (got %q)", f.netMode)
+	}
 	spec := task.RunSpec{
-		ID:          id,
-		ImageRef:    f.image,
-		RepoPath:    repoAbs,
-		BundleDepth: f.bundleDepth,
-		TaskPrompt:  prompt,
-		Detach:      f.detach,
+		ID:           id,
+		ImageRef:     f.image,
+		RepoPath:     repoAbs,
+		SecretsPath:  secretsPath,
+		IncludeDirty: f.includeDirty,
+		Network:      task.NetworkPolicy{Mode: netMode, Allow: f.allow},
+		BundleDepth:  f.bundleDepth,
+		TaskPrompt:   prompt,
+		Detach:       f.detach,
 		Resources: task.Resources{
 			CPUs:      f.cpus,
 			MemoryMiB: f.memory,
