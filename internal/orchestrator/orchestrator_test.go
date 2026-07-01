@@ -22,6 +22,7 @@ import (
 	"github.com/418-cloud/krayt/internal/patch"
 	"github.com/418-cloud/krayt/internal/protocol/pb"
 	"github.com/418-cloud/krayt/internal/provider/fake"
+	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
@@ -119,6 +120,125 @@ func (r *editingRunner) Run(_ context.Context, cfg guest.RunConfig, log guest.Lo
 	}
 	log(pb.LogLine_STDOUT, []byte("agent done\n"), time.Now().UnixMilli())
 	return 0, nil
+}
+
+// TestSecretsRedactedInLogs is the Phase 3 "secrets never appear in logs/artifacts" proof:
+// a secret reaches the container (mounted at /run/secrets), but when the agent prints it the
+// guest redacts it before the line is streamed, so it is absent from the live log, the
+// persisted agent.log, and meta.json (§6.8).
+func TestSecretsRedactedInLogs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
+	img := minimalImage(ctx, t)
+
+	const secretVal = "sk-ant-supersecret-0123456789"
+	secretsFile := filepath.Join(t.TempDir(), "secrets.env")
+	if err := os.WriteFile(secretsFile, []byte("ANTHROPIC_API_KEY="+secretVal+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var mounted string
+	runner := &secretRunner{secret: secretVal, onRun: func(cfg guest.RunConfig) {
+		if cfg.SecretsDir != "" {
+			b, _ := os.ReadFile(filepath.Join(cfg.SecretsDir, "ANTHROPIC_API_KEY"))
+			mounted = string(b)
+		}
+	}}
+	guestRoot := t.TempDir()
+	p := &fake.Provider{Register: func(s *grpc.Server) {
+		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(runner), guest.WithRoot(guestRoot)))
+	}}
+
+	var logs bytes.Buffer
+	runDir := filepath.Join(t.TempDir(), "run")
+	spec := task.RunSpec{
+		ID: "run_secrets", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"), SecretsPath: secretsFile,
+	}
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img, LogOut: &logs}, spec, runDir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The agent could read the real secret (mounted at /run/secrets)…
+	if mounted != secretVal {
+		t.Errorf("secret not mounted for the agent: got %q", mounted)
+	}
+	// …but it must not survive anywhere krayt records output.
+	if bytes.Contains(logs.Bytes(), []byte(secretVal)) {
+		t.Error("secret value leaked into the live log stream")
+	}
+	if !bytes.Contains(logs.Bytes(), []byte(secrets.RedactionMarker)) {
+		t.Errorf("expected a redaction marker in the logs; got %q", logs.String())
+	}
+	for _, f := range []string{"logs/agent.log", "meta.json"} {
+		b, err := os.ReadFile(filepath.Join(runDir, f))
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		if bytes.Contains(b, []byte(secretVal)) {
+			t.Errorf("secret value leaked into %s", f)
+		}
+	}
+}
+
+// TestRunTimeout is the wall-clock-timeout proof: a stuck agent is killed and the run is
+// recorded as timed out, with the VM torn down (§6.1).
+func TestRunTimeout(t *testing.T) {
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	img := minimalImage(context.Background(), t)
+
+	guestRoot := t.TempDir()
+	p := &fake.Provider{Register: func(s *grpc.Server) {
+		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(blockingRunner{}), guest.WithRoot(guestRoot)))
+	}}
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	spec := task.RunSpec{
+		ID: "run_timeout", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"),
+		Resources:  task.Resources{Timeout: 300 * time.Millisecond},
+	}
+	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Provider: p, Image: img}, spec, runDir)
+	if err != nil {
+		t.Fatalf("Run (timeout should not be an error): %v", err)
+	}
+	if !res.TimedOut {
+		t.Error("expected TimedOut = true")
+	}
+	b, err := os.ReadFile(filepath.Join(runDir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b, []byte(`"timed_out": true`)) {
+		t.Errorf("meta.json should record timed_out: true; got %s", b)
+	}
+}
+
+// secretRunner simulates an agent that reads the mounted secret and (carelessly) logs it.
+type secretRunner struct {
+	secret string
+	onRun  func(guest.RunConfig)
+}
+
+func (r *secretRunner) Version() string { return "fake" }
+func (r *secretRunner) Run(_ context.Context, cfg guest.RunConfig, log guest.LogFunc) (int, error) {
+	if r.onRun != nil {
+		r.onRun(cfg)
+	}
+	log(pb.LogLine_STDOUT, []byte("debug: ANTHROPIC_API_KEY="+r.secret+" (oops)\n"), time.Now().UnixMilli())
+	return 0, nil
+}
+
+// blockingRunner never finishes on its own; it returns only when the run context is
+// canceled (the wall-clock timeout).
+type blockingRunner struct{}
+
+func (blockingRunner) Version() string { return "fake" }
+func (blockingRunner) Run(ctx context.Context, _ guest.RunConfig, _ guest.LogFunc) (int, error) {
+	<-ctx.Done()
+	return -1, ctx.Err()
 }
 
 // --- helpers ---

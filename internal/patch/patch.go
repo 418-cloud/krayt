@@ -34,19 +34,26 @@ type Identity struct {
 // DefaultIdentity is the krayt bot identity used in the guest workspace.
 var DefaultIdentity = Identity{Name: "krayt", Email: "krayt@418.cloud"}
 
-// CreateBundle writes a self-contained git bundle of repoPath's current branch to
-// outBundle, using the shallow-clone-then-bundle technique (§6.7): `git bundle create`
-// has no --depth, so we shallow-clone the source over the file:// transport (which honors
-// --depth, unlike a local-path clone) and bundle that shallow clone. The bundle inherits
-// the shallow boundary, so it carries no prerequisites and clones cleanly into the empty
-// guest. depth<=0 means full history (no --depth). (verify current)
-func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int) error {
+// CreateBundle writes a self-contained git bundle of repoPath to outBundle, using the
+// shallow-clone-then-bundle technique (§6.7): `git bundle create` has no --depth, so we
+// shallow-clone the source over the file:// transport (which honors --depth, unlike a
+// local-path clone) and bundle that shallow clone. The bundle inherits the shallow
+// boundary, so it carries no prerequisites and clones cleanly into the empty guest.
+// depth<=0 means full history (no --depth). (verify current)
+//
+// When includeDirty is set, uncommitted changes are folded in without mutating the user's
+// repo: a throwaway commit is built from the source's working tree via a temporary index,
+// writing objects into our own clone (not the source), and the clone's branch is moved to
+// that commit so the bundle's HEAD imports the dirty state as the baseline (§6.7). The
+// user's index, working tree, and refs are never touched.
+func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, includeDirty bool) error {
 	absRepo, err := filepath.Abs(repoPath)
 	if err != nil {
 		return fmt.Errorf("patch: resolve repo path: %w", err)
 	}
-	if err := ensureHasCommits(ctx, absRepo); err != nil {
-		return err
+	hasCommits := gitOK(ctx, absRepo, "rev-parse", "--verify", "HEAD")
+	if !hasCommits && !includeDirty {
+		return fmt.Errorf("patch: repo %s has no commits to bundle (unborn HEAD)", absRepo)
 	}
 
 	tmp, err := os.MkdirTemp("", "krayt-bundle-src-")
@@ -56,25 +63,95 @@ func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int) er
 	defer func() { _ = os.RemoveAll(tmp) }()
 	src := filepath.Join(tmp, "src")
 
-	cloneArgs := []string{"clone", "--quiet"}
-	if depth > 0 {
-		cloneArgs = append(cloneArgs, "--depth", fmt.Sprint(depth))
-	}
-	cloneArgs = append(cloneArgs, "file://"+absRepo, src)
-	if _, err := runGit(ctx, "", cloneArgs...); err != nil {
-		return fmt.Errorf("patch: shallow clone source: %w", err)
+	var branch string
+	if hasCommits {
+		cloneArgs := []string{"clone", "--quiet"}
+		if depth > 0 {
+			cloneArgs = append(cloneArgs, "--depth", fmt.Sprint(depth))
+		}
+		cloneArgs = append(cloneArgs, "file://"+absRepo, src)
+		if _, err := runGit(ctx, "", cloneArgs...); err != nil {
+			return fmt.Errorf("patch: shallow clone source: %w", err)
+		}
+		if branch, err = currentBranch(ctx, src); err != nil {
+			return err
+		}
+	} else {
+		// Unborn HEAD + includeDirty: nothing to clone, so start a fresh empty repo we own
+		// and capture the working tree as a root commit.
+		if _, err := runGit(ctx, "", "init", "--quiet", "-b", "main", src); err != nil {
+			return fmt.Errorf("patch: init empty bundle repo: %w", err)
+		}
+		branch = "main"
 	}
 
-	branch, err := currentBranch(ctx, src)
-	if err != nil {
-		return err
+	if includeDirty {
+		dirty, err := captureDirty(ctx, src, absRepo, hasCommits, filepath.Join(tmp, "idx"))
+		if err != nil {
+			return err
+		}
+		// Move our clone's branch to the dirty commit so HEAD (symbolic → branch) imports
+		// it. The clone is ours, so this mutates nothing in the user's repo.
+		if _, err := runGit(ctx, src, "update-ref", "refs/heads/"+branch, dirty); err != nil {
+			return fmt.Errorf("patch: point branch at dirty commit: %w", err)
+		}
 	}
+
 	// Name a ref (the branch) plus HEAD so `git clone` of the bundle has something to
 	// check out (§6.7).
 	if _, err := runGit(ctx, src, "bundle", "create", outBundle, "HEAD", branch); err != nil {
 		return fmt.Errorf("patch: create bundle: %w", err)
 	}
 	return nil
+}
+
+// captureDirty builds a throwaway commit of the source working tree (committed state +
+// uncommitted, .gitignore honored) without mutating the source repo (§6.7). It writes all
+// objects into cloneDir's object database while reading files from srcWorkTree via a
+// temporary index, so the user's index/worktree/refs stay untouched. The commit's parent is
+// the clone's HEAD when the repo has commits, or it is a root commit on an unborn HEAD. It
+// returns the new commit's SHA.
+func captureDirty(ctx context.Context, cloneDir, srcWorkTree string, hasCommits bool, indexFile string) (string, error) {
+	gitDir := filepath.Join(cloneDir, ".git")
+	env := []string{
+		"GIT_DIR=" + gitDir,
+		"GIT_WORK_TREE=" + srcWorkTree,
+		"GIT_INDEX_FILE=" + indexFile,
+	}
+	if hasCommits {
+		if _, err := runGitEnv(ctx, env, "read-tree", "HEAD"); err != nil {
+			return "", fmt.Errorf("patch: seed temp index: %w", err)
+		}
+	}
+	if _, err := runGitEnv(ctx, env, "add", "-A"); err != nil {
+		return "", fmt.Errorf("patch: stage working tree: %w", err)
+	}
+	tree, err := runGitEnv(ctx, env, "write-tree")
+	if err != nil {
+		return "", fmt.Errorf("patch: write tree: %w", err)
+	}
+	tree = strings.TrimSpace(tree)
+
+	args := []string{"commit-tree", tree, "-m", "krayt: include uncommitted changes"}
+	if hasCommits {
+		head, err := runGit(ctx, cloneDir, "rev-parse", "HEAD")
+		if err != nil {
+			return "", fmt.Errorf("patch: resolve clone HEAD: %w", err)
+		}
+		args = append(args, "-p", strings.TrimSpace(head))
+	}
+	// commit-tree needs only GIT_DIR (+ an identity); reuse the bot identity via env so a
+	// fresh container/host with no git config still commits.
+	commitEnv := []string{
+		"GIT_DIR=" + gitDir,
+		"GIT_AUTHOR_NAME=" + DefaultIdentity.Name, "GIT_AUTHOR_EMAIL=" + DefaultIdentity.Email,
+		"GIT_COMMITTER_NAME=" + DefaultIdentity.Name, "GIT_COMMITTER_EMAIL=" + DefaultIdentity.Email,
+	}
+	dirty, err := runGitEnv(ctx, commitEnv, args...)
+	if err != nil {
+		return "", fmt.Errorf("patch: commit dirty tree: %w", err)
+	}
+	return strings.TrimSpace(dirty), nil
 }
 
 // Ingest performs the guest-side bundle ingest (§6.7), in order: verify the bundle (catch
@@ -184,14 +261,11 @@ func verifyBundle(ctx context.Context, bundlePath string) error {
 	return nil
 }
 
-// ensureHasCommits fails fast with a clear message on an unborn HEAD (no commits yet);
-// `git bundle create` refuses to create an empty bundle. Full unborn-HEAD handling rides
-// with the dirty-capture work in Phase 3 (§6.7).
-func ensureHasCommits(ctx context.Context, repoPath string) error {
-	if _, err := runGit(ctx, repoPath, "rev-parse", "--verify", "HEAD"); err != nil {
-		return fmt.Errorf("patch: repo %s has no commits to bundle (unborn HEAD): %w", repoPath, err)
-	}
-	return nil
+// gitOK reports whether a git command succeeds in dir (used as a predicate, e.g. for an
+// unborn-HEAD check).
+func gitOK(ctx context.Context, dir string, args ...string) bool {
+	_, err := runGit(ctx, dir, args...)
+	return err == nil
 }
 
 // currentBranch returns the checked-out branch name of repoPath. A fresh `git clone`
@@ -204,8 +278,8 @@ func currentBranch(ctx context.Context, repoPath string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// runGit runs git in dir (cwd if empty) and returns trimmed stdout, wrapping failures with
-// stderr so a broken git invocation is diagnosable.
+// runGit runs git in dir (cwd if empty) and returns its raw stdout (callers trim as needed),
+// wrapping failures with stderr so a broken git invocation is diagnosable.
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
 	out, err := runGitRaw(ctx, dir, args...)
 	return string(out), err
@@ -231,4 +305,24 @@ func runGitRaw(ctx context.Context, dir string, args ...string) ([]byte, error) 
 		return nil, fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
 	}
 	return stdout.Bytes(), nil
+}
+
+// runGitEnv runs git with extraEnv appended (e.g. GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE
+// for the non-mutating dirty capture) and returns its raw stdout (callers trim as needed).
+// No working directory is set; the location is controlled entirely by the git env vars.
+func runGitEnv(ctx context.Context, extraEnv []string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
+	cmd.Env = append(cmd.Env, extraEnv...)
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+	}
+	return stdout.String(), nil
 }

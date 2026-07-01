@@ -16,11 +16,15 @@ import (
 	"path/filepath"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/418-cloud/krayt/internal/controlclient"
 	"github.com/418-cloud/krayt/internal/imagestore"
 	"github.com/418-cloud/krayt/internal/patch"
 	"github.com/418-cloud/krayt/internal/protocol/pb"
 	"github.com/418-cloud/krayt/internal/provider"
+	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
@@ -97,7 +101,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return nil, err
 	}
 
-	// 3. Push inputs: image (incremental), code bundle, task.
+	// 3. Push inputs: image (incremental), code bundle, task, secrets.
 	if err := pushImage(ctx, client, deps.Image); err != nil {
 		return nil, err
 	}
@@ -107,15 +111,16 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	if _, err := client.Agent.PushTask(ctx, &pb.TaskSpec{Prompt: spec.TaskPrompt, Env: spec.Env}); err != nil {
 		return nil, fmt.Errorf("orchestrator: push task: %w", err)
 	}
+	if err := pushSecrets(ctx, client, spec.SecretsPath); err != nil {
+		return nil, err
+	}
+	if err := setNetworkPolicy(ctx, client, spec.Network); err != nil {
+		return nil, err
+	}
 
 	// 4. Start the container and consume the event stream (logs + terminal status).
 	exitCode, timedOut, err := streamRun(ctx, client, spec, deps.LogOut, runDir)
 	if err != nil {
-		return nil, err
-	}
-
-	// 5. Collect artifacts into the run dir (§6.7, §8.4).
-	if err := collect(ctx, client, runDir); err != nil {
 		return nil, err
 	}
 
@@ -125,8 +130,15 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		TimedOut:  timedOut,
 		PatchPath: filepath.Join(runDir, "changes.patch"),
 	}
-	if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
-		res.CommitsBundle = cb
+	// 5. Collect artifacts into the run dir (§6.7, §8.4). On a wall-clock timeout the run
+	// context is already dead, so skip collection and just record the timed-out run.
+	if !timedOut {
+		if err := collect(ctx, client, runDir); err != nil {
+			return nil, err
+		}
+		if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
+			res.CommitsBundle = cb
+		}
 	}
 	if err := writeMeta(runDir, spec, res); err != nil {
 		return nil, err
@@ -174,7 +186,7 @@ func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSp
 	// (§6.1/§8.1), and CreateBundle treats depth<=0 as full history. The default of 1 is
 	// applied at the CLI flag (and, in Phase 4, config resolution) — overriding 0 here would
 	// silently defeat an explicit `--bundle-depth 0` request for full history.
-	if err := patch.CreateBundle(ctx, spec.RepoPath, bundle, spec.BundleDepth); err != nil {
+	if err := patch.CreateBundle(ctx, spec.RepoPath, bundle, spec.BundleDepth, spec.IncludeDirty); err != nil {
 		return err
 	}
 	f, err := os.Open(bundle)
@@ -186,6 +198,52 @@ func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSp
 		return fmt.Errorf("orchestrator: push code: %w", err)
 	}
 	return nil
+}
+
+// pushSecrets loads the per-task secrets file (if any) and pushes it to the guest, which
+// holds it in memory and materializes it on tmpfs at /run/secrets (§6.8).
+func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath string) error {
+	if secretsPath == "" {
+		return nil
+	}
+	values, err := secrets.Load(secretsPath)
+	if err != nil {
+		return err
+	}
+	if _, err := client.Agent.PushSecrets(ctx, &pb.SecretsBundle{Values: values}); err != nil {
+		return fmt.Errorf("orchestrator: push secrets: %w", err)
+	}
+	return nil
+}
+
+// setNetworkPolicy translates the task's egress policy to the proto and sends it (§6.6).
+func setNetworkPolicy(ctx context.Context, client *controlclient.Client, np task.NetworkPolicy) error {
+	mode := pb.NetworkPolicy_ALLOWLIST
+	switch np.Mode {
+	case task.NetworkFull:
+		mode = pb.NetworkPolicy_FULL
+	case task.NetworkNone:
+		mode = pb.NetworkPolicy_NONE
+	}
+	if _, err := client.Agent.SetNetworkPolicy(ctx, &pb.NetworkPolicy{Mode: mode, Allow: np.Allow}); err != nil {
+		return fmt.Errorf("orchestrator: set network policy: %w", err)
+	}
+	return nil
+}
+
+// isWallClockTimeout reports whether a Start-stream error is the run's wall-clock timeout
+// rather than a real failure. ctx.Err() can lag the stream teardown under load — the deadline
+// timer may fire just after gRPC observes the expiry and RST_STREAMs the stream — so we also
+// accept a DeadlineExceeded RPC status (set atomically by gRPC at failure time) or a deadline
+// that has already elapsed. A plain cancellation (Ctrl-C) is not a timeout and stays an error.
+func isWallClockTimeout(ctx context.Context, err error) bool {
+	if ctx.Err() == context.DeadlineExceeded || status.Code(err) == codes.DeadlineExceeded {
+		return true
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return true
+	}
+	return false
 }
 
 // streamRun starts the container and consumes RunEvents until the terminal Status. Log
@@ -212,6 +270,11 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 			return 0, false, fmt.Errorf("orchestrator: start stream ended without a terminal status")
 		}
 		if err != nil {
+			// Wall-clock timeout: our run context expired, which canceled the stream. The
+			// guest kills the container and the deferred Destroy tears the VM down (§6.1).
+			if isWallClockTimeout(ctx, err) {
+				return -1, true, nil
+			}
 			return 0, false, fmt.Errorf("orchestrator: stream recv: %w", err)
 		}
 		switch k := ev.GetKind().(type) {

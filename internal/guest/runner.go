@@ -14,6 +14,7 @@ const (
 	ContainerWorkspace  = "/workspace"
 	ContainerTaskPrompt = "/task/prompt.md"
 	ContainerOutput     = "/output"
+	ContainerSecrets    = "/run/secrets"
 )
 
 // RunConfig is what the Service hands the Runner to execute the user's image for one run
@@ -25,6 +26,7 @@ type RunConfig struct {
 	WorkspaceDir     string            // -> /workspace
 	TaskPath         string            // -> /task/prompt.md
 	OutputDir        string            // -> /output
+	SecretsDir       string            // -> /run/secrets (tmpfs); empty when no secrets (§6.8)
 	Env              map[string]string // non-secret env (§6.5 TaskSpec.env)
 }
 

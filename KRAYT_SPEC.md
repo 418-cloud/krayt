@@ -354,16 +354,22 @@ is the simplest correct choice. Enforcement layers:
   (set through `HTTP_PROXY`/`HTTPS_PROXY`); direct sockets are dropped. This closes the
   raw-socket bypass that a pure proxy-env approach would leave open.
 - **Container env:** launched with `HTTP_PROXY` / `HTTPS_PROXY` pointing at the proxy and
-  `NO_PROXY=localhost,127.0.0.1`.
-- **DNS:** the proxy resolves allowlisted names itself; the container needs no direct DNS
-  egress (DNS goes through the proxy uid or a guest-local resolver also running as `proxyd`).
-- **Policy modes:** `allowlist` (default) — proxy enforces the domain list, seeded with
-  the AI endpoints (`api.anthropic.com`, `generativelanguage.googleapis.com`) + registries
-  the task needs; `full` — nftables policy switched to accept (explicit opt-in); `none` —
-  proxy denies everything (usable because image acquisition is off the VM net path, §6.11).
-  The agent's **auth/refresh** endpoints must be allowlisted alongside the inference endpoint
-  (§6.14); an OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key,
-  so it can need a wider list than the seed above.
+  `NO_PROXY=localhost,127.0.0.1` (the lowercase `http_proxy` / `https_proxy` / `no_proxy`
+  forms are set too, for tools that only read those).
+- **DNS:** the proxy resolves names itself, dialing a fixed resolver (`1.1.1.1:53` by
+  default; overridable via `krayt-proxy --dns`) **as `proxyd`**, so the lookup is permitted by
+  the L3 lock. The container does no DNS of its own — its direct egress, port 53 included, is
+  dropped. A system stub resolver (e.g. `systemd-resolved`) is deliberately bypassed: it runs
+  as a different uid and its upstream query would be dropped by the `skuid "proxyd"` rule.
+- **Policy modes:** `allowlist` (default) — the proxy permits only the hosts the task lists
+  (`--allow` / `network.allow`); with none listed it is **deny-all**, so a task that needs the
+  AI endpoints (`api.anthropic.com`, `generativelanguage.googleapis.com`) or a package
+  registry must allow them explicitly — krayt does **not** auto-seed them. `full` — nftables
+  policy switched to accept (explicit opt-in); `none` — proxy denies everything (usable
+  because image acquisition is off the VM net path, §6.11). The agent's **auth/refresh**
+  endpoints must be allowlisted alongside the inference endpoint (§6.14); an
+  OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key, so it can need
+  a wider list.
 
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
@@ -425,10 +431,13 @@ is handled by skipping `read-tree`/`-p` and committing the temp-index tree as a 
 - Optionally drop the `origin` remote (it points at the now-deleted temp bundle file).
 
 **Patch out (primary) + optional commit bundle.** On completion the deliverable is, as
-before, a reviewable patch: `git diff krayt-baseline..HEAD` against the *true* recorded
-baseline (cleaner apply via the real merge-base), written to `/output/changes.patch`; the host
-saves it to the run dir and the human applies it with `git apply` (or `git apply --3way`)
-after review (§8.4). **Additionally**, because the guest now has real history, it **may** emit
+before, a reviewable patch against the *true* recorded baseline (cleaner apply via the real
+merge-base), written to `/output/changes.patch`. The diff stages everything first and
+compares against the baseline (`git add -A` then `git diff --cached krayt-baseline`) rather
+than `krayt-baseline..HEAD`, so an agent that edits the working tree **without committing** —
+the common case — still produces a non-empty patch; a `..HEAD` diff would miss those
+uncommitted edits. The host saves it to the run dir and the human applies it with `git apply`
+(or `git apply --3way`) after review (§8.4). **Additionally**, because the guest now has real history, it **may** emit
 a **reverse range bundle** of just the new commits —
 `git bundle create /output/commits.bundle krayt-baseline..HEAD` — so multi-commit work applies
 faithfully on the host via `git fetch /output/commits.bundle`. A range bundle is correct here
@@ -1042,8 +1051,11 @@ must produce and guarantee:
 - **Networking:** one NAT NIC up via `systemd-networkd`; nftables ruleset from §6.6 applied
   by the guest-agent at run start (not baked statically — it depends on per-task policy).
 - **Closure contents (and nothing else):** kernel, systemd, containerd + `runc`/`crun`,
-  nftables, the static guest-agent binary, CA certificates, busybox-equivalent coreutils.
-  No editors, no shells beyond what systemd needs, no package manager.
+  nftables, the static guest-agent binary, CA certificates, busybox-equivalent coreutils, and
+  the pieces the run pipeline shells out to: **`gitMinimal`** for the §6.7 bundle
+  ingest/diff, **`e2fsprogs` + `util-linux`** to format + mount the per-run scratch disk
+  (§6.10), and the **`krayt-proxy`** binary run as the dedicated **`proxyd`** user for the
+  egress proxy (§6.6). No editors, no shells beyond what systemd needs, no package manager.
 - **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — vfkit boots
   raw/ISO, not qcow2), all `aarch64-linux`, packaged as the OCI artifact in §11.5. vfkit
   boots them via its Linux bootloader (kernel + initrd + cmdline) or EFI.
@@ -1182,12 +1194,12 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - [x] Guaranteed VM teardown (defer + signal handling).
 - [x] **Done when:** `krayt run` against a trivial image that edits one file yields a correct `changes.patch` that `krayt apply` cleanly applies to the host repo. *(Met both via the automated `fakeProvider` proof and a real-VM run on Apple Silicon — see HUMAN_TODO.md.)*
 
-### Phase 3 — Security & capability controls
-- [ ] Egress proxy (uid `proxyd`) + nftables default-deny ruleset (§6.6); per-task allowlist.
-- [ ] Per-task secrets file → `SecretsBundle` → container tmpfs; log redaction.
-- [ ] Resource limits (cpu/mem/disk) + wall-clock timeout → kills container then VM. *(Disk: the per-run scratch disk sized to `DiskGiB` already landed early in the vfkit provider, Phase 2; cpu/mem are applied to the VM; remaining = wall-clock kill of container-then-VM.)*
-- [ ] Include-dirty: non-mutating temp-index capture (`GIT_INDEX_FILE` + `write-tree` + `commit-tree`) folded into the inbound bundle when `include_dirty` is set, leaving the user's repo untouched (§6.7). *(Moved here from Phase 2.)*
-- [ ] **Done when:** a container can reach an allowlisted host, is blocked from a non-allowlisted host and from a raw (non-proxied) socket, and secrets never appear in logs/artifacts (asserted by tests).
+### Phase 3 — Security & capability controls ✅
+- [x] Egress proxy (uid `proxyd`) + nftables default-deny ruleset (§6.6); per-task allowlist. *(Hand-rolled proxy behind a swappable `Factory` seam; L7 allowlist unit-tested, L3 lock + raw-socket block confirmed on hardware. The proxy resolves DNS as `proxyd` so lookups pass the lock while the container stays DNS-blocked.)*
+- [x] Per-task secrets file → `SecretsBundle` → container tmpfs; log redaction.
+- [x] Resource limits (cpu/mem/disk) + wall-clock timeout → kills container then VM. *(Disk: the per-run scratch disk sized to `DiskGiB` landed early in the vfkit provider, Phase 2; cpu/mem are applied to the VM; wall-clock now kills the container task then tears down the VM.)*
+- [x] Include-dirty: non-mutating temp-index capture (`GIT_INDEX_FILE` + `write-tree` + `commit-tree`) folded into the inbound bundle when `include_dirty` is set, leaving the user's repo untouched (§6.7). *(Moved here from Phase 2.)*
+- [x] **Done when:** a container can reach an allowlisted host, is blocked from a non-allowlisted host and from a raw (non-proxied) socket, and secrets never appear in logs/artifacts (asserted by tests). *(Redaction + proxy L7 by the automated suite; the L3 raw-socket lock confirmed on Apple Silicon — `TestEgressEnforcement` green: PASS reach-allowlisted / block-non-allowlisted / block-raw-socket.)*
 
 ### Phase 4 — Concurrency & UX
 - [ ] Orchestrator: multiple concurrent runs, per-VM socket device, state under `.krayt/`.

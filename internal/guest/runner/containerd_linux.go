@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
@@ -88,6 +89,10 @@ func (r *Runner) Run(ctx context.Context, cfg guest.RunConfig, log guest.LogFunc
 			oci.WithProcessCwd(guest.ContainerWorkspace),
 			oci.WithEnv(envSlice(cfg.Env)),
 			oci.WithMounts(contractMounts(cfg)),
+			// Run in the VM's own network namespace (no new netns), so the container
+			// reaches the egress proxy on the VM's loopback and the nftables output lock
+			// applies to its sockets — the VM boundary is the network boundary (§6.6).
+			oci.WithHostNamespace(specs.NetworkNamespace),
 		),
 	)
 	if err != nil {
@@ -116,7 +121,23 @@ func (r *Runner) Run(ctx context.Context, cfg guest.RunConfig, log guest.LogFunc
 		return -1, fmt.Errorf("runner: start task: %w", err)
 	}
 
-	status := <-exitCh
+	// Wait for the container to exit, or kill it on context cancel/deadline — the
+	// wall-clock timeout kills the container, then the host tears down the VM (§6.1).
+	var status containerd.ExitStatus
+	select {
+	case status = <-exitCh:
+	case <-ctx.Done():
+		killCtx := context.WithoutCancel(ctx)
+		_ = task.Kill(killCtx, syscall.SIGKILL)
+		// Drain the exit so the killed task is reaped; the exit code is irrelevant here.
+		select {
+		case <-exitCh:
+		case <-time.After(5 * time.Second):
+		}
+		_ = outW.Close()
+		_ = errW.Close()
+		return -1, ctx.Err()
+	}
 	_ = outW.Close()
 	_ = errW.Close()
 	code, _, err := status.Result()
@@ -162,11 +183,19 @@ func (r *Runner) importImage(ctx context.Context, cfg guest.RunConfig) (containe
 // (§8.2). The task dir (containing prompt.md) is mounted read-only.
 func contractMounts(cfg guest.RunConfig) []specs.Mount {
 	taskDir := parentDir(cfg.TaskPath)
-	return []specs.Mount{
+	mounts := []specs.Mount{
 		{Destination: guest.ContainerWorkspace, Type: "bind", Source: cfg.WorkspaceDir, Options: []string{"rbind", "rw"}},
 		{Destination: "/task", Type: "bind", Source: taskDir, Options: []string{"rbind", "ro"}},
 		{Destination: guest.ContainerOutput, Type: "bind", Source: cfg.OutputDir, Options: []string{"rbind", "rw"}},
 	}
+	// Secrets are bind-mounted read-only from the guest's tmpfs secrets dir (§6.8).
+	if cfg.SecretsDir != "" {
+		mounts = append(mounts, specs.Mount{
+			Destination: guest.ContainerSecrets, Type: "bind", Source: cfg.SecretsDir,
+			Options: []string{"rbind", "ro"},
+		})
+	}
+	return mounts
 }
 
 // forward copies r to the host as log lines until EOF; pipe closure ends it cleanly.

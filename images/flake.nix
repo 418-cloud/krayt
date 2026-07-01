@@ -27,11 +27,13 @@
       # github.com/containerd/containerd/v2/client, §6.10), so vendorHash MUST be
       # regenerated — it is set to fakeHash to force the mismatch that prints the new hash.
       # See HUMAN_TODO.md "[Phase 2] Regenerate guest-agent vendorHash".
+      # Builds both in-VM binaries: the guest-agent and krayt-proxy (the egress proxy run as
+      # proxyd, §6.6). vendorHash is unchanged — krayt-proxy adds no external dependency.
       guest-agent = pkgs.buildGoModule {
         pname = "krayt-agent";
         version = "0.0.0-dev";
         src = ../.; # repo root (go.mod, internal/, cmd/)
-        subPackages = [ "cmd/krayt-agent" ];
+        subPackages = [ "cmd/krayt-agent" "cmd/krayt-proxy" ];
         vendorHash = "sha256-6l937L2Q8MCCJqApw7EW/ZI/Q9DjKXy57GFugFkn5nM=";
         env.CGO_ENABLED = "0";
       };
@@ -67,6 +69,17 @@
               networkConfig.DHCP = "yes";
             };
             networking.nftables.enable = true; # per-task rules applied by the agent at run start
+
+            # ---- egress proxy identity (§6.6) ----
+            # The proxy runs as this dedicated, non-root uid; the nftables lock permits
+            # egress only for `skuid "proxyd"`, so the container (a different uid) cannot
+            # bypass it. The name must exist for both the credential switch and the rule.
+            users.users.proxyd = {
+              isSystemUser = true;
+              group = "proxyd";
+              description = "krayt egress allowlist proxy";
+            };
+            users.groups.proxyd = { };
 
             # ---- per-run scratch disk (§6.10) ----
             # The provider attaches a sparse raw disk sized to DiskGiB as /dev/vdb. The
@@ -105,10 +118,10 @@
               after = [ "containerd.service" "network-online.target" ];
               wants = [ "network-online.target" ];
               requires = [ "containerd.service" ];
-              # git is required in the guest for the bundle ingest + patch generation of
-              # §6.7 (bundle verify, clone, diff); gitMinimal keeps the closure small. This
-              # is the one closure addition §11.6's list omits — flagged for the spec.
-              path = [ pkgs.gitMinimal ];
+              # On PATH for the agent: git for the §6.7 bundle ingest/diff; nftables (`nft`)
+              # for the §6.6 egress lock; and the guest-agent package itself so the agent can
+              # exec `krayt-proxy` (built into the same derivation).
+              path = [ pkgs.gitMinimal pkgs.nftables guest-agent ];
               # Route the agent's working files (image tar, repo bundle, /workspace clone)
               # onto the scratch disk rather than tmpfs/RAM (§6.10).
               environment.TMPDIR = "/var/lib/containerd/tmp";

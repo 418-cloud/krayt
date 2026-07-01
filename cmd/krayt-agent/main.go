@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/418-cloud/krayt/internal/guest"
+	"github.com/418-cloud/krayt/internal/guest/proxy"
 	"github.com/418-cloud/krayt/internal/guest/runner"
 	"github.com/418-cloud/krayt/internal/protocol/pb"
 	"github.com/418-cloud/krayt/internal/provider"
@@ -42,7 +43,13 @@ func run() error {
 	// Wire the containerd Runner (§6.10). If containerd is not reachable yet, still serve
 	// so the host's boot-readiness Hello succeeds; Start then fails with a clear message
 	// rather than the VM appearing dead.
-	var opts []guest.Option
+	// Secrets are materialized on tmpfs (/run is tmpfs, §11.6) so they never touch
+	// persistent disk (§6.8). The egress proxy + nftables lock enforce the per-task network
+	// policy (§6.6).
+	opts := []guest.Option{
+		guest.WithSecretsDir("/run/krayt-secrets"),
+		guest.WithNetwork(proxy.NewController()),
+	}
 	if r, err := runner.New(containerdSocket); err != nil {
 		log.Printf("containerd runner unavailable (%v): Start will fail until containerd is up", err)
 	} else {

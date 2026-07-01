@@ -92,3 +92,79 @@ Getting the real run green took three image iterations, all now resolved:
 The base image also gained `gitMinimal` in the closure (§6.7) — the one addition §11.6's
 closure list omits (flagged for the spec). The `integration,darwin` test
 `TestEndToEndRealVM` remains available to re-verify the path in CI/automation.
+
+### Phase 3 — Security & capability controls — DONE ✅
+Confirmed end-to-end on Apple Silicon: `TestEgressEnforcement` passed against a rebuilt image
+(`ghcr.io/418-cloud/krayt-vmimage@sha256:d3f2991b…`) + the `test-krayt:network` probe under
+`--net allowlist --allow api.anthropic.com` — **PASS 1** reached the allowlisted host through
+the proxy, **PASS 2** the non-allowlisted host was 403'd, **PASS 3** the raw `1.1.1.1:443`
+socket was dropped by nftables. `TestBootHello` and `TestEndToEndRealVM` also re-passed on the
+final image (no regression). Secrets redaction, wall-clock timeout, include-dirty, and the
+proxy L7 allowlist were already green in the automated suite. **Phase 3 complete.**
+
+The OS-agnostic work is implemented and proven by automated tests (no VM):
+- **Secrets + redaction (§6.8):** `internal/orchestrator` `TestSecretsRedactedInLogs` — a
+  secret is mounted at `/run/secrets` for the agent but is scrubbed from the live log,
+  `agent.log`, and `meta.json`.
+- **Egress allowlist L7 (§6.6):** `internal/guest/proxy` tests — allowlisted host allowed,
+  non-allowlisted blocked, `none` blocks all, `full` allows all (hand-rolled proxy behind a
+  swappable `Factory` seam).
+- **Wall-clock timeout (§6.1):** `TestRunTimeout` — a stuck agent is killed, the run records
+  `timed_out: true`, the VM is torn down.
+- **Include-dirty (§6.7):** `internal/patch` tests — uncommitted/untracked captured,
+  `.gitignore` honored, source repo untouched, unborn-HEAD handled.
+
+The L3 nftables lock (raw-socket block) is the one piece that needs a real VM. The handoffs
+below block only that on-hardware confirmation.
+
+## [Phase 3] Rebuild + republish the base VM image (Phase 3 changes), re-pin the digest — BLOCKING (real run)
+- Needed: rebuild with the Phase 3 image additions and publish to GHCR, then update
+  `internal/vmimage/pinned.go`. Image changes (all in `images/flake.nix`): a `proxyd`
+  system user/group (§6.6), the `krayt-proxy` binary (added to the guest-agent
+  `buildGoModule` subPackages), and `nftables` + `krayt-proxy` on the `krayt-agent` service
+  PATH. Plus the updated guest-agent (secrets/redaction/timeout/network wiring).
+- Why the agent can't: Linux builder/CI + registry credentials + real-hardware boot.
+- Note: `vendorHash` does NOT change — the proxy is stdlib and secrets is first-party; no new
+  Go module was added.
+- **Host-netns fix (a second rebuild):** the first attempt at a real egress run surfaced a
+  runner bug — the container was getting a fresh empty network namespace, so it had no route
+  to the proxy and no egress at all. `internal/guest/runner/containerd_linux.go` now runs the
+  container in the VM's own netns (`oci.WithHostNamespace(specs.NetworkNamespace)`, §6.6). Any
+  image built before this fix must be rebuilt for the egress path to work; `vendorHash` is
+  still unchanged. The `pinned.go` comment was also stale (still referenced the Phase 1
+  rc5 image) — update it when re-pinning.
+- **Proxy DNS fix (a third rebuild):** the on-hardware egress run then showed a 502 reaching
+  an allowlisted host — the nftables lock was dropping `proxyd`'s DNS because the system stub
+  resolver (`systemd-resolved`) does the upstream lookup as a *different* uid. The proxy now
+  resolves via `DefaultDNSServer` (1.1.1.1:53) dialed as `proxyd`, so DNS is `proxyd`-owned
+  and permitted by the lock while the container stays fully DNS-blocked (§6.6). Overridable
+  with `krayt-proxy --dns`. `vendorHash` unchanged. Confirmed via a `--net full` run (which
+  reaches the host, proving the network is fine and the failure was the lock/DNS path).
+- Verify success by: `TestBootHello` still round-trips; `TestEndToEndRealVM` still passes
+  (no regression from the Phase 3 wiring).
+- Blocking: yes — the egress + secrets on-hardware tests need this image.
+
+## [Phase 3] Provide a linux/arm64 network-probe image for the egress test — BLOCKING (egress run)
+- Needed: an image whose entrypoint probes egress and exits 0 ONLY when all three hold:
+  (a) HTTPS to `$KRAYT_ALLOW_HOST` via `HTTPS_PROXY` succeeds; (b) HTTPS to a
+  non-allowlisted host fails; (c) a raw TCP connect that ignores `HTTP(S)_PROXY` to a
+  non-allowlisted `host:443` fails (the nftables L3 lock). Otherwise exit non-zero.
+- Why the agent can't: building/publishing an image needs a registry + builder; krayt does
+  not build user images (Non-Goal §2).
+- Exact steps/commands: e.g. a small script using `curl` (honors `HTTPS_PROXY`) for (a)/(b)
+  and a raw `nc`/socket connect for (c); push to a registry the host can pull.
+- Verify success by: the run exits 0 under `--net allowlist --allow $KRAYT_ALLOW_HOST`.
+- Blocking: yes — for the egress integration test only.
+
+## [Phase 3] Run the egress enforcement test on Apple-Silicon hardware — the L3 raw-socket proof
+- Needed: run `internal/orchestrator` `TestEgressEnforcement` (build tag `integration,darwin`)
+  on a Mac with vfkit, the republished image, and the network-probe image above.
+- Why the agent can't: needs real virtualization + nftables + network egress.
+- Exact steps/commands:
+  `KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img
+  KRAYT_NETPROBE_IMAGE=<ref> KRAYT_ALLOW_HOST=api.anthropic.com
+  go test -tags 'integration darwin' -run TestEgressEnforcement -v ./internal/orchestrator/`
+- Verify success by: the test passes (allowlisted reach + non-allowlisted block + raw-socket
+  block all as expected).
+- Blocking: no for the phase's automated proofs (secrets/timeout/include-dirty/proxy-L7 are
+  green); yes for the on-hardware L3 confirmation. Depends on the two entries above.
