@@ -1,0 +1,35 @@
+# Example krayt task config (§8.1). Every field is optional; command-line flags to
+# `krayt run` override anything set here (defaults -> file -> flags, §8.3).
+# Point krayt at this with `krayt run --config configs/krayt.yaml`, or drop a `krayt.yaml`
+# at the repo root and it is picked up automatically.
+
+image: my-agent:latest          # user OCI image (required, via flag or file)
+task: ./task.md                 # path to the task prompt
+repo: .                         # repo to snapshot (default: cwd)
+include_dirty: false            # include uncommitted working-tree changes (§6.7)
+bundle_depth: 1                 # forward-bundle shallow depth; 0 = full history (§6.7)
+
+network:
+  mode: allowlist               # allowlist (default, deny-all unless listed) | full | none
+  allow:                        # hosts the agent may reach through the egress proxy (§6.6)
+    - api.anthropic.com
+    - registry.npmjs.org
+
+secrets: ./secrets.env          # per-task secrets file, mounted on tmpfs at /run/secrets (§6.8)
+
+env:                            # non-secret env passed to the container (§8.2)
+  LOG_LEVEL: info
+
+resources:
+  cpus: 2
+  memory: 4GiB                  # MiB/GiB suffix; bare number = MiB
+  disk: 20GiB                   # MiB/GiB suffix; bare number = GiB
+  timeout: 30m                  # Go duration (e.g. 45m, 1h30m)
+
+questions:                      # agent -> human questions (§6.13)
+  mode: fail                    # fail (default, autonomous) | wait (pause for input)
+  timeout: 10m                  # per-question wait limit
+  on_timeout: sentinel          # sentinel (default; agent decides) | abort (fail the run)
+
+agent:
+  adapter: none                 # none | claude-code | gemini-cli (Phase 5)

@@ -22,5 +22,12 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newImageCmd())
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newApplyCmd())
+	root.AddCommand(newLsCmd())
+	root.AddCommand(newLogsCmd())
+	root.AddCommand(newAttachCmd())
+	root.AddCommand(newStopCmd())
+	root.AddCommand(newRmCmd())
+	root.AddCommand(newPatchCmd())
+	root.AddCommand(newAnswerCmd())
 	return root
 }

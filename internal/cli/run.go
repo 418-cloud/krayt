@@ -27,6 +27,7 @@ type runDeps struct {
 // runFlags holds the Phase 2 `krayt run` flag set (a subset of §13; secrets, network, and
 // questions arrive in later phases).
 type runFlags struct {
+	config       string
 	image        string
 	taskFile     string
 	repo         string
@@ -34,12 +35,17 @@ type runFlags struct {
 	includeDirty bool
 	netMode      string
 	allow        []string
+	env          map[string]string
 	bundleDepth  int
 	cpus         int
 	memory       uint64
 	disk         uint64
 	timeout      time.Duration
 	detach       bool
+
+	onQuestion        string        // fail | wait (§6.13)
+	questionTimeout   time.Duration // per-question wait limit
+	onQuestionTimeout string        // sentinel | abort
 }
 
 func newRunCmd() *cobra.Command {
@@ -52,7 +58,15 @@ func newRunCmd() *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error { return runRun(cmd, &f) },
 	}
+	bindRunFlags(cmd, &f)
+	return cmd
+}
+
+// bindRunFlags registers the `krayt run` flags onto cmd (extracted so config-precedence is
+// testable against a real flag set).
+func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl := cmd.Flags()
+	fl.StringVar(&f.config, "config", "", "path to krayt.yaml (default: ./<repo>/krayt.yaml if present)")
 	fl.StringVar(&f.image, "image", "", "user OCI image to run (required)")
 	fl.StringVar(&f.taskFile, "task", "", "path to the task prompt file (required)")
 	fl.StringVar(&f.repo, "repo", ".", "host repo to bundle")
@@ -66,12 +80,19 @@ func newRunCmd() *cobra.Command {
 	fl.Uint64Var(&f.disk, "disk", 20, "disk (GiB)")
 	fl.DurationVar(&f.timeout, "timeout", 30*time.Minute, "wall-clock run timeout")
 	fl.BoolVar(&f.detach, "detach", false, "headless: do not stream logs to the terminal")
-	return cmd
+	fl.StringVar(&f.onQuestion, "on-question", "fail", "agent question mode: fail (autonomous) | wait (pause for input)")
+	fl.DurationVar(&f.questionTimeout, "question-timeout", 10*time.Minute, "per-question wait timeout")
+	fl.StringVar(&f.onQuestionTimeout, "on-question-timeout", "sentinel", "on question timeout: sentinel | abort")
 }
 
 func runRun(cmd *cobra.Command, f *runFlags) error {
+	// Overlay krayt.yaml under the flags (defaults → file → flags; §8.3) before validation,
+	// so the file can supply required fields like image/task.
+	if err := applyConfig(cmd, f); err != nil {
+		return err
+	}
 	if f.image == "" || f.taskFile == "" {
-		return fmt.Errorf("--image and --task are required")
+		return fmt.Errorf("--image and --task are required (via flags or krayt.yaml)")
 	}
 	prompt, err := os.ReadFile(f.taskFile)
 	if err != nil {
@@ -92,16 +113,22 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 			return err
 		}
 	}
-	netMode := task.NetworkMode(f.netMode)
-	switch netMode {
-	case task.NetworkAllowlist, task.NetworkFull, task.NetworkNone:
-	default:
-		return fmt.Errorf("--net must be allowlist, full, or none (got %q)", f.netMode)
+	netMode, err := task.ParseNetworkMode(f.netMode)
+	if err != nil {
+		return fmt.Errorf("--net: %w", err)
 	}
 	// --allow only means anything under allowlist mode; `full` allows all and `none` denies
 	// all regardless, so reject the combination rather than silently ignoring it (§6.6).
 	if netMode != task.NetworkAllowlist && len(f.allow) > 0 {
 		return fmt.Errorf("--allow can only be used with --net allowlist")
+	}
+	qMode, err := task.ParseQuestionMode(f.onQuestion)
+	if err != nil {
+		return fmt.Errorf("--on-question: %w", err)
+	}
+	qOnTimeout, err := task.ParseQuestionTimeoutAction(f.onQuestionTimeout)
+	if err != nil {
+		return fmt.Errorf("--on-question-timeout: %w", err)
 	}
 	spec := task.RunSpec{
 		ID:           id,
@@ -110,6 +137,7 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		SecretsPath:  secretsPath,
 		IncludeDirty: f.includeDirty,
 		Network:      task.NetworkPolicy{Mode: netMode, Allow: f.allow},
+		Env:          f.env,
 		BundleDepth:  f.bundleDepth,
 		TaskPrompt:   prompt,
 		Detach:       f.detach,
@@ -119,9 +147,8 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 			DiskGiB:   f.disk,
 			Timeout:   f.timeout,
 		},
+		Questions: task.QuestionsPolicy{Mode: qMode, Timeout: f.questionTimeout, OnTimeout: qOnTimeout},
 	}
-
-	runDir := filepath.Join(repoAbs, ".krayt", "runs", id)
 
 	// OS-specific provider + base VM image (vfkit on macOS; error elsewhere until Phase 6).
 	deps, err := newRunDeps()
@@ -139,12 +166,15 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	if f.detach {
 		logOut = nil
 	}
-	res, err := orchestrator.Run(cmd.Context(), orchestrator.Deps{
+	// Drive the run through the Manager so it writes state under <repo>/.krayt (§6.2) and the
+	// management commands can observe it. v1 supervises in the foreground (this process).
+	mgr := orchestrator.NewManager(orchestrator.Deps{
 		Provider: deps.provider,
 		BaseVM:   deps.baseVM,
 		Image:    img,
 		LogOut:   logOut,
-	}, spec, runDir)
+	}, filepath.Join(repoAbs, ".krayt"), 0)
+	res, err := mgr.Run(cmd.Context(), spec)
 	if err != nil {
 		return err
 	}
@@ -173,6 +203,79 @@ func acquireUserImage(cmd *cobra.Command, ref string) (*imagestore.Image, error)
 		return nil, err
 	}
 	return imagestore.Acquire(cmd.Context(), src, ref, cacheRoot)
+}
+
+// applyConfig loads krayt.yaml (explicit --config, else <repo>/krayt.yaml if present) and
+// overlays it under the flags: a config value is used only when its flag was not set on the
+// command line, so flags always win (§8.3).
+func applyConfig(cmd *cobra.Command, f *runFlags) error {
+	path := f.config
+	if path == "" {
+		def := filepath.Join(f.repo, "krayt.yaml")
+		if _, err := os.Stat(def); err != nil {
+			return nil // no config file and none requested
+		}
+		path = def
+	}
+	cfg, err := task.LoadConfig(path)
+	if err != nil {
+		return err
+	}
+	changed := func(name string) bool { return cmd.Flags().Changed(name) }
+	str := func(name, v string, dst *string) {
+		if !changed(name) && v != "" {
+			*dst = v
+		}
+	}
+	str("image", cfg.Image, &f.image)
+	str("task", cfg.Task, &f.taskFile)
+	str("repo", cfg.Repo, &f.repo)
+	str("secrets", cfg.Secrets, &f.secretsFile)
+	str("net", cfg.Network.Mode, &f.netMode)
+	if !changed("allow") && len(cfg.Network.Allow) > 0 {
+		f.allow = cfg.Network.Allow
+	}
+	if !changed("include-dirty") && cfg.IncludeDirty != nil {
+		f.includeDirty = *cfg.IncludeDirty
+	}
+	if !changed("bundle-depth") && cfg.BundleDepth != nil {
+		f.bundleDepth = *cfg.BundleDepth
+	}
+	if !changed("cpus") && cfg.Resources.CPUs != nil {
+		f.cpus = *cfg.Resources.CPUs
+	}
+	if !changed("memory") && cfg.Resources.Memory != "" {
+		m, err := task.ParseMiB(cfg.Resources.Memory)
+		if err != nil {
+			return err
+		}
+		f.memory = m
+	}
+	if !changed("disk") && cfg.Resources.Disk != "" {
+		d, err := task.ParseGiB(cfg.Resources.Disk)
+		if err != nil {
+			return err
+		}
+		f.disk = d
+	}
+	if !changed("timeout") && cfg.Resources.Timeout != "" {
+		d, err := time.ParseDuration(cfg.Resources.Timeout)
+		if err != nil {
+			return fmt.Errorf("config timeout %q: %w", cfg.Resources.Timeout, err)
+		}
+		f.timeout = d
+	}
+	str("on-question", cfg.Questions.Mode, &f.onQuestion)
+	str("on-question-timeout", cfg.Questions.OnTimeout, &f.onQuestionTimeout)
+	if !changed("question-timeout") && cfg.Questions.Timeout != "" {
+		d, err := time.ParseDuration(cfg.Questions.Timeout)
+		if err != nil {
+			return fmt.Errorf("config question timeout %q: %w", cfg.Questions.Timeout, err)
+		}
+		f.questionTimeout = d
+	}
+	f.env = cfg.Env // non-secret container env comes from the file (§8.1)
+	return nil
 }
 
 // newRunID returns a short unique run identifier, e.g. "run_2f9c1a3b".

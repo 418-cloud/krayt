@@ -48,6 +48,25 @@ func Dial(vm provider.VM, port uint32) (*Client, error) {
 	return &Client{conn: conn, Agent: pb.NewGuestAgentClient(conn)}, nil
 }
 
+// DialSocket opens a gRPC connection straight to a guest control socket path (the unix socket
+// a vfkit VM bridges vsock to). It backs `krayt answer`/`stop`, which reach a running VM's
+// guest from a separate invocation using the socket path recorded in the run's meta.json —
+// the daemon-less, process-agnostic path of §6.2/§6.13.
+func DialSocket(socketPath string) (*Client, error) {
+	conn, err := grpc.NewClient(
+		"passthrough:///krayt-guest",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socketPath)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("controlclient: dial socket: %w", err)
+	}
+	return &Client{conn: conn, Agent: pb.NewGuestAgentClient(conn)}, nil
+}
+
 // Close releases the gRPC connection.
 func (c *Client) Close() error { return c.conn.Close() }
 

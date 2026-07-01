@@ -261,6 +261,10 @@ func (v *vm) DialControl(ctx context.Context, _ uint32) (net.Conn, error) {
 	return d.DialContext(ctx, "unix", v.ctrlSock)
 }
 
+// ControlSocket returns the host-side control socket path, which the orchestrator records so
+// a later `krayt answer`/`stop` can dial this run's guest directly (§6.2, §6.13).
+func (v *vm) ControlSocket() string { return v.ctrlSock }
+
 // Stop asks vfkit to stop the guest gracefully, then waits for the process to exit.
 func (v *vm) Stop(ctx context.Context) error {
 	if v.cmd == nil {

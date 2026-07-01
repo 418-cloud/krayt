@@ -168,3 +168,22 @@ below block only that on-hardware confirmation.
   block all as expected).
 - Blocking: no for the phase's automated proofs (secrets/timeout/include-dirty/proxy-L7 are
   green); yes for the on-hardware L3 confirmation. Depends on the two entries above.
+
+## [Phase 4] Verify the agent-question bridge socket + `krayt answer` on hardware — NON-BLOCKING
+- Needed: on an Apple-Silicon Mac with vfkit + the base image, confirm the container-facing
+  ask bridge works end to end: (a) the guest opens `<root>/ask.sock` and the containerd runner
+  bind-mounts it at `/run/krayt/ask.sock` in the container; (b) a `--on-question=wait` run whose
+  container connects to that socket drives the run to `waiting`; (c) `krayt answer <id> <resp>`
+  from a second terminal dials the recorded `ctrl_socket` and resolves it; (d) a desktop
+  notification fires on macOS (`osascript`).
+- Why the agent can't: the socket path needs a real VM + containerd bind mount, and the
+  sandbox blocks `bind(2)` for unix sockets (the socket round-trip test `t.Skip`s here);
+  cross-process `krayt answer` needs a live guest to dial.
+- Exact steps/commands: run a `--on-question=wait` task with an image that calls
+  `/run/krayt/ask.sock` (or wait for the Phase-5 `krayt-ask`/MCP front-ends), observe
+  `krayt ls` show `waiting`, then `krayt answer <id> yes`.
+- Verify success by: `krayt ls` flips `waiting`→`running`→`done`; the run dir has
+  `questions/<qid>.json`; the patch reflects the answered decision.
+- Blocking: no — the channel is fully proven against the fakeProvider in-process
+  (`TestQuestionWaitAnswer`, `TestQuestionFailModeSentinel`); this confirms the real socket
+  transport + notification, and is naturally exercised once the Phase-5 front-ends land.

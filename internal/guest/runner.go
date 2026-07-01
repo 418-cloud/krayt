@@ -15,6 +15,7 @@ const (
 	ContainerTaskPrompt = "/task/prompt.md"
 	ContainerOutput     = "/output"
 	ContainerSecrets    = "/run/secrets"
+	ContainerAskSocket  = "/run/krayt/ask.sock" // in-VM question bridge socket (§6.13); Phase-5 front-ends connect here
 )
 
 // RunConfig is what the Service hands the Runner to execute the user's image for one run
@@ -28,11 +29,20 @@ type RunConfig struct {
 	OutputDir        string            // -> /output
 	SecretsDir       string            // -> /run/secrets (tmpfs); empty when no secrets (§6.8)
 	Env              map[string]string // non-secret env (§6.5 TaskSpec.env)
+	AskSocket        string            // guest-side ask-bridge socket to bind-mount at /run/krayt/ask.sock (§6.13); empty if unavailable
+	Ask              AskFunc           // in-process bridge handle for fake runners; nil for the containerd runner
 }
 
 // LogFunc forwards a container log line to the host as it is produced; the Service wraps it
 // into a RunEvent.LogLine on the Start stream (§6.5).
 type LogFunc func(stream pb.LogLine_Stream, line []byte, tsUnixMs int64)
+
+// AskFunc submits an agent → human question through the in-VM bridge and blocks until the
+// host answers or the run is torn down (§6.13). It returns the response and whether it is a
+// no-answer sentinel. The production containerd runner does not call this — the container
+// reaches the bridge over AskSocket instead — but it lets an in-process (fake) runner drive a
+// stubbed question without a unix socket.
+type AskFunc func(ctx context.Context, prompt string, choices []string) (response string, noAnswer bool, err error)
 
 // Runner runs exactly one user container per VM (§6.10). The production implementation
 // (internal/guest/runner, //go:build linux) drives containerd; tests inject a fake that
