@@ -16,6 +16,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/418-cloud/krayt/internal/controlclient"
 	"github.com/418-cloud/krayt/internal/imagestore"
 	"github.com/418-cloud/krayt/internal/patch"
@@ -228,6 +231,21 @@ func setNetworkPolicy(ctx context.Context, client *controlclient.Client, np task
 	return nil
 }
 
+// isWallClockTimeout reports whether a Start-stream error is the run's wall-clock timeout
+// rather than a real failure. ctx.Err() can lag the stream teardown under load — the deadline
+// timer may fire just after gRPC observes the expiry and RST_STREAMs the stream — so we also
+// accept a DeadlineExceeded RPC status (set atomically by gRPC at failure time) or a deadline
+// that has already elapsed. A plain cancellation (Ctrl-C) is not a timeout and stays an error.
+func isWallClockTimeout(ctx context.Context, err error) bool {
+	if ctx.Err() == context.DeadlineExceeded || status.Code(err) == codes.DeadlineExceeded {
+		return true
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return true
+	}
+	return false
+}
+
 // streamRun starts the container and consumes RunEvents until the terminal Status. Log
 // lines are appended to logs/agent.log and, when not detached, echoed to LogOut.
 func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunSpec, logOut io.Writer, runDir string) (int, bool, error) {
@@ -254,7 +272,7 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 		if err != nil {
 			// Wall-clock timeout: our run context expired, which canceled the stream. The
 			// guest kills the container and the deferred Destroy tears the VM down (§6.1).
-			if ctx.Err() == context.DeadlineExceeded {
+			if isWallClockTimeout(ctx, err) {
 				return -1, true, nil
 			}
 			return 0, false, fmt.Errorf("orchestrator: stream recv: %w", err)
