@@ -93,7 +93,15 @@ The base image also gained `gitMinimal` in the closure (§6.7) — the one addit
 closure list omits (flagged for the spec). The `integration,darwin` test
 `TestEndToEndRealVM` remains available to re-verify the path in CI/automation.
 
-### Phase 3 — Security & capability controls
+### Phase 3 — Security & capability controls — DONE ✅
+Confirmed end-to-end on Apple Silicon: `TestEgressEnforcement` passed against a rebuilt image
+(`ghcr.io/418-cloud/krayt-vmimage@sha256:d3f2991b…`) + the `test-krayt:network` probe under
+`--net allowlist --allow api.anthropic.com` — **PASS 1** reached the allowlisted host through
+the proxy, **PASS 2** the non-allowlisted host was 403'd, **PASS 3** the raw `1.1.1.1:443`
+socket was dropped by nftables. `TestBootHello` and `TestEndToEndRealVM` also re-passed on the
+final image (no regression). Secrets redaction, wall-clock timeout, include-dirty, and the
+proxy L7 allowlist were already green in the automated suite. **Phase 3 complete.**
+
 The OS-agnostic work is implemented and proven by automated tests (no VM):
 - **Secrets + redaction (§6.8):** `internal/orchestrator` `TestSecretsRedactedInLogs` — a
   secret is mounted at `/run/secrets` for the agent but is scrubbed from the live log,

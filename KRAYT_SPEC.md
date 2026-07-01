@@ -1182,12 +1182,12 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - [x] Guaranteed VM teardown (defer + signal handling).
 - [x] **Done when:** `krayt run` against a trivial image that edits one file yields a correct `changes.patch` that `krayt apply` cleanly applies to the host repo. *(Met both via the automated `fakeProvider` proof and a real-VM run on Apple Silicon — see HUMAN_TODO.md.)*
 
-### Phase 3 — Security & capability controls
-- [ ] Egress proxy (uid `proxyd`) + nftables default-deny ruleset (§6.6); per-task allowlist.
-- [ ] Per-task secrets file → `SecretsBundle` → container tmpfs; log redaction.
-- [ ] Resource limits (cpu/mem/disk) + wall-clock timeout → kills container then VM. *(Disk: the per-run scratch disk sized to `DiskGiB` already landed early in the vfkit provider, Phase 2; cpu/mem are applied to the VM; remaining = wall-clock kill of container-then-VM.)*
-- [ ] Include-dirty: non-mutating temp-index capture (`GIT_INDEX_FILE` + `write-tree` + `commit-tree`) folded into the inbound bundle when `include_dirty` is set, leaving the user's repo untouched (§6.7). *(Moved here from Phase 2.)*
-- [ ] **Done when:** a container can reach an allowlisted host, is blocked from a non-allowlisted host and from a raw (non-proxied) socket, and secrets never appear in logs/artifacts (asserted by tests).
+### Phase 3 — Security & capability controls ✅
+- [x] Egress proxy (uid `proxyd`) + nftables default-deny ruleset (§6.6); per-task allowlist. *(Hand-rolled proxy behind a swappable `Factory` seam; L7 allowlist unit-tested, L3 lock + raw-socket block confirmed on hardware. The proxy resolves DNS as `proxyd` so lookups pass the lock while the container stays DNS-blocked.)*
+- [x] Per-task secrets file → `SecretsBundle` → container tmpfs; log redaction.
+- [x] Resource limits (cpu/mem/disk) + wall-clock timeout → kills container then VM. *(Disk: the per-run scratch disk sized to `DiskGiB` landed early in the vfkit provider, Phase 2; cpu/mem are applied to the VM; wall-clock now kills the container task then tears down the VM.)*
+- [x] Include-dirty: non-mutating temp-index capture (`GIT_INDEX_FILE` + `write-tree` + `commit-tree`) folded into the inbound bundle when `include_dirty` is set, leaving the user's repo untouched (§6.7). *(Moved here from Phase 2.)*
+- [x] **Done when:** a container can reach an allowlisted host, is blocked from a non-allowlisted host and from a raw (non-proxied) socket, and secrets never appear in logs/artifacts (asserted by tests). *(Redaction + proxy L7 by the automated suite; the L3 raw-socket lock confirmed on Apple Silicon — `TestEgressEnforcement` green: PASS reach-allowlisted / block-non-allowlisted / block-raw-socket.)*
 
 ### Phase 4 — Concurrency & UX
 - [ ] Orchestrator: multiple concurrent runs, per-VM socket device, state under `.krayt/`.
