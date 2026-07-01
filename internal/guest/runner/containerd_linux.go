@@ -89,6 +89,10 @@ func (r *Runner) Run(ctx context.Context, cfg guest.RunConfig, log guest.LogFunc
 			oci.WithProcessCwd(guest.ContainerWorkspace),
 			oci.WithEnv(envSlice(cfg.Env)),
 			oci.WithMounts(contractMounts(cfg)),
+			// Run in the VM's own network namespace (no new netns), so the container
+			// reaches the egress proxy on the VM's loopback and the nftables output lock
+			// applies to its sockets — the VM boundary is the network boundary (§6.6).
+			oci.WithHostNamespace(specs.NetworkNamespace),
 		),
 	)
 	if err != nil {

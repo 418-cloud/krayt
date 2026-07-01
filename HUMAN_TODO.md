@@ -118,6 +118,13 @@ below block only that on-hardware confirmation.
 - Why the agent can't: Linux builder/CI + registry credentials + real-hardware boot.
 - Note: `vendorHash` does NOT change — the proxy is stdlib and secrets is first-party; no new
   Go module was added.
+- **Host-netns fix (a second rebuild):** the first attempt at a real egress run surfaced a
+  runner bug — the container was getting a fresh empty network namespace, so it had no route
+  to the proxy and no egress at all. `internal/guest/runner/containerd_linux.go` now runs the
+  container in the VM's own netns (`oci.WithHostNamespace(specs.NetworkNamespace)`, §6.6). Any
+  image built before this fix must be rebuilt for the egress path to work; `vendorHash` is
+  still unchanged. The `pinned.go` comment was also stale (still referenced the Phase 1
+  rc5 image) — update it when re-pinning.
 - Verify success by: `TestBootHello` still round-trips; `TestEndToEndRealVM` still passes
   (no regression from the Phase 3 wiring).
 - Blocking: yes — the egress + secrets on-hardware tests need this image.
