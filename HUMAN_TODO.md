@@ -125,6 +125,13 @@ below block only that on-hardware confirmation.
   image built before this fix must be rebuilt for the egress path to work; `vendorHash` is
   still unchanged. The `pinned.go` comment was also stale (still referenced the Phase 1
   rc5 image) — update it when re-pinning.
+- **Proxy DNS fix (a third rebuild):** the on-hardware egress run then showed a 502 reaching
+  an allowlisted host — the nftables lock was dropping `proxyd`'s DNS because the system stub
+  resolver (`systemd-resolved`) does the upstream lookup as a *different* uid. The proxy now
+  resolves via `DefaultDNSServer` (1.1.1.1:53) dialed as `proxyd`, so DNS is `proxyd`-owned
+  and permitted by the lock while the container stays fully DNS-blocked (§6.6). Overridable
+  with `krayt-proxy --dns`. `vendorHash` unchanged. Confirmed via a `--net full` run (which
+  reaches the host, proving the network is fine and the failure was the lock/DNS path).
 - Verify success by: `TestBootHello` still round-trips; `TestEndToEndRealVM` still passes
   (no regression from the Phase 3 wiring).
 - Blocking: yes — the egress + secrets on-hardware tests need this image.

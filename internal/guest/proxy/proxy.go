@@ -56,28 +56,65 @@ func Serve(ctx context.Context, lis net.Listener, p Policy, factory Factory) err
 	return nil
 }
 
+// DefaultDNSServer is where the proxy resolves names. Resolution is done by the proxy
+// itself (dialed as proxyd), not the system stub resolver — the stub runs as a different
+// uid and its upstream queries are dropped by the nftables egress lock, so a stub-based
+// lookup fails under `allowlist`/`none` (§6.6).
+const DefaultDNSServer = "1.1.1.1:53"
+
 // HandRolled is the default allowlist forward proxy: it tunnels CONNECT (HTTPS) and
-// forwards plain HTTP, allowing a request only if its host passes the policy (§6.6).
+// forwards plain HTTP, allowing a request only if its host passes the policy (§6.6). It
+// resolves via DefaultDNSServer.
 func HandRolled(p Policy) http.Handler {
-	return newHandler(p, http.DefaultTransport)
+	return HandRolledDNS(p, DefaultDNSServer)
 }
 
-// newHandler builds the proxy with an injectable transport (tests pass a fake so the
-// forward path needs no real network).
-func newHandler(p Policy, rt http.RoundTripper) *handler {
+// HandRolledDNS is HandRolled with an explicit DNS server (the krayt-proxy --dns flag).
+func HandRolledDNS(p Policy, dnsServer string) http.Handler {
+	d := &net.Dialer{Timeout: dialTimeout, Resolver: resolverVia(dnsServer)}
+	tr := &http.Transport{
+		DialContext:           d.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	return newHandler(p, tr, d.DialContext)
+}
+
+// dialFunc dials an upstream address (resolving as proxyd, §6.6).
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// newHandler builds the proxy with an injectable transport + dialer (tests pass fakes so no
+// real network is needed).
+func newHandler(p Policy, rt http.RoundTripper, dial dialFunc) *handler {
 	allow := make(map[string]bool, len(p.Allow))
 	for _, a := range p.Allow {
 		if a = strings.ToLower(strings.TrimSpace(a)); a != "" {
 			allow[a] = true
 		}
 	}
-	return &handler{mode: p.Mode, allow: allow, transport: rt}
+	return &handler{mode: p.Mode, allow: allow, transport: rt, dial: dial}
+}
+
+// resolverVia forces DNS through dnsServer, dialed by the proxy (proxyd) so the query is
+// permitted by the nftables lock rather than routed through a stub resolver on another uid.
+func resolverVia(dnsServer string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, dnsServer)
+		},
+	}
 }
 
 type handler struct {
 	mode      string
 	allow     map[string]bool
 	transport http.RoundTripper
+	dial      dialFunc
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +144,7 @@ func (h *handler) allowed(host string) bool {
 
 // connect tunnels an HTTPS CONNECT to the (already allowed) target, copying bytes both ways.
 func (h *handler) connect(w http.ResponseWriter, r *http.Request) {
-	upstream, err := net.DialTimeout("tcp", r.Host, dialTimeout)
+	upstream, err := h.dial(r.Context(), "tcp", r.Host)
 	if err != nil {
 		http.Error(w, "krayt: upstream dial failed: "+err.Error(), http.StatusBadGateway)
 		return

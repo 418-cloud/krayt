@@ -28,7 +28,7 @@ func TestAllowed(t *testing.T) {
 		{Policy{Mode: ""}, "api.anthropic.com", false}, // empty mode defaults to allowlist
 	}
 	for _, tc := range cases {
-		h := newHandler(tc.policy, nil)
+		h := newHandler(tc.policy, nil, nil)
 		if got := h.allowed(tc.host); got != tc.want {
 			t.Errorf("mode=%q allow=%v host=%q: allowed=%v, want %v", tc.policy.Mode, tc.policy.Allow, tc.host, got, tc.want)
 		}
@@ -54,7 +54,7 @@ func (f *fakeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 func TestServeHTTPForwarding(t *testing.T) {
 	t.Run("allowlisted forwards", func(t *testing.T) {
 		var reached string
-		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, &fakeTransport{reached: &reached})
+		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, &fakeTransport{reached: &reached}, nil)
 		req := httptest.NewRequest(http.MethodGet, "http://api.anthropic.com/v1/messages", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -68,7 +68,7 @@ func TestServeHTTPForwarding(t *testing.T) {
 
 	t.Run("blocked never reaches upstream", func(t *testing.T) {
 		var reached string
-		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, &fakeTransport{reached: &reached})
+		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, &fakeTransport{reached: &reached}, nil)
 		req := httptest.NewRequest(http.MethodGet, "http://evil.example.com/", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -84,7 +84,7 @@ func TestServeHTTPForwarding(t *testing.T) {
 // TestConnectBlocked checks a CONNECT to a non-allowlisted host is refused before any dial
 // (the allow path's byte-tunnel is covered by the real-VM integration test).
 func TestConnectBlocked(t *testing.T) {
-	h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, http.DefaultTransport)
+	h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, http.DefaultTransport, nil)
 	req := httptest.NewRequest(http.MethodConnect, "//blocked.example.com:443", nil)
 	req.Host = "blocked.example.com:443"
 	rec := httptest.NewRecorder()
