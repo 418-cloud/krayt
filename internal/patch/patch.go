@@ -278,8 +278,8 @@ func currentBranch(ctx context.Context, repoPath string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// runGit runs git in dir (cwd if empty) and returns trimmed stdout, wrapping failures with
-// stderr so a broken git invocation is diagnosable.
+// runGit runs git in dir (cwd if empty) and returns its raw stdout (callers trim as needed),
+// wrapping failures with stderr so a broken git invocation is diagnosable.
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
 	out, err := runGitRaw(ctx, dir, args...)
 	return string(out), err
@@ -308,8 +308,8 @@ func runGitRaw(ctx context.Context, dir string, args ...string) ([]byte, error) 
 }
 
 // runGitEnv runs git with extraEnv appended (e.g. GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE
-// for the non-mutating dirty capture) and returns trimmed stdout. No working directory is
-// set; the location is controlled entirely by the git env vars.
+// for the non-mutating dirty capture) and returns its raw stdout (callers trim as needed).
+// No working directory is set; the location is controlled entirely by the git env vars.
 func runGitEnv(ctx context.Context, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	var stdout, stderr bytes.Buffer

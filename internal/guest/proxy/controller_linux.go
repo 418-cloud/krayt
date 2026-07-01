@@ -69,10 +69,26 @@ func (c *Controller) Apply(ctx context.Context, policy guest.NetworkPolicy) (map
 		return nil, fmt.Errorf("proxy: start krayt-proxy as %s: %w", username, err)
 	}
 
+	// Reap the proxy so that when CommandContext kills it at run end (or via stopProxy on the
+	// error paths below) it is not left as a zombie. Harmless in the one-run-per-VM model
+	// today, but it prevents a per-run zombie/goroutine leak once a warm-VM pool reuses a
+	// long-lived guest-agent across runs (§15).
+	waited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(waited) }()
+	stopProxy := func() {
+		_ = cmd.Process.Kill()
+		select {
+		case <-waited:
+		case <-time.After(2 * time.Second):
+		}
+	}
+
 	if err := ApplyFirewall(ctx, policy.Mode); err != nil {
+		stopProxy()
 		return nil, err
 	}
 	if err := waitListening(ctx, listen, 5*time.Second); err != nil {
+		stopProxy()
 		return nil, fmt.Errorf("proxy: %w", err)
 	}
 

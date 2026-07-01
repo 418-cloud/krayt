@@ -98,6 +98,11 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	default:
 		return fmt.Errorf("--net must be allowlist, full, or none (got %q)", f.netMode)
 	}
+	// --allow only means anything under allowlist mode; `full` allows all and `none` denies
+	// all regardless, so reject the combination rather than silently ignoring it (§6.6).
+	if netMode != task.NetworkAllowlist && len(f.allow) > 0 {
+		return fmt.Errorf("--allow can only be used with --net allowlist")
+	}
 	spec := task.RunSpec{
 		ID:           id,
 		ImageRef:     f.image,

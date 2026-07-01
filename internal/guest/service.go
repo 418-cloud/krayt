@@ -258,8 +258,13 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		Env:              runEnv,
 	}, log)
 
-	// A canceled/expired context means the run hit its wall-clock timeout (§6.1): the
-	// runner kills the container, the host tears the VM down.
+	// The run context being done means the host aborted us — normally the wall-clock timeout
+	// (§6.1), possibly a disconnect. The guest cannot reliably tell which, and must NOT check
+	// for context.DeadlineExceeded: gRPC delivers the server-side context as context.Canceled
+	// on a client-deadline expiry (verified), racing the propagated grpc-timeout deadline, so
+	// DeadlineExceeded would miss real timeouts. Any cancellation means "the stream is dead,
+	// stop reporting and bail." The host is authoritative for the timed_out label — it checks
+	// DeadlineExceeded on its own context in the orchestrator.
 	timedOut := ctx.Err() != nil
 	if runErr != nil && !timedOut {
 		// Infrastructure failure (import/create/start). Report it on the terminal Status.

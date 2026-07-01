@@ -42,7 +42,10 @@ func Load(path string) (map[string]string, error) {
 		raw = strings.TrimPrefix(raw, "export ")
 		k, v, ok := strings.Cut(raw, "=")
 		if !ok {
-			return nil, fmt.Errorf("secrets: %s:%d: not KEY=VALUE: %q", path, line, sc.Text())
+			// Do not echo the line content: a malformed secrets line (e.g. a bare value or a
+			// pasted multi-line secret's continuation) could be secret material, and this
+			// error reaches host logs before any Redactor exists (§6.8). Line number suffices.
+			return nil, fmt.Errorf("secrets: %s:%d: not KEY=VALUE", path, line)
 		}
 		k = strings.TrimSpace(k)
 		if k == "" {
