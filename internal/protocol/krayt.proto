@@ -11,7 +11,7 @@ service GuestAgent {
   rpc QueryImageBlobs(BlobQuery) returns (BlobPresence);
   rpc PushImage(stream Chunk) returns (Ack);        // OCI archive, client-streaming
 
-  rpc PushCode(stream Chunk) returns (Ack);         // repo tarball, client-streaming
+  rpc PushCode(stream Chunk) returns (Ack);         // git bundle stream, client-streaming (§6.7)
   rpc PushTask(TaskSpec) returns (Ack);
   rpc PushSecrets(SecretsBundle) returns (Ack);     // held in memory only (§6.8)
   rpc SetNetworkPolicy(NetworkPolicy) returns (Ack);
@@ -20,7 +20,7 @@ service GuestAgent {
   // the terminal Status (exit code); the stream then closes.
   rpc Start(StartRequest) returns (stream RunEvent);
 
-  rpc CollectArtifacts(CollectRequest) returns (stream Chunk); // patch+report tar
+  rpc CollectArtifacts(CollectRequest) returns (stream Chunk); // patch+report tar (+ optional commits.bundle, §6.7)
   rpc Answer(AnswerRequest) returns (Ack);          // host answers an agent question (§6.13)
   rpc Shutdown(ShutdownRequest) returns (Ack);
 }
