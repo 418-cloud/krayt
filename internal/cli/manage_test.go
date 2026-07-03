@@ -80,6 +80,31 @@ func TestManageCommands(t *testing.T) {
 	}
 }
 
+// TestLsExitColumn checks the EXIT column: a real exit code for `done`, but "-" for `failed`
+// (an orchestration failure has no meaningful container exit code — showing 0 would read like
+// success).
+func TestLsExitColumn(t *testing.T) {
+	repo := t.TempDir()
+	seedRun(t, repo, "run_ok", "done")
+	seedRun(t, repo, "run_bad", "failed")
+
+	out := run(t, newLsCmd(), "--repo", repo)
+	exitFor := func(id string) string {
+		for _, line := range strings.Split(out, "\n") {
+			if f := strings.Fields(line); len(f) >= 3 && f[0] == id {
+				return f[2]
+			}
+		}
+		return ""
+	}
+	if got := exitFor("run_ok"); got != "0" {
+		t.Errorf("done run EXIT = %q, want 0", got)
+	}
+	if got := exitFor("run_bad"); got != "-" {
+		t.Errorf("failed run EXIT = %q, want %q", got, "-")
+	}
+}
+
 // execErr runs a command and returns its error (for the negative case).
 func execErr(cmd *cobra.Command, args ...string) error {
 	cmd.SetArgs(args)

@@ -298,11 +298,17 @@ func isWallClockTimeout(ctx context.Context, err error) bool {
 type controlSocketer interface{ ControlSocket() string }
 
 // streamRun starts the container and consumes RunEvents until the terminal Status. Log lines
-// are appended to logs/agent.log and, when not detached, echoed to LogOut. Agent questions
-// (§6.13) drive the run to `waiting` (setState) with the Q&A persisted and a desktop
-// notification; the answer arrives out of band (the guest Answer RPC), observed here as the
-// stream resuming. In `fail` mode a question is sentinel-answered immediately so the run never
-// blocks.
+// are appended to logs/agent.log and, when not detached, echoed to LogOut. An agent question
+// (§6.13) drives the run to `waiting` (setState) with the Q&A persisted and a desktop
+// notification; it is answered out of band by the guest Answer RPC (`krayt answer` dialing the
+// guest, Manager.Answer, or the timeout below). In `fail` mode a question is sentinel-answered
+// immediately so the run never blocks.
+//
+// The run stays `waiting` until it finishes: a log line is NOT a resume signal — an agent can
+// (and does) keep logging while blocked in ask_human — so we do not infer resumption from the
+// stream. Precise `waiting`→`running` on answer needs a guest "question resolved" RunEvent
+// (§6.13, a Phase-5 protocol addition); until then a resolved run simply shows `waiting` until
+// its terminal state.
 func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunSpec, logOut io.Writer, runDir string, setState func(string)) (int, bool, error) {
 	var timeoutSecs uint32
 	if spec.Resources.Timeout > 0 {
@@ -321,30 +327,7 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 	}
 	defer func() { _ = logFile.Close() }()
 
-	var (
-		pendingQID string
-		qTimer     *time.Timer
-		aborted    atomic.Bool
-	)
-	// resume clears a pending question when the agent produces its next event (any answer,
-	// from `krayt answer` or the timeout sentinel, resumes it out of band).
-	resume := func() {
-		if pendingQID == "" {
-			return
-		}
-		if qTimer != nil {
-			qTimer.Stop()
-			qTimer = nil
-		}
-		pendingQID = ""
-		setState(StateRunning)
-	}
-	defer func() {
-		if qTimer != nil {
-			qTimer.Stop()
-		}
-	}()
-
+	var aborted atomic.Bool
 	for {
 		ev, err := stream.Recv()
 		if err == io.EOF {
@@ -363,14 +346,12 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 		}
 		switch k := ev.GetKind().(type) {
 		case *pb.RunEvent_Log:
-			resume()
 			line := k.Log.GetLine()
 			_, _ = logFile.Write(line)
 			if !spec.Detach && logOut != nil {
 				_, _ = logOut.Write(line)
 			}
 		case *pb.RunEvent_Status:
-			resume()
 			st := k.Status
 			if e := st.GetError(); e != "" {
 				return int(st.GetExitCode()), st.GetTimedOut(), fmt.Errorf("orchestrator: run failed: %s", e)
@@ -384,26 +365,35 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 				_, _ = client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: q.GetId(), NoAnswer: true})
 				continue
 			}
-			pendingQID = q.GetId()
 			setState(StateWaiting)
 			if err := writeQuestion(runDir, q); err != nil {
 				return 0, false, err
 			}
 			notifyWaiting(filepath.Base(runDir), q.GetPrompt())
 			if to := spec.Questions.Timeout; to > 0 {
-				qid := q.GetId()
-				qTimer = time.AfterFunc(to, func() {
-					if spec.Questions.OnTimeout == task.OnTimeoutAbort {
-						aborted.Store(true)
-						streamCancel()
-						return
-					}
-					// sentinel: let the agent fall back gracefully.
-					_, _ = client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: qid, NoAnswer: true})
-				})
+				armQuestionTimeout(ctx, client, spec, q.GetId(), to, &aborted, streamCancel)
 			}
 		}
 	}
+}
+
+// armQuestionTimeout schedules the per-question wait limit (§6.13). On expiry it probes with a
+// no-answer sentinel: Ack.Ok reports whether the question was still pending, so a question the
+// human already answered (possibly from another process) is never wrongly sentinel-echoed or
+// aborted. Only a genuinely-still-pending question triggers the on-timeout action.
+func armQuestionTimeout(ctx context.Context, client *controlclient.Client, spec task.RunSpec, qid string, to time.Duration, aborted *atomic.Bool, cancel context.CancelFunc) {
+	time.AfterFunc(to, func() {
+		ack, err := client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: qid, NoAnswer: true})
+		if err != nil || !ack.GetOk() {
+			return // already answered/resolved, or transient failure — do not act
+		}
+		// The question was genuinely still pending at the deadline. The no-answer sentinel was
+		// just delivered; `abort` additionally fails the whole run.
+		if spec.Questions.OnTimeout == task.OnTimeoutAbort {
+			aborted.Store(true)
+			cancel()
+		}
+	})
 }
 
 // collect streams the guest's artifact tar and extracts it into the run dir (§8.4).

@@ -393,6 +393,16 @@ is the simplest correct choice. Enforcement layers:
   endpoints must be allowlisted alongside the inference endpoint (§6.14); an
   OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key, so it can need
   a wider list.
+- **Isolated as a swappable, memory-safety-critical component.** The proxy is a **standalone
+  in-guest process** (`krayt-proxy`, run as its own `proxyd` uid) — a separate binary, not
+  linked into the guest-agent — sitting behind a stable contract on both ends: the guest-agent
+  selects it through the `Factory` seam (`internal/guest/proxy`) and drives it purely by
+  process interface (fixed flags in — `--listen` / `--mode` / `--allow` / `--dns`; the proxy
+  env out; the nftables `skuid` lock around it). Nothing else in krayt depends on *how* it is
+  implemented. Because it is also the component most directly exposed to **untrusted,
+  adversarial network input**, that isolation makes it the natural candidate for a future
+  **memory-safe reimplementation** (e.g. Rust/Zig): drop in a binary that honors the same
+  flags + env + uid contract and neither the agnostic core nor the guest-agent changes.
 
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
@@ -622,6 +632,16 @@ agent-specific part in the adapter.
   one-line prompt; `choices[]` → tap/select). Multiple pending questions are answered FIFO by id.
 - Every Q&A pair is persisted to `.krayt/runs/<id>/questions/<qid>.json` and summarized in
   `report.md` / `meta.json`, so the patch review shows what the agent asked and what it was told.
+- **State transitions.** A `Question` event moves the run to `waiting`. The reverse edge —
+  `waiting`→`running` when the answer lands — must come from a **guest "question resolved"
+  `RunEvent`** emitted when `bridge.Answer` delivers, *not* from inferring resumption off the
+  log stream: an agent can (and does) keep logging while blocked in `ask_human`, and an answer
+  may arrive from a different process (`krayt answer` dialing the guest directly), so the host
+  cannot reliably detect resumption itself. The resolved event is a Phase-5 protocol addition;
+  until then a run stays `waiting` until it reaches a terminal state (never wrongly showing
+  `running` mid-wait). The per-question timeout is likewise self-correcting — it probes with a
+  no-answer sentinel and acts only if `Ack.Ok` shows the question was still pending, so an
+  already-answered question is never wrongly sentinel-echoed or aborted.
 
 **Concurrency & safety:**
 - A `waiting` run still owns a live VM, so it counts against max-concurrency; the timeout
@@ -1235,6 +1255,7 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 ### Phase 5 — Polish & optional orchestration
 - [ ] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats, questions; agent notes if the image writes `/output/report.md`).
 - [ ] `ask_human` front-ends (§6.13): in-VM MCP server + `krayt-ask` CLI, both bridging to the Phase-4 question channel.
+- [ ] Guest **"question resolved"** `RunEvent` (§6.13): emitted when `bridge.Answer` delivers, so the host flips `waiting`→`running` precisely on answer instead of holding `waiting` until the run ends (proto addition; folds into this phase's image rebuild). *(Phase-4 interim: a run stays `waiting` until terminal — the host never infers resumption from logs.)*
 - [ ] Optional agent adapters (`claude-code`, `gemini-cli`) — incl. registering the MCP server / wiring `krayt-ask` when `--on-question=wait`.
 - [ ] Claude Code adapter maps the provided credential to the correct env var (`ANTHROPIC_API_KEY` vs `CLAUDE_CODE_OAUTH_TOKEN`) and enforces exactly-one auth, failing fast if both are set (§6.14).
 - [ ] **Detached supervisor — "park and walk away" (§6.2):** `krayt run --detach` double-forks a per-run supervisor (no central daemon) that owns the VM to completion, so a run can be started, the terminal closed, the `waiting` notification received later, and resolved with `krayt answer`. Cross-process max-concurrency via a shared limit under `.krayt/`. Reuses the Phase-4 on-disk state + management commands unchanged; localized to the run entrypoint.

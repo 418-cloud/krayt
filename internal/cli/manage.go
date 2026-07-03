@@ -44,8 +44,11 @@ func newLsCmd() *cobra.Command {
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(w, "RUN\tSTATE\tEXIT\tIMAGE\tSTARTED")
 			for _, r := range recs {
+				// The exit code is only meaningful for a clean/killed container exit; a
+				// `failed` run errored in orchestration (no exit code) — show "-", not a
+				// misleading 0. The reason is in the run's meta.json `error`.
 				exit := "-"
-				if r.Terminal() {
+				if r.State == orchestrator.StateDone || r.State == orchestrator.StateTimedOut {
 					exit = fmt.Sprint(r.ExitCode)
 				}
 				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.State, exit, r.ImageRef, r.StartedAt)

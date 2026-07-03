@@ -169,7 +169,22 @@ below block only that on-hardware confirmation.
 - Blocking: no for the phase's automated proofs (secrets/timeout/include-dirty/proxy-L7 are
   green); yes for the on-hardware L3 confirmation. Depends on the two entries above.
 
-## [Phase 4] Verify the agent-question bridge socket + `krayt answer` on hardware — NON-BLOCKING
+## [Phase 4] Verify the agent-question bridge socket + `krayt answer` on hardware — DONE ✅
+- Confirmed on Apple Silicon with the `hack/ask-probe` image (`docker.io/tjololo/test-krayt:ask`):
+  (a) the guest opened the bridge and the runner bind-mounted it — probe logged
+  `/run/krayt/ask.sock present (mode Srwxr-xr-x)`; (b) `--on-question=wait` drove the run to
+  `waiting` and `krayt ls` **correctly showed `STATE=waiting`** during the wait (this is the
+  fix — it wrongly showed `running` before removing the log-as-resume heuristic); (c)
+  `krayt answer run_c63ca3fa yes` from a second terminal dialed the recorded `ctrl_socket` and
+  resolved it (`answered … question q1`) — the run completed exit 0 with the answer in the
+  patch. (d) The desktop notification path was not separately confirmed in this run; low risk.
+- Full `--on-question*` matrix also confirmed on hardware: `--question-timeout 30s` with the
+  default `sentinel` → the probe got `no_answer=true` and proceeded (exit 0); with
+  `--on-question-timeout abort` → the run failed cleanly (`question timed out (abort policy,
+  §6.13)`) and the VM was torn down. The self-correcting timer (`armQuestionTimeout`) worked.
+- Interim state behavior (by design until the Phase-5 guest "question resolved" event): a run
+  stays `waiting` until it reaches its terminal state rather than flipping back to `running`
+  on answer. Original text kept below for reference.
 - Needed: on an Apple-Silicon Mac with vfkit + the base image, confirm the container-facing
   ask bridge works end to end: (a) the guest opens `<root>/ask.sock` and the containerd runner
   bind-mounts it at `/run/krayt/ask.sock` in the container; (b) a `--on-question=wait` run whose
@@ -189,7 +204,14 @@ below block only that on-hardware confirmation.
   (`TestQuestionWaitAnswer`, `TestQuestionFailModeSentinel`); this confirms the real socket
   transport + notification, and is naturally exercised once the Phase-5 front-ends land.
 
-## [Phase 4] Rebuild + re-pin the VM image (guest-agent changed) — BLOCKING for any on-hardware run
+## [Phase 4] Rebuild + re-pin the VM image (guest-agent changed) — DONE ✅
+- Resolved: the base image was rebuilt with the Phase-4 guest-agent and re-pinned; the
+  `hack/ask-probe` run proves it (the new bridge socket existed in-VM, so the rebuilt
+  guest-agent booted). `vendorHash` regenerated to
+  `sha256-7NUdYBWhMvs+nJlHyoBWFzMYA83JXVyW6skWIB2T0Ws=` in `images/flake.nix` (adds
+  gopkg.in/yaml.v3). If the new `internal/vmimage/pinned.go` digest isn't recorded here yet,
+  it lives in that file. NOTE: the `waiting`-state host fix that followed is host-only
+  (`bin/krayt`) and needs **no** further image rebuild.
 - Needed: Phase 4 changed the guest-agent baked into the base image — the ask bridge
   (`internal/guest/ask`), the `Answer` RPC, the serialized `eventSender`, and the containerd
   ask-socket mount (§6.13). Also `gopkg.in/yaml.v3` was added to the module (config loader,

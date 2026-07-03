@@ -115,6 +115,89 @@ func TestQuestionWaitAnswer(t *testing.T) {
 	}
 }
 
+// chattyAskingRunner asks a question and keeps emitting log lines *while blocked* on the
+// answer — reproducing the ask-probe's "question sent — now waiting" line arriving right
+// behind the question. Those logs must not be mistaken for the agent resuming.
+type chattyAskingRunner struct{ prompt string }
+
+func (r *chattyAskingRunner) Version() string { return "fake" }
+func (r *chattyAskingRunner) Run(ctx context.Context, cfg guest.RunConfig, log guest.LogFunc) (int, error) {
+	stop := make(chan struct{})
+	go func() {
+		// small lead so the question reaches the host first, then chatter while blocked
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-stop:
+			return
+		}
+		for i := 0; i < 8; i++ {
+			log(pb.LogLine_STDOUT, []byte("agent: still waiting for input...\n"), time.Now().UnixMilli())
+			select {
+			case <-time.After(50 * time.Millisecond):
+			case <-stop:
+				return
+			}
+		}
+	}()
+	answer, _, err := cfg.Ask(ctx, r.prompt, nil)
+	close(stop)
+	if err != nil {
+		return 1, err
+	}
+	if err := os.WriteFile(filepath.Join(cfg.WorkspaceDir, "greeting.txt"), []byte(answer+"\n"), 0o644); err != nil {
+		return 1, err
+	}
+	return 0, nil
+}
+
+// TestQuestionStaysWaitingWhileAgentLogs is the regression for the ask-probe finding: a run
+// blocked in ask_human must stay `waiting` even as the agent keeps logging — a log line is not
+// a resume signal (§6.13).
+func TestQuestionStaysWaitingWhileAgentLogs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	img := minimalImage(ctx, t)
+	mgr := orchestrator.NewManager(orchestrator.Deps{Provider: askProvider(&chattyAskingRunner{prompt: "proceed?"}), Image: img}, t.TempDir(), 0)
+	stateDir := mgr.StateDir()
+	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
+
+	const id = "run_chatty"
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := mgr.Run(ctx, task.RunSpec{
+			ID: id, ImageRef: "latest", RepoPath: src, BundleDepth: 1, TaskPrompt: []byte("t"),
+			Questions: task.QuestionsPolicy{Mode: task.QuestionWait, Timeout: 30 * time.Second},
+		})
+		runDone <- err
+	}()
+
+	waitState(t, stateDir, id, orchestrator.StateWaiting)
+	runDir := orchestrator.RunDir(stateDir, id)
+	// While the agent chatters (~8 lines over ~450ms), the state must stay `waiting`.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if rec, err := orchestrator.ReadRecord(runDir); err == nil && rec.State != orchestrator.StateWaiting {
+			t.Fatalf("run flipped to %q while still blocked on input (a log was misread as resume)", rec.State)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	qs, _ := orchestrator.ReadQuestions(runDir)
+	if len(qs) == 0 {
+		t.Fatal("no question was recorded")
+	}
+	if err := mgr.Answer(id, qs[0].ID, "yes", false); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if rec, _ := orchestrator.ReadRecord(runDir); rec.State != orchestrator.StateDone {
+		t.Errorf("final state = %q, want done", rec.State)
+	}
+}
+
 // TestQuestionFailModeSentinel confirms the default `fail` mode never blocks: a question is
 // sentinel-answered immediately so the agent proceeds autonomously (§6.13).
 func TestQuestionFailModeSentinel(t *testing.T) {
