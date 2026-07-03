@@ -179,9 +179,10 @@ below block only that on-hardware confirmation.
 - Why the agent can't: the socket path needs a real VM + containerd bind mount, and the
   sandbox blocks `bind(2)` for unix sockets (the socket round-trip test `t.Skip`s here);
   cross-process `krayt answer` needs a live guest to dial.
-- Exact steps/commands: run a `--on-question=wait` task with an image that calls
-  `/run/krayt/ask.sock` (or wait for the Phase-5 `krayt-ask`/MCP front-ends), observe
-  `krayt ls` show `waiting`, then `krayt answer <id> yes`.
+- Exact steps/commands: use the ready-made probe in `hack/ask-probe/` (self-contained
+  static image + full runbook in its README) — build/push it, `krayt run --on-question=wait`,
+  observe `krayt ls` show `waiting`, then `krayt answer <id> yes`. (Or wait for the Phase-5
+  `krayt-ask`/MCP front-ends, which supersede the probe.)
 - Verify success by: `krayt ls` flips `waiting`→`running`→`done`; the run dir has
   `questions/<qid>.json`; the patch reflects the answered decision.
 - Blocking: no — the channel is fully proven against the fakeProvider in-process
