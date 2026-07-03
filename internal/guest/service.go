@@ -13,11 +13,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/418-cloud/krayt/internal/guest/ask"
 	"github.com/418-cloud/krayt/internal/patch"
 	"github.com/418-cloud/krayt/internal/protocol/pb"
 	"github.com/418-cloud/krayt/internal/secrets"
@@ -54,6 +56,21 @@ type Service struct {
 	secrets    map[string]string // received secrets, held in memory only (§6.8)
 	netPolicy  NetworkPolicy     // received network policy (§6.6)
 	baseline   string            // recorded baseline commit, set during Start (§6.7)
+	bridge     *ask.Bridge       // active run's question bridge; Answer routes to it (§6.13)
+}
+
+// eventSender serializes Sends on the Start stream: the runner's stdout/stderr forwarders and
+// the question pusher all emit RunEvents concurrently, and grpc.ServerStream.Send is not safe
+// for concurrent use.
+type eventSender struct {
+	mu     sync.Mutex
+	stream pb.GuestAgent_StartServer
+}
+
+func (e *eventSender) send(ev *pb.RunEvent) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.stream.Send(ev)
 }
 
 // Option configures a Service.
@@ -241,10 +258,40 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		runEnv = mergeEnv(env, proxyEnv)
 	}
 
+	// All RunEvents go through es so the log forwarders and the question pusher can Send
+	// concurrently without racing (§6.13).
+	es := &eventSender{stream: stream}
+
+	// Wire the agent → human question bridge (§6.13): questions become RunEvent.Question on
+	// this stream; the host resolves them via the Answer RPC. The bridge is reachable two
+	// ways — the container connects to a unix socket (AskSocket, used by the Phase-5
+	// front-ends) and, for in-process fake runners, RunConfig.Ask calls it directly.
+	bridge := ask.NewBridge(func(id, prompt string, choices []string) error {
+		return es.send(&pb.RunEvent{Kind: &pb.RunEvent_Question{Question: &pb.Question{
+			Id: id, Prompt: prompt, Choices: choices,
+		}}})
+	})
+	s.mu.Lock()
+	s.bridge = bridge
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.bridge = nil
+		s.mu.Unlock()
+	}()
+
+	// Best-effort ask socket for the container front-ends; if bind is unavailable the direct
+	// RunConfig.Ask handle still serves in-process runners.
+	askSocket := ""
+	if ln, lerr := net.Listen("unix", filepath.Join(root, "ask.sock")); lerr == nil {
+		askSocket = filepath.Join(root, "ask.sock")
+		go func() { _ = ask.Serve(ctx, ln, bridge) }()
+	}
+
 	// Run the agent, streaming logs to the host as they arrive — redacted in the guest so
 	// secret values never cross the wire in logs (§6.8).
 	log := func(strm pb.LogLine_Stream, line []byte, ts int64) {
-		_ = stream.Send(&pb.RunEvent{Kind: &pb.RunEvent_Log{Log: &pb.LogLine{
+		_ = es.send(&pb.RunEvent{Kind: &pb.RunEvent_Log{Log: &pb.LogLine{
 			Stream: strm, Line: redactor.Redact(line), TsUnixMs: ts,
 		}}})
 	}
@@ -256,6 +303,8 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		OutputDir:        outputDir,
 		SecretsDir:       secretsDir,
 		Env:              runEnv,
+		AskSocket:        askSocket,
+		Ask:              bridge.Ask,
 	}, log)
 
 	// The run context being done means the host aborted us — normally the wall-clock timeout
@@ -268,20 +317,34 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	timedOut := ctx.Err() != nil
 	if runErr != nil && !timedOut {
 		// Infrastructure failure (import/create/start). Report it on the terminal Status.
-		return stream.Send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
+		return es.send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
 			ExitCode: -1, Error: runErr.Error(),
 		}}})
 	}
 
 	// Build the patch + optional reverse bundle from the recorded baseline (§6.7).
 	if err := s.buildArtifacts(ctx, workspace, outputDir); err != nil && !timedOut {
-		return stream.Send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
+		return es.send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
 			ExitCode: int32(exitCode), Error: err.Error(),
 		}}})
 	}
-	return stream.Send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
+	return es.send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
 		ExitCode: int32(exitCode), TimedOut: timedOut,
 	}}})
+}
+
+// Answer resolves an outstanding agent question (§6.13). The host calls it (directly, or via
+// `krayt answer` dialing the guest) with the human's response or a no-answer sentinel; it
+// routes to the active run's bridge. Ok=false means no such question is waiting — a duplicate
+// or late answer, which is a harmless no-op.
+func (s *Service) Answer(_ context.Context, req *pb.AnswerRequest) (*pb.Ack, error) {
+	s.mu.Lock()
+	b := s.bridge
+	s.mu.Unlock()
+	if b == nil {
+		return &pb.Ack{Ok: false}, nil
+	}
+	return &pb.Ack{Ok: b.Answer(req.GetQuestionId(), req.GetResponse(), req.GetNoAnswer())}, nil
 }
 
 // writeSecrets materializes each secret as a file under the secrets dir (0600), so the

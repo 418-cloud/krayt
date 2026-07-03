@@ -9,11 +9,11 @@ package orchestrator
 import (
 	"archive/tar"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -40,7 +40,17 @@ type Deps struct {
 	BaseVM   provider.VMSpec   // kernel/initrd/cmdline/rootfs base; resources overlaid from spec
 	Image    *imagestore.Image // acquired user image; nil skips the image push (test/simple paths)
 	LogOut   io.Writer         // live log sink when spec.Detach is false; may be nil
+
+	// OnClient, if set, is invoked once the guest control client is connected with an
+	// AnswerFunc that delivers a human answer to this run's guest (§6.13), and again with nil
+	// as the run ends. The Manager uses it so Manager.Answer / `krayt answer` can resolve a
+	// waiting run in-process without reaching for the transport.
+	OnClient func(runID string, answer AnswerFunc)
 }
+
+// AnswerFunc delivers a human answer (or no-answer sentinel) to a waiting agent question via
+// the guest Answer RPC (§6.13).
+type AnswerFunc func(questionID, response string, noAnswer bool) error
 
 // Result summarizes a completed run for the caller and `krayt` output.
 type Result struct {
@@ -64,6 +74,26 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	if err := os.MkdirAll(filepath.Join(runDir, "logs"), 0o755); err != nil {
 		return nil, fmt.Errorf("orchestrator: create run dir: %w", err)
 	}
+
+	// Publish run state to disk so `ls`/`attach`/`stop` observe it without any in-process
+	// handle (§6.2). Written best-effort at each transition and finalized on return.
+	rec := RunRecord{
+		ID: spec.ID, ImageRef: spec.ImageRef, RepoPath: spec.RepoPath,
+		State: StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
+	}
+	_ = writeRecord(runDir, rec)
+	defer func() {
+		rec.EndedAt = nowStamp()
+		switch {
+		case err != nil:
+			rec.State, rec.Error = StateFailed, err.Error()
+		case res != nil && res.TimedOut:
+			rec.State, rec.ExitCode, rec.TimedOut = StateTimedOut, res.ExitCode, true
+		case res != nil:
+			rec.State, rec.ExitCode = StateDone, res.ExitCode
+		}
+		_ = writeRecord(runDir, rec)
+	}()
 
 	// 1. Provision the VM and guarantee teardown.
 	vmSpec := deps.BaseVM
@@ -101,6 +131,33 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return nil, err
 	}
 
+	// Record how to reach this run's guest (for cross-invocation `krayt answer`/`stop`) and
+	// register the in-process answerer for the Manager (§6.13, §6.2).
+	if cs, ok := vm.(controlSocketer); ok {
+		rec.CtrlSocket = cs.ControlSocket()
+	}
+	if deps.OnClient != nil {
+		deps.OnClient(spec.ID, func(qid, response string, noAnswer bool) error {
+			ack, aerr := client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{
+				QuestionId: qid, Response: response, NoAnswer: noAnswer,
+			})
+			if aerr != nil {
+				return aerr
+			}
+			// Ok=false means no such question was waiting — treat it as a failure, matching
+			// the CLI `krayt answer` and the timeout path, so a stale/duplicate answer doesn't
+			// silently report success (§6.13).
+			if !ack.GetOk() {
+				return fmt.Errorf("orchestrator: no pending question %q on run %q (already answered or timed out)", qid, spec.ID)
+			}
+			_ = RecordAnswer(runDir, qid, response, noAnswer) // complete the on-disk Q&A history (best-effort)
+			return nil
+		})
+		defer deps.OnClient(spec.ID, nil)
+	}
+	rec.State = StateRunning
+	_ = writeRecord(runDir, rec)
+
 	// 3. Push inputs: image (incremental), code bundle, task, secrets.
 	if err := pushImage(ctx, client, deps.Image); err != nil {
 		return nil, err
@@ -118,8 +175,9 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return nil, err
 	}
 
-	// 4. Start the container and consume the event stream (logs + terminal status).
-	exitCode, timedOut, err := streamRun(ctx, client, spec, deps.LogOut, runDir)
+	// 4. Start the container and consume the event stream (logs, questions, terminal status).
+	setState := func(st string) { rec.State = st; _ = writeRecord(runDir, rec) }
+	exitCode, timedOut, err := streamRun(ctx, client, spec, deps.LogOut, runDir, setState)
 	if err != nil {
 		return nil, err
 	}
@@ -140,10 +198,8 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 			res.CommitsBundle = cb
 		}
 	}
-	if err := writeMeta(runDir, spec, res); err != nil {
-		return nil, err
-	}
-	// Best-effort polite shutdown before the deferred Destroy.
+	// Best-effort polite shutdown before the deferred Destroy; the terminal run state is
+	// written by the deferred finalizer above.
 	_, _ = client.Agent.Shutdown(context.WithoutCancel(ctx), &pb.ShutdownRequest{})
 	return res, nil
 }
@@ -246,14 +302,31 @@ func isWallClockTimeout(ctx context.Context, err error) bool {
 	return false
 }
 
-// streamRun starts the container and consumes RunEvents until the terminal Status. Log
-// lines are appended to logs/agent.log and, when not detached, echoed to LogOut.
-func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunSpec, logOut io.Writer, runDir string) (int, bool, error) {
+// controlSocketer is implemented by a VM that exposes its host-side control socket path, so a
+// run can record where a later `krayt answer`/`stop` should dial the guest (§6.2, §6.13). The
+// fakeProvider does not implement it (in-process transport), leaving CtrlSocket empty.
+type controlSocketer interface{ ControlSocket() string }
+
+// streamRun starts the container and consumes RunEvents until the terminal Status. Log lines
+// are appended to logs/agent.log and, when not detached, echoed to LogOut. An agent question
+// (§6.13) drives the run to `waiting` (setState) with the Q&A persisted and a desktop
+// notification; it is answered out of band by the guest Answer RPC (`krayt answer` dialing the
+// guest, Manager.Answer, or the timeout below). In `fail` mode a question is sentinel-answered
+// immediately so the run never blocks.
+//
+// The run stays `waiting` until it finishes: a log line is NOT a resume signal — an agent can
+// (and does) keep logging while blocked in ask_human — so we do not infer resumption from the
+// stream. Precise `waiting`→`running` on answer needs a guest "question resolved" RunEvent
+// (§6.13, a Phase-5 protocol addition); until then a resolved run simply shows `waiting` until
+// its terminal state.
+func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunSpec, logOut io.Writer, runDir string, setState func(string)) (int, bool, error) {
 	var timeoutSecs uint32
 	if spec.Resources.Timeout > 0 {
 		timeoutSecs = uint32(spec.Resources.Timeout.Seconds())
 	}
-	stream, err := client.Agent.Start(ctx, &pb.StartRequest{ImageRef: spec.ImageRef, TimeoutSecs: timeoutSecs})
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
+	stream, err := client.Agent.Start(streamCtx, &pb.StartRequest{ImageRef: spec.ImageRef, TimeoutSecs: timeoutSecs})
 	if err != nil {
 		return 0, false, fmt.Errorf("orchestrator: start: %w", err)
 	}
@@ -264,12 +337,16 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 	}
 	defer func() { _ = logFile.Close() }()
 
+	var aborted atomic.Bool
 	for {
 		ev, err := stream.Recv()
 		if err == io.EOF {
 			return 0, false, fmt.Errorf("orchestrator: start stream ended without a terminal status")
 		}
 		if err != nil {
+			if aborted.Load() {
+				return -1, false, fmt.Errorf("orchestrator: question timed out (abort policy, §6.13)")
+			}
 			// Wall-clock timeout: our run context expired, which canceled the stream. The
 			// guest kills the container and the deferred Destroy tears the VM down (§6.1).
 			if isWallClockTimeout(ctx, err) {
@@ -291,10 +368,43 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 			}
 			return int(st.GetExitCode()), st.GetTimedOut(), nil
 		case *pb.RunEvent_Question:
-			// Agent questions are Phase 4; in Phase 2 (mode fail) none should arrive.
-			continue
+			q := k.Question
+			if spec.Questions.Mode != task.QuestionWait {
+				// fail mode (default): never block — sentinel immediately so the agent
+				// proceeds autonomously (§6.13).
+				_, _ = client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: q.GetId(), NoAnswer: true})
+				continue
+			}
+			setState(StateWaiting)
+			if err := writeQuestion(runDir, q); err != nil {
+				return 0, false, err
+			}
+			notifyWaiting(filepath.Base(runDir), q.GetPrompt())
+			if to := spec.Questions.Timeout; to > 0 {
+				armQuestionTimeout(ctx, client, spec, runDir, q.GetId(), to, &aborted, streamCancel)
+			}
 		}
 	}
+}
+
+// armQuestionTimeout schedules the per-question wait limit (§6.13). On expiry it probes with a
+// no-answer sentinel: Ack.Ok reports whether the question was still pending, so a question the
+// human already answered (possibly from another process) is never wrongly sentinel-echoed or
+// aborted. Only a genuinely-still-pending question triggers the on-timeout action.
+func armQuestionTimeout(ctx context.Context, client *controlclient.Client, spec task.RunSpec, runDir, qid string, to time.Duration, aborted *atomic.Bool, cancel context.CancelFunc) {
+	time.AfterFunc(to, func() {
+		ack, err := client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: qid, NoAnswer: true})
+		if err != nil || !ack.GetOk() {
+			return // already answered/resolved, or transient failure — do not act
+		}
+		// The question was genuinely still pending at the deadline. The no-answer sentinel was
+		// just delivered; record it in the history and, for `abort`, fail the whole run.
+		_ = RecordAnswer(runDir, qid, "", true)
+		if spec.Questions.OnTimeout == task.OnTimeoutAbort {
+			aborted.Store(true)
+			cancel()
+		}
+	})
 }
 
 // collect streams the guest's artifact tar and extracts it into the run dir (§8.4).
@@ -358,33 +468,6 @@ func safeJoin(dir, name string) (string, error) {
 
 func hasDotDotPrefix(rel string) bool {
 	return len(rel) >= 3 && rel[0] == '.' && rel[1] == '.' && (rel[2] == filepath.Separator)
-}
-
-// meta is the minimal run record written in Phase 2; the full §8.4 schema (patch stats,
-// timings, questions) is emitted in Phase 5.
-type meta struct {
-	ID        string `json:"id"`
-	ImageRef  string `json:"image_ref"`
-	ExitCode  int    `json:"exit_code"`
-	TimedOut  bool   `json:"timed_out"`
-	WrittenAt string `json:"written_at"`
-}
-
-func writeMeta(runDir string, spec task.RunSpec, res *Result) error {
-	b, err := json.MarshalIndent(meta{
-		ID:        spec.ID,
-		ImageRef:  spec.ImageRef,
-		ExitCode:  res.ExitCode,
-		TimedOut:  res.TimedOut,
-		WrittenAt: time.Now().UTC().Format(time.RFC3339),
-	}, "", "  ")
-	if err != nil {
-		return fmt.Errorf("orchestrator: marshal meta: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(runDir, "meta.json"), b, 0o644); err != nil {
-		return fmt.Errorf("orchestrator: write meta: %w", err)
-	}
-	return nil
 }
 
 func fileExists(p string) bool {

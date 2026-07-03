@@ -195,6 +195,14 @@ func contractMounts(cfg guest.RunConfig) []specs.Mount {
 			Options: []string{"rbind", "ro"},
 		})
 	}
+	// The agent → human question bridge socket (§6.13); the Phase-5 front-ends (MCP server /
+	// krayt-ask) inside the container connect to it. Empty when the guest could not open it.
+	if cfg.AskSocket != "" {
+		mounts = append(mounts, specs.Mount{
+			Destination: guest.ContainerAskSocket, Type: "bind", Source: cfg.AskSocket,
+			Options: []string{"rbind", "rw"},
+		})
+	}
 	return mounts
 }
 

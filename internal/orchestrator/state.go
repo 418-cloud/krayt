@@ -1,0 +1,176 @@
+package orchestrator
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+)
+
+// Run lifecycle states persisted in meta.json (§6.2). `waiting` is set while an agent
+// question is outstanding (§6.13).
+const (
+	StateStarting = "starting"
+	StateRunning  = "running"
+	StateWaiting  = "waiting"
+	StateDone     = "done"
+	StateFailed   = "failed"
+	StateTimedOut = "timed_out"
+)
+
+// RunRecord is the on-disk record of a run at `.krayt/runs/<id>/meta.json` — the source of
+// truth every management command reads, so runs are observable without any in-process handle
+// or daemon (§6.2, §8.4). It supersedes the Phase 2 minimal meta; the fuller §8.4 schema
+// (patch stats) can extend it later.
+type RunRecord struct {
+	ID         string `json:"id"`
+	ImageRef   string `json:"image_ref"`
+	RepoPath   string `json:"repo_path,omitempty"`
+	State      string `json:"state"`
+	StartedAt  string `json:"started_at,omitempty"`
+	EndedAt    string `json:"ended_at,omitempty"`
+	ExitCode   int    `json:"exit_code"`
+	TimedOut   bool   `json:"timed_out"`
+	Error      string `json:"error,omitempty"`
+	PID        int    `json:"pid,omitempty"`         // supervising process (for `krayt stop`)
+	CtrlSocket string `json:"ctrl_socket,omitempty"` // guest control socket (for `krayt answer`, §6.13)
+}
+
+// Terminal reports whether the run has finished.
+func (r RunRecord) Terminal() bool {
+	return r.State == StateDone || r.State == StateFailed || r.State == StateTimedOut
+}
+
+// runsDir is `<stateDir>/runs`.
+func runsDir(stateDir string) string { return filepath.Join(stateDir, "runs") }
+
+// RunDir is the directory for a run under stateDir (e.g. <repo>/.krayt/runs/<id>).
+func RunDir(stateDir, id string) string { return filepath.Join(runsDir(stateDir), id) }
+
+// metaPath is the meta.json path for a run dir.
+func metaPath(runDir string) string { return filepath.Join(runDir, "meta.json") }
+
+// writeRecord atomically writes a run record to runDir/meta.json (write-temp-then-rename so
+// a concurrent `ls`/`answer` never sees a half-written file).
+func writeRecord(runDir string, rec RunRecord) error {
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return fmt.Errorf("orchestrator: create run dir: %w", err)
+	}
+	b, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return fmt.Errorf("orchestrator: marshal record: %w", err)
+	}
+	tmp := metaPath(runDir) + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return fmt.Errorf("orchestrator: write record: %w", err)
+	}
+	if err := os.Rename(tmp, metaPath(runDir)); err != nil {
+		return fmt.Errorf("orchestrator: commit record: %w", err)
+	}
+	return nil
+}
+
+// ReadRecord reads a run's meta.json.
+func ReadRecord(runDir string) (RunRecord, error) {
+	var rec RunRecord
+	b, err := os.ReadFile(metaPath(runDir))
+	if err != nil {
+		return rec, err
+	}
+	if err := json.Unmarshal(b, &rec); err != nil {
+		return rec, fmt.Errorf("orchestrator: parse %s: %w", metaPath(runDir), err)
+	}
+	return rec, nil
+}
+
+// List returns every run's record under stateDir, newest first, skipping unreadable dirs.
+func List(stateDir string) ([]RunRecord, error) {
+	entries, err := os.ReadDir(runsDir(stateDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("orchestrator: list runs: %w", err)
+	}
+	var recs []RunRecord
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		rec, err := ReadRecord(RunDir(stateDir, e.Name()))
+		if err != nil {
+			continue // a run dir mid-creation or hand-removed; skip rather than fail `ls`
+		}
+		recs = append(recs, rec)
+	}
+	sort.Slice(recs, func(i, j int) bool { return recs[i].StartedAt > recs[j].StartedAt })
+	return recs, nil
+}
+
+// LogPath is the persisted container-log path for a run dir.
+func LogPath(runDir string) string { return filepath.Join(runDir, "logs", "agent.log") }
+
+// FollowLog tails runDir/logs/agent.log, writing new bytes to w as they appear, until the
+// run reaches a terminal state (log then drained) or ctx is canceled. Because it reads the
+// on-disk log, `krayt attach` works for a run supervised by any process (§6.2). poll bounds
+// how often it re-checks for new data.
+func FollowLog(ctx context.Context, runDir string, w io.Writer, poll time.Duration) error {
+	f, err := waitOpen(ctx, LogPath(runDir), poll)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			continue
+		}
+		if err != nil && err != io.EOF {
+			return err
+		}
+		// Caught up to EOF: stop once the run is terminal (after one grace read to catch a
+		// final line written just before the terminal-state write), else wait for more.
+		if rec, rerr := ReadRecord(runDir); rerr == nil && rec.Terminal() {
+			if n2, _ := f.Read(buf); n2 > 0 {
+				_, _ = w.Write(buf[:n2])
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(poll):
+		}
+	}
+}
+
+// waitOpen opens path, retrying until it exists or ctx is canceled (the log file appears a
+// moment after the run starts).
+func waitOpen(ctx context.Context, path string, poll time.Duration) (*os.File, error) {
+	for {
+		f, err := os.Open(path)
+		if err == nil {
+			return f, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(poll):
+		}
+	}
+}
+
+// nowStamp is the timestamp format used in records.
+func nowStamp() string { return time.Now().UTC().Format(time.RFC3339) }

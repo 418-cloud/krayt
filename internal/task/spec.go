@@ -3,7 +3,10 @@
 // merging defaults, config file, and flags (§6.1, §8.3).
 package task
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // RunSpec is the host-side, fully-resolved description of one run (config + flags +
 // defaults already merged). The orchestrator derives the provider.VMSpec from
@@ -40,6 +43,17 @@ const (
 	QuestionWait QuestionMode = "wait" // pause the run and surface the question
 )
 
+// ParseQuestionMode validates s against the known modes, keeping the set of valid values
+// authoritative here rather than duplicated at each call site (CLI flag + config file).
+func ParseQuestionMode(s string) (QuestionMode, error) {
+	switch m := QuestionMode(s); m {
+	case QuestionFail, QuestionWait:
+		return m, nil
+	default:
+		return "", fmt.Errorf("invalid question mode %q (want %q or %q)", s, QuestionFail, QuestionWait)
+	}
+}
+
 // QuestionTimeoutAction is what happens when a question's wait limit expires (§6.13).
 type QuestionTimeoutAction string
 
@@ -48,6 +62,16 @@ const (
 	OnTimeoutSentinel QuestionTimeoutAction = "sentinel" // default; agent gets a "no answer" sentinel
 	OnTimeoutAbort    QuestionTimeoutAction = "abort"    // fail the whole run
 )
+
+// ParseQuestionTimeoutAction validates s against the known on-timeout actions.
+func ParseQuestionTimeoutAction(s string) (QuestionTimeoutAction, error) {
+	switch a := QuestionTimeoutAction(s); a {
+	case OnTimeoutSentinel, OnTimeoutAbort:
+		return a, nil
+	default:
+		return "", fmt.Errorf("invalid on-timeout action %q (want %q or %q)", s, OnTimeoutSentinel, OnTimeoutAbort)
+	}
+}
 
 // QuestionsPolicy governs the optional agent → human question channel (§6.13).
 type QuestionsPolicy struct {
@@ -65,6 +89,16 @@ const (
 	NetworkFull      NetworkMode = "full"      // nftables policy switched to accept
 	NetworkNone      NetworkMode = "none"      // proxy denies everything
 )
+
+// ParseNetworkMode validates s against the known egress modes.
+func ParseNetworkMode(s string) (NetworkMode, error) {
+	switch m := NetworkMode(s); m {
+	case NetworkAllowlist, NetworkFull, NetworkNone:
+		return m, nil
+	default:
+		return "", fmt.Errorf("invalid network mode %q (want %q, %q, or %q)", s, NetworkAllowlist, NetworkFull, NetworkNone)
+	}
+}
 
 // NetworkPolicy is the host-side network policy for a run; it mirrors the proto enum
 // in §6.5 and is translated to protocol.NetworkPolicy before being pushed to the guest.

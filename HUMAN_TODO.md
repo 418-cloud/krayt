@@ -168,3 +168,62 @@ below block only that on-hardware confirmation.
   block all as expected).
 - Blocking: no for the phase's automated proofs (secrets/timeout/include-dirty/proxy-L7 are
   green); yes for the on-hardware L3 confirmation. Depends on the two entries above.
+
+## [Phase 4] Verify the agent-question bridge socket + `krayt answer` on hardware — DONE ✅
+- Confirmed on Apple Silicon with the `hack/ask-probe` image (`docker.io/tjololo/test-krayt:ask`):
+  (a) the guest opened the bridge and the runner bind-mounted it — probe logged
+  `/run/krayt/ask.sock present (mode Srwxr-xr-x)`; (b) `--on-question=wait` drove the run to
+  `waiting` and `krayt ls` **correctly showed `STATE=waiting`** during the wait (this is the
+  fix — it wrongly showed `running` before removing the log-as-resume heuristic); (c)
+  `krayt answer run_c63ca3fa yes` from a second terminal dialed the recorded `ctrl_socket` and
+  resolved it (`answered … question q1`) — the run completed exit 0 with the answer in the
+  patch. (d) The desktop notification path was not separately confirmed in this run; low risk.
+- Full `--on-question*` matrix also confirmed on hardware: `--question-timeout 30s` with the
+  default `sentinel` → the probe got `no_answer=true` and proceeded (exit 0); with
+  `--on-question-timeout abort` → the run failed cleanly (`question timed out (abort policy,
+  §6.13)`) and the VM was torn down. The self-correcting timer (`armQuestionTimeout`) worked.
+- Interim state behavior (by design until the Phase-5 guest "question resolved" event): a run
+  stays `waiting` until it reaches its terminal state rather than flipping back to `running`
+  on answer. Original text kept below for reference.
+- Needed: on an Apple-Silicon Mac with vfkit + the base image, confirm the container-facing
+  ask bridge works end to end: (a) the guest opens `<root>/ask.sock` and the containerd runner
+  bind-mounts it at `/run/krayt/ask.sock` in the container; (b) a `--on-question=wait` run whose
+  container connects to that socket drives the run to `waiting`; (c) `krayt answer <id> <resp>`
+  from a second terminal dials the recorded `ctrl_socket` and resolves it; (d) a desktop
+  notification fires on macOS (`osascript`).
+- Why the agent can't: the socket path needs a real VM + containerd bind mount, and the
+  sandbox blocks `bind(2)` for unix sockets (the socket round-trip test `t.Skip`s here);
+  cross-process `krayt answer` needs a live guest to dial.
+- Exact steps/commands: use the ready-made probe in `hack/ask-probe/` (self-contained
+  static image + full runbook in its README) — build/push it, `krayt run --on-question=wait`,
+  observe `krayt ls` show `waiting`, then `krayt answer <id> yes`. (Or wait for the Phase-5
+  `krayt-ask`/MCP front-ends, which supersede the probe.)
+- Verify success by: `krayt ls` flips `waiting`→`running`→`done`; the run dir has
+  `questions/<qid>.json`; the patch reflects the answered decision.
+- Blocking: no — the channel is fully proven against the fakeProvider in-process
+  (`TestQuestionWaitAnswer`, `TestQuestionFailModeSentinel`); this confirms the real socket
+  transport + notification, and is naturally exercised once the Phase-5 front-ends land.
+
+## [Phase 4] Rebuild + re-pin the VM image (guest-agent changed) — DONE ✅
+- Resolved: the base image was rebuilt with the Phase-4 guest-agent and re-pinned; the
+  `hack/ask-probe` run proves it (the new bridge socket existed in-VM, so the rebuilt
+  guest-agent booted). `vendorHash` regenerated to
+  `sha256-7NUdYBWhMvs+nJlHyoBWFzMYA83JXVyW6skWIB2T0Ws=` in `images/flake.nix` (adds
+  gopkg.in/yaml.v3). If the new `internal/vmimage/pinned.go` digest isn't recorded here yet,
+  it lives in that file. NOTE: the `waiting`-state host fix that followed is host-only
+  (`bin/krayt`) and needs **no** further image rebuild.
+- Needed: Phase 4 changed the guest-agent baked into the base image — the ask bridge
+  (`internal/guest/ask`), the `Answer` RPC, the serialized `eventSender`, and the containerd
+  ask-socket mount (§6.13). Also `gopkg.in/yaml.v3` was added to the module (config loader,
+  §8.1), so the guest-agent `vendorHash` in `images/flake.nix` must be regenerated.
+- Why the agent can't: nix build needs an aarch64-linux builder (CI or a Mac linux-builder);
+  no Nix in the cloud sandbox. Cannot compute vendorHash or produce the image here.
+- Exact steps/commands:
+  1. In `images/flake.nix`, set `vendorHash = pkgs.lib.fakeHash;`, build the guest-agent,
+     and paste the reported `got: sha256-…` back into the `vendorHash` field.
+  2. Rebuild the VM image (kernel+initrd+rootfs), push/publish it.
+  3. Update `internal/vmimage/pinned.go` with the new image digest (same as Phase 2/3).
+- Verify success by: `TestBootHello` + `TestEndToEndRealVM` still pass on hardware; then the
+  `hack/ask-probe` confirmation (above) runs.
+- Blocking: yes — every on-hardware run (incl. the ask-probe confirmation) needs the rebuilt,
+  re-pinned image; the automated fakeProvider proofs do not.
