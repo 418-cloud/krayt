@@ -138,10 +138,20 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	}
 	if deps.OnClient != nil {
 		deps.OnClient(spec.ID, func(qid, response string, noAnswer bool) error {
-			_, aerr := client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{
+			ack, aerr := client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{
 				QuestionId: qid, Response: response, NoAnswer: noAnswer,
 			})
-			return aerr
+			if aerr != nil {
+				return aerr
+			}
+			// Ok=false means no such question was waiting — treat it as a failure, matching
+			// the CLI `krayt answer` and the timeout path, so a stale/duplicate answer doesn't
+			// silently report success (§6.13).
+			if !ack.GetOk() {
+				return fmt.Errorf("orchestrator: no pending question %q on run %q (already answered or timed out)", qid, spec.ID)
+			}
+			_ = RecordAnswer(runDir, qid, response, noAnswer) // complete the on-disk Q&A history (best-effort)
+			return nil
 		})
 		defer deps.OnClient(spec.ID, nil)
 	}
@@ -371,7 +381,7 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 			}
 			notifyWaiting(filepath.Base(runDir), q.GetPrompt())
 			if to := spec.Questions.Timeout; to > 0 {
-				armQuestionTimeout(ctx, client, spec, q.GetId(), to, &aborted, streamCancel)
+				armQuestionTimeout(ctx, client, spec, runDir, q.GetId(), to, &aborted, streamCancel)
 			}
 		}
 	}
@@ -381,14 +391,15 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 // no-answer sentinel: Ack.Ok reports whether the question was still pending, so a question the
 // human already answered (possibly from another process) is never wrongly sentinel-echoed or
 // aborted. Only a genuinely-still-pending question triggers the on-timeout action.
-func armQuestionTimeout(ctx context.Context, client *controlclient.Client, spec task.RunSpec, qid string, to time.Duration, aborted *atomic.Bool, cancel context.CancelFunc) {
+func armQuestionTimeout(ctx context.Context, client *controlclient.Client, spec task.RunSpec, runDir, qid string, to time.Duration, aborted *atomic.Bool, cancel context.CancelFunc) {
 	time.AfterFunc(to, func() {
 		ack, err := client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: qid, NoAnswer: true})
 		if err != nil || !ack.GetOk() {
 			return // already answered/resolved, or transient failure — do not act
 		}
 		// The question was genuinely still pending at the deadline. The no-answer sentinel was
-		// just delivered; `abort` additionally fails the whole run.
+		// just delivered; record it in the history and, for `abort`, fail the whole run.
+		_ = RecordAnswer(runDir, qid, "", true)
 		if spec.Questions.OnTimeout == task.OnTimeoutAbort {
 			aborted.Store(true)
 			cancel()

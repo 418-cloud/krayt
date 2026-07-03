@@ -213,7 +213,10 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	if path == "" {
 		def := filepath.Join(f.repo, "krayt.yaml")
 		if _, err := os.Stat(def); err != nil {
-			return nil // no config file and none requested
+			if os.IsNotExist(err) {
+				return nil // no config file and none requested
+			}
+			return fmt.Errorf("config %s: %w", def, err) // surface a real IO/permission error
 		}
 		path = def
 	}

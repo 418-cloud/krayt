@@ -46,10 +46,37 @@ func writeQuestionRecord(runDir string, rec QuestionRecord) error {
 	if err != nil {
 		return fmt.Errorf("orchestrator: marshal question: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, rec.ID+".json"), b, 0o644); err != nil {
+	// Write-temp-then-rename so a concurrent cross-process reader (`krayt answer` scanning for
+	// the newest question) never observes a half-written file — matching writeRecord (§6.13).
+	path := filepath.Join(dir, rec.ID+".json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return fmt.Errorf("orchestrator: write question: %w", err)
 	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("orchestrator: commit question: %w", err)
+	}
 	return nil
+}
+
+// RecordAnswer completes a persisted question with the answer it received, so the on-disk Q&A
+// history shows both what the agent asked and what it was told (§6.13). Every answer-delivery
+// path (`krayt answer`, the in-process answerer, the timeout sentinel) calls it. It is a no-op
+// if the question was never persisted (e.g. a fail-mode sentinel that never blocked).
+func RecordAnswer(runDir, questionID, response string, noAnswer bool) error {
+	b, err := os.ReadFile(filepath.Join(questionsDir(runDir), questionID+".json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var rec QuestionRecord
+	if err := json.Unmarshal(b, &rec); err != nil {
+		return fmt.Errorf("orchestrator: parse question %s: %w", questionID, err)
+	}
+	rec.Response, rec.NoAnswer, rec.AnswerAt = response, noAnswer, nowStamp()
+	return writeQuestionRecord(runDir, rec)
 }
 
 // ReadQuestions returns a run's persisted Q&A pairs, oldest first.

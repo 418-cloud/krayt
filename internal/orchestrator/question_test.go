@@ -113,6 +113,15 @@ func TestQuestionWaitAnswer(t *testing.T) {
 	if err != nil || !strings.Contains(string(patch), "yes") {
 		t.Errorf("patch should reflect the answer 'yes'; got err=%v patch=\n%s", err, patch)
 	}
+
+	// The answer must be persisted back into the Q&A history (§6.13), not just the question.
+	qs, err = orchestrator.ReadQuestions(runDir)
+	if err != nil || len(qs) != 1 {
+		t.Fatalf("re-read questions: %+v (err %v)", qs, err)
+	}
+	if qs[0].Response != "yes" || qs[0].NoAnswer || qs[0].AnswerAt == "" {
+		t.Errorf("answer not recorded in history: %+v", qs[0])
+	}
 }
 
 // chattyAskingRunner asks a question and keeps emitting log lines *while blocked* on the

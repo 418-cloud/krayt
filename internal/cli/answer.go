@@ -54,6 +54,11 @@ func newAnswerCmd() *cobra.Command {
 			if !ack.GetOk() {
 				return fmt.Errorf("no pending question %q on run %q (already answered or timed out)", qid, runID)
 			}
+			// Complete the on-disk Q&A history (§6.13). Best-effort: the answer already reached
+			// the agent, so a history-write failure warns rather than fails the command.
+			if rerr := orchestrator.RecordAnswer(runDir, qid, response, noAnswer); rerr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not record answer to history: %v\n", rerr)
+			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "answered %s question %s\n", runID, qid)
 			return err
 		},

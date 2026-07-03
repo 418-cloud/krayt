@@ -12,7 +12,7 @@ func TestParseSizes(t *testing.T) {
 	mib := []struct {
 		in   string
 		want uint64
-	}{{"4GiB", 4096}, {"512MiB", 512}, {"2048", 2048}, {"1GB", 1024}}
+	}{{"4GiB", 4096}, {"512MiB", 512}, {"2048", 2048}, {"1GB", 1024}, {"1.5GiB", 1536}}
 	for _, c := range mib {
 		got, err := task.ParseMiB(c.in)
 		if err != nil || got != c.want {
@@ -22,7 +22,7 @@ func TestParseSizes(t *testing.T) {
 	gib := []struct {
 		in   string
 		want uint64
-	}{{"20GiB", 20}, {"20480MiB", 20}, {"10", 10}}
+	}{{"20GiB", 20}, {"20480MiB", 20}, {"10", 10}, {"2048MiB", 2}}
 	for _, c := range gib {
 		got, err := task.ParseGiB(c.in)
 		if err != nil || got != c.want {
@@ -31,6 +31,16 @@ func TestParseSizes(t *testing.T) {
 	}
 	if _, err := task.ParseMiB("4TiB"); err == nil {
 		t.Error("expected error for an unknown unit")
+	}
+	// Fractional values that would truncate must be rejected, not silently rounded.
+	if _, err := task.ParseMiB("1.5MiB"); err == nil {
+		t.Error("ParseMiB(1.5MiB) should be rejected (would truncate to 1)")
+	}
+	if _, err := task.ParseGiB("512MiB"); err == nil {
+		t.Error("ParseGiB(512MiB) should be rejected (would truncate to a 0-GiB disk)")
+	}
+	if _, err := task.ParseGiB("1536MiB"); err == nil {
+		t.Error("ParseGiB(1536MiB) should be rejected (1.5 GiB is not a whole GiB / multiple of 1024 MiB)")
 	}
 }
 
