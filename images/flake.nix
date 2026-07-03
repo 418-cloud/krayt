@@ -28,13 +28,18 @@
       # regenerated — it is set to fakeHash to force the mismatch that prints the new hash.
       # See HUMAN_TODO.md "[Phase 2] Regenerate guest-agent vendorHash".
       # Builds both in-VM binaries: the guest-agent and krayt-proxy (the egress proxy run as
-      # proxyd, §6.6). vendorHash is unchanged — krayt-proxy adds no external dependency.
+      # proxyd, §6.6).
+      #
+      # Phase 4 added gopkg.in/yaml.v3 to the module (the krayt.yaml config loader, §8.1), so
+      # the module dependency set changed again — vendorHash MUST be regenerated (set it to
+      # lib.fakeHash, build, paste the reported got: sha256-… below). The guest-agent itself
+      # doesn't import yaml, but buildGoModule vendors the whole module's go.sum.
       guest-agent = pkgs.buildGoModule {
         pname = "krayt-agent";
         version = "0.0.0-dev";
         src = ../.; # repo root (go.mod, internal/, cmd/)
         subPackages = [ "cmd/krayt-agent" "cmd/krayt-proxy" ];
-        vendorHash = "sha256-6l937L2Q8MCCJqApw7EW/ZI/Q9DjKXy57GFugFkn5nM=";
+        vendorHash = "sha256-7NUdYBWhMvs+nJlHyoBWFzMYA83JXVyW6skWIB2T0Ws=";
         env.CGO_ENABLED = "0";
       };
 

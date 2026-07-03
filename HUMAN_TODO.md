@@ -188,3 +188,20 @@ below block only that on-hardware confirmation.
 - Blocking: no — the channel is fully proven against the fakeProvider in-process
   (`TestQuestionWaitAnswer`, `TestQuestionFailModeSentinel`); this confirms the real socket
   transport + notification, and is naturally exercised once the Phase-5 front-ends land.
+
+## [Phase 4] Rebuild + re-pin the VM image (guest-agent changed) — BLOCKING for any on-hardware run
+- Needed: Phase 4 changed the guest-agent baked into the base image — the ask bridge
+  (`internal/guest/ask`), the `Answer` RPC, the serialized `eventSender`, and the containerd
+  ask-socket mount (§6.13). Also `gopkg.in/yaml.v3` was added to the module (config loader,
+  §8.1), so the guest-agent `vendorHash` in `images/flake.nix` must be regenerated.
+- Why the agent can't: nix build needs an aarch64-linux builder (CI or a Mac linux-builder);
+  no Nix in the cloud sandbox. Cannot compute vendorHash or produce the image here.
+- Exact steps/commands:
+  1. In `images/flake.nix`, set `vendorHash = pkgs.lib.fakeHash;`, build the guest-agent,
+     and paste the reported `got: sha256-…` back into the `vendorHash` field.
+  2. Rebuild the VM image (kernel+initrd+rootfs), push/publish it.
+  3. Update `internal/vmimage/pinned.go` with the new image digest (same as Phase 2/3).
+- Verify success by: `TestBootHello` + `TestEndToEndRealVM` still pass on hardware; then the
+  `hack/ask-probe` confirmation (above) runs.
+- Blocking: yes — every on-hardware run (incl. the ask-probe confirmation) needs the rebuilt,
+  re-pinned image; the automated fakeProvider proofs do not.
