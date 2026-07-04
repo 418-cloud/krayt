@@ -57,8 +57,9 @@ type Result struct {
 	RunDir        string
 	ExitCode      int
 	TimedOut      bool
-	PatchPath     string // path to changes.patch in the run dir
-	CommitsBundle string // path to commits.bundle if the agent committed, else ""
+	PatchPath     string   // path to changes.patch in the run dir
+	CommitsBundle string   // path to commits.bundle if the agent committed, else ""
+	Safety        []string // patch-lint findings, if any (§14 Phase 5), for a run-time warning
 }
 
 // Run executes the full lifecycle and writes artifacts under runDir (§7, §8.4). The VM is
@@ -76,14 +77,21 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	}
 
 	// Publish run state to disk so `ls`/`attach`/`stop` observe it without any in-process
-	// handle (§6.2). Written best-effort at each transition and finalized on return.
+	// handle (§6.2). Written best-effort at each transition and finalized on return. The
+	// static facts (task summary, network, resources, questions mode) are the §8.4 review
+	// schema; the dynamic ones (timings, patch stats, questions, safety) are filled below.
 	rec := RunRecord{
 		ID: spec.ID, ImageRef: spec.ImageRef, RepoPath: spec.RepoPath,
-		State: StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
+		TaskSummary:  summarizeTask(spec.TaskPrompt),
+		Network:      NetworkMeta{Mode: string(spec.Network.Mode), Allow: spec.Network.Allow},
+		Resources:    ResourceMeta{CPUs: spec.Resources.CPUs, MemoryMiB: spec.Resources.MemoryMiB, DiskGiB: spec.Resources.DiskGiB, TimeoutSecs: int(spec.Resources.Timeout.Seconds())},
+		QuestionMode: string(spec.Questions.Mode),
+		State:        StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
 	}
 	_ = writeRecord(runDir, rec)
 	defer func() {
 		rec.EndedAt = nowStamp()
+		rec.DurationSecs = durationSecs(rec.StartedAt, rec.EndedAt)
 		switch {
 		case err != nil:
 			rec.State, rec.Error = StateFailed, err.Error()
@@ -92,7 +100,11 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		case res != nil:
 			rec.State, rec.ExitCode = StateDone, res.ExitCode
 		}
+		rec.Questions = summarizeQuestions(runDir) // §6.13 Q&A summary for the review artifacts
+		// Read any agent-written report.md before overwriting it with the canonical one (§8.4).
+		notes := agentNotes(runDir)
 		_ = writeRecord(runDir, rec)
+		_ = writeReport(runDir, rec, notes)
 	}()
 
 	// 1. Provision the VM and guarantee teardown.
@@ -197,6 +209,17 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
 			res.CommitsBundle = cb
 		}
+		// Diffstat + safety lint of the collected patch → meta.json/report.md (§8.4, §14). The
+		// record is finalized by the deferred writer, which captures rec.Patch/rec.Safety.
+		if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
+			rec.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
+		}
+		if b, rerr := os.ReadFile(res.PatchPath); rerr == nil {
+			for _, f := range patch.Lint(b) {
+				rec.Safety = append(rec.Safety, f.Path+": "+f.Reason)
+			}
+		}
+		res.Safety = rec.Safety
 	}
 	// Best-effort polite shutdown before the deferred Destroy; the terminal run state is
 	// written by the deferred finalizer above.

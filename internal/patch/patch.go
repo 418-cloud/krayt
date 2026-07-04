@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -239,6 +240,62 @@ func Apply(ctx context.Context, repoPath, patchPath string, threeWay bool) error
 		return fmt.Errorf("patch: git apply: %w", err)
 	}
 	return nil
+}
+
+// Stats are the diffstat of a changes.patch, for meta.json / report.md (§8.4).
+type Stats struct {
+	Path         string // artifact-relative name, e.g. "changes.patch"
+	FilesChanged int
+	Insertions   int
+	Deletions    int
+}
+
+// Stat computes the diffstat of a patch file with `git apply --numstat`, which only parses
+// the diff (no repo, no working tree touched), so it is safe to run on the host against a
+// collected changes.patch. An empty patch reports zero changes; binary hunks ("-\t-") count
+// the file but add no line counts.
+func Stat(ctx context.Context, patchPath string) (Stats, error) {
+	st := Stats{Path: filepath.Base(patchPath)}
+	info, err := os.Stat(patchPath)
+	if err != nil {
+		return st, fmt.Errorf("patch: stat %s: %w", patchPath, err)
+	}
+	if info.Size() == 0 {
+		return st, nil // no diff → zero stats
+	}
+	abs, err := filepath.Abs(patchPath)
+	if err != nil {
+		return st, err
+	}
+	// Run from a throwaway non-repo dir: inside a work tree `git apply --numstat` prepends the
+	// cwd's path prefix and matches nothing when invoked from a subdirectory, so parse the diff
+	// in isolation. --numstat only reads the patch; no tree is touched.
+	tmp, err := os.MkdirTemp("", "krayt-stat-")
+	if err != nil {
+		return st, fmt.Errorf("patch: stat temp dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	out, err := runGit(ctx, tmp, "apply", "--numstat", abs)
+	if err != nil {
+		return st, fmt.Errorf("patch: numstat: %w", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		f := strings.SplitN(line, "\t", 3)
+		if len(f) < 3 {
+			continue
+		}
+		st.FilesChanged++
+		if n, err := strconv.Atoi(f[0]); err == nil { // "-" (binary) → skip the count
+			st.Insertions += n
+		}
+		if n, err := strconv.Atoi(f[1]); err == nil {
+			st.Deletions += n
+		}
+	}
+	return st, nil
 }
 
 // verifyBundle runs `git bundle verify` to catch truncation/corruption and unexpected

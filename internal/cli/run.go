@@ -183,7 +183,13 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	if res.CommitsBundle != "" {
 		summary += fmt.Sprintf("  commits: %s\n", res.CommitsBundle)
 	}
+	summary += fmt.Sprintf("  report: %s\n", filepath.Join(res.RunDir, "report.md"))
 	summary += fmt.Sprintf("  apply:  krayt apply %s\n", id)
+	// Flag patch changes that can execute outside the workspace edit (§14 Phase 5); details
+	// are in report.md's Safety section.
+	if len(res.Safety) > 0 {
+		summary += fmt.Sprintf("  ⚠ safety: %d flagged change(s) — review report.md before applying\n", len(res.Safety))
+	}
 	_, err = fmt.Fprint(cmd.OutOrStdout(), summary)
 	return err
 }

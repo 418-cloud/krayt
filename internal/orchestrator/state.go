@@ -24,20 +24,61 @@ const (
 
 // RunRecord is the on-disk record of a run at `.krayt/runs/<id>/meta.json` — the source of
 // truth every management command reads, so runs are observable without any in-process handle
-// or daemon (§6.2, §8.4). It supersedes the Phase 2 minimal meta; the fuller §8.4 schema
-// (patch stats) can extend it later.
+// or daemon (§6.2, §8.4). It is the full §8.4 schema (task summary, network, resources, patch
+// stats, questions) plus the operational fields the daemon-less model needs (state, pid,
+// control socket) that the review schema omits.
 type RunRecord struct {
+	ID           string         `json:"id"`
+	ImageRef     string         `json:"image_ref"`
+	RepoPath     string         `json:"repo_path,omitempty"`
+	TaskSummary  string         `json:"task_summary,omitempty"`
+	Network      NetworkMeta    `json:"network"`
+	Resources    ResourceMeta   `json:"resources"`
+	QuestionMode string         `json:"questions_mode,omitempty"`
+	State        string         `json:"state"`
+	StartedAt    string         `json:"started_at,omitempty"`
+	EndedAt      string         `json:"ended_at,omitempty"`
+	DurationSecs int            `json:"duration_secs,omitempty"`
+	ExitCode     int            `json:"exit_code"`
+	TimedOut     bool           `json:"timed_out"`
+	Patch        *PatchMeta     `json:"patch,omitempty"` // nil until a changes.patch is collected
+	Questions    []QuestionMeta `json:"questions,omitempty"`
+	Safety       []string       `json:"safety,omitempty"` // patch-lint findings (§14 Phase 5)
+	Error        string         `json:"error,omitempty"`
+	PID          int            `json:"pid,omitempty"`         // supervising process (for `krayt stop`)
+	CtrlSocket   string         `json:"ctrl_socket,omitempty"` // guest control socket (for `krayt answer`, §6.13)
+}
+
+// NetworkMeta is the run's egress policy as recorded in meta.json (§8.4).
+type NetworkMeta struct {
+	Mode  string   `json:"mode"`
+	Allow []string `json:"allow,omitempty"`
+}
+
+// ResourceMeta is the run's resource budget as recorded in meta.json (§8.4).
+type ResourceMeta struct {
+	CPUs        int    `json:"cpus,omitempty"`
+	MemoryMiB   uint64 `json:"memory_mib,omitempty"`
+	DiskGiB     uint64 `json:"disk_gib,omitempty"`
+	TimeoutSecs int    `json:"timeout_secs,omitempty"`
+}
+
+// PatchMeta is the changes.patch diffstat as recorded in meta.json (§8.4).
+type PatchMeta struct {
+	Path         string `json:"path"`
+	FilesChanged int    `json:"files_changed"`
+	Insertions   int    `json:"insertions"`
+	Deletions    int    `json:"deletions"`
+}
+
+// QuestionMeta is one agent→human Q&A pair summarized for meta.json / report.md (§6.13, §8.4).
+// The prompt/answer are sanitized (agent-originated text) before landing here.
+type QuestionMeta struct {
 	ID         string `json:"id"`
-	ImageRef   string `json:"image_ref"`
-	RepoPath   string `json:"repo_path,omitempty"`
-	State      string `json:"state"`
-	StartedAt  string `json:"started_at,omitempty"`
-	EndedAt    string `json:"ended_at,omitempty"`
-	ExitCode   int    `json:"exit_code"`
-	TimedOut   bool   `json:"timed_out"`
-	Error      string `json:"error,omitempty"`
-	PID        int    `json:"pid,omitempty"`         // supervising process (for `krayt stop`)
-	CtrlSocket string `json:"ctrl_socket,omitempty"` // guest control socket (for `krayt answer`, §6.13)
+	Prompt     string `json:"prompt"`
+	Answer     string `json:"answer,omitempty"`
+	AnsweredBy string `json:"answered_by,omitempty"` // human | timeout
+	WaitedSecs int    `json:"waited_secs,omitempty"`
 }
 
 // Terminal reports whether the run has finished.
