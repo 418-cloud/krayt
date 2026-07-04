@@ -1,0 +1,42 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":semanticCommitTypeAll(deps)",
+    ":semanticCommitScopeDisabled"
+  ],
+  "semanticCommits": "enabled",
+  "rebaseWhen": "conflicted",
+  "postUpdateOptions": ["gomodTidy"],
+  "minimumReleaseAge": "3 days",
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": "0 days"
+  },
+  "nix": { "enabled": true },
+  "packageRules": [
+    {
+      "matchManagers": ["gomod", "dockerfile", "github-actions", "nix"],
+      "groupName": "{{manager}} non-major dependencies",
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupSlug": "{{manager}}-non-major"
+    },
+    {
+      "matchManagers": ["dockerfile", "github-actions"],
+      "pinDigests": true
+    },
+    {
+      "matchManagers": ["dockerfile", "gomod"],
+      "matchPackageNames": ["golang", "go"],
+      "groupName": "go version",
+      "groupSlug": "go-version"
+    },
+    {
+      "matchManagers": ["github-actions", "dockerfile", "nix"],
+      "semanticCommitType": "chore"
+    },
+    {
+      "matchPackageNames": ["golangci/golangci-lint"],
+      "pinDigests": false
+    }
+  ]
+}

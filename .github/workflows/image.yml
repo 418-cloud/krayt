@@ -6,9 +6,10 @@ name: vm-image
 #   build   — runs on every PR touching the image/guest sources (and on tags / manual).
 #             Use it to read the guest-agent vendorHash from the build log, then to
 #             confirm the image builds. No registry credentials, nothing published.
-#   publish — runs only when you push a `v*` tag (the tag can point at a branch commit,
-#             so no merge needed). Pushes the OCI artifact to GHCR and prints the digest
-#             to pin in internal/vmimage/pinned.go.
+#   publish — runs only when you push a `vmimage-v*` tag (its own pattern, independent of the
+#             CLI's `v*` release-please tags — full traceability, no collision). Pushes the OCI
+#             artifact to GHCR as `krayt-vmimage:v<X.Y.Z>` and prints the digest to pin in
+#             internal/vmimage/pinned.go. The tag can point at a branch commit — no merge needed.
 on:
   pull_request:
     paths:
@@ -17,9 +18,11 @@ on:
       - "go.sum"
       - "internal/**"
       - "cmd/krayt-agent/**"
+      - "cmd/krayt-proxy/**"
+      - "cmd/krayt-ask/**"
       - ".github/workflows/image.yml"
   push:
-    tags: ["v*"]
+    tags: ["vmimage-v*"]
   workflow_dispatch:
     inputs:
       publish:
@@ -82,7 +85,7 @@ jobs:
       - name: Push OCI artifact + record digest
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${GITHUB_REF_NAME#vmimage-}" # vmimage-v1.2.0 -> v1.2.0 (the repo name namespaces it)
           [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && tag="manual-${GITHUB_SHA::12}"
           ref="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage:${tag}"
           cd result

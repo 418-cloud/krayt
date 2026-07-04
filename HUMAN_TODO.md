@@ -412,3 +412,18 @@ below block only that on-hardware confirmation.
   adjust the entrypoint (try `claude mcp add ask-human -- krayt-ask --mcp`). This is the one spot
   that may need a tweak against the live CLI.
 - Blocking: no — closes the Phase 6 "Done when"; nothing else depends on it.
+
+## [Release] Install the Renovate GitHub App
+- Needed: install the **Renovate** GitHub App (https://github.com/apps/renovate) on the repo (or
+  the `418-cloud` org). The committed `renovate.json` configures it, but the config alone does
+  nothing until the App is installed and runs — it then opens the dependency-update PRs.
+- Why the agent can't: installing a GitHub App is an org/repo admin action in the GitHub UI.
+- Exact steps/commands: install the Renovate App, grant it the repo; Renovate opens an onboarding
+  PR, then starts creating grouped `deps:` PRs (Go modules, GitHub Actions, Nix flake inputs,
+  `hack/**` Dockerfiles). Auto-merge is off, so review + merge them yourself.
+- Verify success by: an onboarding/first Renovate PR appears within a few hours.
+- Blocking: no — release-please and the CLI build work without it; this only enables automated
+  dependency updates.
+- Note (no token needed): release-please + the CLI binary build run in one workflow via the
+  default `GITHUB_TOKEN`, so no PAT/App token is required for releases. The VM image releases on
+  its own `vmimage-v*` tag (`image.yml`); see RELEASING.md for the boot-test → pin flow.

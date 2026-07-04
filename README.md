@@ -28,6 +28,12 @@ What this means in practice:
 - Anything that boots a real VM — the vfkit provider, the image boot test, end-to-end runs —
   must happen on your Mac.
 
+**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64**
+— the supported, tested target — and **darwin/amd64**, which compiles and *should* run on Intel
+Macs via Virtualization.framework but is **not tested** (arm64 is what we verify). **Linux
+binaries will follow once the Firecracker backend lands (Phase 7)**; until then `krayt run` is
+macOS-only. Verify a download against the release's `checksums.txt`.
+
 ---
 
 ## Prerequisites
