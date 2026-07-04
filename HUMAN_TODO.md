@@ -255,7 +255,15 @@ below block only that on-hardware confirmation.
   (`cmd/krayt-ask` tests + `internal/cli` adapter tests); only the in-container round-trip on
   real hardware is deferred.
 
-## [Phase 5] Agent adapter end-to-end with live credentials
+## [Phase 5] Agent adapter end-to-end with live credentials — DONE ✅
+- Resolved: verified on Apple Silicon with `docker.io/tjololo/test-krayt:claude`. A
+  `krayt run --agent claude-code --secrets … --allow api.anthropic.com` completed a real coding
+  task (add `hello()` + a pytest test + README note): Claude Code authenticated via
+  `CLAUDE_CODE_OAUTH_TOKEN`, the run reached `done` (exit 0), and the run dir had `changes.patch`
+  (3 files, +12/-0), `report.md` (with Claude's summary under Notes), and `meta.json`; the token
+  never appeared in any of them; `krayt apply` landed the patch cleanly. (Still worth a one-off:
+  the exactly-one guard rejecting a two-credential file before boot — proven by
+  `TestApplyAdapterAuthGate`.)
 - Needed: exercise a real agent image (`--agent claude-code`) with a live credential in the
   secrets file, confirming the container entrypoint exports the resolved credential from
   `/run/secrets` into the environment (§8.2/§6.14) and the agent authenticates and runs.
@@ -307,7 +315,13 @@ below block only that on-hardware confirmation.
   (`TestSpawnDetached`), and the file-lock cap (`TestMaxConcurrency`). Only the on-VM run is
   deferred.
 
-## [Phase 5] Rebuild VM image for the non-root container-filesystem fixes
+## [Phase 5] Rebuild VM image for the non-root container-filesystem fixes — DONE ✅
+- Resolved: base image rebuilt + re-pinned with all four non-root fixes; verified on Apple
+  Silicon by a real `docker.io/tjololo/test-krayt:claude` run (uid 1000 `agent`): Claude Code
+  authenticated via `CLAUDE_CODE_OAUTH_TOKEN`, edited `/workspace` (main.py + new test_main.py +
+  README.md), wrote `/output/report.md`, and the run reached `done` (exit 0) with a clean
+  `changes.patch` that `krayt apply` landed. (The ask-socket fix is shipped but not yet exercised
+  — needs a `--on-question=wait` + `krayt-ask` run.)
 - Needed: rebuild + re-pin the base VM image so the guest-agent makes the container-contract
   paths usable by a **non-root** container (§8.2 requires non-root; Claude Code refuses uid 0).
   All fixed in `internal/guest/service.go`, found by testing the `claude-code` image, each with a
