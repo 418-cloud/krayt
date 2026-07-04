@@ -15,7 +15,8 @@ const (
 	ContainerTaskPrompt = "/task/prompt.md"
 	ContainerOutput     = "/output"
 	ContainerSecrets    = "/run/secrets"
-	ContainerAskSocket  = "/run/krayt/ask.sock" // in-VM question bridge socket (§6.13); Phase-5 front-ends connect here
+	ContainerAskSocket  = "/run/krayt/ask.sock"      // in-VM question bridge socket (§6.13); front-ends connect here
+	ContainerAskBin     = "/usr/local/bin/krayt-ask" // the krayt-ask CLI front-end, on PATH for shell-capable images (§6.13)
 )
 
 // RunConfig is what the Service hands the Runner to execute the user's image for one run
@@ -30,6 +31,7 @@ type RunConfig struct {
 	SecretsDir       string            // -> /run/secrets (tmpfs); empty when no secrets (§6.8)
 	Env              map[string]string // non-secret env (§6.5 TaskSpec.env)
 	AskSocket        string            // guest-side ask-bridge socket to bind-mount at /run/krayt/ask.sock (§6.13); empty if unavailable
+	AskBinary        string            // guest-side krayt-ask binary to bind-mount onto the container PATH (§6.13); empty if unavailable
 	Ask              AskFunc           // in-process bridge handle for fake runners; nil for the containerd runner
 }
 

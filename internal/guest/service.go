@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -226,8 +227,13 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	}
 	workspace := filepath.Join(root, "workspace")
 	outputDir := filepath.Join(root, "output")
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+	if err := os.MkdirAll(outputDir, 0o777); err != nil {
 		return fmt.Errorf("guest: create output dir: %w", err)
+	}
+	// The container runs non-root (§8.2) and writes report.md/changes.patch into /output, so it
+	// must be writable by other uids; chmod explicitly so a non-022 umask can't leave it root-only.
+	if err := os.Chmod(outputDir, 0o777); err != nil {
+		return fmt.Errorf("guest: chmod output dir: %w", err)
 	}
 
 	// Materialize secrets to the (tmpfs) secrets dir and build the redactor (§6.8).
@@ -241,6 +247,11 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	baseline, err := patch.Ingest(ctx, bundlePath, workspace, patch.DefaultIdentity)
 	if err != nil {
 		return err
+	}
+	// Ingest clones the bundle as root; relax the tree so the non-root container can edit it
+	// (§8.2). .git stays root-owned, so the guest's own git (run as root) is unaffected.
+	if err := makeContainerWritable(workspace); err != nil {
+		return fmt.Errorf("guest: make workspace writable: %w", err)
 	}
 	s.mu.Lock()
 	s.baseline = baseline
@@ -271,6 +282,12 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 			Id: id, Prompt: prompt, Choices: choices,
 		}}})
 	})
+	// When a question is answered (by any path — Answer RPC, cross-process `krayt answer`, or the
+	// timeout sentinel), push a Resolved event so the host flips waiting→running precisely (§6.13).
+	// Set before publishing the bridge under s.mu so the read in Bridge.Answer is race-free.
+	bridge.OnResolved(func(id string) {
+		_ = es.send(&pb.RunEvent{Kind: &pb.RunEvent_Resolved{Resolved: &pb.Resolved{QuestionId: id}}})
+	})
 	s.mu.Lock()
 	s.bridge = bridge
 	s.mu.Unlock()
@@ -285,6 +302,9 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	askSocket := ""
 	if ln, lerr := net.Listen("unix", filepath.Join(root, "ask.sock")); lerr == nil {
 		askSocket = filepath.Join(root, "ask.sock")
+		// Connecting to a unix socket needs write permission on it; the container is non-root
+		// (§8.2), so make the socket connectable by other uids (§6.13).
+		_ = os.Chmod(askSocket, 0o777)
 		go func() { _ = ask.Serve(ctx, ln, bridge) }()
 	}
 
@@ -304,6 +324,7 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		SecretsDir:       secretsDir,
 		Env:              runEnv,
 		AskSocket:        askSocket,
+		AskBinary:        askBinaryPath(),
 		Ask:              bridge.Ask,
 	}, log)
 
@@ -358,15 +379,78 @@ func (s *Service) writeSecrets(vals map[string]string) (string, error) {
 	if dir == "" {
 		dir = filepath.Join(s.root, "secrets")
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("guest: create secrets dir: %w", err)
 	}
+	// The guest-agent runs as root, but the container runs as a NON-ROOT uid (Claude Code and
+	// others refuse uid 0, §8.2) and must read its credential from this tmpfs (§6.14). So the
+	// dir must be traversable and the files readable by other uids — mirrors how Kubernetes/Docker
+	// mount secrets (0644). The exposure is bounded: the VM is single-container and ephemeral, and
+	// this container is the credential's intended consumer. Chmod explicitly so a non-022 umask on
+	// the guest init can't leave them root-only. Secrecy on the host disk + log redaction (§6.8)
+	// are unaffected — this is only the in-VM tmpfs.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return "", fmt.Errorf("guest: chmod secrets dir: %w", err)
+	}
 	for k, v := range vals {
-		if err := os.WriteFile(filepath.Join(dir, k), []byte(v), 0o600); err != nil {
+		p := filepath.Join(dir, k)
+		if err := os.WriteFile(p, []byte(v), 0o644); err != nil {
 			return "", fmt.Errorf("guest: write secret %s: %w", k, err)
+		}
+		if err := os.Chmod(p, 0o644); err != nil {
+			return "", fmt.Errorf("guest: chmod secret %s: %w", k, err)
 		}
 	}
 	return dir, nil
+}
+
+// makeContainerWritable relaxes a directory tree so the NON-ROOT container uid (§8.2) can read,
+// traverse, and write it. The guest runs as root and ingests /workspace root-owned, but the
+// agent runs non-root (Claude Code and others refuse uid 0) and must edit the tree. Exposure is
+// bounded to the ephemeral single-container VM. The .git owner is left as root, so the guest's
+// own git (run as root) still works; the agent's git needs `safe.directory`, set by the
+// adapter/entrypoint.
+func makeContainerWritable(root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// os.Chmod follows symlinks, and the repo is untrusted (§10) — a symlink could point
+		// outside the workspace, so (running as root) never chmod through one. WalkDir doesn't
+		// descend symlinks either; a symlink's in-workspace target is relaxed on its own visit.
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		mode := info.Mode().Perm() | 0o066 // group + other read/write
+		if d.IsDir() {
+			mode |= 0o111 // …and traversable
+		}
+		return os.Chmod(p, mode)
+	})
+}
+
+// askBinaryPath returns the krayt-ask binary shipped next to the guest-agent (both built into
+// the same image derivation, §9) so the runner can bind-mount it into the container onto the
+// PATH (§6.13). It returns "" when not found, so a build without krayt-ask degrades gracefully.
+func askBinaryPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return askBinaryIn(filepath.Dir(exe))
+}
+
+// askBinaryIn returns dir/krayt-ask if it is a regular file, else "".
+func askBinaryIn(dir string) string {
+	p := filepath.Join(dir, "krayt-ask")
+	if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+		return p
+	}
+	return ""
 }
 
 // mergeEnv overlays add onto a copy of base (proxy env wins over task env).

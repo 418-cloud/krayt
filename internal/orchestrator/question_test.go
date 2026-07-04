@@ -207,6 +207,80 @@ func TestQuestionStaysWaitingWhileAgentLogs(t *testing.T) {
 	}
 }
 
+// resumingRunner asks a question, then keeps "working" after the answer arrives until the test
+// releases it — giving an observable `running` window between the answer and completion, so the
+// precise waiting→running transition (§6.13) can be asserted.
+type resumingRunner struct {
+	prompt  string
+	resumed chan struct{} // closed once the agent receives its answer
+	release chan struct{} // test closes this to let the agent finish
+}
+
+func (r *resumingRunner) Version() string { return "fake" }
+func (r *resumingRunner) Run(ctx context.Context, cfg guest.RunConfig, _ guest.LogFunc) (int, error) {
+	answer, _, err := cfg.Ask(ctx, r.prompt, []string{"yes", "no"})
+	if err != nil {
+		return 1, err
+	}
+	close(r.resumed)
+	select {
+	case <-r.release:
+	case <-ctx.Done():
+		return 1, ctx.Err()
+	}
+	if err := os.WriteFile(filepath.Join(cfg.WorkspaceDir, "greeting.txt"), []byte(answer+"\n"), 0o644); err != nil {
+		return 1, err
+	}
+	return 0, nil
+}
+
+// TestQuestionResolvedResumes is the Phase 6 proof: answering a waiting question flips the run
+// waiting→running *immediately* (via the guest "question resolved" RunEvent), while the agent is
+// still working — not held at `waiting` until the run ends (§6.13).
+func TestQuestionResolvedResumes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	img := minimalImage(ctx, t)
+	runner := &resumingRunner{prompt: "proceed?", resumed: make(chan struct{}), release: make(chan struct{})}
+	mgr := orchestrator.NewManager(orchestrator.Deps{Provider: askProvider(runner), Image: img}, t.TempDir(), 0)
+	stateDir := mgr.StateDir()
+	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
+
+	const id = "run_resolve"
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := mgr.Run(ctx, task.RunSpec{
+			ID: id, ImageRef: "latest", RepoPath: src, BundleDepth: 1, TaskPrompt: []byte("t"),
+			Questions: task.QuestionsPolicy{Mode: task.QuestionWait, Timeout: 30 * time.Second},
+		})
+		runDone <- err
+	}()
+
+	waitState(t, stateDir, id, orchestrator.StateWaiting)
+	runDir := orchestrator.RunDir(stateDir, id)
+	qs, err := orchestrator.ReadQuestions(runDir)
+	if err != nil || len(qs) != 1 {
+		t.Fatalf("questions = %+v (err %v)", qs, err)
+	}
+
+	if err := mgr.Answer(id, qs[0].ID, "yes", false); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+
+	// The reverse edge: the run returns to `running` on the answer, while the agent is still
+	// working (not yet released) — i.e. before it terminates.
+	waitState(t, stateDir, id, orchestrator.StateRunning)
+
+	close(runner.release)
+	if err := <-runDone; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if rec, _ := orchestrator.ReadRecord(runDir); rec.State != orchestrator.StateDone {
+		t.Errorf("final state = %q, want done", rec.State)
+	}
+}
+
 // TestQuestionFailModeSentinel confirms the default `fail` mode never blocks: a question is
 // sentinel-answered immediately so the agent proceeds autonomously (§6.13).
 func TestQuestionFailModeSentinel(t *testing.T) {

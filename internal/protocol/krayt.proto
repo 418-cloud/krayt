@@ -45,6 +45,7 @@ message RunEvent {
     LogLine  log = 1;
     Status   status = 2;          // terminal; last message on the stream
     Question question = 3;        // agent paused to ask the human (§6.13); not terminal
+    Resolved resolved = 4;        // a question was answered (§6.13); host flips waiting→running
   }
 }
 message LogLine { enum Stream { STDOUT = 0; STDERR = 1; } Stream stream = 1; bytes line = 2; int64 ts_unix_ms = 3; }
@@ -53,6 +54,12 @@ message Status  { int32 exit_code = 1; bool timed_out = 2; string error = 3; }
 // Agent → human question (§6.13). Pushed on the Start stream; host replies via Answer().
 message Question      { string id = 1; string prompt = 2; repeated string choices = 3; uint32 timeout_secs = 4; }
 message AnswerRequest { string question_id = 1; string response = 2; bool no_answer = 3; } // no_answer = timeout/declined
+
+// A pending Question was answered — the host called Answer, the timeout sentinel fired, or a
+// separate `krayt answer` process dialed the guest — so the agent's ask_human call returned. The
+// guest emits it when bridge.Answer delivers; the host flips the run waiting→running precisely,
+// independent of who answered (§6.13).
+message Resolved      { string question_id = 1; }
 
 message CollectRequest  {}
 message Ack             { bool ok = 1; string error = 2; }

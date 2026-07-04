@@ -57,8 +57,9 @@ type Result struct {
 	RunDir        string
 	ExitCode      int
 	TimedOut      bool
-	PatchPath     string // path to changes.patch in the run dir
-	CommitsBundle string // path to commits.bundle if the agent committed, else ""
+	PatchPath     string   // path to changes.patch in the run dir
+	CommitsBundle string   // path to commits.bundle if the agent committed, else ""
+	Safety        []string // patch-lint findings, if any (§14 Phase 5), for a run-time warning
 }
 
 // Run executes the full lifecycle and writes artifacts under runDir (§7, §8.4). The VM is
@@ -76,14 +77,21 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	}
 
 	// Publish run state to disk so `ls`/`attach`/`stop` observe it without any in-process
-	// handle (§6.2). Written best-effort at each transition and finalized on return.
+	// handle (§6.2). Written best-effort at each transition and finalized on return. The
+	// static facts (task summary, network, resources, questions mode) are the §8.4 review
+	// schema; the dynamic ones (timings, patch stats, questions, safety) are filled below.
 	rec := RunRecord{
 		ID: spec.ID, ImageRef: spec.ImageRef, RepoPath: spec.RepoPath,
-		State: StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
+		TaskSummary:  summarizeTask(spec.TaskPrompt),
+		Network:      NetworkMeta{Mode: string(spec.Network.Mode), Allow: spec.Network.Allow},
+		Resources:    ResourceMeta{CPUs: spec.Resources.CPUs, MemoryMiB: spec.Resources.MemoryMiB, DiskGiB: spec.Resources.DiskGiB, TimeoutSecs: int(spec.Resources.Timeout.Seconds())},
+		QuestionMode: string(spec.Questions.Mode),
+		State:        StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
 	}
 	_ = writeRecord(runDir, rec)
 	defer func() {
 		rec.EndedAt = nowStamp()
+		rec.DurationSecs = durationSecs(rec.StartedAt, rec.EndedAt)
 		switch {
 		case err != nil:
 			rec.State, rec.Error = StateFailed, err.Error()
@@ -92,7 +100,11 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		case res != nil:
 			rec.State, rec.ExitCode = StateDone, res.ExitCode
 		}
+		rec.Questions = summarizeQuestions(runDir) // §6.13 Q&A summary for the review artifacts
+		// Read any agent-written report.md before overwriting it with the canonical one (§8.4).
+		notes := agentNotes(runDir)
 		_ = writeRecord(runDir, rec)
+		_ = writeReport(runDir, rec, notes)
 	}()
 
 	// 1. Provision the VM and guarantee teardown.
@@ -197,6 +209,17 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
 			res.CommitsBundle = cb
 		}
+		// Diffstat + safety lint of the collected patch → meta.json/report.md (§8.4, §14). The
+		// record is finalized by the deferred writer, which captures rec.Patch/rec.Safety.
+		if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
+			rec.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
+		}
+		if b, rerr := os.ReadFile(res.PatchPath); rerr == nil {
+			for _, f := range patch.Lint(b) {
+				rec.Safety = append(rec.Safety, f.Path+": "+f.Reason)
+			}
+		}
+		res.Safety = rec.Safety
 	}
 	// Best-effort polite shutdown before the deferred Destroy; the terminal run state is
 	// written by the deferred finalizer above.
@@ -314,11 +337,11 @@ type controlSocketer interface{ ControlSocket() string }
 // guest, Manager.Answer, or the timeout below). In `fail` mode a question is sentinel-answered
 // immediately so the run never blocks.
 //
-// The run stays `waiting` until it finishes: a log line is NOT a resume signal — an agent can
-// (and does) keep logging while blocked in ask_human — so we do not infer resumption from the
-// stream. Precise `waiting`→`running` on answer needs a guest "question resolved" RunEvent
-// (§6.13, a Phase-5 protocol addition); until then a resolved run simply shows `waiting` until
-// its terminal state.
+// A log line is NOT a resume signal — an agent can (and does) keep logging while blocked in
+// ask_human — so resumption comes only from the guest "question resolved" RunEvent (§6.13),
+// which fires however the question was answered (Answer RPC, a separate `krayt answer` process,
+// or the timeout sentinel). The run is `waiting` while any question is outstanding and flips back
+// to `running` when the last one resolves.
 func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunSpec, logOut io.Writer, runDir string, setState func(string)) (int, bool, error) {
 	var timeoutSecs uint32
 	if spec.Resources.Timeout > 0 {
@@ -338,6 +361,7 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 	defer func() { _ = logFile.Close() }()
 
 	var aborted atomic.Bool
+	var outstanding int // wait-mode questions awaiting an answer; run is `waiting` while > 0
 	for {
 		ev, err := stream.Recv()
 		if err == io.EOF {
@@ -375,13 +399,26 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 				_, _ = client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: q.GetId(), NoAnswer: true})
 				continue
 			}
-			setState(StateWaiting)
+			outstanding++
+			// Persist the question BEFORE announcing `waiting`, so any observer that sees the
+			// waiting state — a test, or a cross-process `krayt answer` reading the newest
+			// question — is guaranteed to find it on disk (§6.13). Otherwise there's a window
+			// where the state is `waiting` but the question file isn't written yet.
 			if err := writeQuestion(runDir, q); err != nil {
 				return 0, false, err
 			}
+			setState(StateWaiting)
 			notifyWaiting(filepath.Base(runDir), q.GetPrompt())
 			if to := spec.Questions.Timeout; to > 0 {
 				armQuestionTimeout(ctx, client, spec, runDir, q.GetId(), to, &aborted, streamCancel)
+			}
+		case *pb.RunEvent_Resolved:
+			// A question was answered (§6.13). Resume only when the last outstanding one clears; a
+			// Resolved with none outstanding is a fail-mode sentinel echo, so it's a no-op.
+			if outstanding > 0 {
+				if outstanding--; outstanding == 0 {
+					setState(StateRunning)
+				}
 			}
 		}
 	}

@@ -16,7 +16,7 @@ import (
 type Manager struct {
 	deps     Deps
 	stateDir string
-	sem      chan struct{} // max-concurrency; nil = unbounded
+	max      int // max-concurrency across processes (0 = unbounded); enforced via AcquireSlot
 
 	mu     sync.Mutex
 	active map[string]*activeRun
@@ -30,13 +30,10 @@ type activeRun struct {
 }
 
 // NewManager returns a Manager rooted at stateDir (e.g. <repo>/.krayt). maxConcurrency <= 0
-// means unbounded.
+// means unbounded. The limit is enforced with a file-lock semaphore under stateDir, so it holds
+// across every process sharing this .krayt, not just runs this Manager owns (§6.2).
 func NewManager(deps Deps, stateDir string, maxConcurrency int) *Manager {
-	var sem chan struct{}
-	if maxConcurrency > 0 {
-		sem = make(chan struct{}, maxConcurrency)
-	}
-	m := &Manager{deps: deps, stateDir: stateDir, active: map[string]*activeRun{}, sem: sem}
+	m := &Manager{deps: deps, stateDir: stateDir, active: map[string]*activeRun{}, max: maxConcurrency}
 	// Publish each run's answerer as its client connects, so Manager.Answer can resolve a
 	// waiting run in-process (§6.13).
 	m.deps.OnClient = m.registerAnswerer
@@ -76,14 +73,11 @@ func (m *Manager) StateDir() string { return m.stateDir }
 // max-concurrency. It blocks until the run finishes; the deferred teardown guarantees the VM
 // is destroyed. Callers run it in a goroutine per run for concurrency.
 func (m *Manager) Run(ctx context.Context, spec task.RunSpec) (*Result, error) {
-	if m.sem != nil {
-		select {
-		case m.sem <- struct{}{}:
-			defer func() { <-m.sem }()
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	release, err := AcquireSlot(ctx, m.stateDir, m.max)
+	if err != nil {
+		return nil, err
 	}
+	defer release()
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

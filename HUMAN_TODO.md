@@ -227,3 +227,188 @@ below block only that on-hardware confirmation.
   `hack/ask-probe` confirmation (above) runs.
 - Blocking: yes — every on-hardware run (incl. the ask-probe confirmation) needs the rebuilt,
   re-pinned image; the automated fakeProvider proofs do not.
+
+## [Phase 5] `krayt-ask` container placement + image rebuild
+- Needed: (1) rebuild + re-pin the VM image so it includes the new `krayt-ask` binary —
+  `images/flake.nix` now builds `cmd/krayt-ask` into the guest-agent derivation
+  (`${guest-agent}/bin/krayt-ask`); `vendorHash` is **unchanged** (no new module deps).
+  (2) Bind-mount that binary into the container on `PATH` so an agent can invoke `krayt-ask`,
+  and wire the guest to do it (mirrors the ask-socket mount in
+  `internal/guest/runner/containerd_linux.go`: add a `RunConfig.AskBinary` path, have the
+  Service resolve it next to the guest-agent executable, and mount it read-only).
+- Why the agent can't: needs an aarch64-linux Nix builder (no Nix in the sandbox) to rebuild
+  the image; and the container mount destination is image-dependent (a `scratch`/distroless
+  image has no `/usr/local/bin`), so the exact `PATH` placement must be chosen and validated
+  against a real image — the fakeProvider runner does not perform mounts.
+- Exact steps/commands:
+  1. Decide the mount destination. Recommended: mount at `/run/krayt/bin/krayt-ask` (a dir
+     krayt already owns) and prepend `/run/krayt/bin` to the container `PATH` (or set the
+     adapter env `KRAYT_ASK_BIN`), avoiding reliance on `/usr/local/bin` existing.
+  2. Implement the mount + `RunConfig.AskBinary` wiring in the guest runner; the host path is
+     `filepath.Join(filepath.Dir(os.Executable()), "krayt-ask")` inside the VM.
+  3. Rebuild + re-pin the image (same procedure as the Phase 4 image entry above).
+- Verify success by: in a `--on-question=wait` run, `krayt-ask "…"` inside the container
+  prints the answer supplied by `krayt answer` (exit 0); with `--on-question=fail`, it exits 2
+  immediately. The `hack/ask-probe` runbook can be extended to shell out to `krayt-ask`.
+- Blocking: no — the `krayt-ask` binary, its client logic, the exit-code contract, and the
+  adapter's `KRAYT_ASK_SOCKET` wiring are all proven host-side
+  (`cmd/krayt-ask` tests + `internal/cli` adapter tests); only the in-container round-trip on
+  real hardware is deferred.
+
+## [Phase 5] Agent adapter end-to-end with live credentials — DONE ✅
+- Resolved: verified on Apple Silicon with `docker.io/tjololo/test-krayt:claude`. A
+  `krayt run --agent claude-code --secrets … --allow api.anthropic.com` completed a real coding
+  task (add `hello()` + a pytest test + README note): Claude Code authenticated via
+  `CLAUDE_CODE_OAUTH_TOKEN`, the run reached `done` (exit 0), and the run dir had `changes.patch`
+  (3 files, +12/-0), `report.md` (with Claude's summary under Notes), and `meta.json`; the token
+  never appeared in any of them; `krayt apply` landed the patch cleanly. (Still worth a one-off:
+  the exactly-one guard rejecting a two-credential file before boot — proven by
+  `TestApplyAdapterAuthGate`.)
+- Needed: exercise a real agent image (`--agent claude-code`) with a live credential in the
+  secrets file, confirming the container entrypoint exports the resolved credential from
+  `/run/secrets` into the environment (§8.2/§6.14) and the agent authenticates and runs.
+- Why the agent can't: needs a live `ANTHROPIC_API_KEY` (or `CLAUDE_CODE_OAUTH_TOKEN`) and a
+  real agent image on hardware; the sandbox has neither.
+- Exact steps/commands: use the ready-made image + full runbook in **`hack/claude-code/`**
+  (Dockerfile installs Claude Code, runs it non-root headlessly, exports the credential from
+  `/run/secrets`). Build/push it (`docker buildx build --platform linux/arm64 -t <ref> --push .`),
+  then `krayt run --agent claude-code --secrets ./secrets.env --image <ref> --task ./task.md
+  --allow api.anthropic.com`; put exactly one of `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`
+  in `secrets.env`. Confirm the run fails fast (before boot) if both are present.
+- Verify success by: the run completes with a patch + report + meta; the exactly-one guard
+  rejects a two-credential secrets file with a clear error (`§6.14`) before any VM boots.
+- Blocking: no — the host-side auth gate + `krayt-ask` env wiring are proven
+  (`TestClaudeCodeExactlyOne`, `TestApplyAdapterAuthGate`, `TestApplyAdapterWiresAsk`); the
+  live-credential run is part of the Phase 5 "Done when".
+
+## [Phase 5] Detached "park and walk away" — end-to-end on hardware — DONE ✅
+- Resolved: verified on Apple Silicon with the `hack/ask-probe` image
+  (`docker.io/tjololo/test-krayt:ask`). `krayt run --detach --on-question=wait
+  --question-timeout 120s --on-question-timeout abort` returned immediately printing the run id
+  + supervisor pid (34206); `krayt ls` showed the background run `starting`, then `waiting` once
+  the probe hit `/run/krayt/ask.sock`; `krayt answer run_afbb910f yes` from a **separate shell**
+  resolved `q1` (the supervisor outlived the launcher); a re-`attach` showed the probe receive
+  `response="yes"`, write its decision file, and finish `done: success`. Confirms the
+  session-detached supervisor + cross-process `krayt answer` + `waiting` persistence on a real
+  VM. Still open (their own HUMAN entries): the `krayt-ask` **binary** round-trip (this used the
+  probe's own socket client) and a real agent with live keys; a `--max-concurrency` queue check
+  across invocations is still worth a quick pass but the primitive is proven
+  (`TestAcquireSlotCrossProcess`).
+- Needed: confirm the whole detached flow on a real VM: `krayt run --detach …` returns
+  immediately, the run keeps executing after the launching terminal closes, its `waiting`
+  question fires a notification, and `krayt answer <id> <resp>` from a **separate** invocation
+  resolves it; then `krayt stop <id>` (SIGTERM to the recorded supervisor pid) tears the VM
+  down. Also sanity-check `--max-concurrency N` queues the N+1-th run across separate
+  `krayt run` invocations.
+- Why the agent can't: needs a bootable VM (vfkit + the pinned image) on Apple Silicon; the
+  sandbox has no VM, and the detached child re-execs `krayt run`, which calls `newRunDeps()`
+  (vfkit) — unavailable here.
+- Exact steps/commands: `krayt run --detach --on-question=wait --image <img> --task ./task.md`;
+  note the printed run id; close the terminal; from a new shell `krayt ls` (shows `waiting`),
+  `krayt answer <id> <resp>`, `krayt attach <id>`. For the limit: launch 3× `krayt run --detach
+  --max-concurrency 1 …` and confirm only one boots at a time (`krayt ls`).
+- Verify success by: the supervisor process (its pid is printed and in `meta.json`) outlives the
+  launcher; the run reaches `done` with patch+report+meta; the second/third `--max-concurrency
+  1` runs stay queued until the first finishes.
+- Blocking: no — the mechanism is proven host-side: cross-process limit
+  (`TestAcquireSlotCrossProcess`, real subprocesses), the session-detached spawn
+  (`TestSpawnDetached`), and the file-lock cap (`TestMaxConcurrency`). Only the on-VM run is
+  deferred.
+
+## [Phase 5] Rebuild VM image for the non-root container-filesystem fixes — DONE ✅
+- Resolved: base image rebuilt + re-pinned with all four non-root fixes; verified on Apple
+  Silicon by a real `docker.io/tjololo/test-krayt:claude` run (uid 1000 `agent`): Claude Code
+  authenticated via `CLAUDE_CODE_OAUTH_TOKEN`, edited `/workspace` (main.py + new test_main.py +
+  README.md), wrote `/output/report.md`, and the run reached `done` (exit 0) with a clean
+  `changes.patch` that `krayt apply` landed. (The ask-socket fix is shipped but not yet exercised
+  — needs a `--on-question=wait` + `krayt-ask` run.)
+- Needed: rebuild + re-pin the base VM image so the guest-agent makes the container-contract
+  paths usable by a **non-root** container (§8.2 requires non-root; Claude Code refuses uid 0).
+  All fixed in `internal/guest/service.go`, found by testing the `claude-code` image, each with a
+  regression test:
+  1. **`/run/secrets`** world-readable (dir `0755`, files `0644`) — else exit 78 "no credential".
+     (`writeSecrets`; `TestSecretsRedactedInLogs`.)
+  2. **`/workspace`** made writable after ingest (`makeContainerWritable`: g+o rw, dirs +x) — else
+     the agent can't edit/create files. `.git` stays root-owned so the guest's own git is fine.
+  3. **`/output`** `0777` — else the agent can't write `report.md` (`tee: Permission denied`).
+  4. **ask socket** `0777` — else a non-root agent can't connect to `/run/krayt/ask.sock` (§6.13).
+  (2–4 proven by `TestEndToEndRun`'s writability asserts.)
+- Why the agent can't: the guest-agent is baked into the Nix rootfs; changing it needs an
+  aarch64-linux Nix build (no Nix in the sandbox), same as the Phase 4 image rebuild.
+- Exact steps/commands: rebuild the image (guest-agent picks up the fixes — `vendorHash`
+  unchanged, no new deps), re-pin `internal/vmimage/pinned.go` (same procedure as the Phase 4
+  entry above), push/publish. Also rebuild/push the `hack/claude-code` **image** (its entrypoint
+  now sets `git safe.directory` so the agent's own git tolerates the root-owned `.git`).
+- Verify success by: re-run the `hack/claude-code` demo (non-root image) — it prints
+  `authenticated via …`, Claude edits `/workspace`, writes `/output/report.md`, and the run
+  reaches `done` with a real `changes.patch`. Inside the container, `ls -la /run/secrets` shows
+  `-rw-r--r--` and `/workspace` is writable.
+- Stopgap (no base rebuild): run the container as **root** — drop `USER agent` from
+  `hack/claude-code/Dockerfile` and add `ENV IS_SANDBOX=1` (lets Claude Code tolerate root with
+  `--dangerously-skip-permissions`) — then rebuild/push just the test image. Root sidesteps all
+  four perms issues. Revert to non-root once the base image has the fixes.
+- Blocking: partially — a **non-root** agent image (the §8.2 contract, incl. Claude Code) can't
+  read secrets / write the workspace until this ships; root images (e.g. `ask-probe`) are
+  unaffected. Host-side proof is in place; only the on-VM confirmation waits on the rebuild.
+
+## [Phase 5] Rebuild VM image to ship the krayt-ask CLI front-end — DONE ✅
+- Resolved: shipped in base image **v0.0.0-rc16** (`pinned.go` digest `01b32a57…`) and verified on
+  Apple Silicon with `docker.io/tjololo/test-krayt:krayt-ask` (non-root, uid 1000). A
+  `--on-question=wait` run drove the container to shell out to `krayt-ask` (found on PATH at
+  `/usr/local/bin/krayt-ask`), reach `waiting`, and — after `krayt answer <id> yes` from a second
+  shell — log `got answer: yes` and finish `done` (exit 0) with `changes.patch` adding
+  `krayt-ask-decision.txt` = `yes`. Closes the last Phase-5 "Done when" clause. Also confirmed
+  `--on-question=fail`: `krayt-ask` gets the no-answer sentinel immediately and the agent proceeds
+  autonomously (`krayt-ask-decision.txt` = `no-answer-sentinel`) — the default stays non-blocking.
+- Needed: rebuild + re-pin the base VM image so it (1) contains the `krayt-ask` binary
+  (`flake.nix` builds `cmd/krayt-ask` into the guest-agent derivation) and (2) bind-mounts it
+  into the container at `/usr/local/bin/krayt-ask` (guest resolves it next to the guest-agent and
+  passes `RunConfig.AskBinary`; the runner mounts it read-only). This closes the last Phase-5
+  "Done when" clause — an agent's `krayt-ask` call round-tripping to `krayt answer`.
+- Why the agent can't: the guest-agent + the mount are baked into the Nix rootfs; needs an
+  aarch64-linux Nix build (no Nix in the sandbox), same as the other image rebuilds. `vendorHash`
+  unchanged (krayt-ask imports only `internal/guest/ask` + stdlib, already vendored).
+- Exact steps/commands: rebuild the image, re-pin `internal/vmimage/pinned.go`, push/publish; then
+  build/push the ready-made **`hack/krayt-ask-probe`** image (non-root; shells out to `krayt-ask`)
+  and follow its README — `krayt run --on-question=wait`, then `krayt answer <id> yes` from a
+  second shell.
+- Verify success by: the probe logs `got answer: yes`, the run reaches `done`, and
+  `changes.patch` adds `krayt-ask-decision.txt` = `yes`. In `fail` mode it exits 0 with
+  `no-answer-sentinel`. (Resolution logic proven host-side by `TestAskBinaryIn`.)
+- Blocking: no other Phase-5 work depends on it, but this is the final clause needed to mark the
+  Phase 5 "Done when" fully complete.
+
+## [Phase 6] Rebuild VM image for precise resume + the ask_human MCP server — DONE ✅
+- Resolved: shipped in base image **v0.0.0-rc17** (`pinned.go` digest `149aab02…`) and verified on
+  Apple Silicon with `docker.io/tjololo/test-krayt:claude` (non-root, `--on-question=wait`). Given
+  a task with a genuine DB choice, Claude Code registered the MCP server (`registered ask_human
+  MCP server`), **called the `ask_human` MCP tool** → run went `waiting` (question persisted:
+  "PostgreSQL or SQLite?"); after `krayt answer <id> postgres` the answer flowed back and Claude
+  **implemented the chosen database** (`db.py` with `psycopg`, `requirements.txt`) and finished
+  `done` (exit 0) — the whole §6.13 premium path. Precise resume **directly observed**: `krayt ls`
+  showed `run_f671edac` flip `waiting`→`running` immediately after `krayt answer` (guest `Resolved`
+  event; `TestQuestionResolvedResumes`). `q1.json` also confirms the MCP tool passed
+  `choices: [PostgreSQL, SQLite]`. Closes the Phase 6 "Done when".
+- Needed: one base image rebuild carrying both Phase-6 pieces, then a hardware round-trip.
+  1. `make proto` regen is already committed (`RunEvent.Resolved`); the **guest-agent** now emits
+     the Resolved event, so a rebuild ships the precise `waiting`→`running` resume on-VM.
+  2. `cmd/krayt-ask --mcp` (the MCP server) is built into the image; it pulls a **new** module
+     (`github.com/modelcontextprotocol/go-sdk`), so the `flake.nix` **`vendorHash` MUST be
+     regenerated** (set `lib.fakeHash`, build, paste the reported `got: sha256-…`).
+  3. Rebuild + re-pin `internal/vmimage/pinned.go`, push/publish.
+- Why the agent can't: aarch64-linux Nix build + the guest is baked into the rootfs (no Nix in
+  the sandbox); the MCP round-trip needs a real MCP-speaking agent + live keys.
+- Exact steps/commands: after the rebuild, rebuild/push the `hack/claude-code` image (its
+  entrypoint now writes an `.mcp.json` registering `krayt-ask --mcp` when `KRAYT_ASK_SOCKET` is
+  set) and run `krayt run --agent claude-code --secrets … --on-question=wait --allow
+  api.anthropic.com` with a task that forces a genuine decision (e.g. "if it's ambiguous whether
+  to target Postgres or SQLite, ask the human"). Answer from a second shell with `krayt answer`.
+- Verify success by: Claude calls the `ask_human` MCP tool → run shows `waiting` → after `krayt
+  answer` the run **flips back to `running`** (not held at waiting) and completes using the
+  answer. Precise-resume + MCP handler are host-proven (`TestQuestionResolvedResumes`,
+  `TestBridgeOnResolved`, `TestAskHumanHandler`).
+- Watch-out: the Claude Code MCP registration is agent-specific glue — the entrypoint uses
+  `--mcp-config <.mcp.json>`; if that flag/format shifted in the installed Claude Code version,
+  adjust the entrypoint (try `claude mcp add ask-human -- krayt-ask --mcp`). This is the one spot
+  that may need a tweak against the live CLI.
+- Blocking: no — closes the Phase 6 "Done when"; nothing else depends on it.

@@ -109,6 +109,38 @@ To actually boot a VM you also need a published base image (`krayt image pull`) 
 
 ---
 
+## Running an agent
+
+With a booted base image (`krayt image pull`) and an agent container image, a run looks like:
+
+```bash
+# the agent works on a copy of the repo, returns a patch you review
+krayt run --image <agent-image> --task ./task.md --repo . \
+  --secrets ./secrets.env --allow api.anthropic.com
+
+krayt ls                      # states: starting → running → (waiting) → done
+krayt patch <run-id>          # inspect the diff …
+krayt apply <run-id>          # … then apply it to your repo if you're satisfied
+```
+
+- **Agent auth** rides the per-task secrets file (`--secrets`), lands on tmpfs at
+  `/run/secrets`, and is redacted from logs. With `--agent claude-code` the adapter enforces
+  exactly-one credential (`ANTHROPIC_API_KEY` xor `CLAUDE_CODE_OAUTH_TOKEN`) and fails fast
+  before booting (§6.14).
+- **Ask-the-human:** add `--on-question=wait` and the agent can pause to ask you a question
+  (via the `ask_human` MCP tool or the `krayt-ask` CLI); resolve it with
+  `krayt answer <run-id> <response>` from any terminal. Default `--on-question=fail` keeps
+  unattended runs non-blocking.
+- **Park & walk away:** add `--detach` and the run survives the terminal closing — track it
+  with `krayt ls`/`attach` and answer questions later.
+- Flags can live in a `krayt.yaml` instead (see `configs/`); each run leaves a self-contained
+  `.krayt/runs/<id>/` with `changes.patch`, `report.md`, `meta.json`, and logs.
+
+Reproducible, ready-to-run examples live under `hack/` — most notably `hack/claude-code/`
+(a real Claude Code agent) and `hack/krayt-ask-probe/` (the question channel).
+
+---
+
 ## Repo orientation
 
 | File | What it is |
@@ -118,6 +150,9 @@ To actually boot a VM you also need a published base image (`krayt image pull`) 
 | `HUMAN_TODO.md` | Handoff log the agent maintains for steps a human must do (created during development). |
 | `images/` | Nix flake for the micro-VM image (CI-built). |
 | `internal/` | The implementation (see §9 of the spec for package layout). |
+| `cmd/` | Binaries: `krayt` (CLI), `krayt-agent` (guest), `krayt-proxy` (egress), `krayt-ask` (question front-end + MCP server). |
+| `configs/` | Example `krayt.yaml` + default allowlist. |
+| `hack/` | Reproducible demo/probe images used to verify features on hardware (`claude-code` agent, `ask-probe`, `krayt-ask-probe`). |
 
 ### Steps a human is expected to own (the `[HUMAN]` handoffs)
 Claude Code does everything it can, then logs these to `HUMAN_TODO.md` and pauses if blocked:
@@ -151,11 +186,22 @@ See `CLAUDE.md` for the full working agreement.
 
 ## Status
 
-Built phase by phase per `KRAYT_SPEC.md` §14.
+Built phase by phase per `KRAYT_SPEC.md` §14. **Phases 0–6 are complete and verified on
+Apple-Silicon hardware** — krayt runs a real coding agent (Claude Code) in an isolated
+micro-VM over an untrusted repo and hands back a reviewable patch, with egress control,
+secrets, concurrency, park-and-walk-away, and an agent↔human question channel.
 
-- **Phase 0 — Foundations:** done. Provider/protocol/types scaffold, `fakeProvider`
-  loopback, `krayt doctor`; `Hello` round-trips over the fake provider.
-- **Phase 1 — Boot a VM on macOS:** done. vfkit provider, host control client +
-  boot-readiness, base-image pull + digest verify, `krayt-agent` vsock binary, Nix image
-  flake, and CI. Verified on real Apple-Silicon hardware: `krayt` boots the published
-  image and a `Hello` RPC round-trips host↔guest over the vfkit vsock socket.
+| Phase | What | State |
+|---|---|---|
+| 0 — Foundations | provider/protocol scaffold, `fakeProvider`, `doctor` | ✅ |
+| 1 — Boot a VM on macOS | vfkit provider, vsock guest-agent, image pull; `Hello` round-trips | ✅ hardware |
+| 2 — End-to-end run | bundle → clone → agent edit → `changes.patch` that applies cleanly | ✅ hardware |
+| 3 — Security & limits | egress allowlist proxy + nftables lock, secrets + redaction, resource/timeout | ✅ hardware |
+| 4 — Concurrency & UX | `Manager`, `ls`/`attach`/`logs`/`stop`/`rm`, config file, question channel | ✅ |
+| 5 — Polish & orchestration | `report.md`/`meta.json`, patch lint, agent adapters + auth, `krayt-ask`, detached "park & walk away" | ✅ hardware |
+| 6 — `ask_human` MCP + precise resume | in-VM MCP server, `waiting`→`running` on answer | ✅ hardware |
+| 7 — Linux backend (parity) | `firecracker` provider behind the same interface | planned |
+
+The showcase: a real agent, blocked mid-task on a decision only a human could make, paused,
+asked over MCP, got the answer, and continued with it — all inside the VM with a live
+credential. See `hack/claude-code/` for the reproducible example.
