@@ -25,11 +25,11 @@ func writeReport(runDir string, rec RunRecord, agentNotes string) error {
 	// is validated by image acquisition before any report is written, but sanitize it too so the
 	// invariant holds without a per-field reachability argument (§6.13).
 	fmt.Fprintf(&b, "# Run %s\n", rec.ID)
-	fmt.Fprintf(&b, "- Image: %s   Task: %s\n", sanitize(rec.ImageRef), rec.TaskSummary)
+	fmt.Fprintf(&b, "- Image: %s   Task: %s\n", Sanitize(rec.ImageRef), rec.TaskSummary)
 	fmt.Fprintf(&b, "- Result: %s   Exit: %d   Duration: %s\n", resultWord(rec), rec.ExitCode, hms(rec.DurationSecs))
-	fmt.Fprintf(&b, "- Network: %s\n", sanitize(networkLine(rec.Network)))
+	fmt.Fprintf(&b, "- Network: %s\n", Sanitize(networkLine(rec.Network)))
 	if rec.Error != "" {
-		fmt.Fprintf(&b, "- Error: %s\n", sanitize(rec.Error))
+		fmt.Fprintf(&b, "- Error: %s\n", Sanitize(rec.Error))
 	}
 
 	b.WriteString("\n## Changes\n")
@@ -48,7 +48,7 @@ func writeReport(runDir string, rec RunRecord, agentNotes string) error {
 		b.WriteString("\n## Safety\n")
 		b.WriteString("The patch touches paths that can execute outside the workspace — review carefully:\n")
 		for _, s := range rec.Safety {
-			fmt.Fprintf(&b, "- %s\n", sanitize(s)) // derived from agent-named diff paths (§6.13 invariant)
+			fmt.Fprintf(&b, "- %s\n", Sanitize(s)) // derived from agent-named diff paths (§6.13 invariant)
 		}
 	}
 
@@ -66,7 +66,7 @@ func writeReport(runDir string, rec RunRecord, agentNotes string) error {
 	}
 
 	b.WriteString("\n## Notes\n")
-	if n := strings.TrimSpace(sanitize(agentNotes)); n != "" {
+	if n := strings.TrimSpace(Sanitize(agentNotes)); n != "" {
 		b.WriteString(n)
 		b.WriteString("\n")
 	} else {
@@ -90,7 +90,7 @@ func agentNotes(runDir string) string {
 // summarizeTask is the meta.json task_summary: the first 200 characters of the task prompt,
 // sanitized and single-lined (§8.4).
 func summarizeTask(prompt []byte) string {
-	s := sanitize(strings.Join(strings.Fields(string(prompt)), " "))
+	s := Sanitize(strings.Join(strings.Fields(string(prompt)), " "))
 	if r := []rune(s); len(r) > 200 {
 		return string(r[:200])
 	}
@@ -107,13 +107,13 @@ func summarizeQuestions(runDir string) []QuestionMeta {
 	}
 	out := make([]QuestionMeta, 0, len(qs))
 	for _, q := range qs {
-		m := QuestionMeta{ID: q.ID, Prompt: sanitize(q.Prompt)}
+		m := QuestionMeta{ID: q.ID, Prompt: Sanitize(q.Prompt)}
 		if q.AnswerAt != "" {
 			m.WaitedSecs = durationSecs(q.AskedAt, q.AnswerAt)
 			if q.NoAnswer {
 				m.AnsweredBy = "timeout"
 			} else {
-				m.Answer, m.AnsweredBy = sanitize(q.Response), "human"
+				m.Answer, m.AnsweredBy = Sanitize(q.Response), "human"
 			}
 		}
 		out = append(out, m)
@@ -172,9 +172,11 @@ func durationSecs(start, end string) int {
 // a question is displayed (§6.13 "sanitize on display").
 var ansiEscape = regexp.MustCompile(`\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_][0-?]*[ -/]*[@-~]|\x1b`)
 
-// sanitize strips terminal escape sequences and other C0 control characters (keeping tab and
-// newline) from untrusted agent text before it lands in a review artifact (§6.13).
-func sanitize(s string) string {
+// Sanitize strips terminal escape sequences and other C0 control characters (keeping tab and
+// newline) from untrusted agent text before it lands in a review artifact or is printed to a
+// terminal — used by the report writer and the `krayt questions` command (§6.13, "sanitize on
+// display").
+func Sanitize(s string) string {
 	s = ansiEscape.ReplaceAllString(s, "")
 	return strings.Map(func(r rune) rune {
 		if r == '\t' || r == '\n' {

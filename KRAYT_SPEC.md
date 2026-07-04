@@ -632,6 +632,9 @@ agent-specific part in the adapter.
 **Host UX:**
 - The run shows `waiting` in `krayt ls`, **and a system/desktop notification fires**
   ("run `<id>` is waiting for input").
+- `krayt questions <run-id>` lists the run's questions — pending and answered — with the prompt
+  (sanitized, labeled as agent-originated) and choices, so the human never reads
+  `questions/*.json` by hand; each pending entry prints the exact `krayt answer` line to run.
 - The human answers with `krayt answer <run-id> [<qid>] <response>` (or an interactive
   one-line prompt; `choices[]` → tap/select). Multiple pending questions are answered FIFO by id.
 - Every Q&A pair is persisted to `.krayt/runs/<id>/questions/<qid>.json` and summarized in
@@ -1156,6 +1159,7 @@ krayt run     [--image] [--task] [--repo] [--config] [--secrets]
 krayt ls                       # list active/recent runs (shows `waiting` runs)
 krayt attach  <run-id>         # live-stream a running agent's logs
 krayt logs    <run-id>         # show persisted logs
+krayt questions <run-id> [--pending-only] [--sort asked|pending-first|pending-last]   # list a run's questions + answers (§6.13)
 krayt answer  <run-id> [<qid>] <response>   # answer a waiting agent question (§6.13); FIFO if qid omitted
 krayt patch   <run-id>         # print/locate the run's changes.patch
 krayt apply   <run-id>         # helper: git apply the patch onto the host (after review)

@@ -51,7 +51,15 @@ func newLsCmd() *cobra.Command {
 				if r.State == orchestrator.StateDone || r.State == orchestrator.StateTimedOut {
 					exit = fmt.Sprint(r.ExitCode)
 				}
-				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.State, exit, r.ImageRef, r.StartedAt)
+				// Hint that a `waiting` run has outstanding questions, nudging toward
+				// `krayt questions <id>` (§6.13).
+				state := r.State
+				if r.State == orchestrator.StateWaiting {
+					if n := pendingQuestions(sd, r.ID); n > 0 {
+						state = fmt.Sprintf("%s (%d?)", r.State, n)
+					}
+				}
+				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, state, exit, r.ImageRef, r.StartedAt)
 			}
 			return w.Flush()
 		},
