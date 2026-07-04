@@ -229,10 +229,11 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	return err
 }
 
-// applyAdapter runs the optional per-agent adapter's host-side pre-flight (§6.14): it reads the
-// per-task secret key names (never values), enforces the agent's exactly-one auth rule, and
-// merges the adapter's non-secret env additions (e.g. the krayt-ask socket) under spec.Env so a
-// user-set value always wins. Called before the VM boots so a bad credential set fails fast.
+// applyAdapter runs the optional per-agent adapter's host-side pre-flight (§6.14): it loads the
+// per-task secrets file and passes only the credential key names — never the values — to the
+// adapter, which enforces the agent's exactly-one auth rule; then it merges the adapter's
+// non-secret env additions (e.g. the krayt-ask socket) under spec.Env so a user-set value always
+// wins. Called before the VM boots so a bad credential set fails fast.
 func applyAdapter(spec *task.RunSpec, name string) error {
 	ad, err := adapter.Get(name)
 	if err != nil {

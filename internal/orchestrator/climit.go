@@ -35,13 +35,19 @@ func AcquireSlot(ctx context.Context, stateDir string, limit int) (func(), error
 			if err != nil {
 				return nil, fmt.Errorf("orchestrator: open slot: %w", err)
 			}
-			// Non-blocking exclusive lock: a held slot returns EWOULDBLOCK, so we move on to the
-			// next; separate open()s contend even within one process, so this bounds same-process
-			// concurrency too.
-			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			// Non-blocking exclusive lock: a held slot returns EWOULDBLOCK/EAGAIN, so we move on to
+			// the next; separate open()s contend even within one process, so this bounds same-process
+			// concurrency too. Any OTHER flock error (e.g. a filesystem that doesn't support flock)
+			// is persistent — polling won't clear it — so fail fast with a clear error instead of
+			// spinning until ctx expires and reporting a misleading deadline.
+			lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			if lerr == nil {
 				return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, nil
 			}
 			_ = f.Close()
+			if lerr != syscall.EWOULDBLOCK && lerr != syscall.EAGAIN {
+				return nil, fmt.Errorf("orchestrator: lock slot %d in %s: %w", i, dir, lerr)
+			}
 		}
 		select {
 		case <-ctx.Done():
