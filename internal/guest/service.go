@@ -318,6 +318,7 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		SecretsDir:       secretsDir,
 		Env:              runEnv,
 		AskSocket:        askSocket,
+		AskBinary:        askBinaryPath(),
 		Ask:              bridge.Ask,
 	}, log)
 
@@ -418,6 +419,26 @@ func makeContainerWritable(root string) error {
 		}
 		return os.Chmod(p, mode)
 	})
+}
+
+// askBinaryPath returns the krayt-ask binary shipped next to the guest-agent (both built into
+// the same image derivation, §9) so the runner can bind-mount it into the container onto the
+// PATH (§6.13). It returns "" when not found, so a build without krayt-ask degrades gracefully.
+func askBinaryPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return askBinaryIn(filepath.Dir(exe))
+}
+
+// askBinaryIn returns dir/krayt-ask if it is a regular file, else "".
+func askBinaryIn(dir string) string {
+	p := filepath.Join(dir, "krayt-ask")
+	if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+		return p
+	}
+	return ""
 }
 
 // mergeEnv overlays add onto a copy of base (proxy env wins over task env).

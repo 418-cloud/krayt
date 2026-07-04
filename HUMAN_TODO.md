@@ -350,3 +350,22 @@ below block only that on-hardware confirmation.
 - Blocking: partially — a **non-root** agent image (the §8.2 contract, incl. Claude Code) can't
   read secrets / write the workspace until this ships; root images (e.g. `ask-probe`) are
   unaffected. Host-side proof is in place; only the on-VM confirmation waits on the rebuild.
+
+## [Phase 5] Rebuild VM image to ship the krayt-ask CLI front-end
+- Needed: rebuild + re-pin the base VM image so it (1) contains the `krayt-ask` binary
+  (`flake.nix` builds `cmd/krayt-ask` into the guest-agent derivation) and (2) bind-mounts it
+  into the container at `/usr/local/bin/krayt-ask` (guest resolves it next to the guest-agent and
+  passes `RunConfig.AskBinary`; the runner mounts it read-only). This closes the last Phase-5
+  "Done when" clause — an agent's `krayt-ask` call round-tripping to `krayt answer`.
+- Why the agent can't: the guest-agent + the mount are baked into the Nix rootfs; needs an
+  aarch64-linux Nix build (no Nix in the sandbox), same as the other image rebuilds. `vendorHash`
+  unchanged (krayt-ask imports only `internal/guest/ask` + stdlib, already vendored).
+- Exact steps/commands: rebuild the image, re-pin `internal/vmimage/pinned.go`, push/publish; then
+  build/push the ready-made **`hack/krayt-ask-probe`** image (non-root; shells out to `krayt-ask`)
+  and follow its README — `krayt run --on-question=wait`, then `krayt answer <id> yes` from a
+  second shell.
+- Verify success by: the probe logs `got answer: yes`, the run reaches `done`, and
+  `changes.patch` adds `krayt-ask-decision.txt` = `yes`. In `fail` mode it exits 0 with
+  `no-answer-sentinel`. (Resolution logic proven host-side by `TestAskBinaryIn`.)
+- Blocking: no other Phase-5 work depends on it, but this is the final clause needed to mark the
+  Phase 5 "Done when" fully complete.
