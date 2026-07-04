@@ -77,6 +77,24 @@ func TestEndToEndRun(t *testing.T) {
 		t.Errorf("exit code = %d, want 0", res.ExitCode)
 	}
 
+	// The container runs non-root (§8.2), so the guest must leave /workspace and /output writable
+	// by other uids — the root-owned-dirs bug the claude-code image hit.
+	for _, d := range []string{"workspace", "output"} {
+		fi, err := os.Stat(filepath.Join(guestRoot, d))
+		if err != nil {
+			t.Fatalf("stat %s: %v", d, err)
+		}
+		if fi.Mode().Perm()&0o002 == 0 {
+			t.Errorf("%s dir mode %v not world-writable; a non-root container can't write it (§8.2)", d, fi.Mode().Perm())
+		}
+	}
+	// An ingested (root-cloned) file must be writable too, so the non-root agent can edit it.
+	if fi, err := os.Stat(filepath.Join(guestRoot, "workspace", "keep.txt")); err != nil {
+		t.Fatalf("stat keep.txt: %v", err)
+	} else if fi.Mode().Perm()&0o002 == 0 {
+		t.Errorf("ingested file mode %v not world-writable; a non-root agent can't edit it (§8.2)", fi.Mode().Perm())
+	}
+
 	// Artifacts + logs landed in the run dir.
 	patchBytes, err := os.ReadFile(res.PatchPath)
 	if err != nil || len(patchBytes) == 0 {

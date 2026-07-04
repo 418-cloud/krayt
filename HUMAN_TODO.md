@@ -307,25 +307,32 @@ below block only that on-hardware confirmation.
   (`TestSpawnDetached`), and the file-lock cap (`TestMaxConcurrency`). Only the on-VM run is
   deferred.
 
-## [Phase 5] Rebuild VM image for the non-root secrets-perms fix
-- Needed: rebuild + re-pin the base VM image so the guest-agent writes the `/run/secrets` tmpfs
-  world-readable (dir `0755`, files `0644`) instead of root-only (`0700`/`0600`). Found while
-  testing the `claude-code` image: the guest runs as root but the container runs **non-root**
-  (Claude Code refuses uid 0, §8.2), so it could not read its own credential and the entrypoint
-  exited 78 ("no credential in /run/secrets"). Fixed in `internal/guest/service.go`
-  (`writeSecrets`) with a regression test in `TestSecretsRedactedInLogs`.
+## [Phase 5] Rebuild VM image for the non-root container-filesystem fixes
+- Needed: rebuild + re-pin the base VM image so the guest-agent makes the container-contract
+  paths usable by a **non-root** container (§8.2 requires non-root; Claude Code refuses uid 0).
+  All fixed in `internal/guest/service.go`, found by testing the `claude-code` image, each with a
+  regression test:
+  1. **`/run/secrets`** world-readable (dir `0755`, files `0644`) — else exit 78 "no credential".
+     (`writeSecrets`; `TestSecretsRedactedInLogs`.)
+  2. **`/workspace`** made writable after ingest (`makeContainerWritable`: g+o rw, dirs +x) — else
+     the agent can't edit/create files. `.git` stays root-owned so the guest's own git is fine.
+  3. **`/output`** `0777` — else the agent can't write `report.md` (`tee: Permission denied`).
+  4. **ask socket** `0777` — else a non-root agent can't connect to `/run/krayt/ask.sock` (§6.13).
+  (2–4 proven by `TestEndToEndRun`'s writability asserts.)
 - Why the agent can't: the guest-agent is baked into the Nix rootfs; changing it needs an
   aarch64-linux Nix build (no Nix in the sandbox), same as the Phase 4 image rebuild.
-- Exact steps/commands: rebuild the image (guest-agent picks up the fix — `vendorHash`
+- Exact steps/commands: rebuild the image (guest-agent picks up the fixes — `vendorHash`
   unchanged, no new deps), re-pin `internal/vmimage/pinned.go` (same procedure as the Phase 4
-  entry above), push/publish.
-- Verify success by: re-run the `hack/claude-code` demo (non-root image) — the entrypoint prints
-  `authenticated via ANTHROPIC_API_KEY` and the run completes instead of exiting 78; a
-  `ls -la /run/secrets` inside the container shows `-rw-r--r--`.
-- Stopgap (no base rebuild): to test the rest of the `claude-code` flow before the rebuild, run
-  the container as **root** — drop `USER agent` from `hack/claude-code/Dockerfile` and add
-  `ENV IS_SANDBOX=1` (lets Claude Code tolerate root with `--dangerously-skip-permissions`) —
-  then rebuild/push just the test image. Revert to non-root once the base image has the fix.
+  entry above), push/publish. Also rebuild/push the `hack/claude-code` **image** (its entrypoint
+  now sets `git safe.directory` so the agent's own git tolerates the root-owned `.git`).
+- Verify success by: re-run the `hack/claude-code` demo (non-root image) — it prints
+  `authenticated via …`, Claude edits `/workspace`, writes `/output/report.md`, and the run
+  reaches `done` with a real `changes.patch`. Inside the container, `ls -la /run/secrets` shows
+  `-rw-r--r--` and `/workspace` is writable.
+- Stopgap (no base rebuild): run the container as **root** — drop `USER agent` from
+  `hack/claude-code/Dockerfile` and add `ENV IS_SANDBOX=1` (lets Claude Code tolerate root with
+  `--dangerously-skip-permissions`) — then rebuild/push just the test image. Root sidesteps all
+  four perms issues. Revert to non-root once the base image has the fixes.
 - Blocking: partially — a **non-root** agent image (the §8.2 contract, incl. Claude Code) can't
-  read its credential until this ships; root images (e.g. `ask-probe`) are unaffected. Host-side
-  proof is in place; only the on-VM confirmation waits on the rebuild.
+  read secrets / write the workspace until this ships; root images (e.g. `ask-probe`) are
+  unaffected. Host-side proof is in place; only the on-VM confirmation waits on the rebuild.

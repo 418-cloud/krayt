@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -226,8 +227,13 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	}
 	workspace := filepath.Join(root, "workspace")
 	outputDir := filepath.Join(root, "output")
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+	if err := os.MkdirAll(outputDir, 0o777); err != nil {
 		return fmt.Errorf("guest: create output dir: %w", err)
+	}
+	// The container runs non-root (§8.2) and writes report.md/changes.patch into /output, so it
+	// must be writable by other uids; chmod explicitly so a non-022 umask can't leave it root-only.
+	if err := os.Chmod(outputDir, 0o777); err != nil {
+		return fmt.Errorf("guest: chmod output dir: %w", err)
 	}
 
 	// Materialize secrets to the (tmpfs) secrets dir and build the redactor (§6.8).
@@ -241,6 +247,11 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	baseline, err := patch.Ingest(ctx, bundlePath, workspace, patch.DefaultIdentity)
 	if err != nil {
 		return err
+	}
+	// Ingest clones the bundle as root; relax the tree so the non-root container can edit it
+	// (§8.2). .git stays root-owned, so the guest's own git (run as root) is unaffected.
+	if err := makeContainerWritable(workspace); err != nil {
+		return fmt.Errorf("guest: make workspace writable: %w", err)
 	}
 	s.mu.Lock()
 	s.baseline = baseline
@@ -285,6 +296,9 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	askSocket := ""
 	if ln, lerr := net.Listen("unix", filepath.Join(root, "ask.sock")); lerr == nil {
 		askSocket = filepath.Join(root, "ask.sock")
+		// Connecting to a unix socket needs write permission on it; the container is non-root
+		// (§8.2), so make the socket connectable by other uids (§6.13).
+		_ = os.Chmod(askSocket, 0o777)
 		go func() { _ = ask.Serve(ctx, ln, bridge) }()
 	}
 
@@ -381,6 +395,29 @@ func (s *Service) writeSecrets(vals map[string]string) (string, error) {
 		}
 	}
 	return dir, nil
+}
+
+// makeContainerWritable relaxes a directory tree so the NON-ROOT container uid (§8.2) can read,
+// traverse, and write it. The guest runs as root and ingests /workspace root-owned, but the
+// agent runs non-root (Claude Code and others refuse uid 0) and must edit the tree. Exposure is
+// bounded to the ephemeral single-container VM. The .git owner is left as root, so the guest's
+// own git (run as root) still works; the agent's git needs `safe.directory`, set by the
+// adapter/entrypoint.
+func makeContainerWritable(root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		mode := info.Mode().Perm() | 0o066 // group + other read/write
+		if d.IsDir() {
+			mode |= 0o111 // …and traversable
+		}
+		return os.Chmod(p, mode)
+	})
 }
 
 // mergeEnv overlays add onto a copy of base (proxy env wins over task env).
