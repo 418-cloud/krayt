@@ -8,6 +8,10 @@
   "semanticCommits": "enabled",
   "rebaseWhen": "conflicted",
   "postUpdateOptions": ["gomodTidy"],
+  "minimumReleaseAge": "3 days",
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": "0 days"
+  },
   "nix": { "enabled": true },
   "packageRules": [
     {

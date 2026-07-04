@@ -52,8 +52,9 @@ it's a deliberate step:
 2. **Publish.** Push a `vmimage-vI.J.K` tag → `image.yml` publishes
    `ghcr.io/418-cloud/krayt-vmimage:vI.J.K` and prints the ref + digest in a `::notice`.
 3. **Pin.** Copy that ref + digest into `internal/vmimage/pinned.go` (note the image version in the
-   comment), commit to `main` (a normal `fix:`/`chore:` commit — release-please folds it into the
-   next CLI release). **Never pin a digest you haven't boot-tested.**
+   comment), commit to `main` as **`fix:`** so release-please cuts a CLI release that ships the new
+   pin (a `chore:` here would *not* release, so the pin wouldn't ship). **Never pin a digest you
+   haven't boot-tested.**
 4. The next CLI release then ships pinning the new image.
 
 Publishing (step 2) ≠ pinning (step 3): an image can sit in the registry unused until it's
@@ -61,10 +62,16 @@ verified and pinned.
 
 ## Dependency updates
 
-[Renovate] opens grouped `deps:` PRs for Go modules, GitHub Actions (kept SHA-pinned), the Nix
-flake inputs, and the `hack/**` Dockerfiles. Auto-merge is **off** — review and merge them
-yourself (they land in the next release's Dependencies section). Renovate does **not** touch
-`pinned.go` (the boot-test gate is manual by design).
+[Renovate] opens grouped PRs for Go modules, GitHub Actions (kept SHA-pinned), the Nix flake
+inputs, and the `hack/**` Dockerfiles. **Auto-merge is off** — review and merge them yourself.
+Per the commit conventions above, only **Go-module** updates are typed `deps:` (they show up under
+Dependencies in the next CLI release); **Actions / Nix / Dockerfile** updates are typed `chore:`
+(hidden, and they don't cut a CLI release). Renovate does **not** touch `pinned.go` (the boot-test
+gate is manual by design).
+
+Updates are held for **3 days** after a release (`minimumReleaseAge`) — a stability window so a
+yanked or hot-fixed release is caught before Renovate proposes it. **Security fixes bypass this**
+and are raised immediately (`vulnerabilityAlerts` sets `minimumReleaseAge: 0`).
 
 [release-please]: https://github.com/googleapis/release-please
 [Renovate]: https://docs.renovatebot.com
