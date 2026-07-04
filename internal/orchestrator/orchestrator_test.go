@@ -165,6 +165,20 @@ func TestSecretsRedactedInLogs(t *testing.T) {
 	if mounted != secretVal {
 		t.Errorf("secret not mounted for the agent: got %q", mounted)
 	}
+	// …and, since the container runs as a NON-ROOT uid (§8.2) while the guest writes the tmpfs as
+	// root, the dir must be traversable and the file world-readable or the agent can't read its
+	// credential (the exit-78 bug the claude-code image hit).
+	secDir := filepath.Join(guestRoot, "secrets")
+	if di, err := os.Stat(secDir); err != nil {
+		t.Fatalf("stat secrets dir: %v", err)
+	} else if di.Mode().Perm()&0o001 == 0 {
+		t.Errorf("secrets dir mode %v not traversable by others; a non-root container can't reach /run/secrets (§8.2)", di.Mode().Perm())
+	}
+	if fi, err := os.Stat(filepath.Join(secDir, "ANTHROPIC_API_KEY")); err != nil {
+		t.Fatalf("stat secret file: %v", err)
+	} else if fi.Mode().Perm()&0o004 == 0 {
+		t.Errorf("secret file mode %v not readable by others; a non-root container can't read it (§8.2/§6.14)", fi.Mode().Perm())
+	}
 	// …but it must not survive anywhere krayt records output.
 	if bytes.Contains(logs.Bytes(), []byte(secretVal)) {
 		t.Error("secret value leaked into the live log stream")

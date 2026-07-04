@@ -358,12 +358,26 @@ func (s *Service) writeSecrets(vals map[string]string) (string, error) {
 	if dir == "" {
 		dir = filepath.Join(s.root, "secrets")
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("guest: create secrets dir: %w", err)
 	}
+	// The guest-agent runs as root, but the container runs as a NON-ROOT uid (Claude Code and
+	// others refuse uid 0, §8.2) and must read its credential from this tmpfs (§6.14). So the
+	// dir must be traversable and the files readable by other uids — mirrors how Kubernetes/Docker
+	// mount secrets (0644). The exposure is bounded: the VM is single-container and ephemeral, and
+	// this container is the credential's intended consumer. Chmod explicitly so a non-022 umask on
+	// the guest init can't leave them root-only. Secrecy on the host disk + log redaction (§6.8)
+	// are unaffected — this is only the in-VM tmpfs.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return "", fmt.Errorf("guest: chmod secrets dir: %w", err)
+	}
 	for k, v := range vals {
-		if err := os.WriteFile(filepath.Join(dir, k), []byte(v), 0o600); err != nil {
+		p := filepath.Join(dir, k)
+		if err := os.WriteFile(p, []byte(v), 0o644); err != nil {
 			return "", fmt.Errorf("guest: write secret %s: %w", k, err)
+		}
+		if err := os.Chmod(p, 0o644); err != nil {
+			return "", fmt.Errorf("guest: chmod secret %s: %w", k, err)
 		}
 	}
 	return dir, nil

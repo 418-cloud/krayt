@@ -261,10 +261,12 @@ below block only that on-hardware confirmation.
   `/run/secrets` into the environment (§8.2/§6.14) and the agent authenticates and runs.
 - Why the agent can't: needs a live `ANTHROPIC_API_KEY` (or `CLAUDE_CODE_OAUTH_TOKEN`) and a
   real agent image on hardware; the sandbox has neither.
-- Exact steps/commands: `krayt run --agent claude-code --secrets ./secrets.env --image
-  <claude-code-image> --task ./task.md`; put exactly one of `ANTHROPIC_API_KEY` /
-  `CLAUDE_CODE_OAUTH_TOKEN` in `secrets.env`. Confirm the run fails fast (before boot) if both
-  are present.
+- Exact steps/commands: use the ready-made image + full runbook in **`hack/claude-code/`**
+  (Dockerfile installs Claude Code, runs it non-root headlessly, exports the credential from
+  `/run/secrets`). Build/push it (`docker buildx build --platform linux/arm64 -t <ref> --push .`),
+  then `krayt run --agent claude-code --secrets ./secrets.env --image <ref> --task ./task.md
+  --allow api.anthropic.com`; put exactly one of `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`
+  in `secrets.env`. Confirm the run fails fast (before boot) if both are present.
 - Verify success by: the run completes with a patch + report + meta; the exactly-one guard
   rejects a two-credential secrets file with a clear error (`§6.14`) before any VM boots.
 - Blocking: no — the host-side auth gate + `krayt-ask` env wiring are proven
@@ -304,3 +306,26 @@ below block only that on-hardware confirmation.
   (`TestAcquireSlotCrossProcess`, real subprocesses), the session-detached spawn
   (`TestSpawnDetached`), and the file-lock cap (`TestMaxConcurrency`). Only the on-VM run is
   deferred.
+
+## [Phase 5] Rebuild VM image for the non-root secrets-perms fix
+- Needed: rebuild + re-pin the base VM image so the guest-agent writes the `/run/secrets` tmpfs
+  world-readable (dir `0755`, files `0644`) instead of root-only (`0700`/`0600`). Found while
+  testing the `claude-code` image: the guest runs as root but the container runs **non-root**
+  (Claude Code refuses uid 0, §8.2), so it could not read its own credential and the entrypoint
+  exited 78 ("no credential in /run/secrets"). Fixed in `internal/guest/service.go`
+  (`writeSecrets`) with a regression test in `TestSecretsRedactedInLogs`.
+- Why the agent can't: the guest-agent is baked into the Nix rootfs; changing it needs an
+  aarch64-linux Nix build (no Nix in the sandbox), same as the Phase 4 image rebuild.
+- Exact steps/commands: rebuild the image (guest-agent picks up the fix — `vendorHash`
+  unchanged, no new deps), re-pin `internal/vmimage/pinned.go` (same procedure as the Phase 4
+  entry above), push/publish.
+- Verify success by: re-run the `hack/claude-code` demo (non-root image) — the entrypoint prints
+  `authenticated via ANTHROPIC_API_KEY` and the run completes instead of exiting 78; a
+  `ls -la /run/secrets` inside the container shows `-rw-r--r--`.
+- Stopgap (no base rebuild): to test the rest of the `claude-code` flow before the rebuild, run
+  the container as **root** — drop `USER agent` from `hack/claude-code/Dockerfile` and add
+  `ENV IS_SANDBOX=1` (lets Claude Code tolerate root with `--dangerously-skip-permissions`) —
+  then rebuild/push just the test image. Revert to non-root once the base image has the fix.
+- Blocking: partially — a **non-root** agent image (the §8.2 contract, incl. Claude Code) can't
+  read its credential until this ships; root images (e.g. `ask-probe`) are unaffected. Host-side
+  proof is in place; only the on-VM confirmation waits on the rebuild.
