@@ -605,10 +605,11 @@ agent-specific part in the adapter.
   - **`krayt-ask` CLI:** a small binary in the base image, mounted into the container, that
     any agent can shell out to (`krayt-ask [--choices a,b] "question"` → answer on stdout).
     Universal lowest-common-denominator fallback. Same channel underneath.
-- **Registration (per-agent adapter, Phase 5):** wiring the agent's config to the MCP
-  server is agent-specific (Claude Code et al. each configure MCP differently), so it lives
-  in the optional adapter — **not** the agnostic core. The adapter registers the MCP server
-  / wires the CLI **only when `--on-question=wait`**.
+- **Registration (per-agent adapter):** wiring the agent's config to the MCP server is
+  agent-specific (Claude Code et al. each configure MCP differently), so it lives in the
+  optional adapter — **not** the agnostic core. The adapter wires the CLI **only when
+  `--on-question=wait`** (Phase 5); MCP-server registration lands with the MCP server itself
+  (Phase 6).
 
 **Modes — `--on-question`, default `fail`:**
 - `fail` (default): neither front-end is wired → `ask_human` is absent and `krayt-ask`
@@ -657,7 +658,7 @@ on tmpfs at `/run/secrets`, is never written to the VM disk, and is redacted fro
 agnostic core needs **no** change to support agent auth — it only transports the secrets
 bundle. Everything agent-specific (which env var a credential maps to, and enforcing that
 exactly one is set) lives in the optional **per-agent adapter** — the same place the
-`ask_human` MCP registration lives (§6.13, Phase 5), **not** the core. Claude Code is the
+`ask_human` MCP registration lives (§6.13, Phase 6), **not** the core. Claude Code is the
 worked example; its specifics below track the official auth docs
 (`code.claude.com/docs/en/authentication`).
 
@@ -901,7 +902,7 @@ at implementation time; major versions shown where they matter.)
 | macOS VM backend (v1) | `github.com/crc-org/vfkit` (`pkg/config` + REST) | drives a signed vfkit subprocess; pure-Go host (no cgo); pin version |
 | macOS VM backend (fallback) | `github.com/Code-Hex/vz/v3` | direct in-process embedding; cgo + macOS SDK; used only if the vz provider is built |
 | Guest vsock listener | `github.com/mdlayher/vsock` | `vsock.Listen` → `net.Listener` for gRPC (guest, linux) |
-| Linux VM backend (Phase 6) | `github.com/firecracker-microvm/firecracker-go-sdk` | host `AF_VSOCK` to guest CID |
+| Linux VM backend (Phase 7) | `github.com/firecracker-microvm/firecracker-go-sdk` | host `AF_VSOCK` to guest CID |
 | gRPC | `google.golang.org/grpc` + `google.golang.org/protobuf` | control protocol (§6.5) |
 | Proto codegen | `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc` | or `buf`; run via Nix/CI |
 | Container runtime client | `github.com/containerd/containerd/v2/client` | guest, drives containerd (§6.10) |
@@ -1006,7 +1007,7 @@ bit-for-bit.
 - **Cheap updates:** bumping the kernel or any package is a one-line input/lock change —
   important because the guest kernel is the security boundary and needs timely patching.
 - **Linux backend bonus:** `microvm.nix` is purpose-built for minimal NixOS microVMs on
-  firecracker / cloud-hypervisor / qemu — nearly turnkey for the Phase 6 Linux provider.
+  firecracker / cloud-hypervisor / qemu — nearly turnkey for the Phase 7 Linux provider.
 
 ### 11.3 The macOS build caveat (settled: build in CI)
 Apple's Virtualization.framework is **not** a `microvm.nix` backend, and building
@@ -1253,17 +1254,22 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - [x] **Done when:** N runs execute concurrently with isolated patches/logs, `attach` shows live output, and (with `--on-question=wait`) a stubbed agent question drives a `waiting` state that `krayt answer` resolves. ✅ *(`TestConcurrentRuns` + `TestAttachLive` + `TestQuestionWaitAnswer`, all against the fakeProvider; race-clean.)*
 
 ### Phase 5 — Polish & optional orchestration
-- [ ] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats, questions; agent notes if the image writes `/output/report.md`).
-- [ ] `ask_human` front-ends (§6.13): in-VM MCP server + `krayt-ask` CLI, both bridging to the Phase-4 question channel.
-- [ ] Guest **"question resolved"** `RunEvent` (§6.13): emitted when `bridge.Answer` delivers, so the host flips `waiting`→`running` precisely on answer instead of holding `waiting` until the run ends (proto addition; folds into this phase's image rebuild). *(Phase-4 interim: a run stays `waiting` until terminal — the host never infers resumption from logs.)*
-- [ ] Optional agent adapters (`claude-code`, `gemini-cli`) — incl. registering the MCP server / wiring `krayt-ask` when `--on-question=wait`.
-- [ ] Claude Code adapter maps the provided credential to the correct env var (`ANTHROPIC_API_KEY` vs `CLAUDE_CODE_OAUTH_TOKEN`) and enforces exactly-one auth, failing fast if both are set (§6.14).
+- [x] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats, questions; agent notes if the image writes `/output/report.md`). *(Host-side, fakeProvider-proven: `RunRecord` is the full §8.4 schema; `report.go` renders the fixed-section report and folds the agent's `/output/report.md` into Notes; patch diffstat via `patch.Stat` (`git apply --numstat`). `TestReportAndMeta` + `TestReportPrefersAgentNotes`.)*
+- [x] `krayt-ask` CLI front-end (§6.13): a small in-container binary any agent can shell out to (`krayt-ask [--choices a,b] "question"`), bridging to the Phase-4 question channel over the mounted unix socket; prints the answer on stdout (exit 0) or a no-answer sentinel (exit 2) so the agent falls back. *(`cmd/krayt-ask`, reusing `ask.OverSocket`; `TestRunSentinelWhenUnreachable`/`TestRunUsage`, round-trip `TestRunRoundTrip` skips under the sandbox's blocked `bind(2)` — HUMAN-verified on hardware. Built into the image via `flake.nix`; container placement is a HUMAN handoff.)*
+- [x] Optional agent adapters (`internal/adapter`: `none`/`claude-code`/`gemini-cli`) — host-side pre-flight (`--agent` flag + `agent.adapter`) that validates auth and wires `krayt-ask` (`KRAYT_ASK_SOCKET`) when `--on-question=wait`. *(In-container credential export + agent launch run in the image entrypoint (§8.2) and need live keys — HUMAN. MCP-server registration is Phase 6.)*
+- [x] Claude Code adapter maps the provided credential to the correct env var (`ANTHROPIC_API_KEY` vs `CLAUDE_CODE_OAUTH_TOKEN`) and enforces exactly-one auth, failing fast if both are set (§6.14). *(`claude-code` adapter, exactly-one over the recognized keys; wired into `krayt run` before any VM boot. `TestClaudeCodeExactlyOne` + `TestApplyAdapterAuthGate`/`TestApplyAdapterWiresAsk`.)*
 - [ ] **Detached supervisor — "park and walk away" (§6.2):** `krayt run --detach` double-forks a per-run supervisor (no central daemon) that owns the VM to completion, so a run can be started, the terminal closed, the `waiting` notification received later, and resolved with `krayt answer`. Cross-process max-concurrency via a shared limit under `.krayt/`. Reuses the Phase-4 on-disk state + management commands unchanged; localized to the run entrypoint.
 - [ ] Warm-VM pool to amortize boot time (optional) — shares the same cross-process coordination as the detached supervisor above.
-- [ ] Patch safety lint (flag hooks/suspicious changes).
-- [ ] **Done when:** a real agent image completes a task and the run dir contains patch + report + meta; with the adapter + `--on-question=wait`, the agent's `ask_human` call round-trips to `krayt answer`; and a `--detach`ed run survives its launching process — its `waiting` question is answerable from a separate invocation after the terminal closes. **[HUMAN: live API keys for the agent image]**
+- [x] Patch safety lint (flag hooks/suspicious changes). *(`patch.Lint` flags changes that execute outside the workspace edit — git hooks, CI config, shell startup files, direnv, newly-executable files — surfaced in `meta.json` `safety`, report.md's Safety section, and a `krayt run` warning. `TestLint`.)*
+- [ ] **Done when:** a real agent image completes a task and the run dir contains patch + report + meta; with the adapter + `--on-question=wait`, an agent's `krayt-ask` call round-trips to `krayt answer`; and a `--detach`ed run survives its launching process — its `waiting` question is answerable from a separate invocation after the terminal closes. **[HUMAN: live API keys for the agent image]** *(The premium MCP front-end and precise `waiting`→`running` resume are Phase 6.)*
 
-### Phase 6 — Linux backend (parity)
+### Phase 6 — `ask_human` MCP front-end & precise resume
+Both items need a `.proto`/image change, so they share one guest image rebuild and one HUMAN gate — carved out of Phase 5 to keep that phase fully host-provable.
+- [ ] In-VM `ask_human` **MCP server** (§6.13): a tiny MCP server krayt runs inside the VM exposing one tool — `ask_human{ question, choices?, context? }` — bridged to the question channel. The premium path for MCP-speaking agents; its tool *description* steers *when* to ask. The adapter registers it only when `--on-question=wait`. **[decision: no MCP SDK is pinned in §9.1 — add one, or hand-roll a minimal JSON-RPC-over-stdio server]**
+- [ ] Guest **"question resolved"** `RunEvent` (§6.13): emitted when `bridge.Answer` delivers, so the host flips `waiting`→`running` precisely on answer instead of holding `waiting` until the run ends (proto addition). *(Phase-4/5 interim: a run stays `waiting` until terminal — the host never infers resumption from logs.)*
+- [ ] **Done when:** on a rebuilt image with the adapter + `--on-question=wait`, an agent's `ask_human` **MCP tool call** round-trips to `krayt answer`, and the run flips `waiting`→`running` precisely when the answer lands (not on the next log line). **[HUMAN: proto regen (codegen toolchain) + image rebuild + live API keys]**
+
+### Phase 7 — Linux backend (parity)
 - [ ] `firecracker` provider behind the same `Provider` interface (`CID`-based vsock).
 - [ ] `/dev/kvm` detection + graceful messaging in `doctor`.
 - [ ] Reuse guest-agent, protocol, patch, secrets, orchestrator unchanged.

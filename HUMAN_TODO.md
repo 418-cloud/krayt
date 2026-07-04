@@ -227,3 +227,46 @@ below block only that on-hardware confirmation.
   `hack/ask-probe` confirmation (above) runs.
 - Blocking: yes — every on-hardware run (incl. the ask-probe confirmation) needs the rebuilt,
   re-pinned image; the automated fakeProvider proofs do not.
+
+## [Phase 5] `krayt-ask` container placement + image rebuild
+- Needed: (1) rebuild + re-pin the VM image so it includes the new `krayt-ask` binary —
+  `images/flake.nix` now builds `cmd/krayt-ask` into the guest-agent derivation
+  (`${guest-agent}/bin/krayt-ask`); `vendorHash` is **unchanged** (no new module deps).
+  (2) Bind-mount that binary into the container on `PATH` so an agent can invoke `krayt-ask`,
+  and wire the guest to do it (mirrors the ask-socket mount in
+  `internal/guest/runner/containerd_linux.go`: add a `RunConfig.AskBinary` path, have the
+  Service resolve it next to the guest-agent executable, and mount it read-only).
+- Why the agent can't: needs an aarch64-linux Nix builder (no Nix in the sandbox) to rebuild
+  the image; and the container mount destination is image-dependent (a `scratch`/distroless
+  image has no `/usr/local/bin`), so the exact `PATH` placement must be chosen and validated
+  against a real image — the fakeProvider runner does not perform mounts.
+- Exact steps/commands:
+  1. Decide the mount destination. Recommended: mount at `/run/krayt/bin/krayt-ask` (a dir
+     krayt already owns) and prepend `/run/krayt/bin` to the container `PATH` (or set the
+     adapter env `KRAYT_ASK_BIN`), avoiding reliance on `/usr/local/bin` existing.
+  2. Implement the mount + `RunConfig.AskBinary` wiring in the guest runner; the host path is
+     `filepath.Join(filepath.Dir(os.Executable()), "krayt-ask")` inside the VM.
+  3. Rebuild + re-pin the image (same procedure as the Phase 4 image entry above).
+- Verify success by: in a `--on-question=wait` run, `krayt-ask "…"` inside the container
+  prints the answer supplied by `krayt answer` (exit 0); with `--on-question=fail`, it exits 2
+  immediately. The `hack/ask-probe` runbook can be extended to shell out to `krayt-ask`.
+- Blocking: no — the `krayt-ask` binary, its client logic, the exit-code contract, and the
+  adapter's `KRAYT_ASK_SOCKET` wiring are all proven host-side
+  (`cmd/krayt-ask` tests + `internal/cli` adapter tests); only the in-container round-trip on
+  real hardware is deferred.
+
+## [Phase 5] Agent adapter end-to-end with live credentials
+- Needed: exercise a real agent image (`--agent claude-code`) with a live credential in the
+  secrets file, confirming the container entrypoint exports the resolved credential from
+  `/run/secrets` into the environment (§8.2/§6.14) and the agent authenticates and runs.
+- Why the agent can't: needs a live `ANTHROPIC_API_KEY` (or `CLAUDE_CODE_OAUTH_TOKEN`) and a
+  real agent image on hardware; the sandbox has neither.
+- Exact steps/commands: `krayt run --agent claude-code --secrets ./secrets.env --image
+  <claude-code-image> --task ./task.md`; put exactly one of `ANTHROPIC_API_KEY` /
+  `CLAUDE_CODE_OAUTH_TOKEN` in `secrets.env`. Confirm the run fails fast (before boot) if both
+  are present.
+- Verify success by: the run completes with a patch + report + meta; the exactly-one guard
+  rejects a two-credential secrets file with a clear error (`§6.14`) before any VM boots.
+- Blocking: no — the host-side auth gate + `krayt-ask` env wiring are proven
+  (`TestClaudeCodeExactlyOne`, `TestApplyAdapterAuthGate`, `TestApplyAdapterWiresAsk`); the
+  live-credential run is part of the Phase 5 "Done when".

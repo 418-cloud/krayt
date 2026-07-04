@@ -10,9 +10,12 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/418-cloud/krayt/internal/adapter"
+	"github.com/418-cloud/krayt/internal/guest"
 	"github.com/418-cloud/krayt/internal/imagestore"
 	"github.com/418-cloud/krayt/internal/orchestrator"
 	"github.com/418-cloud/krayt/internal/provider"
+	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
@@ -46,6 +49,8 @@ type runFlags struct {
 	onQuestion        string        // fail | wait (§6.13)
 	questionTimeout   time.Duration // per-question wait limit
 	onQuestionTimeout string        // sentinel | abort
+
+	agent string // none | claude-code | gemini-cli (§6.14, §8.1)
 }
 
 func newRunCmd() *cobra.Command {
@@ -83,6 +88,7 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.StringVar(&f.onQuestion, "on-question", "fail", "agent question mode: fail (autonomous) | wait (pause for input)")
 	fl.DurationVar(&f.questionTimeout, "question-timeout", 10*time.Minute, "per-question wait timeout")
 	fl.StringVar(&f.onQuestionTimeout, "on-question-timeout", "sentinel", "on question timeout: sentinel | abort")
+	fl.StringVar(&f.agent, "agent", "none", "agent adapter: none | claude-code | gemini-cli")
 }
 
 func runRun(cmd *cobra.Command, f *runFlags) error {
@@ -150,7 +156,14 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		Questions: task.QuestionsPolicy{Mode: qMode, Timeout: f.questionTimeout, OnTimeout: qOnTimeout},
 	}
 
-	// OS-specific provider + base VM image (vfkit on macOS; error elsewhere until Phase 6).
+	// Optional per-agent adapter (§6.14): validate auth (exactly-one, fail fast before any VM
+	// boots or image pull) and merge its env additions — e.g. wiring krayt-ask when questions
+	// are enabled — under the user's env, which wins.
+	if err := applyAdapter(&spec, f.agent); err != nil {
+		return err
+	}
+
+	// OS-specific provider + base VM image (vfkit on macOS; error elsewhere until Phase 7).
 	deps, err := newRunDeps()
 	if err != nil {
 		return err
@@ -192,6 +205,44 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	}
 	_, err = fmt.Fprint(cmd.OutOrStdout(), summary)
 	return err
+}
+
+// applyAdapter runs the optional per-agent adapter's host-side pre-flight (§6.14): it reads the
+// per-task secret key names (never values), enforces the agent's exactly-one auth rule, and
+// merges the adapter's non-secret env additions (e.g. the krayt-ask socket) under spec.Env so a
+// user-set value always wins. Called before the VM boots so a bad credential set fails fast.
+func applyAdapter(spec *task.RunSpec, name string) error {
+	ad, err := adapter.Get(name)
+	if err != nil {
+		return err
+	}
+	var secretKeys []string
+	if spec.SecretsPath != "" {
+		vals, err := secrets.Load(spec.SecretsPath)
+		if err != nil {
+			return fmt.Errorf("read secrets: %w", err)
+		}
+		for k := range vals {
+			secretKeys = append(secretKeys, k)
+		}
+	}
+	plan, err := ad.Prepare(adapter.Input{
+		SecretKeys:    secretKeys,
+		QuestionsWait: spec.Questions.Mode == task.QuestionWait,
+		AskSocket:     guest.ContainerAskSocket,
+	})
+	if err != nil {
+		return err
+	}
+	if len(plan.Env) > 0 && spec.Env == nil {
+		spec.Env = map[string]string{}
+	}
+	for k, v := range plan.Env {
+		if _, set := spec.Env[k]; !set {
+			spec.Env[k] = v
+		}
+	}
+	return nil
 }
 
 // acquireUserImage pulls the user image into the host cache and returns it (§6.11).
@@ -274,6 +325,7 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 		}
 		f.timeout = d
 	}
+	str("agent", cfg.Agent.Adapter, &f.agent)
 	str("on-question", cfg.Questions.Mode, &f.onQuestion)
 	str("on-question-timeout", cfg.Questions.OnTimeout, &f.onQuestionTimeout)
 	if !changed("question-timeout") && cfg.Questions.Timeout != "" {
