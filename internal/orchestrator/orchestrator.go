@@ -400,10 +400,14 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 				continue
 			}
 			outstanding++
-			setState(StateWaiting)
+			// Persist the question BEFORE announcing `waiting`, so any observer that sees the
+			// waiting state — a test, or a cross-process `krayt answer` reading the newest
+			// question — is guaranteed to find it on disk (§6.13). Otherwise there's a window
+			// where the state is `waiting` but the question file isn't written yet.
 			if err := writeQuestion(runDir, q); err != nil {
 				return 0, false, err
 			}
+			setState(StateWaiting)
 			notifyWaiting(filepath.Base(runDir), q.GetPrompt())
 			if to := spec.Questions.Timeout; to > 0 {
 				armQuestionTimeout(ctx, client, spec, runDir, q.GetId(), to, &aborted, streamCancel)
