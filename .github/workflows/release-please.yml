@@ -1,0 +1,67 @@
+name: Release Please
+
+# release-please maintains a "release PR" that bumps the version + CHANGELOG from Conventional
+# Commits; merging it cuts the release (tag `vX.Y.Z` + GitHub Release). The CLI binaries are built
+# and uploaded in the same run (gated on release_created), so no PAT is needed — the default
+# GITHUB_TOKEN can't trigger a *separate* tag-driven workflow, but this runs in-workflow.
+#
+# The VM image releases on its own `vmimage-v*` tags (see .github/workflows/image.yml); the CLI
+# pins its digest via internal/vmimage/pinned.go. See RELEASING.md.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  cli-release:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload release assets
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      # Pure-Go (CGO off): one Linux runner cross-builds the macOS binaries. arm64 is the
+      # supported target; amd64 builds but is untested (see README). Linux lands with Phase 7.
+      - name: Build krayt (darwin/arm64, darwin/amd64)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w" -o dist/krayt ./cmd/krayt
+            tar -C dist -czf "dist/krayt_${TAG}_darwin_${arch}.tar.gz" krayt
+            rm dist/krayt
+          done
+          (cd dist && sha256sum *.tar.gz > checksums.txt)
+
+      - name: Upload binaries to the release
+        run: gh release upload "$TAG" dist/krayt_*.tar.gz dist/checksums.txt --clobber
