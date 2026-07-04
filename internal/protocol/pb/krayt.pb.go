@@ -567,6 +567,7 @@ type RunEvent struct {
 	//	*RunEvent_Log
 	//	*RunEvent_Status
 	//	*RunEvent_Question
+	//	*RunEvent_Resolved
 	Kind          isRunEvent_Kind `protobuf_oneof:"kind"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -636,6 +637,15 @@ func (x *RunEvent) GetQuestion() *Question {
 	return nil
 }
 
+func (x *RunEvent) GetResolved() *Resolved {
+	if x != nil {
+		if x, ok := x.Kind.(*RunEvent_Resolved); ok {
+			return x.Resolved
+		}
+	}
+	return nil
+}
+
 type isRunEvent_Kind interface {
 	isRunEvent_Kind()
 }
@@ -652,11 +662,17 @@ type RunEvent_Question struct {
 	Question *Question `protobuf:"bytes,3,opt,name=question,proto3,oneof"` // agent paused to ask the human (§6.13); not terminal
 }
 
+type RunEvent_Resolved struct {
+	Resolved *Resolved `protobuf:"bytes,4,opt,name=resolved,proto3,oneof"` // a question was answered (§6.13); host flips waiting→running
+}
+
 func (*RunEvent_Log) isRunEvent_Kind() {}
 
 func (*RunEvent_Status) isRunEvent_Kind() {}
 
 func (*RunEvent_Question) isRunEvent_Kind() {}
+
+func (*RunEvent_Resolved) isRunEvent_Kind() {}
 
 type LogLine struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -907,6 +923,54 @@ func (x *AnswerRequest) GetNoAnswer() bool {
 	return false
 }
 
+// A pending Question was answered — the host called Answer, the timeout sentinel fired, or a
+// separate `krayt answer` process dialed the guest — so the agent's ask_human call returned. The
+// guest emits it when bridge.Answer delivers; the host flips the run waiting→running precisely,
+// independent of who answered (§6.13).
+type Resolved struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	QuestionId    string                 `protobuf:"bytes,1,opt,name=question_id,json=questionId,proto3" json:"question_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Resolved) Reset() {
+	*x = Resolved{}
+	mi := &file_krayt_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Resolved) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Resolved) ProtoMessage() {}
+
+func (x *Resolved) ProtoReflect() protoreflect.Message {
+	mi := &file_krayt_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Resolved.ProtoReflect.Descriptor instead.
+func (*Resolved) Descriptor() ([]byte, []int) {
+	return file_krayt_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *Resolved) GetQuestionId() string {
+	if x != nil {
+		return x.QuestionId
+	}
+	return ""
+}
+
 type CollectRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -915,7 +979,7 @@ type CollectRequest struct {
 
 func (x *CollectRequest) Reset() {
 	*x = CollectRequest{}
-	mi := &file_krayt_proto_msgTypes[14]
+	mi := &file_krayt_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -927,7 +991,7 @@ func (x *CollectRequest) String() string {
 func (*CollectRequest) ProtoMessage() {}
 
 func (x *CollectRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_krayt_proto_msgTypes[14]
+	mi := &file_krayt_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -940,7 +1004,7 @@ func (x *CollectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CollectRequest.ProtoReflect.Descriptor instead.
 func (*CollectRequest) Descriptor() ([]byte, []int) {
-	return file_krayt_proto_rawDescGZIP(), []int{14}
+	return file_krayt_proto_rawDescGZIP(), []int{15}
 }
 
 type Ack struct {
@@ -953,7 +1017,7 @@ type Ack struct {
 
 func (x *Ack) Reset() {
 	*x = Ack{}
-	mi := &file_krayt_proto_msgTypes[15]
+	mi := &file_krayt_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -965,7 +1029,7 @@ func (x *Ack) String() string {
 func (*Ack) ProtoMessage() {}
 
 func (x *Ack) ProtoReflect() protoreflect.Message {
-	mi := &file_krayt_proto_msgTypes[15]
+	mi := &file_krayt_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -978,7 +1042,7 @@ func (x *Ack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ack.ProtoReflect.Descriptor instead.
 func (*Ack) Descriptor() ([]byte, []int) {
-	return file_krayt_proto_rawDescGZIP(), []int{15}
+	return file_krayt_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *Ack) GetOk() bool {
@@ -1003,7 +1067,7 @@ type ShutdownRequest struct {
 
 func (x *ShutdownRequest) Reset() {
 	*x = ShutdownRequest{}
-	mi := &file_krayt_proto_msgTypes[16]
+	mi := &file_krayt_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1015,7 +1079,7 @@ func (x *ShutdownRequest) String() string {
 func (*ShutdownRequest) ProtoMessage() {}
 
 func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_krayt_proto_msgTypes[16]
+	mi := &file_krayt_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1028,7 +1092,7 @@ func (x *ShutdownRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownRequest.ProtoReflect.Descriptor instead.
 func (*ShutdownRequest) Descriptor() ([]byte, []int) {
-	return file_krayt_proto_rawDescGZIP(), []int{16}
+	return file_krayt_proto_rawDescGZIP(), []int{17}
 }
 
 var File_krayt_proto protoreflect.FileDescriptor
@@ -1069,11 +1133,12 @@ const file_krayt_proto_rawDesc = "" +
 	"\x04NONE\x10\x02\"N\n" +
 	"\fStartRequest\x12\x1b\n" +
 	"\timage_ref\x18\x01 \x01(\tR\bimageRef\x12!\n" +
-	"\ftimeout_secs\x18\x02 \x01(\rR\vtimeoutSecs\"\x97\x01\n" +
+	"\ftimeout_secs\x18\x02 \x01(\rR\vtimeoutSecs\"\xc9\x01\n" +
 	"\bRunEvent\x12%\n" +
 	"\x03log\x18\x01 \x01(\v2\x11.krayt.v1.LogLineH\x00R\x03log\x12*\n" +
 	"\x06status\x18\x02 \x01(\v2\x10.krayt.v1.StatusH\x00R\x06status\x120\n" +
-	"\bquestion\x18\x03 \x01(\v2\x12.krayt.v1.QuestionH\x00R\bquestionB\x06\n" +
+	"\bquestion\x18\x03 \x01(\v2\x12.krayt.v1.QuestionH\x00R\bquestion\x120\n" +
+	"\bresolved\x18\x04 \x01(\v2\x12.krayt.v1.ResolvedH\x00R\bresolvedB\x06\n" +
 	"\x04kind\"\x8f\x01\n" +
 	"\aLogLine\x120\n" +
 	"\x06stream\x18\x01 \x01(\x0e2\x18.krayt.v1.LogLine.StreamR\x06stream\x12\x12\n" +
@@ -1098,7 +1163,10 @@ const file_krayt_proto_rawDesc = "" +
 	"\vquestion_id\x18\x01 \x01(\tR\n" +
 	"questionId\x12\x1a\n" +
 	"\bresponse\x18\x02 \x01(\tR\bresponse\x12\x1b\n" +
-	"\tno_answer\x18\x03 \x01(\bR\bnoAnswer\"\x10\n" +
+	"\tno_answer\x18\x03 \x01(\bR\bnoAnswer\"+\n" +
+	"\bResolved\x12\x1f\n" +
+	"\vquestion_id\x18\x01 \x01(\tR\n" +
+	"questionId\"\x10\n" +
 	"\x0eCollectRequest\"+\n" +
 	"\x03Ack\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
@@ -1131,7 +1199,7 @@ func file_krayt_proto_rawDescGZIP() []byte {
 }
 
 var file_krayt_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_krayt_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_krayt_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_krayt_proto_goTypes = []any{
 	(NetworkPolicy_Mode)(0), // 0: krayt.v1.NetworkPolicy.Mode
 	(LogLine_Stream)(0),     // 1: krayt.v1.LogLine.Stream
@@ -1149,47 +1217,49 @@ var file_krayt_proto_goTypes = []any{
 	(*Status)(nil),          // 13: krayt.v1.Status
 	(*Question)(nil),        // 14: krayt.v1.Question
 	(*AnswerRequest)(nil),   // 15: krayt.v1.AnswerRequest
-	(*CollectRequest)(nil),  // 16: krayt.v1.CollectRequest
-	(*Ack)(nil),             // 17: krayt.v1.Ack
-	(*ShutdownRequest)(nil), // 18: krayt.v1.ShutdownRequest
-	nil,                     // 19: krayt.v1.TaskSpec.EnvEntry
-	nil,                     // 20: krayt.v1.SecretsBundle.ValuesEntry
+	(*Resolved)(nil),        // 16: krayt.v1.Resolved
+	(*CollectRequest)(nil),  // 17: krayt.v1.CollectRequest
+	(*Ack)(nil),             // 18: krayt.v1.Ack
+	(*ShutdownRequest)(nil), // 19: krayt.v1.ShutdownRequest
+	nil,                     // 20: krayt.v1.TaskSpec.EnvEntry
+	nil,                     // 21: krayt.v1.SecretsBundle.ValuesEntry
 }
 var file_krayt_proto_depIdxs = []int32{
-	19, // 0: krayt.v1.TaskSpec.env:type_name -> krayt.v1.TaskSpec.EnvEntry
-	20, // 1: krayt.v1.SecretsBundle.values:type_name -> krayt.v1.SecretsBundle.ValuesEntry
+	20, // 0: krayt.v1.TaskSpec.env:type_name -> krayt.v1.TaskSpec.EnvEntry
+	21, // 1: krayt.v1.SecretsBundle.values:type_name -> krayt.v1.SecretsBundle.ValuesEntry
 	0,  // 2: krayt.v1.NetworkPolicy.mode:type_name -> krayt.v1.NetworkPolicy.Mode
 	12, // 3: krayt.v1.RunEvent.log:type_name -> krayt.v1.LogLine
 	13, // 4: krayt.v1.RunEvent.status:type_name -> krayt.v1.Status
 	14, // 5: krayt.v1.RunEvent.question:type_name -> krayt.v1.Question
-	1,  // 6: krayt.v1.LogLine.stream:type_name -> krayt.v1.LogLine.Stream
-	2,  // 7: krayt.v1.GuestAgent.Hello:input_type -> krayt.v1.HelloRequest
-	4,  // 8: krayt.v1.GuestAgent.QueryImageBlobs:input_type -> krayt.v1.BlobQuery
-	6,  // 9: krayt.v1.GuestAgent.PushImage:input_type -> krayt.v1.Chunk
-	6,  // 10: krayt.v1.GuestAgent.PushCode:input_type -> krayt.v1.Chunk
-	7,  // 11: krayt.v1.GuestAgent.PushTask:input_type -> krayt.v1.TaskSpec
-	8,  // 12: krayt.v1.GuestAgent.PushSecrets:input_type -> krayt.v1.SecretsBundle
-	9,  // 13: krayt.v1.GuestAgent.SetNetworkPolicy:input_type -> krayt.v1.NetworkPolicy
-	10, // 14: krayt.v1.GuestAgent.Start:input_type -> krayt.v1.StartRequest
-	16, // 15: krayt.v1.GuestAgent.CollectArtifacts:input_type -> krayt.v1.CollectRequest
-	15, // 16: krayt.v1.GuestAgent.Answer:input_type -> krayt.v1.AnswerRequest
-	18, // 17: krayt.v1.GuestAgent.Shutdown:input_type -> krayt.v1.ShutdownRequest
-	3,  // 18: krayt.v1.GuestAgent.Hello:output_type -> krayt.v1.HelloResponse
-	5,  // 19: krayt.v1.GuestAgent.QueryImageBlobs:output_type -> krayt.v1.BlobPresence
-	17, // 20: krayt.v1.GuestAgent.PushImage:output_type -> krayt.v1.Ack
-	17, // 21: krayt.v1.GuestAgent.PushCode:output_type -> krayt.v1.Ack
-	17, // 22: krayt.v1.GuestAgent.PushTask:output_type -> krayt.v1.Ack
-	17, // 23: krayt.v1.GuestAgent.PushSecrets:output_type -> krayt.v1.Ack
-	17, // 24: krayt.v1.GuestAgent.SetNetworkPolicy:output_type -> krayt.v1.Ack
-	11, // 25: krayt.v1.GuestAgent.Start:output_type -> krayt.v1.RunEvent
-	6,  // 26: krayt.v1.GuestAgent.CollectArtifacts:output_type -> krayt.v1.Chunk
-	17, // 27: krayt.v1.GuestAgent.Answer:output_type -> krayt.v1.Ack
-	17, // 28: krayt.v1.GuestAgent.Shutdown:output_type -> krayt.v1.Ack
-	18, // [18:29] is the sub-list for method output_type
-	7,  // [7:18] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	16, // 6: krayt.v1.RunEvent.resolved:type_name -> krayt.v1.Resolved
+	1,  // 7: krayt.v1.LogLine.stream:type_name -> krayt.v1.LogLine.Stream
+	2,  // 8: krayt.v1.GuestAgent.Hello:input_type -> krayt.v1.HelloRequest
+	4,  // 9: krayt.v1.GuestAgent.QueryImageBlobs:input_type -> krayt.v1.BlobQuery
+	6,  // 10: krayt.v1.GuestAgent.PushImage:input_type -> krayt.v1.Chunk
+	6,  // 11: krayt.v1.GuestAgent.PushCode:input_type -> krayt.v1.Chunk
+	7,  // 12: krayt.v1.GuestAgent.PushTask:input_type -> krayt.v1.TaskSpec
+	8,  // 13: krayt.v1.GuestAgent.PushSecrets:input_type -> krayt.v1.SecretsBundle
+	9,  // 14: krayt.v1.GuestAgent.SetNetworkPolicy:input_type -> krayt.v1.NetworkPolicy
+	10, // 15: krayt.v1.GuestAgent.Start:input_type -> krayt.v1.StartRequest
+	17, // 16: krayt.v1.GuestAgent.CollectArtifacts:input_type -> krayt.v1.CollectRequest
+	15, // 17: krayt.v1.GuestAgent.Answer:input_type -> krayt.v1.AnswerRequest
+	19, // 18: krayt.v1.GuestAgent.Shutdown:input_type -> krayt.v1.ShutdownRequest
+	3,  // 19: krayt.v1.GuestAgent.Hello:output_type -> krayt.v1.HelloResponse
+	5,  // 20: krayt.v1.GuestAgent.QueryImageBlobs:output_type -> krayt.v1.BlobPresence
+	18, // 21: krayt.v1.GuestAgent.PushImage:output_type -> krayt.v1.Ack
+	18, // 22: krayt.v1.GuestAgent.PushCode:output_type -> krayt.v1.Ack
+	18, // 23: krayt.v1.GuestAgent.PushTask:output_type -> krayt.v1.Ack
+	18, // 24: krayt.v1.GuestAgent.PushSecrets:output_type -> krayt.v1.Ack
+	18, // 25: krayt.v1.GuestAgent.SetNetworkPolicy:output_type -> krayt.v1.Ack
+	11, // 26: krayt.v1.GuestAgent.Start:output_type -> krayt.v1.RunEvent
+	6,  // 27: krayt.v1.GuestAgent.CollectArtifacts:output_type -> krayt.v1.Chunk
+	18, // 28: krayt.v1.GuestAgent.Answer:output_type -> krayt.v1.Ack
+	18, // 29: krayt.v1.GuestAgent.Shutdown:output_type -> krayt.v1.Ack
+	19, // [19:30] is the sub-list for method output_type
+	8,  // [8:19] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_krayt_proto_init() }
@@ -1201,6 +1271,7 @@ func file_krayt_proto_init() {
 		(*RunEvent_Log)(nil),
 		(*RunEvent_Status)(nil),
 		(*RunEvent_Question)(nil),
+		(*RunEvent_Resolved)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1208,7 +1279,7 @@ func file_krayt_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_krayt_proto_rawDesc), len(file_krayt_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   19,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

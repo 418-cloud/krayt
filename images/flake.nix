@@ -34,10 +34,11 @@
       # the module dependency set changed again — vendorHash MUST be regenerated (set it to
       # lib.fakeHash, build, paste the reported got: sha256-… below). The guest-agent itself
       # doesn't import yaml, but buildGoModule vendors the whole module's go.sum.
-      # Phase 5 added cmd/krayt-ask (the in-container question front-end, §6.13). It imports
-      # only internal/guest/ask + stdlib (already vendored), so the vendorHash is unchanged; it
-      # is bind-mounted into the container at run time (see HUMAN_TODO "[Phase 5] krayt-ask
-      # container placement").
+      # Phase 5 added cmd/krayt-ask (the in-container question front-end, §6.13), bind-mounted into
+      # the container at run time.
+      # Phase 6 gave cmd/krayt-ask an `--mcp` mode built on github.com/modelcontextprotocol/go-sdk
+      # (§6.13). That is a NEW module dependency vendored into this derivation, so vendorHash MUST
+      # be regenerated again (set it to lib.fakeHash, build, paste the reported got: sha256-…).
       guest-agent = pkgs.buildGoModule {
         pname = "krayt-agent";
         version = "0.0.0-dev";

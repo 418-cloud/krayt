@@ -337,11 +337,11 @@ type controlSocketer interface{ ControlSocket() string }
 // guest, Manager.Answer, or the timeout below). In `fail` mode a question is sentinel-answered
 // immediately so the run never blocks.
 //
-// The run stays `waiting` until it finishes: a log line is NOT a resume signal — an agent can
-// (and does) keep logging while blocked in ask_human — so we do not infer resumption from the
-// stream. Precise `waiting`→`running` on answer needs a guest "question resolved" RunEvent
-// (§6.13, a Phase-5 protocol addition); until then a resolved run simply shows `waiting` until
-// its terminal state.
+// A log line is NOT a resume signal — an agent can (and does) keep logging while blocked in
+// ask_human — so resumption comes only from the guest "question resolved" RunEvent (§6.13),
+// which fires however the question was answered (Answer RPC, a separate `krayt answer` process,
+// or the timeout sentinel). The run is `waiting` while any question is outstanding and flips back
+// to `running` when the last one resolves.
 func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunSpec, logOut io.Writer, runDir string, setState func(string)) (int, bool, error) {
 	var timeoutSecs uint32
 	if spec.Resources.Timeout > 0 {
@@ -361,6 +361,7 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 	defer func() { _ = logFile.Close() }()
 
 	var aborted atomic.Bool
+	var outstanding int // wait-mode questions awaiting an answer; run is `waiting` while > 0
 	for {
 		ev, err := stream.Recv()
 		if err == io.EOF {
@@ -398,6 +399,7 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 				_, _ = client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: q.GetId(), NoAnswer: true})
 				continue
 			}
+			outstanding++
 			setState(StateWaiting)
 			if err := writeQuestion(runDir, q); err != nil {
 				return 0, false, err
@@ -405,6 +407,14 @@ func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunS
 			notifyWaiting(filepath.Base(runDir), q.GetPrompt())
 			if to := spec.Questions.Timeout; to > 0 {
 				armQuestionTimeout(ctx, client, spec, runDir, q.GetId(), to, &aborted, streamCancel)
+			}
+		case *pb.RunEvent_Resolved:
+			// A question was answered (§6.13). Resume only when the last outstanding one clears; a
+			// Resolved with none outstanding is a fail-mode sentinel echo, so it's a no-op.
+			if outstanding > 0 {
+				if outstanding--; outstanding == 0 {
+					setState(StateRunning)
+				}
 			}
 		}
 	}

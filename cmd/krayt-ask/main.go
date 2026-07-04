@@ -27,7 +27,29 @@ const (
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Getenv("KRAYT_ASK_SOCKET"), os.Stdout, os.Stderr))
+	args := os.Args[1:]
+	// `--mcp` switches to the stdio MCP-server front-end (§6.13); bare invocation is the CLI.
+	if hasMCPFlag(args) {
+		socket := os.Getenv("KRAYT_ASK_SOCKET")
+		if socket == "" {
+			socket = defaultSocket
+		}
+		if err := runMCP(socket); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "krayt-ask --mcp:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	os.Exit(run(args, os.Getenv("KRAYT_ASK_SOCKET"), os.Stdout, os.Stderr))
+}
+
+func hasMCPFlag(args []string) bool {
+	for _, a := range args {
+		if a == "--mcp" {
+			return true
+		}
+	}
+	return false
 }
 
 // run is the testable core: it parses args, submits the question over the socket, and maps the

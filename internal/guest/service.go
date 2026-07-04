@@ -282,6 +282,12 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 			Id: id, Prompt: prompt, Choices: choices,
 		}}})
 	})
+	// When a question is answered (by any path — Answer RPC, cross-process `krayt answer`, or the
+	// timeout sentinel), push a Resolved event so the host flips waiting→running precisely (§6.13).
+	// Set before publishing the bridge under s.mu so the read in Bridge.Answer is race-free.
+	bridge.OnResolved(func(id string) {
+		_ = es.send(&pb.RunEvent{Kind: &pb.RunEvent_Resolved{Resolved: &pb.Resolved{QuestionId: id}}})
+	})
 	s.mu.Lock()
 	s.bridge = bridge
 	s.mu.Unlock()

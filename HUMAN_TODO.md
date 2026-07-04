@@ -377,3 +377,28 @@ below block only that on-hardware confirmation.
   `no-answer-sentinel`. (Resolution logic proven host-side by `TestAskBinaryIn`.)
 - Blocking: no other Phase-5 work depends on it, but this is the final clause needed to mark the
   Phase 5 "Done when" fully complete.
+
+## [Phase 6] Rebuild VM image for precise resume + the ask_human MCP server
+- Needed: one base image rebuild carrying both Phase-6 pieces, then a hardware round-trip.
+  1. `make proto` regen is already committed (`RunEvent.Resolved`); the **guest-agent** now emits
+     the Resolved event, so a rebuild ships the precise `waiting`→`running` resume on-VM.
+  2. `cmd/krayt-ask --mcp` (the MCP server) is built into the image; it pulls a **new** module
+     (`github.com/modelcontextprotocol/go-sdk`), so the `flake.nix` **`vendorHash` MUST be
+     regenerated** (set `lib.fakeHash`, build, paste the reported `got: sha256-…`).
+  3. Rebuild + re-pin `internal/vmimage/pinned.go`, push/publish.
+- Why the agent can't: aarch64-linux Nix build + the guest is baked into the rootfs (no Nix in
+  the sandbox); the MCP round-trip needs a real MCP-speaking agent + live keys.
+- Exact steps/commands: after the rebuild, rebuild/push the `hack/claude-code` image (its
+  entrypoint now writes an `.mcp.json` registering `krayt-ask --mcp` when `KRAYT_ASK_SOCKET` is
+  set) and run `krayt run --agent claude-code --secrets … --on-question=wait --allow
+  api.anthropic.com` with a task that forces a genuine decision (e.g. "if it's ambiguous whether
+  to target Postgres or SQLite, ask the human"). Answer from a second shell with `krayt answer`.
+- Verify success by: Claude calls the `ask_human` MCP tool → run shows `waiting` → after `krayt
+  answer` the run **flips back to `running`** (not held at waiting) and completes using the
+  answer. Precise-resume + MCP handler are host-proven (`TestQuestionResolvedResumes`,
+  `TestBridgeOnResolved`, `TestAskHumanHandler`).
+- Watch-out: the Claude Code MCP registration is agent-specific glue — the entrypoint uses
+  `--mcp-config <.mcp.json>`; if that flag/format shifted in the installed Claude Code version,
+  adjust the entrypoint (try `claude mcp add ask-human -- krayt-ask --mcp`). This is the one spot
+  that may need a tweak against the live CLI.
+- Blocking: no — closes the Phase 6 "Done when"; nothing else depends on it.

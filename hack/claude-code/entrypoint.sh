@@ -50,10 +50,30 @@ cd "$WORKSPACE"
 git config --global --add safe.directory "$WORKSPACE" 2>/dev/null || true
 git config --global --add safe.directory '*' 2>/dev/null || true
 
+# When questions are enabled the adapter sets KRAYT_ASK_SOCKET (§6.13); register the ask_human
+# MCP server so Claude can ask the human. `krayt-ask --mcp` bridges to that socket. In fail mode
+# the var is unset and no server is registered — the run stays autonomous.
+extra=()
+if [ -n "${KRAYT_ASK_SOCKET:-}" ] && command -v krayt-ask >/dev/null 2>&1; then
+  cat > /tmp/krayt-mcp.json <<EOF
+{
+  "mcpServers": {
+    "ask-human": {
+      "command": "krayt-ask",
+      "args": ["--mcp"],
+      "env": { "KRAYT_ASK_SOCKET": "${KRAYT_ASK_SOCKET}" }
+    }
+  }
+}
+EOF
+  extra+=(--mcp-config /tmp/krayt-mcp.json)
+  echo "[claude-code] registered ask_human MCP server (questions enabled)"
+fi
+
 echo "[claude-code] running claude -p in $(pwd) (model: ${ANTHROPIC_MODEL:-default})"
 # Print/headless mode with autonomous edits — safe because the whole run is already isolated in
 # the krayt micro-VM, so the tool-permission prompts add nothing. Claude reads ANTHROPIC_MODEL
 # from the environment if set. Tee its final summary into /output/report.md so it surfaces in the
 # krayt report's Notes; pipefail keeps the pipeline's exit code Claude's, not tee's.
-claude -p "$(cat "$TASK_FILE")" --dangerously-skip-permissions | tee /output/report.md
+claude -p "$(cat "$TASK_FILE")" --dangerously-skip-permissions "${extra[@]}" | tee /output/report.md
 echo "[claude-code] done"

@@ -36,7 +36,8 @@ type answer struct {
 // one run. push sends the question to the host (the guest-agent wraps it as a
 // RunEvent.Question on the Start stream); it must be safe for concurrent use.
 type Bridge struct {
-	push func(id, prompt string, choices []string) error
+	push       func(id, prompt string, choices []string) error
+	onResolved func(id string)
 
 	mu      sync.Mutex
 	seq     int
@@ -47,6 +48,12 @@ type Bridge struct {
 func NewBridge(push func(id, prompt string, choices []string) error) *Bridge {
 	return &Bridge{push: push, pending: map[string]chan answer{}}
 }
+
+// OnResolved registers a callback invoked when a pending question is answered (§6.13), so the
+// guest can push a "question resolved" event to the host. Set once before the Bridge handles any
+// Answer; the guest-agent orders it before publishing the bridge under its mutex, so the read in
+// Answer is race-free.
+func (b *Bridge) OnResolved(fn func(id string)) { b.onResolved = fn }
 
 // Ask registers a question, pushes it to the host, and blocks until the host answers it or
 // ctx is done (the run being torn down → treated as a no-answer sentinel so the caller can
@@ -87,6 +94,9 @@ func (b *Bridge) Answer(id, response string, noAnswer bool) bool {
 	}
 	select {
 	case ch <- answer{response: response, noAnswer: noAnswer}:
+		if b.onResolved != nil {
+			b.onResolved(id) // tell the host the question resolved so it flips waiting→running (§6.13)
+		}
 		return true
 	default:
 		return false // already answered

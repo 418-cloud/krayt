@@ -920,6 +920,7 @@ at implementation time; major versions shown where they matter.)
 | Egress proxy (optional) | `github.com/elazarl/goproxy` | or hand-rolled CONNECT proxy (§6.6) |
 | CLI | `github.com/spf13/cobra` (+ `spf13/pflag`) | command surface (§13) |
 | Config | `gopkg.in/yaml.v3` | task config file (§8.1) |
+| `ask_human` MCP server | `github.com/modelcontextprotocol/go-sdk` (v1.2.0, `/mcp`) | stdio MCP server for `krayt-ask --mcp` (§6.13, Phase 6); pulled only by `cmd/krayt-ask`, so it vendors into the guest-agent image → regenerate `flake.nix` `vendorHash` |
 
 Build constraints: `internal/provider/vfkit` and `internal/provider/vz` are
 `//go:build darwin` (vfkit is pure-Go host-side; the vz fallback adds cgo). `internal/guest`
@@ -1273,9 +1274,9 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 
 ### Phase 6 — `ask_human` MCP front-end & precise resume
 Both items need a `.proto`/image change, so they share one guest image rebuild and one HUMAN gate — carved out of Phase 5 to keep that phase fully host-provable.
-- [ ] In-VM `ask_human` **MCP server** (§6.13): a tiny MCP server krayt runs inside the VM exposing one tool — `ask_human{ question, choices?, context? }` — bridged to the question channel. The premium path for MCP-speaking agents; its tool *description* steers *when* to ask. The adapter registers it only when `--on-question=wait`. **[decision: no MCP SDK is pinned in §9.1 — add one, or hand-roll a minimal JSON-RPC-over-stdio server]**
-- [ ] Guest **"question resolved"** `RunEvent` (§6.13): emitted when `bridge.Answer` delivers, so the host flips `waiting`→`running` precisely on answer instead of holding `waiting` until the run ends (proto addition). *(Phase-4/5 interim: a run stays `waiting` until terminal — the host never infers resumption from logs.)*
-- [ ] **Done when:** on a rebuilt image with the adapter + `--on-question=wait`, an agent's `ask_human` **MCP tool call** round-trips to `krayt answer`, and the run flips `waiting`→`running` precisely when the answer lands (not on the next log line). **[HUMAN: proto regen (codegen toolchain) + image rebuild + live API keys]**
+- [x] In-VM `ask_human` **MCP server** (§6.13): `krayt-ask --mcp` runs a stdio MCP server (official Go SDK) exposing one tool — `ask_human{ question, choices?, context? }` — bridged to the question channel via `ask.OverSocket`; its tool *description* steers *when* to ask, and a no-answer maps to a "proceed autonomously" sentinel. The `claude-code` entrypoint registers it (`.mcp.json` / `--mcp-config`) only when `--on-question=wait` (i.e. `KRAYT_ASK_SOCKET` set). *(Handler host-proven by `TestAskHumanHandler`; on-VM round-trip rides the shared Phase-6 rebuild. Decision resolved: official `github.com/modelcontextprotocol/go-sdk` v1.2.0 (§9.1), for maintainability over bespoke wire code.)*
+- [x] Guest **"question resolved"** `RunEvent` (§6.13): emitted when `bridge.Answer` delivers, so the host flips `waiting`→`running` precisely on answer instead of holding `waiting` until the run ends. *(`RunEvent.Resolved` added to the proto + regenerated; `ask.Bridge.OnResolved` → guest emit; host tracks outstanding questions and resumes at zero — fires for every answer path (Answer RPC / cross-process `krayt answer` / timeout sentinel). Host-proven by `TestQuestionResolvedResumes` + `TestBridgeOnResolved`; existing waiting-state tests still pass. On-VM confirmation rides the shared Phase-6 image rebuild.)*
+- [ ] **Done when:** on a rebuilt image with the adapter + `--on-question=wait`, an agent's `ask_human` **MCP tool call** round-trips to `krayt answer`, and the run flips `waiting`→`running` precisely when the answer lands (not on the next log line). **[HUMAN: image rebuild (`vendorHash` regen) + live API keys]** *(Proto regen done; both pieces host-proven — `TestQuestionResolvedResumes` + `TestAskHumanHandler`. Awaiting the shared image rebuild — see HUMAN_TODO "[Phase 6] Rebuild VM image for precise resume + the ask_human MCP server".)*
 
 ### Phase 7 — Linux backend (parity)
 - [ ] `firecracker` provider behind the same `Provider` interface (`CID`-based vsock).
