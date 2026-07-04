@@ -270,3 +270,37 @@ below block only that on-hardware confirmation.
 - Blocking: no — the host-side auth gate + `krayt-ask` env wiring are proven
   (`TestClaudeCodeExactlyOne`, `TestApplyAdapterAuthGate`, `TestApplyAdapterWiresAsk`); the
   live-credential run is part of the Phase 5 "Done when".
+
+## [Phase 5] Detached "park and walk away" — end-to-end on hardware — DONE ✅
+- Resolved: verified on Apple Silicon with the `hack/ask-probe` image
+  (`docker.io/tjololo/test-krayt:ask`). `krayt run --detach --on-question=wait
+  --question-timeout 120s --on-question-timeout abort` returned immediately printing the run id
+  + supervisor pid (34206); `krayt ls` showed the background run `starting`, then `waiting` once
+  the probe hit `/run/krayt/ask.sock`; `krayt answer run_afbb910f yes` from a **separate shell**
+  resolved `q1` (the supervisor outlived the launcher); a re-`attach` showed the probe receive
+  `response="yes"`, write its decision file, and finish `done: success`. Confirms the
+  session-detached supervisor + cross-process `krayt answer` + `waiting` persistence on a real
+  VM. Still open (their own HUMAN entries): the `krayt-ask` **binary** round-trip (this used the
+  probe's own socket client) and a real agent with live keys; a `--max-concurrency` queue check
+  across invocations is still worth a quick pass but the primitive is proven
+  (`TestAcquireSlotCrossProcess`).
+- Needed: confirm the whole detached flow on a real VM: `krayt run --detach …` returns
+  immediately, the run keeps executing after the launching terminal closes, its `waiting`
+  question fires a notification, and `krayt answer <id> <resp>` from a **separate** invocation
+  resolves it; then `krayt stop <id>` (SIGTERM to the recorded supervisor pid) tears the VM
+  down. Also sanity-check `--max-concurrency N` queues the N+1-th run across separate
+  `krayt run` invocations.
+- Why the agent can't: needs a bootable VM (vfkit + the pinned image) on Apple Silicon; the
+  sandbox has no VM, and the detached child re-execs `krayt run`, which calls `newRunDeps()`
+  (vfkit) — unavailable here.
+- Exact steps/commands: `krayt run --detach --on-question=wait --image <img> --task ./task.md`;
+  note the printed run id; close the terminal; from a new shell `krayt ls` (shows `waiting`),
+  `krayt answer <id> <resp>`, `krayt attach <id>`. For the limit: launch 3× `krayt run --detach
+  --max-concurrency 1 …` and confirm only one boots at a time (`krayt ls`).
+- Verify success by: the supervisor process (its pid is printed and in `meta.json`) outlives the
+  launcher; the run reaches `done` with patch+report+meta; the second/third `--max-concurrency
+  1` runs stay queued until the first finishes.
+- Blocking: no — the mechanism is proven host-side: cross-process limit
+  (`TestAcquireSlotCrossProcess`, real subprocesses), the session-detached spawn
+  (`TestSpawnDetached`), and the file-lock cap (`TestMaxConcurrency`). Only the on-VM run is
+  deferred.

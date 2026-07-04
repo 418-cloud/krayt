@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,6 +19,13 @@ import (
 	"github.com/418-cloud/krayt/internal/provider"
 	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
+)
+
+// Env vars coordinating the detached-supervisor handoff (§6.2): the parent sets both when it
+// forks; the child reads them so it supervises the same run instead of re-detaching.
+const (
+	envDetachChild = "KRAYT_DETACH_CHILD" // present on the child → run in the foreground, don't re-fork
+	envRunID       = "KRAYT_RUN_ID"       // the run id the parent already generated and printed
 )
 
 // runDeps are the OS-specific collaborators for a run, assembled by the build-tagged
@@ -45,6 +54,7 @@ type runFlags struct {
 	disk         uint64
 	timeout      time.Duration
 	detach       bool
+	maxConc      int
 
 	onQuestion        string        // fail | wait (§6.13)
 	questionTimeout   time.Duration // per-question wait limit
@@ -84,7 +94,8 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.Uint64Var(&f.memory, "memory", 4096, "memory (MiB)")
 	fl.Uint64Var(&f.disk, "disk", 20, "disk (GiB)")
 	fl.DurationVar(&f.timeout, "timeout", 30*time.Minute, "wall-clock run timeout")
-	fl.BoolVar(&f.detach, "detach", false, "headless: do not stream logs to the terminal")
+	fl.BoolVar(&f.detach, "detach", false, "run in the background: a detached supervisor owns the VM to completion, so this command returns immediately and the run survives the terminal closing (§6.2). Track it with krayt ls/attach/answer")
+	fl.IntVar(&f.maxConc, "max-concurrency", 0, "max concurrent runs sharing this repo's .krayt (0 = unbounded); enforced across processes")
 	fl.StringVar(&f.onQuestion, "on-question", "fail", "agent question mode: fail (autonomous) | wait (pause for input)")
 	fl.DurationVar(&f.questionTimeout, "question-timeout", 10*time.Minute, "per-question wait timeout")
 	fl.StringVar(&f.onQuestionTimeout, "on-question-timeout", "sentinel", "on question timeout: sentinel | abort")
@@ -109,9 +120,13 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		return err
 	}
 
-	id, err := newRunID()
-	if err != nil {
-		return err
+	// A detached supervisor child inherits the run id its parent already printed (envRunID),
+	// so both name the same run dir; a fresh invocation generates one.
+	id := os.Getenv(envRunID)
+	if id == "" {
+		if id, err = newRunID(); err != nil {
+			return err
+		}
 	}
 	secretsPath := f.secretsFile
 	if secretsPath != "" {
@@ -163,6 +178,13 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		return err
 	}
 
+	// --detach: hand the run to a session-detached supervisor child and return, so the run
+	// survives this terminal closing and its `waiting` question can be answered later (§6.2).
+	// The child re-enters here with envDetachChild set and runs the same spec in the foreground.
+	if f.detach && os.Getenv(envDetachChild) == "" {
+		return spawnDetachedRun(cmd, filepath.Join(repoAbs, ".krayt"), spec.ID)
+	}
+
 	// OS-specific provider + base VM image (vfkit on macOS; error elsewhere until Phase 7).
 	deps, err := newRunDeps()
 	if err != nil {
@@ -186,7 +208,7 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		BaseVM:   deps.baseVM,
 		Image:    img,
 		LogOut:   logOut,
-	}, filepath.Join(repoAbs, ".krayt"), 0)
+	}, filepath.Join(repoAbs, ".krayt"), f.maxConc)
 	res, err := mgr.Run(cmd.Context(), spec)
 	if err != nil {
 		return err
@@ -260,6 +282,64 @@ func acquireUserImage(cmd *cobra.Command, ref string) (*imagestore.Image, error)
 		return nil, err
 	}
 	return imagestore.Acquire(cmd.Context(), src, ref, cacheRoot)
+}
+
+// spawnDetachedRun launches a session-detached copy of this krayt invocation to supervise the
+// run in the background, then returns after printing how to track it (§6.2). The child re-execs
+// the same argv with envDetachChild + envRunID set, so it names the same run dir and runs the
+// identical spec in the foreground; its own stdout/stderr go to the run's supervisor log.
+func spawnDetachedRun(cmd *cobra.Command, stateDir, id string) error {
+	runDir := orchestrator.RunDir(stateDir, id)
+	if err := os.MkdirAll(filepath.Join(runDir, "logs"), 0o755); err != nil {
+		return fmt.Errorf("create run dir: %w", err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve executable: %w", err)
+	}
+	env := append(os.Environ(), envDetachChild+"=1", envRunID+"="+id)
+	logPath := filepath.Join(runDir, "logs", "supervisor.log")
+	pid, err := spawnDetached(exe, os.Args[1:], env, logPath)
+	if err != nil {
+		return fmt.Errorf("start detached supervisor: %w", err)
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(),
+		"run %s started in background (supervisor pid %d)\n"+
+			"  track:  krayt ls\n"+
+			"  attach: krayt attach %s\n"+
+			"  answer: krayt answer %s <response>\n"+
+			"  stop:   krayt stop %s\n",
+		id, pid, id, id, id)
+	return err
+}
+
+// spawnDetached starts exe (args, env) as a new-session background process whose stdio is
+// redirected to logPath (stdin from /dev/null), returning its pid. Setsid puts it in its own
+// session so it detaches from the controlling terminal and outlives the launching shell (§6.2).
+func spawnDetached(exe string, args, env []string, logPath string) (int, error) {
+	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = logf.Close() }()
+	devnull, err := os.Open(os.DevNull)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = devnull.Close() }()
+
+	c := exec.Command(exe, args...)
+	c.Env = env
+	c.Stdin = devnull
+	c.Stdout = logf
+	c.Stderr = logf
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := c.Start(); err != nil {
+		return 0, err
+	}
+	pid := c.Process.Pid
+	_ = c.Process.Release() // detach: don't wait, let the parent return while the child runs
+	return pid, nil
 }
 
 // applyConfig loads krayt.yaml (explicit --config, else <repo>/krayt.yaml if present) and

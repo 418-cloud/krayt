@@ -197,17 +197,20 @@ recorded guest control socket** (§6.12), never on an in-process handle. This is
 daemon: the guest's `Answer` RPC (§6.5) is the coordination point, and the socket path lives
 in the run dir.
 
-- **v1 (foreground supervisor):** the `krayt run` process itself supervises its run to
-  completion; `--detach` means *headless* (no terminal echo), not backgrounded. Concurrency
-  is several `krayt run` invocations in parallel; the in-process `Manager` enforces
-  max-concurrency for runs it owns.
-- **Planned for Phase 5 (detached supervisor — "park and walk away"; §14):** `krayt run
-  --detach` will double-fork a **per-run detached supervisor** (still no central daemon) that
-  owns the VM to completion, so the human can start a run, close the terminal, get the
-  `waiting` notification later, and `krayt answer` it. Cross-process max-concurrency then
-  needs a shared limit under `.krayt/` (the warm-VM pool, §14 Phase 5, wants the same
-  coordination). Because the state model and every management command are already daemon-less
-  and process-agnostic, this is localized to the run entrypoint — the rest is unchanged.
+- **Foreground supervisor:** without `--detach`, the `krayt run` process itself supervises its
+  run to completion, streaming logs to the terminal.
+- **Detached supervisor — "park and walk away" (Phase 5):** `krayt run --detach` re-execs a
+  **session-detached (`setsid`) per-run supervisor child** (still **no central daemon**) that
+  owns the VM to completion, then returns immediately — so the human can start a run, close the
+  terminal, get the `waiting` notification later, and `krayt answer` it. Go's runtime rules out
+  a raw `fork()`, so the child is a re-exec of the same argv with the run id passed through the
+  environment; `setsid` detaches it from the controlling terminal so it outlives the shell. It
+  records its own pid, so `krayt stop` signals it like any foreground run. Max-concurrency is
+  enforced **across every process** sharing one `.krayt` by a file-lock semaphore (`AcquireSlot`
+  over `.krayt/slots/`, sized by `--max-concurrency`), so foreground and detached runs queue
+  against the same limit and a crashed holder's slot is released by the OS. Because the state
+  model and every management command are already daemon-less and process-agnostic, this is
+  localized to the run entrypoint — the rest is unchanged.
 
 ### 6.3 Provider interface (`internal/provider`)
 The single OS-specific seam.
@@ -1254,14 +1257,13 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - [x] **Done when:** N runs execute concurrently with isolated patches/logs, `attach` shows live output, and (with `--on-question=wait`) a stubbed agent question drives a `waiting` state that `krayt answer` resolves. ✅ *(`TestConcurrentRuns` + `TestAttachLive` + `TestQuestionWaitAnswer`, all against the fakeProvider; race-clean.)*
 
 ### Phase 5 — Polish & optional orchestration
-- [x] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats, questions; agent notes if the image writes `/output/report.md`). *(Host-side, fakeProvider-proven: `RunRecord` is the full §8.4 schema; `report.go` renders the fixed-section report and folds the agent's `/output/report.md` into Notes; patch diffstat via `patch.Stat` (`git apply --numstat`). `TestReportAndMeta` + `TestReportPrefersAgentNotes`.)*
+- [x] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats, questions; agent notes if the image writes `/output/report.md`). *(Host-side, fakeProvider-proven: `RunRecord` is the full §8.4 schema; `report.go` renders the fixed-section report and folds the agent's `/output/report.md` into Notes; patch diffstat via `patch.Stat` (`git apply --numstat`). `TestReportAndMeta` + `TestReportPrefersAgentNotes`. **Confirmed on Apple Silicon** — run_afbb910f wrote a full §8.4 `meta.json` (`questions[]` with `answered_by`/`waited_secs`, patch diffstat, timings) and a rendered `report.md`.)*
 - [x] `krayt-ask` CLI front-end (§6.13): a small in-container binary any agent can shell out to (`krayt-ask [--choices a,b] "question"`), bridging to the Phase-4 question channel over the mounted unix socket; prints the answer on stdout (exit 0) or a no-answer sentinel (exit 2) so the agent falls back. *(`cmd/krayt-ask`, reusing `ask.OverSocket`; `TestRunSentinelWhenUnreachable`/`TestRunUsage`, round-trip `TestRunRoundTrip` skips under the sandbox's blocked `bind(2)` — HUMAN-verified on hardware. Built into the image via `flake.nix`; container placement is a HUMAN handoff.)*
 - [x] Optional agent adapters (`internal/adapter`: `none`/`claude-code`/`gemini-cli`) — host-side pre-flight (`--agent` flag + `agent.adapter`) that validates auth and wires `krayt-ask` (`KRAYT_ASK_SOCKET`) when `--on-question=wait`. *(In-container credential export + agent launch run in the image entrypoint (§8.2) and need live keys — HUMAN. MCP-server registration is Phase 6.)*
 - [x] Claude Code adapter maps the provided credential to the correct env var (`ANTHROPIC_API_KEY` vs `CLAUDE_CODE_OAUTH_TOKEN`) and enforces exactly-one auth, failing fast if both are set (§6.14). *(`claude-code` adapter, exactly-one over the recognized keys; wired into `krayt run` before any VM boot. `TestClaudeCodeExactlyOne` + `TestApplyAdapterAuthGate`/`TestApplyAdapterWiresAsk`.)*
-- [ ] **Detached supervisor — "park and walk away" (§6.2):** `krayt run --detach` double-forks a per-run supervisor (no central daemon) that owns the VM to completion, so a run can be started, the terminal closed, the `waiting` notification received later, and resolved with `krayt answer`. Cross-process max-concurrency via a shared limit under `.krayt/`. Reuses the Phase-4 on-disk state + management commands unchanged; localized to the run entrypoint.
-- [ ] Warm-VM pool to amortize boot time (optional) — shares the same cross-process coordination as the detached supervisor above.
+- [x] **Detached supervisor — "park and walk away" (§6.2):** `krayt run --detach` re-execs a session-detached (`setsid`) per-run supervisor (no central daemon) that owns the VM to completion; the launcher returns immediately. Cross-process max-concurrency via a file-lock semaphore (`AcquireSlot` over `.krayt/slots/`, `--max-concurrency`). Reuses the Phase-4 on-disk state + management commands unchanged; localized to the run entrypoint. *(`TestAcquireSlotLimits`/`TestAcquireSlotCrossProcess` (real subprocesses) + `TestSpawnDetached`; existing `TestMaxConcurrency` now backed by the file lock. End-to-end "close the terminal, answer after" **verified on Apple Silicon** via `hack/ask-probe`: `--detach` returned with the supervisor pid, `krayt ls` showed `starting`→`waiting`, and `krayt answer` from a separate shell resolved it to `done` — see HUMAN_TODO.)*
 - [x] Patch safety lint (flag hooks/suspicious changes). *(`patch.Lint` flags changes that execute outside the workspace edit — git hooks, CI config, shell startup files, direnv, newly-executable files — surfaced in `meta.json` `safety`, report.md's Safety section, and a `krayt run` warning. `TestLint`.)*
-- [ ] **Done when:** a real agent image completes a task and the run dir contains patch + report + meta; with the adapter + `--on-question=wait`, an agent's `krayt-ask` call round-trips to `krayt answer`; and a `--detach`ed run survives its launching process — its `waiting` question is answerable from a separate invocation after the terminal closes. **[HUMAN: live API keys for the agent image]** *(The premium MCP front-end and precise `waiting`→`running` resume are Phase 6.)*
+- [ ] **Done when:** a real agent image completes a task and the run dir contains patch + report + meta; with the adapter + `--on-question=wait`, an agent's `krayt-ask` call round-trips to `krayt answer`; and a `--detach`ed run survives its launching process — its `waiting` question is answerable from a separate invocation after the terminal closes. **[HUMAN: live API keys for the agent image]** *(Detach clause **verified on hardware** via `hack/ask-probe`; remaining: a real agent image + the `krayt-ask` **binary** round-trip (the probe used its own socket client). The premium MCP front-end and precise `waiting`→`running` resume are Phase 6.)*
 
 ### Phase 6 — `ask_human` MCP front-end & precise resume
 Both items need a `.proto`/image change, so they share one guest image rebuild and one HUMAN gate — carved out of Phase 5 to keep that phase fully host-provable.
@@ -1279,7 +1281,12 @@ Both items need a `.proto`/image change, so they share one guest image rebuild a
 
 ## 15. Open Questions / Future Work
 
-- **VM boot time** on macOS — measure; consider a warm pool if cold boot hurts UX.
+- **VM boot time / warm-VM pool** on macOS — measure cold-boot latency first; if it hurts UX,
+  add an optional **warm-VM pool** that pre-boots and parks idle VMs to amortize boot time.
+  Deferred deliberately: it's a boot-time optimization that should be driven by real-world
+  measurements, not built speculatively. It shares the detached supervisor's cross-process
+  coordination — the `.krayt/` file-lock semaphore (`orchestrator.AcquireSlot`, §6.2) — so a
+  pooled VM counts against the same max-concurrency limit as an in-flight run.
 - **Container runtime choice** — *resolved:* **containerd** via its Go client (§6.10).
   `runc` vs `crun` left as a build-time toggle; either is acceptable.
 - **Image distribution** — *resolved:* **host pulls + pre-loads over vsock** (§6.11). The

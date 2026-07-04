@@ -29,8 +29,12 @@ func writeReport(runDir string, rec RunRecord, agentNotes string) error {
 
 	b.WriteString("\n## Changes\n")
 	if rec.Patch != nil {
-		fmt.Fprintf(&b, "%d files, +%d/-%d. See changes.patch.\n",
-			rec.Patch.FilesChanged, rec.Patch.Insertions, rec.Patch.Deletions)
+		noun := "files"
+		if rec.Patch.FilesChanged == 1 {
+			noun = "file"
+		}
+		fmt.Fprintf(&b, "%d %s, +%d/-%d. See changes.patch.\n",
+			rec.Patch.FilesChanged, noun, rec.Patch.Insertions, rec.Patch.Deletions)
 	} else {
 		b.WriteString("No changes.patch was produced.\n")
 	}
