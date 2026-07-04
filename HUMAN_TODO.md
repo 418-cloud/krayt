@@ -351,7 +351,15 @@ below block only that on-hardware confirmation.
   read secrets / write the workspace until this ships; root images (e.g. `ask-probe`) are
   unaffected. Host-side proof is in place; only the on-VM confirmation waits on the rebuild.
 
-## [Phase 5] Rebuild VM image to ship the krayt-ask CLI front-end
+## [Phase 5] Rebuild VM image to ship the krayt-ask CLI front-end — DONE ✅
+- Resolved: shipped in base image **v0.0.0-rc16** (`pinned.go` digest `01b32a57…`) and verified on
+  Apple Silicon with `docker.io/tjololo/test-krayt:krayt-ask` (non-root, uid 1000). A
+  `--on-question=wait` run drove the container to shell out to `krayt-ask` (found on PATH at
+  `/usr/local/bin/krayt-ask`), reach `waiting`, and — after `krayt answer <id> yes` from a second
+  shell — log `got answer: yes` and finish `done` (exit 0) with `changes.patch` adding
+  `krayt-ask-decision.txt` = `yes`. Closes the last Phase-5 "Done when" clause. Also confirmed
+  `--on-question=fail`: `krayt-ask` gets the no-answer sentinel immediately and the agent proceeds
+  autonomously (`krayt-ask-decision.txt` = `no-answer-sentinel`) — the default stays non-blocking.
 - Needed: rebuild + re-pin the base VM image so it (1) contains the `krayt-ask` binary
   (`flake.nix` builds `cmd/krayt-ask` into the guest-agent derivation) and (2) bind-mounts it
   into the container at `/usr/local/bin/krayt-ask` (guest resolves it next to the guest-agent and
