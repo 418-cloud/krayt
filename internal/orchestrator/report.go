@@ -19,10 +19,15 @@ const reportName = "report.md"
 // failure, leaves a report.
 func writeReport(runDir string, rec RunRecord, agentNotes string) error {
 	var b strings.Builder
+	// Sanitize every externally-sourced field before it lands in a catted artifact. TaskSummary
+	// is already sanitized (summarizeTask); the network allow list comes straight from an
+	// untrusted <repo>/krayt.yaml with no validation, so it can carry terminal escapes. ImageRef
+	// is validated by image acquisition before any report is written, but sanitize it too so the
+	// invariant holds without a per-field reachability argument (§6.13).
 	fmt.Fprintf(&b, "# Run %s\n", rec.ID)
-	fmt.Fprintf(&b, "- Image: %s   Task: %s\n", rec.ImageRef, rec.TaskSummary)
+	fmt.Fprintf(&b, "- Image: %s   Task: %s\n", sanitize(rec.ImageRef), rec.TaskSummary)
 	fmt.Fprintf(&b, "- Result: %s   Exit: %d   Duration: %s\n", resultWord(rec), rec.ExitCode, hms(rec.DurationSecs))
-	fmt.Fprintf(&b, "- Network: %s\n", networkLine(rec.Network))
+	fmt.Fprintf(&b, "- Network: %s\n", sanitize(networkLine(rec.Network)))
 	if rec.Error != "" {
 		fmt.Fprintf(&b, "- Error: %s\n", sanitize(rec.Error))
 	}
@@ -43,7 +48,7 @@ func writeReport(runDir string, rec RunRecord, agentNotes string) error {
 		b.WriteString("\n## Safety\n")
 		b.WriteString("The patch touches paths that can execute outside the workspace — review carefully:\n")
 		for _, s := range rec.Safety {
-			fmt.Fprintf(&b, "- %s\n", s)
+			fmt.Fprintf(&b, "- %s\n", sanitize(s)) // derived from agent-named diff paths (§6.13 invariant)
 		}
 	}
 

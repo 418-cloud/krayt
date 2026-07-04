@@ -415,6 +415,12 @@ func makeContainerWritable(root string) error {
 		if err != nil {
 			return err
 		}
+		// os.Chmod follows symlinks, and the repo is untrusted (§10) — a symlink could point
+		// outside the workspace, so (running as root) never chmod through one. WalkDir doesn't
+		// descend symlinks either; a symlink's in-workspace target is relaxed on its own visit.
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
 		info, err := d.Info()
 		if err != nil {
 			return err
