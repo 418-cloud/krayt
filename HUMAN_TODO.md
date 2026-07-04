@@ -378,7 +378,17 @@ below block only that on-hardware confirmation.
 - Blocking: no other Phase-5 work depends on it, but this is the final clause needed to mark the
   Phase 5 "Done when" fully complete.
 
-## [Phase 6] Rebuild VM image for precise resume + the ask_human MCP server
+## [Phase 6] Rebuild VM image for precise resume + the ask_human MCP server — DONE ✅
+- Resolved: shipped in base image **v0.0.0-rc17** (`pinned.go` digest `149aab02…`) and verified on
+  Apple Silicon with `docker.io/tjololo/test-krayt:claude` (non-root, `--on-question=wait`). Given
+  a task with a genuine DB choice, Claude Code registered the MCP server (`registered ask_human
+  MCP server`), **called the `ask_human` MCP tool** → run went `waiting` (question persisted:
+  "PostgreSQL or SQLite?"); after `krayt answer <id> postgres` the answer flowed back and Claude
+  **implemented the chosen database** (`db.py` with `psycopg`, `requirements.txt`) and finished
+  `done` (exit 0) — the whole §6.13 premium path. Precise resume **directly observed**: `krayt ls`
+  showed `run_f671edac` flip `waiting`→`running` immediately after `krayt answer` (guest `Resolved`
+  event; `TestQuestionResolvedResumes`). `q1.json` also confirms the MCP tool passed
+  `choices: [PostgreSQL, SQLite]`. Closes the Phase 6 "Done when".
 - Needed: one base image rebuild carrying both Phase-6 pieces, then a hardware round-trip.
   1. `make proto` regen is already committed (`RunEvent.Resolved`); the **guest-agent** now emits
      the Resolved event, so a rebuild ships the precise `waiting`→`running` resume on-VM.
