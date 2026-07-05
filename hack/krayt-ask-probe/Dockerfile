@@ -1,9 +1,9 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 # Exercises the krayt-ask CLI front-end (§6.13) on hardware: a NON-ROOT image that shells out to
 # the `krayt-ask` binary krayt bind-mounts onto the PATH (/usr/local/bin/krayt-ask), proving both
 # the binary round-trip and the non-root socket-connect fix. Alpine gives a small image with a
 # shell + coreutils.
-FROM alpine:3.20
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 # Non-root user (uid 1000) — also validates that a non-root agent can reach the ask socket.
 RUN adduser -D -u 1000 agent
