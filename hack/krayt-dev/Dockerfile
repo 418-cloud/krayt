@@ -44,7 +44,7 @@ RUN set -eu; \
 # runs as this user so it owns its own Go/lint caches (see ENV block).
 RUN useradd --create-home --uid 1000 --shell /bin/bash agent
 
-COPY --chmod=0755 entrypoint.sh /usr/local/bin/krayt-dev-entrypoint
+COPY --chmod=0755 hack/krayt-dev/entrypoint.sh /usr/local/bin/krayt-dev-entrypoint
 
 USER agent
 WORKDIR /home/agent
