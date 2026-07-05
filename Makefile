@@ -1,4 +1,4 @@
-.PHONY: proto build krayt test lint tidy clean
+.PHONY: proto proto-direct build krayt test lint tidy clean
 
 BIN := bin
 
@@ -8,6 +8,11 @@ BIN := bin
 # no protoc.
 proto:
 	nix --extra-experimental-features nix-command --extra-experimental-features flakes run .#proto
+
+# Same codegen without Nix (protoc + protoc-gen-go + protoc-gen-go-grpc on PATH), for the
+# krayt-dev agent image (hack/krayt-dev), which has no Nix. See hack/krayt-dev/proto-direct.sh.
+proto-direct:
+	hack/krayt-dev/proto-direct.sh
 
 build:
 	go build ./...

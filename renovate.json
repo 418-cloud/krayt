@@ -13,6 +13,57 @@
     "minimumReleaseAge": "0 days"
   },
   "nix": { "enabled": true },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "hack/krayt-dev/Dockerfile: protoc has no native Dockerfile-manager datasource (fetched as a release zip, not a base image)",
+      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "matchStrings": ["ARG PROTOC_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "protocolbuffers/protobuf",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "hack/krayt-dev/Dockerfile: protoc-gen-go, installed via `go install` rather than gomod, so it needs its own manager",
+      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "matchStrings": ["ARG PROTOC_GEN_GO_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "go",
+      "packageNameTemplate": "google.golang.org/protobuf"
+    },
+    {
+      "customType": "regex",
+      "description": "hack/krayt-dev/Dockerfile: protoc-gen-go-grpc, installed via `go install`",
+      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "matchStrings": ["ARG PROTOC_GEN_GO_GRPC_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "go",
+      "packageNameTemplate": "google.golang.org/grpc/cmd/protoc-gen-go-grpc"
+    },
+    {
+      "customType": "regex",
+      "description": "hack/krayt-dev/Dockerfile: buf, installed via `go install`",
+      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "matchStrings": ["ARG BUF_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "go",
+      "packageNameTemplate": "github.com/bufbuild/buf"
+    },
+    {
+      "customType": "regex",
+      "description": "hack/krayt-dev/Dockerfile: oras CLI, installed via `go install`",
+      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "matchStrings": ["ARG ORAS_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "go",
+      "packageNameTemplate": "oras.land/oras"
+    },
+    {
+      "customType": "regex",
+      "description": "hack/krayt-dev/Dockerfile: golangci-lint, installed via `go install` (v2+ module path)",
+      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "matchStrings": ["ARG GOLANGCI_LINT_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "go",
+      "packageNameTemplate": "github.com/golangci/golangci-lint/v2"
+    }
+  ],
   "packageRules": [
     {
       "matchManagers": ["gomod", "dockerfile", "github-actions", "nix"],

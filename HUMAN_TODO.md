@@ -427,3 +427,52 @@ below block only that on-hardware confirmation.
 - Note (no token needed): release-please + the CLI binary build run in one workflow via the
   default `GITHUB_TOKEN`, so no PAT/App token is required for releases. The VM image releases on
   its own `vmimage-v*` tag (`image.yml`); see RELEASING.md for the boot-test → pin flow.
+
+## [Dev image] Build + push hack/krayt-dev, then run a first real dogfood task
+- Needed: a real `docker buildx` multi-arch build/push of `hack/krayt-dev` to
+  `ghcr.io/418-cloud/krayt-dev` (via `.github/workflows/dev-image.yml`, or manually), plus a live
+  `krayt run` on Apple-Silicon hardware exercising the image against krayt's own repo.
+- Why the agent can't: no `docker`/`buildx` in this sandbox, no registry credentials, and no
+  Apple-Silicon Mac to run `krayt` itself (same constraints as every other real-hardware/CI item
+  in this file). I have **not** run `docker build` or fabricated a build/push result — the
+  Dockerfile/entrypoint/workflow are written and `bash -n`-checked, but genuinely untested.
+- Exact steps/commands:
+  1. Merge to `main` (or `workflow_dispatch`) so `dev-image.yml` builds + pushes `linux/amd64` +
+     `linux/arm64` to GHCR; watch the Action run for the actual build/push to succeed (first
+     build is the real proof — `go install`/`protoc` version pins below could be wrong).
+  2. Then, on the Mac:
+     ```sh
+     krayt run --image ghcr.io/418-cloud/krayt-dev --agent claude-code \
+       --allow api.anthropic.com,proxy.golang.org,sum.golang.org \
+       --secrets ./secrets.env --task hack/krayt-dev/task.example.md --repo .
+     ```
+- Verify success by: the Action run shows a real green multi-arch build + push (note the actual
+  image digest in this entry once done — do not invent one); `krayt ls` shows the run reaching
+  `done`/`EXIT 0`; `krayt patch <id>` shows the agent's real `go build`/`test`/`lint` output
+  reflected in its summary/changes.
+- Blocking: no — nothing else in the roadmap depends on this image; it only enables dogfooding.
+- Watch-out: the pinned tool versions in `hack/krayt-dev/Dockerfile` (`PROTOC_VERSION`,
+  `PROTOC_GEN_GO_VERSION`, `PROTOC_GEN_GO_GRPC_VERSION`, `BUF_VERSION`, `ORAS_VERSION`,
+  `GOLANGCI_LINT_VERSION`) were chosen from training knowledge, not verified against a live
+  registry (this sandbox has no network egress at all, not even to resolve a version string) — if
+  the first build fails on a `go install .../<tool>@vX.Y.Z: unknown revision` error, bump that one
+  `ARG` to a real current release and retry; nothing else in the Dockerfile should need to change.
+
+## [Dev image] Verify GitHub Action digest pins in dev-image.yml
+- Needed: pin `docker/setup-qemu-action@v3`, `docker/setup-buildx-action@v3`, and
+  `docker/build-push-action@v6` in `.github/workflows/dev-image.yml` to exact commit SHAs, per
+  this repo's existing style (every other action, here and elsewhere, is SHA-pinned with a
+  version comment, e.g. `docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0`,
+  which I copied verbatim from `image.yml` since it's already verified/in use).
+- Why the agent can't: this sandbox has no network access at all (confirmed: direct `curl` and
+  the `WebFetch` tool both failed to reach GitHub), so there was no way to look up the current
+  commit SHA for these three tags without guessing — and I won't fabricate a digest.
+- Exact steps/commands: once the Renovate GitHub App above is installed, its first pass should
+  open a PR converting these three tag-refs to digest-pins automatically (`renovate.json` already
+  sets `"pinDigests": true` for the `github-actions` manager) — merge that PR. If you want it done
+  sooner, pin manually: `gh api repos/docker/setup-qemu-action/git/refs/tags/v3... ` (or just open
+  each action's GitHub releases page) and swap in the SHA + version comment.
+- Verify success by: the three actions in `dev-image.yml` read `owner/action@<40-char-sha> #
+  vX.Y.Z`, matching the rest of the file.
+- Blocking: no — the workflow runs correctly with tag refs; this only tightens supply-chain
+  pinning to match repo convention.

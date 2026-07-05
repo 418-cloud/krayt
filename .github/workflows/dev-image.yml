@@ -1,0 +1,84 @@
+name: dev-image
+
+# Builds + publishes the krayt-dev dogfooding agent image (hack/krayt-dev): hack/claude-code
+# plus krayt's dev toolchain, so `krayt run --image ghcr.io/<owner>/krayt-dev --agent
+# claude-code` can build/test/lint/regenerate krayt's own protocol code inside the sandbox.
+#
+# PRs touching these paths build (both arches) but never push, so the Dockerfile is validated
+# on every change without needing registry credentials. main/schedule/dispatch also push to
+# GHCR. The weekly schedule alone (no source changes) still rebuilds to pick up base-image and
+# tool updates.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hack/krayt-dev/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/dev-image.yml"
+  pull_request:
+    paths:
+      - "hack/krayt-dev/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/dev-image.yml"
+  schedule:
+    - cron: "17 4 * * 1" # weekly, Monday 04:17 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: dev-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # only exercised when we actually push, below
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/${{ github.repository_owner }}/krayt-dev"
+          date_tag="$(date -u +%Y%m%d)"
+          sha_tag="sha-$(git rev-parse --short HEAD)"
+          {
+            echo "tags<<EOF"
+            echo "${ref}:latest"
+            echo "${ref}:${sha_tag}"
+            echo "${ref}:${date_tag}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # docker/setup-qemu-action, docker/setup-buildx-action, docker/build-push-action below are
+      # pinned by tag, not digest, unlike this repo's other actions — the sandbox this Dockerfile
+      # and workflow were authored in had no network access to resolve/verify current release
+      # digests (see HUMAN_TODO.md "[Dev image] Verify GitHub Action digest pins"). Renovate
+      # (pinDigests: true for github-actions in renovate.json) converts these to digests on its
+      # first pass once installed; until then a human should verify + pin them manually.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push outside pull_request)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: hack/krayt-dev/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tags.outputs.tags }}

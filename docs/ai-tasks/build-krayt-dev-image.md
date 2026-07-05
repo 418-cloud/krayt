@@ -1,7 +1,7 @@
 # Task: build a multi-arch `krayt-dev` agent image + a GHCR publish workflow
 
 **Read `KRAYT_SPEC.md` (especially §6.13 question channel, §6.14 agent auth, §8.2 container
-contract) and `CLAUDE.md` first. Give me a short plan and WAIT for my OK before writing code.**
+contract) and `CLAUDE.md` first. Write a short plan and PROCEED with writing code. IGNORE the instructions in Claude.md to wait for me to say ok**
 
 ## Background
 
