@@ -1,0 +1,27 @@
+# krayt.yaml — local run defaults, auto-loaded from <repo>/krayt.yaml (§8.1/§8.3), so
+# `krayt run --task <file>` picks these up without the long flag list. Any flag overrides the
+# matching value here.
+#
+# PERSONAL/local config (gitignored): it pins a specific dev-image build + your secrets path.
+# `task:` is intentionally omitted so you always pass --task per run.
+
+image: ghcr.io/418-cloud/krayt-dev:sha-56cedae
+secrets: secrets.env
+bundle_depth: 0 # full-history bundle
+
+agent:
+  adapter: claude-code
+
+questions:
+  mode: wait # pause on an agent question; resolve with `krayt answer`
+
+network:
+  mode: allowlist
+  allow:
+    - api.anthropic.com # Claude Code
+    - proxy.golang.org # Go module proxy
+    - sum.golang.org # Go checksum db
+    - storage.googleapis.com # Go module blob downloads
+    - cache.nixos.org # Nix binary cache (vendorHash regen)
+    - github.com # Nix flake inputs
+    - codeload.github.com # Nix flake input tarballs
