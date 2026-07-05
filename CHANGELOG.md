@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/418-cloud/krayt/compare/v0.1.1...v0.1.2) (2026-07-05)
+
+
+### Bug Fixes
+
+* upgrade vm oci image digest ([e4e2a7a](https://github.com/418-cloud/krayt/commit/e4e2a7a61f8f767dea9a02f13ddb7d8e02ad3da7))
+
 ## [0.1.1](https://github.com/418-cloud/krayt/compare/v0.1.0...v0.1.1) (2026-07-05)
 
 
