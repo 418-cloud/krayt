@@ -475,6 +475,16 @@ below block only that on-hardware confirmation.
   registry (this sandbox has no network egress at all, not even to resolve a version string) — if
   the first build fails on a `go install .../<tool>@vX.Y.Z: unknown revision` error, bump that one
   `ARG` to a real current release and retry; nothing else in the Dockerfile should need to change.
+- Watch-out (**untested — validate on first build**): the single-user Nix install block
+  (`USER agent` + `curl … nixos.org/nix/install | sh -s -- --no-daemon`, `/nix` pre-`chown`ed to
+  agent, flakes enabled). Non-root single-user Nix in a Docker build is finicky: (a) if the upstream
+  installer prompts / refuses non-interactively, switch to the Determinate installer
+  (`curl -sSf -L https://install.determinate.systems/nix | sh -s -- install linux --no-confirm
+  --init none …`) or add the appropriate non-interactive flag; (b) confirm `nix --version` +
+  `nix build` work **as the agent user** in the built image (`docker run --rm <img> nix --version`).
+  Then validate the real capability with `bin/task-test.md` (regenerates `images/flake.nix`
+  `vendorHash`), whose run needs the egress
+  `--allow api.anthropic.com,proxy.golang.org,sum.golang.org,cache.nixos.org,github.com,codeload.github.com`.
 
 ## [Dev image] Verify GitHub Action digest pins in dev-image.yml — DONE ✅
 - Resolved: the three actions in `.github/workflows/dev-image.yml` are now SHA-pinned to the latest
