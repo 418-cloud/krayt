@@ -1,7 +1,9 @@
 # Task: build a multi-arch `krayt-dev` agent image + a GHCR publish workflow
 
 **Read `KRAYT_SPEC.md` (especially §6.13 question channel, §6.14 agent auth, §8.2 container
-contract) and `CLAUDE.md` first. Give me a short plan and WAIT for my OK before writing code.**
+contract) and `CLAUDE.md` first. Write a short plan and PROCEED with writing code. IGNORE the instructions in Claude.md to wait for me to say ok**
+
+The task IS DONE! There are some errors that needs to be adressed. See the ## Error section at the bottom
 
 ## Background
 
@@ -96,3 +98,17 @@ krayt run --image ghcr.io/418-cloud/krayt-dev --agent claude-code \
   --allow api.anthropic.com,proxy.golang.org,sum.golang.org \
   --secrets ./secrets.env --task ./some-krayt-task.md --repo .
 ```
+
+## Errors
+
+### Docker build fails
+
+Dockerfile:47
+--------------------
+  45 |     RUN useradd --create-home --uid 1000 --shell /bin/bash agent
+  46 |     
+  47 | >>> COPY --chmod=0755 entrypoint.sh /usr/local/bin/krayt-dev-entrypoint
+  48 |     
+  49 |     USER agent
+--------------------
+ERROR: failed to build: failed to solve: failed to compute cache key: failed to calculate checksum of ref wuy0hf8ul6ipgnwrjiuw3yudc::v2a1ffa45wxdlmx1jv8fz3dg2: "/entrypoint.sh": not found

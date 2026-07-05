@@ -445,3 +445,43 @@ below block only that on-hardware confirmation.
   `TestRoundTripMultiCommitMerge` / `TestCreateBundleMultiCommitIncludeDirty`.
 - Still worth a one-off: confirm `--bundle-depth 0` (full-history path) on hardware too.
 - Blocking: no — done; unit tests reproduce the failure and prove the fix, now confirmed on-VM.
+
+## [Dev image] Build + push hack/krayt-dev, then run a first real dogfood task
+- Needed: a real `docker buildx` multi-arch build/push of `hack/krayt-dev` to
+  `ghcr.io/418-cloud/krayt-dev` (via `.github/workflows/dev-image.yml`, or manually), plus a live
+  `krayt run` on Apple-Silicon hardware exercising the image against krayt's own repo.
+- Why the agent can't: no `docker`/`buildx` in this sandbox, no registry credentials, and no
+  Apple-Silicon Mac to run `krayt` itself (same constraints as every other real-hardware/CI item
+  in this file). I have **not** run `docker build` or fabricated a build/push result — the
+  Dockerfile/entrypoint/workflow are written and `bash -n`-checked, but genuinely untested.
+- Exact steps/commands:
+  1. Merge to `main` (or `workflow_dispatch`) so `dev-image.yml` builds + pushes `linux/amd64` +
+     `linux/arm64` to GHCR; watch the Action run for the actual build/push to succeed (first
+     build is the real proof — `go install`/`protoc` version pins below could be wrong).
+  2. Then, on the Mac:
+     ```sh
+     krayt run --image ghcr.io/418-cloud/krayt-dev --agent claude-code \
+       --allow api.anthropic.com,proxy.golang.org,sum.golang.org \
+       --secrets ./secrets.env --task hack/krayt-dev/task.example.md --repo .
+     ```
+- Verify success by: the Action run shows a real green multi-arch build + push (note the actual
+  image digest in this entry once done — do not invent one); `krayt ls` shows the run reaching
+  `done`/`EXIT 0`; `krayt patch <id>` shows the agent's real `go build`/`test`/`lint` output
+  reflected in its summary/changes.
+- Blocking: no — nothing else in the roadmap depends on this image; it only enables dogfooding.
+- Watch-out: the pinned tool versions in `hack/krayt-dev/Dockerfile` (`PROTOC_VERSION`,
+  `PROTOC_GEN_GO_VERSION`, `PROTOC_GEN_GO_GRPC_VERSION`, `BUF_VERSION`, `ORAS_VERSION`,
+  `GOLANGCI_LINT_VERSION`) were chosen from training knowledge, not verified against a live
+  registry (this sandbox has no network egress at all, not even to resolve a version string) — if
+  the first build fails on a `go install .../<tool>@vX.Y.Z: unknown revision` error, bump that one
+  `ARG` to a real current release and retry; nothing else in the Dockerfile should need to change.
+
+## [Dev image] Verify GitHub Action digest pins in dev-image.yml — DONE ✅
+- Resolved: the three actions in `.github/workflows/dev-image.yml` are now SHA-pinned to the latest
+  release **within the majors the workflow already used** (digests resolved from the GitHub API,
+  not fabricated): `docker/setup-qemu-action@c7c5346… # v3.7.0`,
+  `docker/setup-buildx-action@8d2750c… # v3.12.0`, `docker/build-push-action@10e90e3… # v6.19.2`.
+  The "authored offline" comment was removed. (Newer majors exist — setup-qemu/buildx v4.x,
+  build-push v7.x — left for Renovate to propose as reviewable bumps rather than folding an
+  untested major jump into the pinning fix.)
+- Blocking: no — was only supply-chain hygiene to match repo convention; done.
