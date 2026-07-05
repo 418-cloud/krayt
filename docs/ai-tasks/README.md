@@ -10,3 +10,4 @@ can act on it. Name them descriptively in kebab-case after the outcome (e.g.
 | Task | What it does |
 |---|---|
 | [`build-krayt-dev-image.md`](./build-krayt-dev-image.md) | Build the multi-arch `krayt-dev` agent image (Claude Code + the krayt dev toolchain) and its GHCR publish workflow, for dogfooding krayt on krayt. |
+| [`task-prompt-from-stdin.md`](./task-prompt-from-stdin.md) | Add `krayt run --task -` to read the task prompt from stdin (host-side CLI only; no image rebuild). |
