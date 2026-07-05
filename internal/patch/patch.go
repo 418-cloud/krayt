@@ -35,18 +35,23 @@ type Identity struct {
 // DefaultIdentity is the krayt bot identity used in the guest workspace.
 var DefaultIdentity = Identity{Name: "krayt", Email: "krayt@418.cloud"}
 
-// CreateBundle writes a self-contained git bundle of repoPath to outBundle, using the
-// shallow-clone-then-bundle technique (§6.7): `git bundle create` has no --depth, so we
-// shallow-clone the source over the file:// transport (which honors --depth, unlike a
-// local-path clone) and bundle that shallow clone. The bundle inherits the shallow
-// boundary, so it carries no prerequisites and clones cleanly into the empty guest.
-// depth<=0 means full history (no --depth). (verify current)
+// CreateBundle writes a **self-contained** git bundle of repoPath to outBundle — one the guest can
+// `git clone` with no prerequisites (§6.7). `depth` selects the shape:
+//   - depth <= 0: full history — a full clone bundled as-is (real commit SHAs, all reachable
+//     objects included).
+//   - depth >= 1 (default): a single-commit **snapshot** of the current state — a *parentless* root
+//     commit whose tree is HEAD's (plus dirty, if requested), bundled alone.
 //
-// When includeDirty is set, uncommitted changes are folded in without mutating the user's
-// repo: a throwaway commit is built from the source's working tree via a temporary index,
-// writing objects into our own clone (not the source), and the clone's branch is moved to
-// that commit so the bundle's HEAD imports the dirty state as the baseline (§6.7). The
-// user's index, working tree, and refs are never touched.
+// The snapshot exists because a shallow clone cannot be bundled self-contained: `git bundle create`
+// does not record the shallow boundary, so bundling a shallow clone references parents it omits and
+// the guest clone fails ("remote did not send all necessary objects"). A parentless snapshot has no
+// such boundary. Because a snapshot's baseline is synthetic, the optional reverse commits.bundle
+// (§6.7) isn't host-fetchable for a snapshot — use depth 0 if you need faithful multi-commit
+// application; changes.patch (the primary deliverable) is unaffected either way.
+//
+// When includeDirty is set, uncommitted changes are folded into the tip's tree without mutating the
+// user's repo: the working tree is captured via a temporary index, writing objects into our own
+// clone (not the source), leaving the user's index/worktree/refs untouched.
 func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, includeDirty bool) error {
 	absRepo, err := filepath.Abs(repoPath)
 	if err != nil {
@@ -64,15 +69,18 @@ func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, in
 	defer func() { _ = os.RemoveAll(tmp) }()
 	src := filepath.Join(tmp, "src")
 
+	// depth >= 1 → a self-contained single-commit snapshot; depth <= 0 → full history.
+	snapshot := depth >= 1
+
 	var branch string
 	if hasCommits {
 		cloneArgs := []string{"clone", "--quiet"}
-		if depth > 0 {
-			cloneArgs = append(cloneArgs, "--depth", fmt.Sprint(depth))
+		if snapshot {
+			cloneArgs = append(cloneArgs, "--depth", "1") // only the tip's tree is needed to snapshot it
 		}
 		cloneArgs = append(cloneArgs, "file://"+absRepo, src)
 		if _, err := runGit(ctx, "", cloneArgs...); err != nil {
-			return fmt.Errorf("patch: shallow clone source: %w", err)
+			return fmt.Errorf("patch: clone source: %w", err)
 		}
 		if branch, err = currentBranch(ctx, src); err != nil {
 			return err
@@ -86,36 +94,62 @@ func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, in
 		branch = "main"
 	}
 
-	if includeDirty {
-		dirty, err := captureDirty(ctx, src, absRepo, hasCommits, filepath.Join(tmp, "idx"))
+	gitDir := filepath.Join(src, ".git")
+
+	// Build the tip commit the bundle checks out. It must be self-contained so the guest clones
+	// cleanly: a snapshot tip is parentless; a full-history tip keeps the real chain.
+	var tip string
+	switch {
+	case includeDirty:
+		tree, err := captureWorkTree(ctx, src, absRepo, hasCommits, filepath.Join(tmp, "idx"))
 		if err != nil {
 			return err
 		}
-		// Move our clone's branch to the dirty commit so HEAD (symbolic → branch) imports
-		// it. The clone is ours, so this mutates nothing in the user's repo.
-		if _, err := runGit(ctx, src, "update-ref", "refs/heads/"+branch, dirty); err != nil {
-			return fmt.Errorf("patch: point branch at dirty commit: %w", err)
+		var parents []string
+		if hasCommits && !snapshot { // full history keeps the real parent; a snapshot is rootless
+			head, err := runGit(ctx, src, "rev-parse", "HEAD")
+			if err != nil {
+				return fmt.Errorf("patch: resolve clone HEAD: %w", err)
+			}
+			parents = []string{strings.TrimSpace(head)}
+		}
+		if tip, err = commitTree(ctx, gitDir, tree, "krayt: include uncommitted changes", parents...); err != nil {
+			return err
+		}
+	case snapshot:
+		// Snapshot committed HEAD's tree as a parentless root commit (hasCommits holds here).
+		tree, err := runGit(ctx, src, "rev-parse", "HEAD^{tree}")
+		if err != nil {
+			return fmt.Errorf("patch: resolve HEAD tree: %w", err)
+		}
+		if tip, err = commitTree(ctx, gitDir, strings.TrimSpace(tree), "krayt: workspace snapshot"); err != nil {
+			return err
+		}
+	default:
+		// Full history, no dirty: the real HEAD is already self-contained; bundle it as-is.
+	}
+
+	if tip != "" {
+		// HEAD is a symbolic ref to the branch, so moving the branch moves what HEAD resolves to.
+		if _, err := runGit(ctx, src, "update-ref", "refs/heads/"+branch, tip); err != nil {
+			return fmt.Errorf("patch: point branch at bundle tip: %w", err)
 		}
 	}
 
-	// Name a ref (the branch) plus HEAD so `git clone` of the bundle has something to
-	// check out (§6.7).
+	// Name a ref (the branch) plus HEAD so `git clone` of the bundle has something to check out (§6.7).
 	if _, err := runGit(ctx, src, "bundle", "create", outBundle, "HEAD", branch); err != nil {
 		return fmt.Errorf("patch: create bundle: %w", err)
 	}
 	return nil
 }
 
-// captureDirty builds a throwaway commit of the source working tree (committed state +
-// uncommitted, .gitignore honored) without mutating the source repo (§6.7). It writes all
-// objects into cloneDir's object database while reading files from srcWorkTree via a
-// temporary index, so the user's index/worktree/refs stay untouched. The commit's parent is
-// the clone's HEAD when the repo has commits, or it is a root commit on an unborn HEAD. It
-// returns the new commit's SHA.
-func captureDirty(ctx context.Context, cloneDir, srcWorkTree string, hasCommits bool, indexFile string) (string, error) {
-	gitDir := filepath.Join(cloneDir, ".git")
+// captureWorkTree writes a tree of the source working tree (committed state + uncommitted,
+// .gitignore honored) into cloneDir's object database, without mutating the source repo (§6.7): it
+// reads files from srcWorkTree through GIT_INDEX_FILE while writing objects into cloneDir, so the
+// user's index/worktree/refs stay untouched. Returns the tree SHA.
+func captureWorkTree(ctx context.Context, cloneDir, srcWorkTree string, hasCommits bool, indexFile string) (string, error) {
 	env := []string{
-		"GIT_DIR=" + gitDir,
+		"GIT_DIR=" + filepath.Join(cloneDir, ".git"),
 		"GIT_WORK_TREE=" + srcWorkTree,
 		"GIT_INDEX_FILE=" + indexFile,
 	}
@@ -131,28 +165,26 @@ func captureDirty(ctx context.Context, cloneDir, srcWorkTree string, hasCommits 
 	if err != nil {
 		return "", fmt.Errorf("patch: write tree: %w", err)
 	}
-	tree = strings.TrimSpace(tree)
+	return strings.TrimSpace(tree), nil
+}
 
-	args := []string{"commit-tree", tree, "-m", "krayt: include uncommitted changes"}
-	if hasCommits {
-		head, err := runGit(ctx, cloneDir, "rev-parse", "HEAD")
-		if err != nil {
-			return "", fmt.Errorf("patch: resolve clone HEAD: %w", err)
-		}
-		args = append(args, "-p", strings.TrimSpace(head))
+// commitTree makes a commit object for tree with the given parents (none = a root commit), using
+// the krayt bot identity via env so a config-less host/container still commits (§6.7).
+func commitTree(ctx context.Context, gitDir, tree, message string, parents ...string) (string, error) {
+	args := []string{"commit-tree", tree, "-m", message}
+	for _, p := range parents {
+		args = append(args, "-p", p)
 	}
-	// commit-tree needs only GIT_DIR (+ an identity); reuse the bot identity via env so a
-	// fresh container/host with no git config still commits.
-	commitEnv := []string{
+	env := []string{
 		"GIT_DIR=" + gitDir,
 		"GIT_AUTHOR_NAME=" + DefaultIdentity.Name, "GIT_AUTHOR_EMAIL=" + DefaultIdentity.Email,
 		"GIT_COMMITTER_NAME=" + DefaultIdentity.Name, "GIT_COMMITTER_EMAIL=" + DefaultIdentity.Email,
 	}
-	dirty, err := runGitEnv(ctx, commitEnv, args...)
+	out, err := runGitEnv(ctx, env, args...)
 	if err != nil {
-		return "", fmt.Errorf("patch: commit dirty tree: %w", err)
+		return "", fmt.Errorf("patch: commit-tree: %w", err)
 	}
-	return strings.TrimSpace(dirty), nil
+	return strings.TrimSpace(out), nil
 }
 
 // Ingest performs the guest-side bundle ingest (§6.7), in order: verify the bundle (catch

@@ -428,6 +428,24 @@ below block only that on-hardware confirmation.
   default `GITHUB_TOKEN`, so no PAT/App token is required for releases. The VM image releases on
   its own `vmimage-v*` tag (`image.yml`); see RELEASING.md for the boot-test → pin flow.
 
+## [Verify] Self-contained bundle fix over a real multi-commit repo — DONE ✅
+- Resolved: verified on Apple Silicon by dogfooding krayt over its **own** repo (a real merge-commit
+  history — the exact failing shape). The **old** globally-installed `krayt` reproduced the bug
+  (`clone bundle … Could not read b5295a9… / Failed to traverse parents / remote did not send all
+  necessary objects`); the **rebuilt** `./bin/krayt` (with the fix) cloned cleanly and drove a full
+  `--agent claude-code --on-question=wait` run to completion — Claude Code authenticated, registered
+  the `ask_human` MCP server, edited `README.md`, and the run reached `done` (exit 0) as
+  `run_9ba953aa` with a clean `changes.patch`. **Host-only fix, no image rebuild** (`CreateBundle`
+  runs in the host orchestrator; the guest-agent's ingest/clone code is unchanged).
+- What: dogfooding exposed a bug — `krayt run` over a repo with real history failed at guest clone
+  with *"remote did not send all necessary objects"*. Root cause: the old shallow-clone-then-bundle
+  produced a non-self-contained bundle (git bundle doesn't record the shallow boundary). Fixed in
+  `internal/patch/patch.go`: `bundle_depth >= 1` now bundles a **parentless single-commit snapshot**
+  of the current state; `bundle_depth 0` bundles full history. Reproduced + covered by
+  `TestRoundTripMultiCommitMerge` / `TestCreateBundleMultiCommitIncludeDirty`.
+- Still worth a one-off: confirm `--bundle-depth 0` (full-history path) on hardware too.
+- Blocking: no — done; unit tests reproduce the failure and prove the fix, now confirmed on-VM.
+
 ## [Dev image] Build + push hack/krayt-dev, then run a first real dogfood task
 - Needed: a real `docker buildx` multi-arch build/push of `hack/krayt-dev` to
   `ghcr.io/418-cloud/krayt-dev` (via `.github/workflows/dev-image.yml`, or manually), plus a live
