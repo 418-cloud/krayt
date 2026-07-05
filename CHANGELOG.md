@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.1](https://github.com/418-cloud/krayt/compare/v0.1.0...v0.1.1) (2026-07-05)
+
+
+### Bug Fixes
+
+* make forward git bundle self-contained for repos with history ([#16](https://github.com/418-cloud/krayt/issues/16)) ([eefbf7f](https://github.com/418-cloud/krayt/commit/eefbf7f74ce445727330e6c2510b68eaa21ab84c))
+
+
+### Dependencies
+
+* update gomod non-major dependencies ([#18](https://github.com/418-cloud/krayt/issues/18)) ([fc40b93](https://github.com/418-cloud/krayt/commit/fc40b9377f3e41c970668f1ce46b1e1b9f99928d))
+
 ## 0.1.0 (2026-07-04)
 
 
