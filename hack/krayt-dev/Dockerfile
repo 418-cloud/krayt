@@ -70,8 +70,14 @@ ENV DISABLE_AUTOUPDATER=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
 # krayt's dev toolchain, pinned by the ARGs above. All installable via `go install`, so one
-# command works for both target architectures with no per-arch binary URLs.
-RUN go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}" \
+# command works for both target architectures with no per-arch binary URLs. Agent-owned BuildKit
+# cache mounts keep the compiled objects (GOCACHE) and downloaded modules (GOMODCACHE) across
+# rebuilds, so bumping a tool version (or a weekly base rebuild) recompiles in seconds, not minutes.
+# The tool *binaries* land in $GOPATH/bin (outside the mounts), so they still persist into the image;
+# the tools' own modules stay in the cache (not the image), which also keeps the layer lean.
+RUN --mount=type=cache,target=/home/agent/.cache/go-build,uid=1000,gid=1000 \
+    --mount=type=cache,target=/home/agent/go/pkg/mod,uid=1000,gid=1000 \
+    go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}" \
  && go install "google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION}" \
  && go install "google.golang.org/grpc/cmd/protoc-gen-go-grpc@${PROTOC_GEN_GO_GRPC_VERSION}" \
  && go install "github.com/bufbuild/buf/cmd/buf@${BUF_VERSION}" \

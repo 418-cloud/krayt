@@ -86,17 +86,20 @@ Tell the agent (in the task prompt) to run this — and to re-run `go build ./..
 
 ## Build + publish
 
-Multi-arch (amd64 + arm64), built and pushed to GHCR by
-`.github/workflows/dev-image.yml` on pushes to `main` (path-filtered to
-`hack/krayt-dev/**`, `go.mod`, `go.sum`), weekly (to pick up base-image + tool updates), and
-`workflow_dispatch`. PRs touching those paths build both architectures but never push, so the
-Dockerfile is validated without registry credentials.
+Multi-arch (amd64 + arm64): `.github/workflows/dev-image.yml` builds each arch on its **own native
+runner** (`ubuntu-24.04` + `ubuntu-24.04-arm`, no QEMU) and merges them into one manifest, so both
+arches pull under the same tags (`:latest`, `:sha-<short>`, `:<date>`). It runs on pushes to `main`
+(path-filtered to `hack/krayt-dev/**`, `go.mod`, `go.sum`), weekly (to pick up base-image + tool
+updates), and `workflow_dispatch`; PRs build both arches to validate the Dockerfile but never push.
 
-To build locally:
+To build locally, build **only your host arch** — a multi-arch local build emulates the other arch
+under QEMU and is very slow, since the image compiles several Go tools (`golangci-lint`, `buf`, …)
+from source. On Apple Silicon that's arm64, which is also what the krayt VM runs, so it's all you
+need locally — let CI produce the multi-arch image:
 
 ```sh
 cd /path/to/krayt   # repo root — the Dockerfile COPYs go.mod/go.sum from here
-docker buildx build --platform linux/amd64,linux/arm64 \
+docker buildx build --platform linux/arm64 \
   -f hack/krayt-dev/Dockerfile \
   -t ghcr.io/418-cloud/krayt-dev:local .
 ```

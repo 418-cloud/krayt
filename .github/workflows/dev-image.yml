@@ -1,13 +1,15 @@
 name: dev-image
 
-# Builds + publishes the krayt-dev dogfooding agent image (hack/krayt-dev): hack/claude-code
-# plus krayt's dev toolchain, so `krayt run --image ghcr.io/<owner>/krayt-dev --agent
+# Builds + publishes the krayt-dev dogfooding agent image (hack/krayt-dev): a non-root Claude Code
+# agent plus krayt's dev toolchain, so `krayt run --image ghcr.io/<owner>/krayt-dev --agent
 # claude-code` can build/test/lint/regenerate krayt's own protocol code inside the sandbox.
 #
-# PRs touching these paths build (both arches) but never push, so the Dockerfile is validated
-# on every change without needing registry credentials. main/schedule/dispatch also push to
-# GHCR. The weekly schedule alone (no source changes) still rebuilds to pick up base-image and
-# tool updates.
+# Each arch builds on its OWN native runner (no QEMU — §11.5), then a merge job assembles a
+# multi-arch manifest so both arches pull under the SAME tags. Building the amd64 variant under
+# emulation is otherwise minutes-to-an-hour slow because the image compiles several Go tools
+# (golangci-lint, buf, …) from source. PRs build both arches to validate the Dockerfile but never
+# push; main/schedule/dispatch push. The weekly schedule rebuilds even with no source changes to
+# pick up base-image + tool updates.
 on:
   push:
     branches: [main]
@@ -33,31 +35,25 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/krayt-dev
+
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # One native runner per arch — no emulation, so the from-source Go tool builds run at full
+    # speed. Each pushes its single-arch image BY DIGEST (no tag); the merge job names the tags.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
+          - { platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      packages: write # only exercised when we actually push, below
+      packages: write # only exercised on push (below)
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Compute tags
-        id: tags
-        run: |
-          set -euo pipefail
-          ref="ghcr.io/${{ github.repository_owner }}/krayt-dev"
-          date_tag="$(date -u +%Y%m%d)"
-          sha_tag="sha-$(git rev-parse --short HEAD)"
-          {
-            echo "tags<<EOF"
-            echo "${ref}:latest"
-            echo "${ref}:${sha_tag}"
-            echo "${ref}:${date_tag}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
@@ -68,11 +64,72 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build (and push outside pull_request)
+      - name: Build ${{ matrix.platform }} (push by digest outside pull_request)
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: hack/krayt-dev/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.tags.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          # PR: build only, to validate the Dockerfile (cacheonly runs every step, exports nothing).
+          # push/schedule/dispatch: push by digest so the merge job gathers them under the tags.
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}
+          # Persist the layer cache across CI runs (fresh runners otherwise rebuild from scratch).
+          # Scoped per-arch so amd64 and arm64 don't evict each other's cache.
+          cache-from: type=gha,scope=dev-image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=dev-image-${{ matrix.arch }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    # Assemble the per-arch digests into one manifest list published under the shared tags, so
+    # `:latest` / `:sha-<short>` / `:<date>` each resolve to both amd64 and arm64.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create + push manifest list under shared tags
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          date_tag="$(date -u +%Y%m%d)"
+          sha_tag="sha-${GITHUB_SHA::7}"
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${sha_tag}" \
+            -t "${IMAGE}:${date_tag}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:latest"
