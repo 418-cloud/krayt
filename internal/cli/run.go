@@ -89,7 +89,7 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.BoolVar(&f.includeDirty, "include-dirty", false, "include uncommitted working-tree changes in the bundle")
 	fl.StringVar(&f.netMode, "net", "allowlist", "egress policy: allowlist | full | none")
 	fl.StringArrayVar(&f.allow, "allow", nil, "allowlisted egress domain (repeatable); only with --net allowlist")
-	fl.IntVar(&f.bundleDepth, "bundle-depth", 1, "forward-bundle shallow depth (0 = full history)")
+	fl.IntVar(&f.bundleDepth, "bundle-depth", 1, "forward bundle: 1 = single-commit snapshot, 0 = full history")
 	fl.IntVar(&f.cpus, "cpus", 2, "vCPUs")
 	fl.Uint64Var(&f.memory, "memory", 4096, "memory (MiB)")
 	fl.Uint64Var(&f.disk, "disk", 20, "disk (GiB)")

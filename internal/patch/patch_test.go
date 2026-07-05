@@ -3,6 +3,7 @@ package patch_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -236,7 +237,107 @@ func TestCreateBundleIncludeDirtyUnbornHead(t *testing.T) {
 	}
 }
 
+// TestRoundTripMultiCommitMerge is the regression for the shallow-bundle bug: a repo whose HEAD is
+// a *merge commit* on top of real history. The old shallow-clone-then-bundle produced a bundle that
+// referenced HEAD's parents without including them, so the guest clone failed with "remote did not
+// send all necessary objects". The single-commit repos in the other tests hid it. Both the snapshot
+// (depth 1) and full-history (depth 0) shapes must ingest cleanly and round-trip a diff.
+func TestRoundTripMultiCommitMerge(t *testing.T) {
+	ctx := context.Background()
+	src := newRepoWithHistory(t)
+
+	for _, depth := range []int{1, 0} {
+		t.Run(fmt.Sprintf("depth=%d", depth), func(t *testing.T) {
+			bundle := filepath.Join(t.TempDir(), "repo.bundle")
+			if err := patch.CreateBundle(ctx, src, bundle, depth, false); err != nil {
+				t.Fatalf("CreateBundle: %v", err)
+			}
+			ws := filepath.Join(t.TempDir(), "ws")
+			baseline, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity)
+			if err != nil {
+				t.Fatalf("Ingest (failed before the self-contained-bundle fix): %v", err)
+			}
+			if baseline == "" {
+				t.Fatal("empty baseline")
+			}
+			// The merged HEAD tree is present in the workspace.
+			if got := readFile(t, filepath.Join(ws, "feature.txt")); got != "feature\n" {
+				t.Errorf("feature.txt = %q, want merged HEAD tree", got)
+			}
+
+			// Edit → diff → apply onto a fresh checkout of the source.
+			writeFile(t, filepath.Join(ws, "base.txt"), "edited\n")
+			patchBytes, err := patch.Diff(ctx, ws, patch.BaselineTag)
+			if err != nil || len(patchBytes) == 0 {
+				t.Fatalf("Diff: err=%v len=%d", err, len(patchBytes))
+			}
+			target := filepath.Join(t.TempDir(), "target")
+			if out, err := exec.Command("git", "clone", "--quiet", src, target).CombinedOutput(); err != nil {
+				t.Fatalf("clone target: %v\n%s", err, out)
+			}
+			patchFile := filepath.Join(t.TempDir(), "changes.patch")
+			writeFile(t, patchFile, string(patchBytes))
+			if err := patch.Apply(ctx, target, patchFile, false); err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if got := readFile(t, filepath.Join(target, "base.txt")); got != "edited\n" {
+				t.Errorf("base.txt after apply = %q, want 'edited'", got)
+			}
+		})
+	}
+}
+
+// TestCreateBundleMultiCommitIncludeDirty pairs the multi-commit/merge history with uncommitted
+// changes: the snapshot must fold the dirty edit in and still clone cleanly.
+func TestCreateBundleMultiCommitIncludeDirty(t *testing.T) {
+	ctx := context.Background()
+	src := newRepoWithHistory(t)
+	writeFile(t, filepath.Join(src, "base.txt"), "base dirty\n") // uncommitted edit on a merge HEAD
+
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, src, bundle, 1, true); err != nil {
+		t.Fatalf("CreateBundle includeDirty: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if got := readFile(t, filepath.Join(ws, "base.txt")); got != "base dirty\n" {
+		t.Errorf("base.txt = %q, want the uncommitted edit", got)
+	}
+	if got := readFile(t, filepath.Join(ws, "feature.txt")); got != "feature\n" {
+		t.Errorf("feature.txt = %q, want committed merge state", got)
+	}
+}
+
 // --- helpers ---
+
+// newRepoWithHistory builds a repo whose HEAD is a merge commit on top of several commits — the
+// shape that broke the old shallow-clone-then-bundle (HEAD with parents whose objects the bundle
+// omitted). Returns the repo path.
+func newRepoWithHistory(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	git(t, dir, "init", "--quiet", "-b", "main")
+	git(t, dir, "config", "user.name", "tester")
+	git(t, dir, "config", "user.email", "tester@example.com")
+
+	writeFile(t, filepath.Join(dir, "base.txt"), "base\n")
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "--quiet", "-m", "c1")
+	writeFile(t, filepath.Join(dir, "base.txt"), "base2\n")
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "--quiet", "-m", "c2")
+
+	// Diverge on a feature branch, then merge with --no-ff so HEAD is a real merge commit.
+	git(t, dir, "checkout", "--quiet", "-b", "feature")
+	writeFile(t, filepath.Join(dir, "feature.txt"), "feature\n")
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "--quiet", "-m", "feat")
+	git(t, dir, "checkout", "--quiet", "main")
+	git(t, dir, "merge", "--no-ff", "--quiet", "-m", "merge feature", "feature")
+	return dir
+}
 
 // newRepo creates a git repo on branch main with the given files in one commit, returning
 // its path. Local identity is set so commits succeed in a clean test environment.
