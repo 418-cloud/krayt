@@ -40,4 +40,7 @@ func TestWaitReadyHello(t *testing.T) {
 	if resp.GetAgentVersion() != guest.Version {
 		t.Errorf("agent_version = %q, want %q", resp.GetAgentVersion(), guest.Version)
 	}
+	if resp.GetBootId() == "" {
+		t.Error("boot_id = \"\", want a non-empty id")
+	}
 }

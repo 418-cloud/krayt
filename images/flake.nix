@@ -39,12 +39,15 @@
       # Phase 6 gave cmd/krayt-ask an `--mcp` mode built on github.com/modelcontextprotocol/go-sdk
       # (§6.13). That is a NEW module dependency vendored into this derivation, so vendorHash MUST
       # be regenerated again (set it to lib.fakeHash, build, paste the reported got: sha256-…).
+      # krayt-dev capability smoke test: the guest Hello handshake gained boot_id, filled via a
+      # new github.com/google/uuid import — vendorHash regenerated the same way (fakeHash, build,
+      # paste got: sha256-…) to prove the krayt-dev image can drive this Nix step.
       guest-agent = pkgs.buildGoModule {
         pname = "krayt-agent";
         version = "0.0.0-dev";
         src = ../.; # repo root (go.mod, internal/, cmd/)
         subPackages = [ "cmd/krayt-agent" "cmd/krayt-proxy" "cmd/krayt-ask" ];
-        vendorHash = "sha256-FJN6nuazolDQTL9SPblHEbGqKkK7nfcfjAma/yZ3PII=";
+        vendorHash = "sha256-XQLNy8Wb7KvxzwDCe+LBkCFwuCpKaIJhIdATlMto7zU=";
         env.CGO_ENABLED = "0";
       };
 

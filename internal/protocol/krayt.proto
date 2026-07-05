@@ -26,7 +26,7 @@ service GuestAgent {
 }
 
 message HelloRequest  { string client_version = 1; }
-message HelloResponse { string agent_version = 1; string containerd_version = 2; }
+message HelloResponse { string agent_version = 1; string containerd_version = 2; string boot_id = 3; }
 
 message BlobQuery     { repeated string digests = 1; } // sha256: of image layers/config
 message BlobPresence  { repeated string missing_digests = 1; }

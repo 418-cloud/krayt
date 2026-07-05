@@ -6,6 +6,7 @@ require (
 	github.com/containerd/containerd/v2 v2.3.2
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/crc-org/vfkit v0.6.3
+	github.com/google/uuid v1.6.0
 	github.com/mdlayher/vsock v1.3.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/opencontainers/go-digest v1.0.0

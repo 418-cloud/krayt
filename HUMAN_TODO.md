@@ -495,3 +495,23 @@ below block only that on-hardware confirmation.
   build-push v7.x — left for Renovate to propose as reviewable bumps rather than folding an
   untested major jump into the pinning fix.)
 - Blocking: no — was only supply-chain hygiene to match repo convention; done.
+
+## [Dev image] krayt-dev capability smoke test (protobuf codegen + Nix vendorHash) — DONE ✅
+- Resolved: ran inside a krayt-dev sandbox against a throwaway change (`HelloResponse.boot_id`,
+  filled via a new `github.com/google/uuid` import) to prove out the two toolchains this image
+  needs to support real dogfood tasks.
+  - **Protobuf codegen: WORKED.** `hack/krayt-dev/proto-direct.sh` regenerated
+    `internal/protocol/pb/krayt.pb.go`/`krayt_grpc.pb.go` as pure tool output; the diff is only
+    the new field plus a cosmetic `protoc` version-comment bump (this image ships protoc
+    v7.35.1 vs the Nix-pinned v7.34.1 — harmless, same drift Phase 0 already flagged).
+  - **Nix vendorHash: WORKED.** `nix` (2.34.7) is installed and usable in this image. Set
+    `vendorHash = pkgs.lib.fakeHash` in `images/flake.nix`, ran `nix build ./images#guest-agent`,
+    read the real `got: sha256-XQLNy8Wb7KvxzwDCe+LBkCFwuCpKaIJhIdATlMto7zU=` from the
+    hash-mismatch error, pasted it back in, and the rebuild succeeded — confirming this image
+    (with `nix` added per commit `56cedae`) really can regenerate `vendorHash`, not just evaluate
+    the flake.
+  - `go build ./...`, `GOOS=linux GOARCH=arm64 go build ./...`, `go test -race ./...`, and
+    `golangci-lint run` all pass; `go.sum` needed no new lines (`google/uuid` was already an
+    indirect dep at the same version). See `/output/report.md` for the full checklist and diffs.
+- Blocking: no — this was a capability probe, not a feature; the `boot_id` field is real and
+  tested (`TestWaitReadyHello`) but has no consumer yet.

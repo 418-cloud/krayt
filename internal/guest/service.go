@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/google/uuid"
+
 	"github.com/418-cloud/krayt/internal/guest/ask"
 	"github.com/418-cloud/krayt/internal/patch"
 	"github.com/418-cloud/krayt/internal/protocol/pb"
@@ -28,6 +30,10 @@ import (
 
 // Version is the guest-agent version reported in the Hello handshake (§6.5).
 const Version = "0.0.0-dev"
+
+// bootID is generated once per guest-agent process and reported in the Hello handshake
+// (§6.5) so the host can tell whether it's still talking to the same VM boot across calls.
+var bootID = uuid.NewString()
 
 // chunkSize bounds each protocol Chunk; keep streams flowing without buffering a whole
 // artifact in memory on either side (§6.5).
@@ -109,7 +115,7 @@ func (s *Service) Hello(_ context.Context, _ *pb.HelloRequest) (*pb.HelloRespons
 	if s.runner != nil {
 		cv = s.runner.Version()
 	}
-	return &pb.HelloResponse{AgentVersion: Version, ContainerdVersion: cv}, nil
+	return &pb.HelloResponse{AgentVersion: Version, ContainerdVersion: cv, BootId: bootID}, nil
 }
 
 // QueryImageBlobs reports which of the host's blobs the guest is missing (§6.11). A fresh
