@@ -1,11 +1,11 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1 # renovate: ignore
 # A real-world krayt agent image: runs Claude Code headlessly against the task and edits
 # /workspace, which krayt diffs into changes.patch (§6.14, §8.2). This is the image behind the
 # HUMAN_TODO "[Phase 5] Agent adapter end-to-end with live credentials".
 #
 # Debian slim (glibc) so the official native `claude` binary runs; a dedicated non-root user
 # because Claude Code refuses to run as uid 0 (§8.2 container contract).
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 
 # git: Claude Code shells out to it for repo ops; curl + ca-certificates: install + HTTPS to the
 # model API; bash: the entrypoint.
