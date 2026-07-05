@@ -57,14 +57,8 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # docker/setup-qemu-action, docker/setup-buildx-action, docker/build-push-action below are
-      # pinned by tag, not digest, unlike this repo's other actions — the sandbox this Dockerfile
-      # and workflow were authored in had no network access to resolve/verify current release
-      # digests (see HUMAN_TODO.md "[Dev image] Verify GitHub Action digest pins"). Renovate
-      # (pinDigests: true for github-actions in renovate.json) converts these to digests on its
-      # first pass once installed; until then a human should verify + pin them manually.
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -75,7 +69,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build (and push outside pull_request)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: hack/krayt-dev/Dockerfile

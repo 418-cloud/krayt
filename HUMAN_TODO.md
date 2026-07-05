@@ -476,21 +476,12 @@ below block only that on-hardware confirmation.
   the first build fails on a `go install .../<tool>@vX.Y.Z: unknown revision` error, bump that one
   `ARG` to a real current release and retry; nothing else in the Dockerfile should need to change.
 
-## [Dev image] Verify GitHub Action digest pins in dev-image.yml
-- Needed: pin `docker/setup-qemu-action@v3`, `docker/setup-buildx-action@v3`, and
-  `docker/build-push-action@v6` in `.github/workflows/dev-image.yml` to exact commit SHAs, per
-  this repo's existing style (every other action, here and elsewhere, is SHA-pinned with a
-  version comment, e.g. `docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0`,
-  which I copied verbatim from `image.yml` since it's already verified/in use).
-- Why the agent can't: this sandbox has no network access at all (confirmed: direct `curl` and
-  the `WebFetch` tool both failed to reach GitHub), so there was no way to look up the current
-  commit SHA for these three tags without guessing — and I won't fabricate a digest.
-- Exact steps/commands: once the Renovate GitHub App above is installed, its first pass should
-  open a PR converting these three tag-refs to digest-pins automatically (`renovate.json` already
-  sets `"pinDigests": true` for the `github-actions` manager) — merge that PR. If you want it done
-  sooner, pin manually: `gh api repos/docker/setup-qemu-action/git/refs/tags/v3... ` (or just open
-  each action's GitHub releases page) and swap in the SHA + version comment.
-- Verify success by: the three actions in `dev-image.yml` read `owner/action@<40-char-sha> #
-  vX.Y.Z`, matching the rest of the file.
-- Blocking: no — the workflow runs correctly with tag refs; this only tightens supply-chain
-  pinning to match repo convention.
+## [Dev image] Verify GitHub Action digest pins in dev-image.yml — DONE ✅
+- Resolved: the three actions in `.github/workflows/dev-image.yml` are now SHA-pinned to the latest
+  release **within the majors the workflow already used** (digests resolved from the GitHub API,
+  not fabricated): `docker/setup-qemu-action@c7c5346… # v3.7.0`,
+  `docker/setup-buildx-action@8d2750c… # v3.12.0`, `docker/build-push-action@10e90e3… # v6.19.2`.
+  The "authored offline" comment was removed. (Newer majors exist — setup-qemu/buildx v4.x,
+  build-push v7.x — left for Renovate to propose as reviewable bumps rather than folding an
+  untested major jump into the pinning fix.)
+- Blocking: no — was only supply-chain hygiene to match repo convention; done.

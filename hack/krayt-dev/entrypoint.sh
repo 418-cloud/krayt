@@ -25,7 +25,7 @@ for key in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN; do
   fi
 done
 if [ -z "$cred" ]; then
-  echo "[krayt-dev] no credential in $SECRETS_DIR (expected ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)" >&2
+  echo "[krayt-dev] no credential in $SECRETS_DIR (expected ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_AUTH_TOKEN)" >&2
   echo "[krayt-dev] diag: running as $(id)" >&2
   if ls -la "$SECRETS_DIR" >&2 2>&1; then :; else
     echo "[krayt-dev] diag: cannot list $SECRETS_DIR — a non-root container can't read a root-only secrets mount (needs the krayt guest secrets-perms fix + base image rebuild)" >&2
