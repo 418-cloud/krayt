@@ -150,7 +150,7 @@ type RunSpec struct {
     ImageRef     string            // user OCI image (tag or digest)
     RepoPath     string            // host repo to bundle (default: cwd)
     IncludeDirty bool              // include uncommitted changes via non-mutating capture (§6.7)
-    BundleDepth  int               // forward-bundle shallow depth (§6.7); default 1, 0 = full history
+    BundleDepth  int               // forward-bundle shape (§6.7); default 1 = snapshot, 0 = full history
     TaskPrompt   []byte            // contents of the task (file or inline)
     Env          map[string]string // non-secret env for the container
     SecretsPath  string            // path to per-task secrets file (may be empty)
@@ -410,29 +410,46 @@ is the simplest correct choice. Enforcement layers:
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
 real git objects — and is **cloned** into `/workspace` as a real repository. Unlike a flat
-`git archive` snapshot, a bundle gives the guest a genuine HEAD and history, so there is **no
-synthetic baseline commit**: the baseline is simply the imported HEAD. This yields cleaner
-3-way patch application (a real merge-base) and lets multi-commit agent output survive the
-round-trip. A bundle also preserves git's object model exactly — file modes, executable bits,
-symlinks — which the tar/`git archive` path did not guarantee.
+`git archive` snapshot, a bundle imports a **real commit as HEAD** (tagged `krayt-baseline`), so
+the guest never fabricates a baseline at apply time. *What* that imported HEAD is depends on
+`bundle_depth` (below): full history (`0`) imports the repo's real HEAD, keeping real ancestry — a
+commit-level merge-base and a host-fetchable reverse `commits.bundle`; a snapshot (`>= 1`, the
+default) imports a synthetic **parentless** commit carrying HEAD's tree, so the net change still
+round-trips via `changes.patch` (3-way apply matches at the **blob** level, since the tree's blobs
+are the host's) but individual agent commits do not. Either way a bundle preserves git's object
+model exactly — file modes, executable bits, symlinks — which the tar/`git archive` path did not
+guarantee.
 
 **The forward bundle must be self-contained (host → guest).** The guest clones into an
 *empty* VM, so the inbound bundle must carry **no prerequisites**. A range bundle (e.g.
 `HEAD~1..HEAD`) records prerequisite commit IDs in its header, and a clone into an empty repo
 then fails with a "does not have … prerequisite commits" error — so the forward direction
-**must not** use a range. `git bundle create` has **no `--depth` flag**, so there is no native
-way to emit a self-contained shallow slice in one step. To stay lean *and* self-contained,
-krayt **shallow-clones-then-bundles** on the host *(verify current)*:
+**must not** use a range. `git bundle create` also has **no `--depth` flag**, and — critically —
+it does **not** record a shallow clone's boundary: bundling a shallow clone produces a bundle
+that references HEAD's parents without including them, so the guest clone fails with *"remote did
+not send all necessary objects"* for any repo whose HEAD has parents. (A single-commit repo hides
+this, since depth-1 cuts nothing.) krayt therefore makes the bundle self-contained *by shape*,
+keyed on `bundle_depth`:
 
 ```
-git clone --depth <bundle_depth> file://$REPO $TMP/src         # shallow working copy
-git -C $TMP/src bundle create $TMP/repo.bundle HEAD <branch>   # inherits the shallow boundary
+# bundle_depth >= 1 (default): a single-commit SNAPSHOT of the current state
+git clone --depth 1 file://$REPO $TMP/src                    # just the tip's tree + blobs
+TREE=$(git -C $TMP/src rev-parse 'HEAD^{tree}')
+SNAP=$(git -C $TMP/src commit-tree $TREE -m "krayt: workspace snapshot")   # PARENTLESS root commit
+git -C $TMP/src update-ref refs/heads/<branch> $SNAP
+git -C $TMP/src bundle create $TMP/repo.bundle HEAD <branch> # no boundary → self-contained
+
+# bundle_depth <= 0: full history — a full clone bundled as-is (real SHAs, all objects)
+git clone file://$REPO $TMP/src
+git -C $TMP/src bundle create $TMP/repo.bundle HEAD <branch>
 ```
 
-The bundle inherits the shallow clone's boundary, so it has no prerequisites and clones
-cleanly into the empty guest (it must name at least one ref so `git clone` has something to
-check out). `bundle_depth` is configurable (§6.1/§8.1), default shallow (`1`); raise it — or
-take full history — when the agent needs deeper context.
+A parentless snapshot has no shallow boundary, so it clones cleanly into the empty guest (the
+bundle must name at least one ref for `git clone` to check out). So `bundle_depth` (§6.1/§8.1)
+means **`0` = full history; `>= 1` = single-commit snapshot** (default `1`). Use `0` when the
+agent needs history, or when you want the reverse `commits.bundle` to be host-fetchable — its
+baseline is a real commit only with full history; a snapshot baseline is synthetic, so
+`changes.patch` (always produced) is the deliverable.
 
 **Non-mutating dirty capture (`include_dirty`).** A bundle carries only *committed* objects,
 so uncommitted work needs explicit handling — and the capture **must never mutate the user's
@@ -445,7 +462,7 @@ export GIT_INDEX_FILE=$TMP/idx
 git read-tree HEAD             # seed the temp index from HEAD (skip if unborn HEAD)
 git add -A                     # overlay tracked + new (non-ignored) changes
 TREE=$(git write-tree)
-DIRTY=$(git commit-tree $TREE -p HEAD -m "krayt: dirty worktree")   # drop -p if unborn HEAD
+DIRTY=$(git commit-tree $TREE -p HEAD -m "krayt: dirty worktree")   # parentless for a snapshot or unborn HEAD
 ```
 
 The user's index, working tree, and refs stay untouched; `$DIRTY` is bundled as the imported
@@ -726,8 +743,8 @@ the docs and examples lead with it.
 
 1. **Resolve spec** — merge flags + config file into a `RunSpec` (image, task, repo,
    network policy, secrets file, resources, env).
-2. **Bundle code** — create a self-contained git bundle (shallow-clone-then-bundle at
-   `bundle_depth`; non-mutating temp-index capture if `include_dirty`) → byte stream (§6.7).
+2. **Bundle code** — create a self-contained git bundle (parentless snapshot, or full history at
+   `bundle_depth 0`; non-mutating temp-index capture if `include_dirty`) → byte stream (§6.7).
 3. **Acquire image (host)** — resolve + pull the user's OCI image into the host store and
    export an OCI archive; reuse the digest-keyed cache to skip if already present (§6.11).
 4. **Provision VM** — `Provider.Create` makes a CoW copy of the base rootfs, assigns a CID;
@@ -754,7 +771,7 @@ image: my-agent:latest          # required (flag or file)
 task: ./task.md                 # path to task prompt (or inline `task_text:`)
 repo: .                         # repo to bundle (default: cwd)
 include_dirty: true             # include uncommitted changes (non-mutating capture, §6.7)
-bundle_depth: 1                 # forward-bundle shallow depth; 0 = full history (§6.7)
+bundle_depth: 1                 # 1 = single-commit snapshot; 0 = full history (§6.7)
 
 network:
   mode: allowlist               # allowlist | full | none
@@ -1245,7 +1262,7 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 ### Phase 2 — End-to-end single run (happy path) ✅
 - [x] Host: pull user OCI image + export OCI archive; digest-keyed cache (`imagestore`).
 - [x] `QueryImageBlobs` + `PushImage` (stream only missing blobs); guest imports into containerd.
-- [x] Host: create a **self-contained git bundle** (shallow-clone-then-bundle at `bundle_depth`) (§6.7). *(Non-mutating `include_dirty` capture is deferred to Phase 3.)*
+- [x] Host: create a **self-contained git bundle** (parentless snapshot, or full history at `bundle_depth 0`) (§6.7). *(Non-mutating `include_dirty` capture is deferred to Phase 3.)*
 - [x] `PushCode` streams the bundle → guest writes it to a temp file, `git bundle verify`s it (from a throwaway repo — verify needs a repo context), clones into `/workspace`, sets the krayt bot git identity, and **records the baseline** (`krayt-baseline`) before the agent runs (§6.7).
 - [x] `PushTask` injection at `/task/prompt.md`; `Start` runs the container entrypoint (agent-agnostic).
 - [x] Patch generation (`git diff` vs the recorded `krayt-baseline`, staging all so uncommitted edits are captured) + optional reverse range bundle (`commits.bundle`) + `CollectArtifacts` back to host (§6.7).
@@ -1326,8 +1343,8 @@ Both items need a `.proto`/image change, so they share one guest image rebuild a
 - **git bundle** — a single file packaging real git objects + refs; krayt ships the repo
   into the VM as a bundle and clones a real repository from it (§6.7).
 - **Self-contained vs. range bundle** — a *self-contained* bundle has no prerequisites and
-  clones into an empty repo (used host→guest, produced via shallow-clone-then-bundle); a
-  *range* bundle (`<base>..HEAD`) records prerequisites and only unbundles where the base
+  clones into an empty repo (used host→guest, produced as a parentless snapshot or a full-history
+  clone); a *range* bundle (`<base>..HEAD`) records prerequisites and only unbundles where the base
   already exists (used guest→host for the optional commits bundle) (§6.7).
 - **Baseline (`krayt-baseline`)** — the imported HEAD of the cloned bundle, recorded and
   tagged in the guest before the agent runs; the agent's changes are diffed against it to
