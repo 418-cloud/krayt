@@ -483,8 +483,8 @@ below block only that on-hardware confirmation.
   --init none …`) or add the appropriate non-interactive flag; (b) confirm `nix --version` +
   `nix build` work **as the agent user** in the built image (`docker run --rm <img> nix --version`).
   Then validate the real capability with `bin/task-test.md` (regenerates `images/flake.nix`
-  `vendorHash`), whose run needs the extra egress
-  `--allow …,cache.nixos.org,github.com,codeload.github.com`.
+  `vendorHash`), whose run needs the egress
+  `--allow api.anthropic.com,proxy.golang.org,sum.golang.org,cache.nixos.org,github.com,codeload.github.com`.
 
 ## [Dev image] Verify GitHub Action digest pins in dev-image.yml — DONE ✅
 - Resolved: the three actions in `.github/workflows/dev-image.yml` are now SHA-pinned to the latest

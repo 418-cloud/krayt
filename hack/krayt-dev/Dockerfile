@@ -89,9 +89,11 @@ RUN --mount=type=cache,target=/home/agent/.cache/go-build,uid=1000,gid=1000 \
 
 # --- Nix (single-user, agent-owned) so the agent can regenerate images/flake.nix vendorHash ---
 # The guest-agent is built with Nix `buildGoModule`; when its Go deps change, `vendorHash` must be
-# recomputed via `nix build`. This is a SINGLE-USER (`--no-daemon`) install because the container
-# runs non-root with no daemon: /nix is owned by the agent user, and builds run directly as that
-# user. Flakes are enabled for `nix build`. NOTE: at run time `nix build` needs egress to
+# recomputed via `nix build`. This is a SINGLE-USER (`--no-daemon`) install — deliberately **not**
+# the repo's CI Determinate installer (root README "Setup / deps"): Determinate defaults to a
+# *multi-user* install that needs a root daemon at run time, which a non-root container can't run.
+# Single-user is the only mode that works as uid 1000 — /nix is owned by the agent user and builds
+# run directly as that user. Flakes are enabled for `nix build`. NOTE: at run time `nix build` needs egress to
 # cache.nixos.org + the flake inputs (github / codeload) + the Go module proxy — add those to the
 # run's --allow (see README). The install itself happens at image-build time (full network).
 USER root
