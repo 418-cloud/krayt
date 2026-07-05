@@ -410,11 +410,15 @@ is the simplest correct choice. Enforcement layers:
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
 real git objects — and is **cloned** into `/workspace` as a real repository. Unlike a flat
-`git archive` snapshot, a bundle gives the guest a genuine HEAD and history, so there is **no
-synthetic baseline commit**: the baseline is simply the imported HEAD. This yields cleaner
-3-way patch application (a real merge-base) and lets multi-commit agent output survive the
-round-trip. A bundle also preserves git's object model exactly — file modes, executable bits,
-symlinks — which the tar/`git archive` path did not guarantee.
+`git archive` snapshot, a bundle imports a **real commit as HEAD** (tagged `krayt-baseline`), so
+the guest never fabricates a baseline at apply time. *What* that imported HEAD is depends on
+`bundle_depth` (below): full history (`0`) imports the repo's real HEAD, keeping real ancestry — a
+commit-level merge-base and a host-fetchable reverse `commits.bundle`; a snapshot (`>= 1`, the
+default) imports a synthetic **parentless** commit carrying HEAD's tree, so the net change still
+round-trips via `changes.patch` (3-way apply matches at the **blob** level, since the tree's blobs
+are the host's) but individual agent commits do not. Either way a bundle preserves git's object
+model exactly — file modes, executable bits, symlinks — which the tar/`git archive` path did not
+guarantee.
 
 **The forward bundle must be self-contained (host → guest).** The guest clones into an
 *empty* VM, so the inbound bundle must carry **no prerequisites**. A range bundle (e.g.
@@ -444,7 +448,7 @@ A parentless snapshot has no shallow boundary, so it clones cleanly into the emp
 bundle must name at least one ref for `git clone` to check out). So `bundle_depth` (§6.1/§8.1)
 means **`0` = full history; `>= 1` = single-commit snapshot** (default `1`). Use `0` when the
 agent needs history, or when you want the reverse `commits.bundle` to be host-fetchable — its
-baseline is a real commit only with full history; a snapshot baseline is synthetic, so there
+baseline is a real commit only with full history; a snapshot baseline is synthetic, so
 `changes.patch` (always produced) is the deliverable.
 
 **Non-mutating dirty capture (`include_dirty`).** A bundle carries only *committed* objects,
