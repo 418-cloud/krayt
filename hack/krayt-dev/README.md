@@ -1,17 +1,20 @@
 # krayt-dev — dogfooding agent image
 
-`hack/claude-code`, plus krayt's own dev toolchain (Go, `golangci-lint`, `protoc`/`buf`
-codegen, `oras`), so an agent running **inside a krayt sandbox** can build, test, lint, and
-regenerate protocol code for **krayt itself** before returning its patch. This is how krayt
-dogfoods its own development: `krayt run --image ghcr.io/418-cloud/krayt-dev --agent
+A non-root **Claude Code** agent image plus krayt's own dev toolchain (Go, `golangci-lint`,
+`protoc`/`buf` codegen, `oras`), so an agent running **inside a krayt sandbox** can build, test,
+lint, and regenerate protocol code for **krayt itself** before returning its patch. This is how
+krayt dogfoods its own development: `krayt run --image ghcr.io/418-cloud/krayt-dev --agent
 claude-code`, with the krayt repo injected at `/workspace`.
 
-Same container contract as `hack/claude-code` (§8.2): non-root, `/workspace` +
-`/task/prompt.md` + `/run/secrets/*` + `/output/` injected by krayt, `ask_human` MCP wired
-when `--on-question=wait`. See that image's README for the credential/secrets/exactly-one-auth
-mechanics — they're unchanged here; this doc only covers what's different.
+**Container contract (§8.2, §6.14).** Runs **non-root** (uid 1000 `agent`; Claude Code refuses
+uid 0). krayt injects `/workspace` (the repo), `/task/prompt.md`, `/run/secrets/*`, and
+`/output/`; the `ask_human` MCP server is wired when `--on-question=wait`. The entrypoint exports
+**exactly one** model credential from `/run/secrets` — `ANTHROPIC_API_KEY`,
+`CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN` (the host `--agent claude-code` adapter
+enforces exactly-one *before* boot, §6.14) — then runs `claude -p` headlessly against the task and
+tees its summary to `/output/report.md`.
 
-## What's added over hack/claude-code
+## What's in the image
 
 - **Go 1.26** (matches `go.mod`), `git`, `curl`, `ca-certificates`, `bash`, `unzip`.
 - `golangci-lint` (matches `.golangci.yml`'s `version: "2"` config schema).
@@ -50,8 +53,7 @@ all work **offline** — no `--allow` entries needed for them.
 If the agent's task adds a **new** dependency (edits `go.mod` to something not already
 vendored into this image), `go mod download`/`go build` will need to reach the module proxy —
 add `proxy.golang.org` and `sum.golang.org` to the run's `--allow` list. Claude Code itself
-needs `api.anthropic.com` (plus whatever your credential shape needs — see
-`hack/claude-code/README.md`'s auth section).
+needs `api.anthropic.com` (plus whatever host your credential's provider requires).
 
 ## Proto without Nix
 
@@ -112,11 +114,12 @@ krayt run --image ghcr.io/418-cloud/krayt-dev --agent claude-code \
   new dependency; drop them to prove the module cache prebake is actually working offline.
 - A good first task: ask the agent to run `go build ./... && go test -race ./... &&
   golangci-lint run`, fix anything red, and summarize.
-- Success looks like `hack/claude-code/README.md`'s "Success looks like" section: `krayt ls`
-  reaches `done` / `EXIT 0`, `krayt patch <id>` applies cleanly, `report.md` carries Claude's
-  notes.
+- Success: `krayt ls` reaches `done` (exit 0), `krayt patch <id>` applies cleanly, and
+  `report.md` carries Claude's notes.
 
 ## Entrypoint exit codes
 
-Same as `hack/claude-code` — see that README's table (`66` = task file missing, `78` = no
-credential in `/run/secrets`, other = Claude Code's own exit code).
+- `66` (`EX_NOINPUT`) — the task file (`/task/prompt.md`) is missing.
+- `78` (`EX_CONFIG`) — no recognized credential in `/run/secrets` (`ANTHROPIC_API_KEY`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN`).
+- any other code — Claude Code's own exit code.

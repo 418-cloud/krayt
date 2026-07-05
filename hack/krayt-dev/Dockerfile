@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
-# krayt-dev — the dogfooding agent image: hack/claude-code's Claude Code adapter plus krayt's
+# krayt-dev — the dogfooding agent image: a non-root Claude Code agent (§6.14) plus krayt's
 # own dev toolchain, so an agent running `krayt run --image krayt-dev --agent claude-code`
 # against krayt's own repo can build, test, lint, and regenerate protocol code inside the
 # sandbox before returning its patch (§6.14, §8.2).
 #
 # Debian bookworm (glibc, not Nix) so the official native `claude` binary runs; non-root
-# throughout, matching hack/claude-code and the §8.2 container contract.
+# throughout, per the §8.2 container contract.
 FROM golang:1.26-bookworm
 
 # Tool versions, pinned so Renovate's custom regex manager (renovate.json) can bump them
@@ -58,7 +58,7 @@ ENV GOPATH=/home/agent/go \
     GOFLAGS=-mod=mod \
     PATH="/home/agent/go/bin:/home/agent/.local/bin:${PATH}"
 
-# Official installer (native binary; the npm package is deprecated) — same as hack/claude-code.
+# Official installer (native binary; the npm package is deprecated).
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # Keep egress tight for the krayt allowlist (§6.6): no autoupdater, telemetry, or error

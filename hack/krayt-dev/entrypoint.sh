@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# krayt-dev adapter entrypoint (§6.14, §8.2) — the dogfooding image's entrypoint. Identical
-# contract to hack/claude-code's entrypoint (this image is that one plus the dev toolchain):
+# krayt-dev adapter entrypoint (§6.14, §8.2) — the dogfooding image's entrypoint. This image is a
+# non-root Claude Code agent plus krayt's dev toolchain; the entrypoint fulfills the contract:
 #   1. materializes the model credential from the per-task secrets tmpfs (/run/secrets) into the
 #      environment (§6.14);
 #   2. runs Claude Code non-interactively against the task, editing /workspace — here, krayt's
