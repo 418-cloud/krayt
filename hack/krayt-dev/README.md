@@ -21,6 +21,9 @@ tees its summary to `/output/report.md`.
 - `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc` + `buf` — krayt's protocol codegen
   toolchain (§9.2), installed without Nix (see below).
 - `oras` — for anyone poking at the vmimage OCI artifacts (§6.11) from inside the sandbox.
+- **Nix** (single-user, agent-owned `/nix`, flakes enabled) — so the agent can regenerate the
+  guest-agent's `vendorHash` in `images/flake.nix` when a guest dependency changes. See
+  **Regenerating vendorHash (Nix)** below.
 - Agent-owned, writable Go caches (`GOCACHE`, `GOMODCACHE`, `GOPATH`,
   `GOLANGCI_LINT_CACHE`) and `GOFLAGS=-mod=mod`, so `go build`, `go test -race`, and
   `golangci-lint run` all work under the non-root agent uid with no permission errors.
@@ -55,12 +58,13 @@ vendored into this image), `go mod download`/`go build` will need to reach the m
 add `proxy.golang.org` and `sum.golang.org` to the run's `--allow` list. Claude Code itself
 needs `api.anthropic.com` (plus whatever host your credential's provider requires).
 
-## Proto without Nix
+## Proto codegen (direct, no Nix needed)
 
-`make proto` shells out to `nix run .#proto`, which isn't available in this image (no Nix, by
-design — this stays a glibc image for the native `claude` binary). If a task has the agent
-edit `internal/protocol/krayt.proto`, it needs to regenerate `internal/protocol/pb` — the
-generated code is committed, so this only matters when the `.proto` file itself changes.
+`make proto` shells out to `nix run .#proto`. Nix *is* present in this image (for `vendorHash`,
+below), but proto codegen doesn't need it — the direct `protoc` path is lighter and pulls no flake
+inputs, so prefer it. If a task has the agent edit `internal/protocol/krayt.proto`, it needs to
+regenerate `internal/protocol/pb` — the generated code is committed, so this only matters when the
+`.proto` file itself changes.
 
 Two equivalent no-Nix paths, both wrapping the same command as the flake's `proto` derivation
 (verified against `flake.nix`):
@@ -83,6 +87,24 @@ protoc \
 
 Tell the agent (in the task prompt) to run this — and to re-run `go build ./...` /
 `go test ./...` afterwards — whenever it changes `krayt.proto`.
+
+## Regenerating vendorHash (Nix)
+
+The guest-agent is built with Nix `buildGoModule`, whose `vendorHash` (in `images/flake.nix`) pins
+the exact set of Go modules. When a task changes the guest-agent's dependencies (`go.mod`/`go.sum`),
+that hash goes stale and must be recomputed — which needs **Nix** (there's no non-Nix way to derive
+it). This image ships **single-user Nix** (agent-owned `/nix`, flakes on) so the agent can do it:
+
+1. set `vendorHash = pkgs.lib.fakeHash;` in `images/flake.nix`;
+2. run the guest-agent Nix build; read the reported `got: sha256-…` from the hash-mismatch error;
+3. paste that real hash back into `vendorHash`.
+
+**Egress.** `nix build` fetches from the binary cache + flake inputs + the Go proxy, so a run that
+does this needs `--allow` to include at least
+`cache.nixos.org,github.com,codeload.github.com,proxy.golang.org,sum.golang.org` (plus
+`api.anthropic.com`). The first such build downloads a large Nix closure. **Never fabricate a
+`vendorHash`** — it must be a real build's `got:` value; if the build can't run, leave it and
+document the step.
 
 ## Build + publish
 

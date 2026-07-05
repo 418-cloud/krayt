@@ -20,9 +20,10 @@ ARG ORAS_VERSION=v1.3.2
 ARG GOLANGCI_LINT_VERSION=v2.12.2
 
 # git: repo ops + module fetches; curl + ca-certificates: installers/HTTPS; bash: entrypoint +
-# proto-direct.sh; unzip: protoc's release archive is a zip, not a tarball.
+# proto-direct.sh; unzip: protoc's release archive is a zip; xz-utils: the Nix installer's tarball
+# is .tar.xz.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git bash unzip \
+ && apt-get install -y --no-install-recommends ca-certificates curl git bash unzip xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # protoc itself has no Go module (it's the C++ compiler), so it's the one tool fetched as a
@@ -85,6 +86,22 @@ RUN --mount=type=cache,target=/home/agent/.cache/go-build,uid=1000,gid=1000 \
  && go install "google.golang.org/grpc/cmd/protoc-gen-go-grpc@${PROTOC_GEN_GO_GRPC_VERSION}" \
  && go install "github.com/bufbuild/buf/cmd/buf@${BUF_VERSION}" \
  && go install "oras.land/oras/cmd/oras@${ORAS_VERSION}"
+
+# --- Nix (single-user, agent-owned) so the agent can regenerate images/flake.nix vendorHash ---
+# The guest-agent is built with Nix `buildGoModule`; when its Go deps change, `vendorHash` must be
+# recomputed via `nix build`. This is a SINGLE-USER (`--no-daemon`) install because the container
+# runs non-root with no daemon: /nix is owned by the agent user, and builds run directly as that
+# user. Flakes are enabled for `nix build`. NOTE: at run time `nix build` needs egress to
+# cache.nixos.org + the flake inputs (github / codeload) + the Go module proxy — add those to the
+# run's --allow (see README). The install itself happens at image-build time (full network).
+USER root
+RUN install -d -m 0755 -o agent -g agent /nix
+USER agent
+RUN export USER=agent \
+ && curl -fsSL https://nixos.org/nix/install | sh -s -- --no-daemon \
+ && mkdir -p /home/agent/.config/nix \
+ && printf 'experimental-features = nix-command flakes\n' > /home/agent/.config/nix/nix.conf
+ENV PATH="/home/agent/.nix-profile/bin:/nix/var/nix/profiles/default/bin:${PATH}"
 
 # Pre-bake krayt's module graph into GOMODCACHE so `go build ./...` / `go test -race ./...` work
 # offline inside the sandbox's allowlisted egress (see README). Only manifests are copied, not
