@@ -1188,6 +1188,11 @@ krayt doctor                   # check host prereqs (vfkit installed+runnable on
 `run` is headless/detached-capable; default streams logs to the terminal but the VM
 work is the same either way.
 
+`--task` takes a path to the task prompt file, or `-` to read the prompt from stdin (e.g.
+`echo "…" | krayt run --task - …`), so a prompt can be supplied without a file on disk. Combined
+with `--detach`, the already-read stdin bytes are spooled to a file in the run dir and handed to
+the detached supervisor child, since its stdin is gone after it re-execs (§6.2).
+
 ---
 
 ## 14. Milestone Roadmap

@@ -124,6 +124,9 @@ With a booted base image (`krayt image pull`) and an agent container image, a ru
 krayt run --image <agent-image> --task ./task.md --repo . \
   --secrets ./secrets.env --allow api.anthropic.com
 
+# or pipe the prompt in headlessly (--task -) instead of a file:
+echo "fix the flaky test in internal/foo" | krayt run --image <agent-image> --task - --repo .
+
 krayt ls                      # states: starting → running → (waiting) → done
 krayt patch <run-id>          # inspect the diff …
 krayt apply <run-id>          # … then apply it to your repo if you're satisfied

@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,7 +28,11 @@ import (
 const (
 	envDetachChild = "KRAYT_DETACH_CHILD" // present on the child → run in the foreground, don't re-fork
 	envRunID       = "KRAYT_RUN_ID"       // the run id the parent already generated and printed
+	envTaskFile    = "KRAYT_TASK_FILE"    // set when the parent spooled a stdin-read prompt for the detached child
 )
+
+// stdinTaskArg is the --task value that means "read the prompt from stdin" instead of a file path.
+const stdinTaskArg = "-"
 
 // runDeps are the OS-specific collaborators for a run, assembled by the build-tagged
 // newRunDeps (vfkit + the pulled base image on macOS; an error elsewhere until the
@@ -83,7 +89,7 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl := cmd.Flags()
 	fl.StringVar(&f.config, "config", "", "path to krayt.yaml (default: ./<repo>/krayt.yaml if present)")
 	fl.StringVar(&f.image, "image", "", "user OCI image to run (required)")
-	fl.StringVar(&f.taskFile, "task", "", "path to the task prompt file (required)")
+	fl.StringVar(&f.taskFile, "task", "", "path to the task prompt file, or - to read from stdin (required)")
 	fl.StringVar(&f.repo, "repo", ".", "host repo to bundle")
 	fl.StringVar(&f.secretsFile, "secrets", "", "per-task secrets file (KEY=VALUE), mounted on tmpfs at /run/secrets")
 	fl.BoolVar(&f.includeDirty, "include-dirty", false, "include uncommitted working-tree changes in the bundle")
@@ -111,9 +117,12 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	if f.image == "" || f.taskFile == "" {
 		return fmt.Errorf("--image and --task are required (via flags or krayt.yaml)")
 	}
-	prompt, err := os.ReadFile(f.taskFile)
+	prompt, err := readTaskPrompt(cmd, f.taskFile)
 	if err != nil {
-		return fmt.Errorf("read task file: %w", err)
+		return err
+	}
+	if len(bytes.TrimSpace(prompt)) == 0 {
+		return fmt.Errorf("task prompt is empty")
 	}
 	repoAbs, err := filepath.Abs(f.repo)
 	if err != nil {
@@ -182,7 +191,15 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	// survives this terminal closing and its `waiting` question can be answered later (§6.2).
 	// The child re-enters here with envDetachChild set and runs the same spec in the foreground.
 	if f.detach && os.Getenv(envDetachChild) == "" {
-		return spawnDetachedRun(cmd, filepath.Join(repoAbs, ".krayt"), spec.ID)
+		// A stdin-sourced prompt can't be re-read by the detached child (its stdin is gone),
+		// so spool the bytes we already read to a file the child reads instead (§6.2).
+		var spooledTaskFile string
+		if f.taskFile == stdinTaskArg {
+			if spooledTaskFile, err = spoolTaskPrompt(filepath.Join(repoAbs, ".krayt"), spec.ID, prompt); err != nil {
+				return err
+			}
+		}
+		return spawnDetachedRun(cmd, filepath.Join(repoAbs, ".krayt"), spec.ID, spooledTaskFile)
 	}
 
 	// OS-specific provider + base VM image (vfkit on macOS; error elsewhere until Phase 7).
@@ -285,11 +302,53 @@ func acquireUserImage(cmd *cobra.Command, ref string) (*imagestore.Image, error)
 	return imagestore.Acquire(cmd.Context(), src, ref, cacheRoot)
 }
 
+// spoolTaskPrompt writes a stdin-read task prompt to a file in the run dir so a detached
+// supervisor child — whose stdin is gone after re-exec — can still read it (§6.2). Doubles as a
+// record of what was run.
+func spoolTaskPrompt(stateDir, id string, prompt []byte) (string, error) {
+	runDir := orchestrator.RunDir(stateDir, id)
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return "", fmt.Errorf("create run dir: %w", err)
+	}
+	path := filepath.Join(runDir, "prompt.md")
+	if err := os.WriteFile(path, prompt, 0o644); err != nil {
+		return "", fmt.Errorf("spool task prompt: %w", err)
+	}
+	return path, nil
+}
+
+// readTaskPrompt resolves the task prompt from, in order: a spooled file left by the parent for
+// a detached child (envTaskFile), stdin (taskFile == "-"), or the given file path — mirroring
+// exactly how the prompt is sourced today except for the new stdin case (§13).
+func readTaskPrompt(cmd *cobra.Command, taskFile string) ([]byte, error) {
+	if spooled := os.Getenv(envTaskFile); spooled != "" {
+		b, err := os.ReadFile(spooled)
+		if err != nil {
+			return nil, fmt.Errorf("read spooled task file: %w", err)
+		}
+		return b, nil
+	}
+	if taskFile == stdinTaskArg {
+		b, err := io.ReadAll(cmd.InOrStdin())
+		if err != nil {
+			return nil, fmt.Errorf("read task prompt from stdin: %w", err)
+		}
+		return b, nil
+	}
+	b, err := os.ReadFile(taskFile)
+	if err != nil {
+		return nil, fmt.Errorf("read task file: %w", err)
+	}
+	return b, nil
+}
+
 // spawnDetachedRun launches a session-detached copy of this krayt invocation to supervise the
 // run in the background, then returns after printing how to track it (§6.2). The child re-execs
 // the same argv with envDetachChild + envRunID set, so it names the same run dir and runs the
 // identical spec in the foreground; its own stdout/stderr go to the run's supervisor log.
-func spawnDetachedRun(cmd *cobra.Command, stateDir, id string) error {
+// spooledTaskFile, if non-empty, is a stdin-read prompt already spooled to disk by the parent;
+// the child can't re-read stdin after re-exec, so it's handed the file via envTaskFile instead.
+func spawnDetachedRun(cmd *cobra.Command, stateDir, id, spooledTaskFile string) error {
 	runDir := orchestrator.RunDir(stateDir, id)
 	if err := os.MkdirAll(filepath.Join(runDir, "logs"), 0o755); err != nil {
 		return fmt.Errorf("create run dir: %w", err)
@@ -299,6 +358,9 @@ func spawnDetachedRun(cmd *cobra.Command, stateDir, id string) error {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
 	env := append(os.Environ(), envDetachChild+"=1", envRunID+"="+id)
+	if spooledTaskFile != "" {
+		env = append(env, envTaskFile+"="+spooledTaskFile)
+	}
 	logPath := filepath.Join(runDir, "logs", "supervisor.log")
 	pid, err := spawnDetached(exe, os.Args[1:], env, logPath)
 	if err != nil {
