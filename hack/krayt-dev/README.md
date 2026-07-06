@@ -39,6 +39,18 @@ Krayt's own source is **not** `COPY`'d into the image — only `go.mod`/`go.sum`
 module cache prebake). The repo itself arrives at `/workspace` at run time, injected by krayt
 (§6.7), same as any other agent image.
 
+## Model + effort selection
+
+The entrypoint passes `--model` and `--effort` to `claude -p`, taken from the `CLAUDE_MODEL` and
+`CLAUDE_EFFORT` env vars (set via `krayt.yaml`'s `env:`, §8.1). Unset, they default to
+`claude-sonnet-5` on `high` effort:
+
+```yaml
+env:
+  CLAUDE_MODEL: claude-opus-4-8
+  CLAUDE_EFFORT: max
+```
+
 ## Offline module cache
 
 `go mod download` runs at **image build time** against krayt's `go.mod`/`go.sum`, so
