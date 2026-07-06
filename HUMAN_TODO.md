@@ -495,3 +495,11 @@ below block only that on-hardware confirmation.
   build-push v7.x — left for Renovate to propose as reviewable bumps rather than folding an
   untested major jump into the pinning fix.)
 - Blocking: no — was only supply-chain hygiene to match repo convention; done.
+
+## [Security review] Rotate the working-tree `secrets.env` token — DONE ✅
+- Resolved: the maintainer revoked the exposed `CLAUDE_CODE_OAUTH_TOKEN` (scope `user:inference`)
+  in the Claude web UI on 2026-07-06; the token in `secrets.env` is now dead.
+- Follow-up (not a security item): drop a fresh token into `secrets.env` (gitignored) to run krayt
+  again. Never inline a token into the tracked `krayt.yaml` — see
+  `docs/ai-tasks/fix-krayt-yaml-tracking.md`.
+- Blocking: no.
