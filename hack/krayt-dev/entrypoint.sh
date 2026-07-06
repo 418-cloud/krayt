@@ -67,7 +67,13 @@ EOF
   echo "[krayt-dev] registered ask_human MCP server (questions enabled)"
 fi
 
-echo "[krayt-dev] running claude -p in $(pwd) (model: ${ANTHROPIC_MODEL:-default})"
+# CLAUDE_MODEL/CLAUDE_EFFORT (set via krayt.yaml's `env:`, §8.1) pick the model + reasoning
+# effort for this run; default to claude-sonnet-5 on high effort when unset.
+model="${CLAUDE_MODEL:-claude-sonnet-5}"
+effort="${CLAUDE_EFFORT:-high}"
+extra+=(--model "$model" --effort "$effort")
+
+echo "[krayt-dev] running claude -p in $(pwd) (model: $model, effort: $effort)"
 # Print/headless mode with autonomous edits — safe because the whole run is already isolated in
 # the krayt micro-VM, so the tool-permission prompts add nothing. The task prompt is expected to
 # tell the agent to build/test/lint/regenerate proto as needed (see README + task.example.md).
