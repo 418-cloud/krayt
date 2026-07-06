@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/418-cloud/krayt/compare/v0.1.2...v0.2.0) (2026-07-06)
+
+
+### Features
+
+* add prompt input from stdin to support headless and simplify sm… ([#29](https://github.com/418-cloud/krayt/issues/29)) ([379098c](https://github.com/418-cloud/krayt/commit/379098c5a0fb5066f45d9b7734a93c36643fa007))
+
 ## [0.1.2](https://github.com/418-cloud/krayt/compare/v0.1.1...v0.1.2) (2026-07-05)
 
 
