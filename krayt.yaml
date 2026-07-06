@@ -5,8 +5,12 @@
 # PERSONAL/local config (gitignored): it pins a specific dev-image build + your secrets path.
 # `task:` is intentionally omitted so you always pass --task per run.
 
-image: ghcr.io/418-cloud/krayt-dev:sha-56cedae
+image: ghcr.io/418-cloud/krayt-dev:sha-7ca7cc7
 secrets: secrets.env
+env:
+  CLAUDE_MODEL: claude-opus-4-8
+  CLAUDE_EFFORT: high
+
 bundle_depth: 0 # full-history bundle
 
 agent:
