@@ -318,10 +318,12 @@ func spoolTaskPrompt(stateDir, id string, prompt []byte) (string, error) {
 }
 
 // readTaskPrompt resolves the task prompt from, in order: a spooled file left by the parent for
-// a detached child (envTaskFile), stdin (taskFile == "-"), or the given file path — mirroring
-// exactly how the prompt is sourced today except for the new stdin case (§13).
+// a detached child (envTaskFile — only honored when envDetachChild marks us as that child, so a
+// stray KRAYT_TASK_FILE in a user's shell can't hijack --task), stdin (taskFile == "-"), or the
+// given file path — mirroring exactly how the prompt is sourced today except for the new stdin
+// case (§13).
 func readTaskPrompt(cmd *cobra.Command, taskFile string) ([]byte, error) {
-	if spooled := os.Getenv(envTaskFile); spooled != "" {
+	if spooled := os.Getenv(envTaskFile); spooled != "" && os.Getenv(envDetachChild) != "" {
 		b, err := os.ReadFile(spooled)
 		if err != nil {
 			return nil, fmt.Errorf("read spooled task file: %w", err)

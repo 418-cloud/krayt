@@ -55,14 +55,16 @@ func TestReadTaskPromptFile(t *testing.T) {
 }
 
 // TestReadTaskPromptSpooledEnvWins proves the detached-child side of the handoff: when
-// KRAYT_TASK_FILE is set (the parent already spooled a stdin-read prompt for it), it takes
-// precedence over both stdin and any --task file value.
+// KRAYT_TASK_FILE is set (the parent already spooled a stdin-read prompt for it) AND we are the
+// detached child (KRAYT_DETACH_CHILD marks us as such), it takes precedence over both stdin and any
+// --task file value.
 func TestReadTaskPromptSpooledEnvWins(t *testing.T) {
 	dir := t.TempDir()
 	spool := filepath.Join(dir, "prompt.md")
 	if err := os.WriteFile(spool, []byte("spooled prompt"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv(envDetachChild, "1") // we are the detached child — only then is the spool honored
 	t.Setenv(envTaskFile, spool)
 
 	var f runFlags
@@ -75,6 +77,30 @@ func TestReadTaskPromptSpooledEnvWins(t *testing.T) {
 	}
 	if string(got) != "spooled prompt" {
 		t.Errorf("prompt = %q, want the spooled file's contents", got)
+	}
+}
+
+// TestReadTaskPromptSpooledIgnoredWithoutDetachChild guards the scoping fix: a stray
+// KRAYT_TASK_FILE in a normal (non-detached) invocation must NOT hijack --task/stdin — the spool is
+// honored only when KRAYT_DETACH_CHILD marks this process as the detached child.
+func TestReadTaskPromptSpooledIgnoredWithoutDetachChild(t *testing.T) {
+	dir := t.TempDir()
+	spool := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(spool, []byte("stray spool"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envTaskFile, spool) // set, but envDetachChild is NOT → must be ignored
+
+	var f runFlags
+	cmd := newTestRunCmd(&f)
+	cmd.SetIn(strings.NewReader("from stdin"))
+
+	got, err := readTaskPrompt(cmd, stdinTaskArg)
+	if err != nil {
+		t.Fatalf("readTaskPrompt: %v", err)
+	}
+	if string(got) != "from stdin" {
+		t.Errorf("prompt = %q, want stdin content (a stray KRAYT_TASK_FILE must not win)", got)
 	}
 }
 
