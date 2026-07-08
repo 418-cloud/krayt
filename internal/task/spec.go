@@ -23,7 +23,40 @@ type RunSpec struct {
 	Network      NetworkPolicy     // mode + allowlist (mirrors the proto enum, §6.5)
 	Resources    Resources         // CPUs, MemoryMiB, DiskGiB, Timeout
 	Questions    QuestionsPolicy   // mode + per-question timeout + on-timeout (§6.13)
+	Container    ContainerPolicy   // least-privilege OCI overrides applied by the guest runner (§6.10, §10)
 	Detach       bool              // headless vs stream-to-terminal
+}
+
+// ContainerPolicy is the resolved per-task container hardening policy the guest runner turns
+// into OCI spec options (§6.10, §10). The defaults are the secure ones — all capabilities
+// dropped, the containerd seccomp profile applied, writable rootfs — so a zero value already
+// closes the egress bypass; the fields only widen or narrow from there.
+type ContainerPolicy struct {
+	AddCapabilities   []string // opt-in caps re-granted on top of drop-all (normalized + validated, CAP_-prefixed)
+	SeccompUnconfined bool     // drop the default seccomp profile (seccomp: unconfined)
+	ReadonlyRootfs    bool     // mount the container rootfs read-only (default false; §8.2 caveat)
+}
+
+// SeccompMode is the config value for the container's seccomp profile (§8.1).
+type SeccompMode string
+
+// Seccomp modes (§8.1). An unset field ("") and the explicit "default" both apply the containerd
+// default profile — so an unset field stays secure; only "unconfined" opts out.
+const (
+	SeccompUnset      SeccompMode = ""           // unset ⇒ containerd default profile (secure default)
+	SeccompDefault    SeccompMode = "default"    // explicit alias for the default profile
+	SeccompUnconfined SeccompMode = "unconfined" // no seccomp filter
+)
+
+// ParseSeccompMode validates a config seccomp value, mirroring ParseNetworkMode so a typo fails
+// fast at config load rather than silently disabling the filter.
+func ParseSeccompMode(s string) (SeccompMode, error) {
+	switch m := SeccompMode(s); m {
+	case SeccompUnset, SeccompDefault, SeccompUnconfined:
+		return m, nil
+	default:
+		return "", fmt.Errorf("invalid seccomp mode %q (want %q or %q)", s, SeccompDefault, SeccompUnconfined)
+	}
 }
 
 // Resources bounds one run (§6.1). Expiry of Timeout kills the container then the VM.

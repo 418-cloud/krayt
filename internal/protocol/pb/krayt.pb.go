@@ -360,12 +360,19 @@ func (x *Chunk) GetLast() bool {
 	return false
 }
 
+// TaskSpec carries the non-secret task config to the guest (§6.10/§8.1). The container-policy
+// fields (3–5) let the host opt into least-privilege overrides the guest applies when it builds
+// the OCI spec: caps default to drop-all (empty add_capabilities), seccomp defaults to the
+// containerd profile, and the rootfs is writable unless readonly_rootfs is set.
 type TaskSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Prompt        []byte                 `protobuf:"bytes,1,opt,name=prompt,proto3" json:"prompt,omitempty"`
-	Env           map[string]string      `protobuf:"bytes,2,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Prompt            []byte                 `protobuf:"bytes,1,opt,name=prompt,proto3" json:"prompt,omitempty"`
+	Env               map[string]string      `protobuf:"bytes,2,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // env = non-secret
+	AddCapabilities   []string               `protobuf:"bytes,3,rep,name=add_capabilities,json=addCapabilities,proto3" json:"add_capabilities,omitempty"`                            // opt-in caps, CAP_-prefixed; empty = drop all
+	SeccompUnconfined bool                   `protobuf:"varint,4,opt,name=seccomp_unconfined,json=seccompUnconfined,proto3" json:"seccomp_unconfined,omitempty"`                     // opt-out of the default seccomp profile
+	ReadonlyRootfs    bool                   `protobuf:"varint,5,opt,name=readonly_rootfs,json=readonlyRootfs,proto3" json:"readonly_rootfs,omitempty"`                              // opt-in read-only rootfs (default false)
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *TaskSpec) Reset() {
@@ -410,6 +417,27 @@ func (x *TaskSpec) GetEnv() map[string]string {
 		return x.Env
 	}
 	return nil
+}
+
+func (x *TaskSpec) GetAddCapabilities() []string {
+	if x != nil {
+		return x.AddCapabilities
+	}
+	return nil
+}
+
+func (x *TaskSpec) GetSeccompUnconfined() bool {
+	if x != nil {
+		return x.SeccompUnconfined
+	}
+	return false
+}
+
+func (x *TaskSpec) GetReadonlyRootfs() bool {
+	if x != nil {
+		return x.ReadonlyRootfs
+	}
+	return false
 }
 
 type SecretsBundle struct {
@@ -1112,10 +1140,13 @@ const file_krayt_proto_rawDesc = "" +
 	"\x05Chunk\x12\x12\n" +
 	"\x04data\x18\x01 \x01(\fR\x04data\x12\x16\n" +
 	"\x06digest\x18\x02 \x01(\tR\x06digest\x12\x12\n" +
-	"\x04last\x18\x03 \x01(\bR\x04last\"\x89\x01\n" +
+	"\x04last\x18\x03 \x01(\bR\x04last\"\x8c\x02\n" +
 	"\bTaskSpec\x12\x16\n" +
 	"\x06prompt\x18\x01 \x01(\fR\x06prompt\x12-\n" +
-	"\x03env\x18\x02 \x03(\v2\x1b.krayt.v1.TaskSpec.EnvEntryR\x03env\x1a6\n" +
+	"\x03env\x18\x02 \x03(\v2\x1b.krayt.v1.TaskSpec.EnvEntryR\x03env\x12)\n" +
+	"\x10add_capabilities\x18\x03 \x03(\tR\x0faddCapabilities\x12-\n" +
+	"\x12seccomp_unconfined\x18\x04 \x01(\bR\x11seccompUnconfined\x12'\n" +
+	"\x0freadonly_rootfs\x18\x05 \x01(\bR\x0ereadonlyRootfs\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x87\x01\n" +

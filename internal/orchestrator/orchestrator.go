@@ -177,7 +177,13 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	if err := pushCode(ctx, client, spec); err != nil {
 		return nil, err
 	}
-	if _, err := client.Agent.PushTask(ctx, &pb.TaskSpec{Prompt: spec.TaskPrompt, Env: spec.Env}); err != nil {
+	if _, err := client.Agent.PushTask(ctx, &pb.TaskSpec{
+		Prompt:            spec.TaskPrompt,
+		Env:               spec.Env,
+		AddCapabilities:   spec.Container.AddCapabilities,
+		SeccompUnconfined: spec.Container.SeccompUnconfined,
+		ReadonlyRootfs:    spec.Container.ReadonlyRootfs,
+	}); err != nil {
 		return nil, fmt.Errorf("orchestrator: push task: %w", err)
 	}
 	if err := pushSecrets(ctx, client, spec.SecretsPath); err != nil {

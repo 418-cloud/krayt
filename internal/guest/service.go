@@ -39,6 +39,15 @@ const (
 	fileCommitsBundle = "commits.bundle"
 )
 
+// containerPolicy is the guest-held copy of the per-task container hardening policy (§6.10),
+// received in PushTask and threaded into RunConfig at Start. The zero value is the secure
+// default (drop all caps, default seccomp, writable rootfs).
+type containerPolicy struct {
+	addCapabilities   []string
+	seccompUnconfined bool
+	readonlyRootfs    bool
+}
+
 // Service implements pb.GuestAgentServer for one run (§6.5). The Runner is the only piece
 // that needs a real OS/runtime; everything else (bundle ingest, baseline, diff, artifact
 // streaming) is OS-agnostic.
@@ -54,6 +63,7 @@ type Service struct {
 	bundlePath string // received git bundle (§6.7)
 	imagePath  string // received OCI archive (§6.11)
 	taskEnv    map[string]string
+	container  containerPolicy   // received container hardening policy (§6.10, §10)
 	secrets    map[string]string // received secrets, held in memory only (§6.8)
 	netPolicy  NetworkPolicy     // received network policy (§6.6)
 	baseline   string            // recorded baseline commit, set during Start (§6.7)
@@ -168,6 +178,11 @@ func (s *Service) PushTask(_ context.Context, req *pb.TaskSpec) (*pb.Ack, error)
 	}
 	s.mu.Lock()
 	s.taskEnv = req.GetEnv()
+	s.container = containerPolicy{
+		addCapabilities:   req.GetAddCapabilities(),
+		seccompUnconfined: req.GetSeccompUnconfined(),
+		readonlyRootfs:    req.GetReadonlyRootfs(),
+	}
 	s.mu.Unlock()
 	return &pb.Ack{Ok: true}, nil
 }
@@ -213,6 +228,7 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	ctx := stream.Context()
 	s.mu.Lock()
 	bundlePath, imagePath, env, secretVals, netPolicy := s.bundlePath, s.imagePath, s.taskEnv, s.secrets, s.netPolicy
+	container := s.container
 	s.mu.Unlock()
 
 	if s.runner == nil {
@@ -326,6 +342,10 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		AskSocket:        askSocket,
 		AskBinary:        askBinaryPath(),
 		Ask:              bridge.Ask,
+		// Container hardening policy (§6.10, §10); zero value = drop all caps + default seccomp.
+		AddCapabilities:   container.addCapabilities,
+		SeccompUnconfined: container.seccompUnconfined,
+		ReadonlyRootfs:    container.readonlyRootfs,
 	}, log)
 
 	// The run context being done means the host aborted us — normally the wall-clock timeout

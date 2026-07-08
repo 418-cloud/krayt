@@ -67,6 +67,10 @@ type runFlags struct {
 	onQuestionTimeout string        // sentinel | abort
 
 	agent string // none | claude-code | gemini-cli (§6.14, §8.1)
+
+	// container is resolved from krayt.yaml's `container:` block (§8.1); there are no CLI flags
+	// for it in v1 (config-file only), so it stays the secure zero value when no config is present.
+	container task.ContainerPolicy
 }
 
 func newRunCmd() *cobra.Command {
@@ -178,6 +182,7 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 			Timeout:   f.timeout,
 		},
 		Questions: task.QuestionsPolicy{Mode: qMode, Timeout: f.questionTimeout, OnTimeout: qOnTimeout},
+		Container: f.container,
 	}
 
 	// Optional per-agent adapter (§6.14): validate auth (exactly-one, fail fast before any VM
@@ -481,6 +486,23 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 		f.questionTimeout = d
 	}
 	f.env = cfg.Env // non-secret container env comes from the file (§8.1)
+
+	// Resolve the container hardening policy from the file (§8.1). No flags overlay it in v1, so
+	// this is config-file only; validation (seccomp mode, capability allow/deny-list) runs here so
+	// a bad value fails fast at load, before any VM boots.
+	seccomp, err := task.ParseSeccompMode(cfg.Container.Seccomp)
+	if err != nil {
+		return fmt.Errorf("config container.seccomp: %w", err)
+	}
+	caps, err := task.NormalizeCapabilities(cfg.Container.Capabilities)
+	if err != nil {
+		return fmt.Errorf("config container.capabilities: %w", err)
+	}
+	f.container = task.ContainerPolicy{
+		AddCapabilities:   caps,
+		SeccompUnconfined: seccomp == task.SeccompUnconfined,
+		ReadonlyRootfs:    cfg.Container.ReadonlyRootfs != nil && *cfg.Container.ReadonlyRootfs,
+	}
 	return nil
 }
 
