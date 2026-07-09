@@ -504,7 +504,31 @@ below block only that on-hardware confirmation.
   `docs/ai-tasks/fix-krayt-yaml-tracking.md`.
 - Blocking: no.
 
-## [Security review] Run the container-hardening integration tests on a Mac (findings #1/#3)
+## [Security review] Rebuild + re-pin the VM image for the container-hardening changes — DONE ✅
+- Resolved: the guest-agent's `vendorHash` in `images/flake.nix` was regenerated to
+  `sha256-jM5Xcp/sE2nuYKpi8H1P9YNhx0S33gd+JcelJO+9tzE=` (no new Go module — the hardening task
+  added no dependency; the hash moved because `nixpkgs/nixos-unstable` is a floating input), the
+  image rebuilt and published as **v0.2.0-rc1**, and `internal/vmimage/pinned.go` re-pinned to
+  `ghcr.io/418-cloud/krayt-vmimage@sha256:8e5e90c76b0b21261bd1d350b62e04b5ce1eaf37d7d96776e2e6bcfefb61e4fe`.
+  `TestBootHello` re-passed on the new image (`containerd=v2.3.1`, no regression) before the
+  hardening tests below were trusted.
+- Why the agent can't: needs an aarch64-linux Nix builder (no Nix in the sandbox) — the guest-agent
+  (`internal/guest/runner/containerd_linux.go` et al., the whole `harden-container-oci-spec.md`
+  task) is baked into the rootfs, so the previously-pinned image (v0.1.2) predated these changes
+  and could not prove them.
+- Blocking: yes — was blocking the tests below (an unrehardened image would prove nothing); now
+  resolved.
+
+## [Security review] Run the container-hardening integration tests on a Mac (findings #1/#3) — DONE ✅
+- Resolved: both tests **PASS** on Apple Silicon against the rebuilt image (v0.2.0-rc1) with the
+  `hack/hardening-probe` and `hack/root-probe` images
+  (`docker.io/tjololo/test-krayt:hardening-probe` / `:root-probe`):
+  `TestContainerHardening` (13.67s) — the probe's own log confirms every control: `CapEff`/`CapAmb`
+  all-zero, `NoNewPrivs=1`, `Seccomp=2`, uid 1000 (non-root), proxyd found at uid 998 via
+  `/proc/net/tcp`, and `setuid(998)` failed with `EPERM` — the egress-allowlist bypass (finding #1)
+  is closed. `TestRootImageFailsClosed` (17.45s) also passed — the root image's run was rejected
+  before it launched. No regression: `TestBootHello` re-passed on the same image. Findings #1 and
+  #3 are now confirmed closed on real hardware, not just in the in-memory spec-builder unit tests.
 - Needed: on the Apple-Silicon Mac + vfkit (same host as the other integration tests), run the
   new gated tests that prove the least-privilege OCI spec on a real containerd:
   `TestContainerHardening`, `TestRootImageFailsClosed` (both in
@@ -537,7 +561,12 @@ below block only that on-hardware confirmation.
   are the final on-metal confirmation of findings #1/#3, mirroring the existing egress-probe
   handoff. `fix-egress-allowlist-bypass.md` depends on this task and shares the setuid regression.
 
-## [Security review] Normalize the protobuf codegen version comment (make proto)
+## [Security review] Normalize the protobuf codegen version comment (make proto) — DONE ✅
+- Resolved: `make proto` re-run with the pinned Nix toolchain; `internal/protocol/pb/krayt.pb.go`
+  now reads the canonical `protoc v7.34.1` header, and `git diff HEAD` on the generated files is
+  empty — the hardening commit (`e71df7d`) already carries the canonical, toolchain-verified
+  codegen for the new `TaskSpec` fields (`add_capabilities`, `seccomp_unconfined`,
+  `readonly_rootfs`).
 - Needed: re-run `make proto` with the pinned Nix toolchain and commit the result, so
   `internal/protocol/pb/krayt.pb.go`'s header reads the canonical `protoc v7.34.1` rather than the
   `v7.35.1` the sandbox's `protoc` emits.
