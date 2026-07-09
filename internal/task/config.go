@@ -38,6 +38,11 @@ type Config struct {
 	Agent struct {
 		Adapter string `yaml:"adapter"`
 	} `yaml:"agent"`
+	Container struct {
+		Capabilities   []string `yaml:"capabilities"`    // opt-in caps re-granted to the drop-all default (§8.1)
+		Seccomp        string   `yaml:"seccomp"`         // ""/"default" (default profile) | "unconfined"
+		ReadonlyRootfs *bool    `yaml:"readonly_rootfs"` // opt-in; pointer distinguishes unset from explicit false
+	} `yaml:"container"`
 }
 
 // LoadConfig reads and parses a krayt.yaml. Unknown keys are rejected so typos surface

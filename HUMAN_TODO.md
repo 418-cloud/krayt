@@ -495,3 +495,90 @@ below block only that on-hardware confirmation.
   build-push v7.x — left for Renovate to propose as reviewable bumps rather than folding an
   untested major jump into the pinning fix.)
 - Blocking: no — was only supply-chain hygiene to match repo convention; done.
+
+## [Security review] Rotate the working-tree `secrets.env` token — DONE ✅
+- Resolved: the maintainer revoked the exposed `CLAUDE_CODE_OAUTH_TOKEN` (scope `user:inference`)
+  in the Claude web UI on 2026-07-06; the token in `secrets.env` is now dead.
+- Follow-up (not a security item): drop a fresh token into `secrets.env` (gitignored) to run krayt
+  again. Never inline a token into the tracked `krayt.yaml` — see
+  `docs/ai-tasks/fix-krayt-yaml-tracking.md`.
+- Blocking: no.
+
+## [Security review] Rebuild + re-pin the VM image for the container-hardening changes — DONE ✅
+- Resolved: the guest-agent's `vendorHash` in `images/flake.nix` was regenerated to
+  `sha256-jM5Xcp/sE2nuYKpi8H1P9YNhx0S33gd+JcelJO+9tzE=` (no new Go module — the hardening task
+  added no dependency; the hash moved because `nixpkgs/nixos-unstable` is a floating input), the
+  image rebuilt and published as **v0.2.0-rc1**, and `internal/vmimage/pinned.go` re-pinned to
+  `ghcr.io/418-cloud/krayt-vmimage@sha256:8e5e90c76b0b21261bd1d350b62e04b5ce1eaf37d7d96776e2e6bcfefb61e4fe`.
+  `TestBootHello` re-passed on the new image (`containerd=v2.3.1`, no regression) before the
+  hardening tests below were trusted.
+- Why the agent can't: needs an aarch64-linux Nix builder (no Nix in the sandbox) — the guest-agent
+  (`internal/guest/runner/containerd_linux.go` et al., the whole `harden-container-oci-spec.md`
+  task) is baked into the rootfs, so the previously-pinned image (v0.1.2) predated these changes
+  and could not prove them.
+- Blocking: yes — was blocking the tests below (an unrehardened image would prove nothing); now
+  resolved.
+
+## [Security review] Run the container-hardening integration tests on a Mac (findings #1/#3) — DONE ✅
+- Resolved: both tests **PASS** on Apple Silicon against the rebuilt image (v0.2.0-rc1) with the
+  `hack/hardening-probe` and `hack/root-probe` images
+  (`docker.io/tjololo/test-krayt:hardening-probe` / `:root-probe`):
+  `TestContainerHardening` (13.67s) — the probe's own log confirms every control: `CapEff`/`CapAmb`
+  all-zero, `NoNewPrivs=1`, `Seccomp=2`, uid 1000 (non-root), proxyd found at uid 998 via
+  `/proc/net/tcp`, and `setuid(998)` failed with `EPERM` — the egress-allowlist bypass (finding #1)
+  is closed. `TestRootImageFailsClosed` (17.45s) also passed — the root image's run was rejected
+  before it launched. No regression: `TestBootHello` re-passed on the same image. Findings #1 and
+  #3 are now confirmed closed on real hardware, not just in the in-memory spec-builder unit tests.
+- Needed: on the Apple-Silicon Mac + vfkit (same host as the other integration tests), run the
+  new gated tests that prove the least-privilege OCI spec on a real containerd:
+  `TestContainerHardening`, `TestRootImageFailsClosed` (both in
+  `internal/orchestrator/integration_test.go`). These verify the caps-drop / non-root / seccomp /
+  no-new-privs / setuid(proxyd)=EPERM behavior end to end — the unit tests only cover the spec
+  builder in memory (`internal/guest/runner/spec_linux_test.go`, run in CI on linux).
+- Why the agent can't: needs virtualization hardware, the base VM image (containerd + nftables),
+  and purpose-built linux/arm64 probe images — none available in the cloud sandbox (§14, §11.6).
+- Exact steps/commands:
+  1. Build/publish two linux/arm64 probe images and set their refs:
+     - `KRAYT_HARDENING_IMAGE` — **non-root** (e.g. `USER 1000`) image whose entrypoint exits 0
+       ONLY when ALL hold: `/proc/self/status` has `CapEff: 0000000000000000`,
+       `CapAmb: 0000000000000000`, `NoNewPrivs: 1`, `Seccomp: 2` (filter mode); `id -u` != 0; and
+       a `setuid(<proxyd uid>)` returns `EPERM` (read proxyd's uid from `/proc/net/tcp` owners or
+       brute-force the system-uid range, then attempt the syscall). Non-zero exit on any failure.
+     - `KRAYT_ROOT_IMAGE` — a linux/arm64 image with `USER root` (or no USER); its entrypoint is
+       irrelevant because the run must fail before it launches.
+  2. Run:
+     ```
+     KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img \
+     KRAYT_HARDENING_IMAGE=ghcr.io/you/krayt-hardening-probe:latest \
+     KRAYT_ROOT_IMAGE=ghcr.io/you/krayt-root-probe:latest \
+       go test -tags 'integration darwin' \
+       -run 'TestContainerHardening|TestRootImageFailsClosed' -v ./internal/orchestrator/
+     ```
+- Verify success by: both tests PASS — `TestContainerHardening` exits 0 (all assertions hold),
+  and `TestRootImageFailsClosed` gets a run error naming the non-root / uid-0 requirement.
+- Blocking: no — the Go changes, unit tests (caps validator, spec builder, plumbing), `go build`
+  for `linux/arm64`, and `go test -race ./...` all pass in the sandbox; these hardware assertions
+  are the final on-metal confirmation of findings #1/#3, mirroring the existing egress-probe
+  handoff. `fix-egress-allowlist-bypass.md` depends on this task and shares the setuid regression.
+
+## [Security review] Normalize the protobuf codegen version comment (make proto) — DONE ✅
+- Resolved: `make proto` re-run with the pinned Nix toolchain; `internal/protocol/pb/krayt.pb.go`
+  now reads the canonical `protoc v7.34.1` header, and `git diff HEAD` on the generated files is
+  empty — the hardening commit (`e71df7d`) already carries the canonical, toolchain-verified
+  codegen for the new `TaskSpec` fields (`add_capabilities`, `seccomp_unconfined`,
+  `readonly_rootfs`).
+- Needed: re-run `make proto` with the pinned Nix toolchain and commit the result, so
+  `internal/protocol/pb/krayt.pb.go`'s header reads the canonical `protoc v7.34.1` rather than the
+  `v7.35.1` the sandbox's `protoc` emits.
+- Why the agent can't: `nix run .#proto` needs to build the pinned codegen derivation, which needs
+  network/substituter access unavailable in this sandbox; the sandbox `protoc` is v7.35.1, one
+  patch ahead of the canonical v7.34.1 (Phase 0 precedent: only the version *comment* differed,
+  the generated code was otherwise identical). The new `TaskSpec` fields (`add_capabilities`,
+  `seccomp_unconfined`, `readonly_rootfs`) were regenerated with the sandbox `protoc` and are
+  functionally correct — the code compiles, builds for `linux/arm64`, and passes `go test -race`.
+  `krayt_grpc.pb.go` was restored to the canonical committed copy (it had no real change).
+- Exact steps/commands: `make proto && git diff internal/protocol/pb` (expect only the `protoc`
+  version comment to change back to v7.34.1); commit if so.
+- Verify success by: `git diff` shows just the header comment normalized; `go build ./...` and
+  `go test -race ./...` still pass.
+- Blocking: no — cosmetic; the committed generated code is functionally correct.

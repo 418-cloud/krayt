@@ -119,6 +119,88 @@ func TestEndToEndRun(t *testing.T) {
 	}
 }
 
+// TestContainerPolicyReachesRunner proves the per-task container hardening policy (§6.10, §10)
+// travels host → guest end to end: RunSpec.Container is pushed in the TaskSpec proto and threaded
+// into the guest.RunConfig the Runner receives. The containerd Runner turns these into OCI spec
+// opts (unit-tested separately in the linux runner package); here we assert the plumbing.
+func TestContainerPolicyReachesRunner(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	img := minimalImage(ctx, t)
+
+	var got guest.RunConfig
+	runner := &capturingRunner{onRun: func(cfg guest.RunConfig) { got = cfg }}
+	p := &fake.Provider{Register: func(s *grpc.Server) {
+		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(runner), guest.WithRoot(t.TempDir())))
+	}}
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	spec := task.RunSpec{
+		ID: "run_container", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"),
+		Container: task.ContainerPolicy{
+			AddCapabilities:   []string{"CAP_NET_BIND_SERVICE"},
+			SeccompUnconfined: true,
+			ReadonlyRootfs:    true,
+		},
+	}
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img}, spec, runDir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(got.AddCapabilities) != 1 || got.AddCapabilities[0] != "CAP_NET_BIND_SERVICE" {
+		t.Errorf("AddCapabilities = %v, want [CAP_NET_BIND_SERVICE]", got.AddCapabilities)
+	}
+	if !got.SeccompUnconfined {
+		t.Error("SeccompUnconfined did not reach the runner")
+	}
+	if !got.ReadonlyRootfs {
+		t.Error("ReadonlyRootfs did not reach the runner")
+	}
+}
+
+// TestContainerPolicyDefaultsAreSecure confirms the zero-value policy stays least-privilege end to
+// end: no opt-in caps (drop all), seccomp on, writable rootfs (§10).
+func TestContainerPolicyDefaultsAreSecure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	img := minimalImage(ctx, t)
+
+	var got guest.RunConfig
+	runner := &capturingRunner{onRun: func(cfg guest.RunConfig) { got = cfg }}
+	p := &fake.Provider{Register: func(s *grpc.Server) {
+		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(runner), guest.WithRoot(t.TempDir())))
+	}}
+	runDir := filepath.Join(t.TempDir(), "run")
+	spec := task.RunSpec{ID: "run_default", ImageRef: "latest", RepoPath: src, BundleDepth: 1, TaskPrompt: []byte("task")}
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img}, spec, runDir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(got.AddCapabilities) != 0 {
+		t.Errorf("default AddCapabilities = %v, want empty (drop all)", got.AddCapabilities)
+	}
+	if got.SeccompUnconfined {
+		t.Error("default must apply the seccomp profile (SeccompUnconfined=false)")
+	}
+	if got.ReadonlyRootfs {
+		t.Error("default rootfs must be writable (ReadonlyRootfs=false)")
+	}
+}
+
+// capturingRunner records the RunConfig it was handed, so a test can assert host→guest plumbing.
+type capturingRunner struct{ onRun func(guest.RunConfig) }
+
+func (r *capturingRunner) Version() string { return "fake" }
+func (r *capturingRunner) Run(_ context.Context, cfg guest.RunConfig, _ guest.LogFunc) (int, error) {
+	if r.onRun != nil {
+		r.onRun(cfg)
+	}
+	return 0, nil
+}
+
 // editingRunner is a stand-in for the containerd runner: it simulates the agent by writing
 // known edits into the workspace and emitting a couple of log lines (§14).
 type editingRunner struct{ edits map[string]string }

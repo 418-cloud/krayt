@@ -21,6 +21,8 @@ import (
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/contrib/seccomp"
+	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
@@ -84,18 +86,11 @@ func (r *Runner) Run(ctx context.Context, cfg guest.RunConfig, log guest.LogFunc
 	container, err := r.client.NewContainer(ctx, containerID,
 		containerd.WithImage(image),
 		containerd.WithNewSnapshot(snapshotID, image),
-		containerd.WithNewSpec(
-			oci.WithImageConfig(image),
-			oci.WithProcessCwd(guest.ContainerWorkspace),
-			oci.WithEnv(envSlice(cfg.Env)),
-			oci.WithMounts(contractMounts(cfg)),
-			// Run in the VM's own network namespace (no new netns), so the container
-			// reaches the egress proxy on the VM's loopback and the nftables output lock
-			// applies to its sockets — the VM boundary is the network boundary (§6.6).
-			oci.WithHostNamespace(specs.NetworkNamespace),
-		),
+		containerd.WithNewSpec(buildSpecOpts(cfg, image)...),
 	)
 	if err != nil {
+		// A root image (uid 0) fails here via withEnforceNonRoot; the runner surfaces it as an
+		// infrastructure error (§8.2, §10). Other create failures land here too.
 		return -1, fmt.Errorf("runner: create container: %w", err)
 	}
 	defer func() { _ = container.Delete(ctx, containerd.WithSnapshotCleanup) }()
@@ -147,6 +142,84 @@ func (r *Runner) Run(ctx context.Context, cfg guest.RunConfig, log guest.LogFunc
 	return int(code), nil
 }
 
+// buildSpecOpts assembles the ordered OCI spec options for the untrusted agent container so it
+// runs with least privilege (§6.10, §10). Order matters: WithImageConfig first (it resolves the
+// image's USER and default caps/env), the security opts after (they read/overwrite what the image
+// config set — enforce non-root off the resolved USER, drop all caps, clear ambient), then the
+// host network namespace last so the container shares the VM's netns and the egress lock applies
+// (§6.6). Factored out (and split from securitySpecOpts) so the security decisions are unit-tested
+// against an in-memory spec without a containerd daemon (§14).
+func buildSpecOpts(cfg guest.RunConfig, image oci.Image) []oci.SpecOpts {
+	opts := []oci.SpecOpts{
+		oci.WithImageConfig(image),
+		oci.WithProcessCwd(guest.ContainerWorkspace),
+		oci.WithEnv(envSlice(cfg.Env)),
+		oci.WithMounts(contractMounts(cfg)),
+	}
+	opts = append(opts, securitySpecOpts(cfg)...)
+	// Run in the VM's own network namespace (no new netns), so the container reaches the egress
+	// proxy on the VM's loopback and the nftables output lock applies to its sockets — the VM
+	// boundary is the network boundary (§6.6).
+	opts = append(opts, oci.WithHostNamespace(specs.NetworkNamespace))
+	return opts
+}
+
+// securitySpecOpts is the least-privilege half of the spec (§10): it depends only on the task
+// policy in cfg, not on the image, so it applies cleanly to a seeded *specs.Spec in tests.
+//   - withEnforceNonRoot fails the run if the image would run as uid 0 (§8.2) — the enforcement
+//     that, together with dropped CAP_SETUID/SETGID, makes the skuid-based egress lock unbypassable.
+//   - WithCapabilities(cfg.AddCapabilities) drops ALL capabilities when the opt-in list is empty
+//     (Bounding/Effective/Permitted/Inheritable), or grants exactly the validated opt-in set.
+//   - withClearAmbient zeroes the ambient set belt-and-suspenders, regardless of the image config.
+//   - the containerd default seccomp profile is applied unless the task opts out.
+//   - the rootfs is read-only only on explicit opt-in (writable tmpfs /tmp + /run come from
+//     contractMounts so they precede the /run/secrets bind).
+//
+// NoNewPrivileges stays the containerd default (true); nothing here relaxes it.
+func securitySpecOpts(cfg guest.RunConfig) []oci.SpecOpts {
+	opts := []oci.SpecOpts{
+		withEnforceNonRoot(),
+		oci.WithCapabilities(cfg.AddCapabilities),
+		withClearAmbient(),
+	}
+	if !cfg.SeccompUnconfined {
+		opts = append(opts, seccomp.WithDefaultProfile())
+	}
+	if cfg.ReadonlyRootfs {
+		opts = append(opts, oci.WithRootFSReadonly())
+	}
+	return opts
+}
+
+// withEnforceNonRoot fails container creation when the image would run as root (uid 0), covering
+// both an explicit `USER root` and an unset USER (which WithImageConfig leaves at the uid-0
+// default). krayt requires non-root because egress and secret confinement depend on it: a uid-0
+// process could setuid to proxyd even with caps dropped in some kernels, and some agents refuse
+// uid 0 anyway (§8.2). Must run AFTER WithImageConfig, which resolves s.Process.User from the
+// image config.
+func withEnforceNonRoot() oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Process == nil {
+			return fmt.Errorf("krayt: image has no process config; cannot verify non-root user")
+		}
+		if s.Process.User.UID == 0 {
+			return fmt.Errorf("krayt: image runs as root (uid 0); set a non-root USER in the image (§8.2) — egress and secret confinement require non-root")
+		}
+		return nil
+	}
+}
+
+// withClearAmbient explicitly empties the ambient capability set so no capability is
+// inheritable-ambient regardless of what the image config or WithCapabilities left behind (§10).
+func withClearAmbient() oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Process != nil && s.Process.Capabilities != nil {
+			s.Process.Capabilities.Ambient = nil
+		}
+		return nil
+	}
+}
+
 // importImage imports the OCI archive into containerd's content store and resolves the
 // runnable image. containerd verifies blob digests on import, giving the same integrity
 // guarantee as the base image (§6.11).
@@ -183,11 +256,24 @@ func (r *Runner) importImage(ctx context.Context, cfg guest.RunConfig) (containe
 // (§8.2). The task dir (containing prompt.md) is mounted read-only.
 func contractMounts(cfg guest.RunConfig) []specs.Mount {
 	taskDir := parentDir(cfg.TaskPath)
-	mounts := []specs.Mount{
-		{Destination: guest.ContainerWorkspace, Type: "bind", Source: cfg.WorkspaceDir, Options: []string{"rbind", "rw"}},
-		{Destination: "/task", Type: "bind", Source: taskDir, Options: []string{"rbind", "ro"}},
-		{Destination: guest.ContainerOutput, Type: "bind", Source: cfg.OutputDir, Options: []string{"rbind", "rw"}},
+	var mounts []specs.Mount
+	// Read-only rootfs (§8.2 opt-in) still needs writable /tmp and /run. These ephemeral tmpfs
+	// mounts MUST precede the /run/secrets + ask-socket binds below, or a tmpfs mounted on /run
+	// afterwards would shadow them. /run drops exec (nothing legitimately execs from it); /tmp
+	// keeps exec because agents run helper scripts from it (verified against the krayt-dev image).
+	// Both drop suid/dev. This is only ever a tmpfs over an empty system dir, never a blanket
+	// tmpfs over a populated one (§10).
+	if cfg.ReadonlyRootfs {
+		mounts = append(mounts,
+			specs.Mount{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777"}},
+			specs.Mount{Destination: "/run", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "noexec", "mode=0755"}},
+		)
 	}
+	mounts = append(mounts,
+		specs.Mount{Destination: guest.ContainerWorkspace, Type: "bind", Source: cfg.WorkspaceDir, Options: []string{"rbind", "rw"}},
+		specs.Mount{Destination: "/task", Type: "bind", Source: taskDir, Options: []string{"rbind", "ro"}},
+		specs.Mount{Destination: guest.ContainerOutput, Type: "bind", Source: cfg.OutputDir, Options: []string{"rbind", "rw"}},
+	)
 	// Secrets are bind-mounted read-only from the guest's tmpfs secrets dir (§6.8).
 	if cfg.SecretsDir != "" {
 		mounts = append(mounts, specs.Mount{

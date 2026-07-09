@@ -549,6 +549,31 @@ via containerd's **native Go client** over its local gRPC socket.
 - **Mounts/env per the container contract (§8.2):** `/workspace`, `/task/prompt.md`,
   `/run/secrets/*` (tmpfs), `/output/`, plus `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` for
   the egress proxy.
+- **Least-privilege OCI spec (hardened, §10).** The container runs the untrusted agent, so
+  the guest builds its OCI spec fail-closed rather than inheriting containerd's permissive
+  defaults:
+  - **All Linux capabilities dropped by default** (bounding/effective/permitted/inheritable
+    all empty, ambient explicitly cleared). A task may re-grant a specific few via
+    `container.capabilities` (§8.1); the setuid class (`CAP_SETUID`/`SETGID`/`SETPCAP`),
+    the network-admin class (`CAP_NET_ADMIN`/`NET_RAW`), and broad escape primitives
+    (`CAP_SYS_ADMIN`/`SYS_PTRACE`/`DAC_READ_SEARCH`/`BPF`) are **never** grantable — they
+    would re-open the egress bypass or the VM. Dropping `CAP_SETUID`/`SETGID` is what makes
+    the `skuid "proxyd"` egress lock (§6.6) unbypassable: the container cannot become
+    proxyd's uid to slip past the allowlist.
+  - **Enforced non-root, fail-closed.** An image that would run as uid 0 (explicit `USER root`
+    or an unset `USER`) **fails the run** with a clear error — krayt never silently forces a
+    uid. Non-root is load-bearing for egress and secret confinement (§8.2), not a convention.
+  - **Containerd's default seccomp profile** is applied by default; a task opts out with
+    `container.seccomp: unconfined` (§8.1).
+  - **`NoNewPrivileges=true`** (containerd default) is kept.
+  - **Read-only rootfs is a per-task opt-in** (`container.readonly_rootfs: true`, default
+    OFF), paired with writable ephemeral tmpfs for `/tmp` and `/run` only (never a blanket
+    tmpfs over a populated dir). Default-off is deliberate — see §8.2 for the two reasons
+    (image compatibility + marginal benefit in the ephemeral-VM model).
+
+  The container-policy inputs travel host→guest in `TaskSpec` (§6.5); the host validates and
+  normalizes the capability list before pushing, so a typo or a denylisted cap fails fast at
+  config load, before any VM boots.
 
 ### 6.11 Image acquisition — host pull + vsock pre-load (`internal/imagestore`)
 The **host** is the only component that touches a registry. The user's image is
@@ -800,7 +825,32 @@ questions:                      # agent → human questions (§6.13)
 # The adapter also wires the ask_human MCP server / krayt-ask CLI when mode: wait (§6.13).
 agent:
   adapter: none                 # none | claude-code | gemini-cli
+
+# optional container hardening overrides (§6.10, §10). The defaults are the secure ones —
+# all capabilities dropped, containerd's seccomp profile applied, writable rootfs — so an
+# absent `container:` block already runs least-privilege. Config-file only (no CLI flags in v1).
+container:
+  capabilities:                 # opt-in caps re-granted on top of drop-all; CAP_ prefix optional
+    - net_bind_service          # e.g. bind :80/:443 as non-root
+  seccomp: default              # default (containerd profile) | unconfined (drop the filter)
+  readonly_rootfs: false        # opt-in read-only rootfs (default false; see §8.2 caveat)
 ```
+
+**`container.capabilities` denylist.** These are **never** grantable, even if named, and the
+config is rejected at load if one appears: `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`,
+`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_DAC_READ_SEARCH`, `CAP_BPF`,
+`CAP_SYS_PTRACE`. The setuid/net classes would re-open the egress-allowlist bypass (§6.6, §10);
+the rest are broad container-escape primitives. A task that needs open networking uses
+`network.mode: full` — a deliberate, separately-reviewed opt-in — not a capability grant.
+
+**`readonly_rootfs` caveat.** It is opt-in (default OFF) for two reasons: (1) **compatibility** —
+the reference agent images run as `USER agent` and write into `$HOME` (nix profile, `~/.claude`,
+Go caches); a read-only rootfs breaks them, and a tmpfs over `$HOME` would hide the image's
+pre-installed tooling; (2) **marginal benefit** — krayt's isolation is the ephemeral VM +
+single-use container (one run per VM, CoW disk destroyed on teardown, no host fs shared, the
+trusted guest-agent runs *outside* the container), so read-only rootfs mainly buys
+persistence/tamper resistance that has almost no blast radius here. When enabled it is paired
+with writable ephemeral tmpfs for `/tmp` and `/run` only.
 
 ### 8.2 Container contract (convention)
 Injected by the tool, regardless of adapter:
@@ -817,8 +867,18 @@ Because the container runs **non-root** (below), the tool makes these usable by 
 `/run/secrets` is world-readable, `/workspace` and `/output` are writable, and the ask socket is
 connectable (§8.2 was root-only before Phase 5 — fixed in the guest).
 
-Run the container as a **non-root** uid: some agents (Claude Code among them) refuse to run
-as uid 0, and any non-root uid satisfies them *(verify current)*.
+The container **must** run as a **non-root** uid — this is now **enforced, not just a
+convention** (§6.10, §10): an image whose `USER` is root (uid 0) or unset **fails the run**
+with a clear error and never launches. Non-root is load-bearing, not cosmetic: dropped
+`CAP_SETUID`/`SETGID` plus a non-root uid are jointly what stop the container from becoming
+proxyd's uid and bypassing the egress allowlist (§6.6). Set a non-root `USER` in the image
+(the reference images use `USER agent`, uid 1000). Some agents (Claude Code among them) also
+refuse uid 0 independently.
+
+An image that writes into its own rootfs — e.g. `$HOME` under `/home/agent` (nix profile,
+`~/.claude`, Go caches) — is **incompatible with `container.readonly_rootfs: true`** (§8.1);
+read-only rootfs is opt-in (default OFF) partly for this reason. When enabled, only `/tmp` and
+`/run` are writable (ephemeral tmpfs); a writable tmpfs is never mounted over a populated dir.
 
 Completion = container process exit. Exit code is surfaced in `meta.json`.
 
@@ -988,13 +1048,18 @@ exposed.
 | Host kernel | Not shared — full VM boundary |
 | Host filesystem | No live mount; input via git bundle, output via reviewed patch |
 | Repo ingest | git bundle cloned in-guest — source `.git/hooks` are never executed or imported, and the guest commits under a throwaway krayt bot identity (§6.7) |
-| Network egress | Default-deny + allowlist proxy; per-task opt-in to widen |
+| Network egress | Default-deny + allowlist proxy; per-task opt-in to widen. The L3 lock keys egress on proxyd's uid, which the container **cannot** reach because `CAP_SETUID`/`SETGID` are dropped and it runs non-root — so the allowlist is unbypassable (§6.6, §6.10) |
+| Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
 | Secrets | tmpfs only, never on disk, redacted from logs, destroyed with VM |
 | Persistence | CoW disk destroyed on teardown; fresh VM per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
 
 **Residual considerations to document:**
-- Proxy-bypass via raw sockets (mitigated by default-deny egress).
+- Proxy-bypass via raw sockets (mitigated by default-deny egress) and via **setuid to proxyd**
+  (mitigated by dropping `CAP_SETUID`/`SETGID` and enforcing non-root, §6.10 — the container
+  cannot assume proxyd's uid to satisfy the `skuid` L3 lock).
+- Container-runtime / guest-kernel bugs — blast radius minimized by the least-privilege OCI
+  spec (dropped caps, seccomp, no-new-privs, non-root) inside the already-isolated VM (§6.10).
 - Malicious patch content (e.g. `.git/hooks`, build scripts) — reviewing the diff
   before apply is the control; consider a `--strip-hooks` / lint pass on patches later.
 - Resource exhaustion — bounded by per-VM CPU/mem/disk + wall-clock timeout.

@@ -33,7 +33,17 @@ message BlobPresence  { repeated string missing_digests = 1; }
 
 message Chunk { bytes data = 1; string digest = 2; bool last = 3; } // digest set on blob/stream boundaries
 
-message TaskSpec      { bytes prompt = 1; map<string, string> env = 2; } // env = non-secret
+// TaskSpec carries the non-secret task config to the guest (§6.10/§8.1). The container-policy
+// fields (3–5) let the host opt into least-privilege overrides the guest applies when it builds
+// the OCI spec: caps default to drop-all (empty add_capabilities), seccomp defaults to the
+// containerd profile, and the rootfs is writable unless readonly_rootfs is set.
+message TaskSpec {
+  bytes prompt = 1;
+  map<string, string> env = 2;            // env = non-secret
+  repeated string add_capabilities = 3;   // opt-in caps, CAP_-prefixed; empty = drop all
+  bool seccomp_unconfined = 4;            // opt-out of the default seccomp profile
+  bool readonly_rootfs = 5;              // opt-in read-only rootfs (default false)
+}
 message SecretsBundle { map<string, string> values = 1; }               // tmpfs at /run/secrets
 message NetworkPolicy { enum Mode { ALLOWLIST = 0; FULL = 1; NONE = 2; }
                         Mode mode = 1; repeated string allow = 2; }

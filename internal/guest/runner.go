@@ -33,6 +33,14 @@ type RunConfig struct {
 	AskSocket        string            // guest-side ask-bridge socket to bind-mount at /run/krayt/ask.sock (§6.13); empty if unavailable
 	AskBinary        string            // guest-side krayt-ask binary to bind-mount onto the container PATH (§6.13); empty if unavailable
 	Ask              AskFunc           // in-process bridge handle for fake runners; nil for the containerd runner
+
+	// Container hardening policy applied when building the OCI spec (§6.10, §10). The zero value
+	// is the secure default: all capabilities dropped, the containerd seccomp profile applied,
+	// writable rootfs. Fields only widen (AddCapabilities, SeccompUnconfined) or narrow
+	// (ReadonlyRootfs) from there. Validated + normalized host-side before it reaches here.
+	AddCapabilities   []string // opt-in caps re-granted on top of drop-all; empty ⇒ drop all
+	SeccompUnconfined bool     // drop the default seccomp profile
+	ReadonlyRootfs    bool     // mount the rootfs read-only, with writable tmpfs /tmp + /run
 }
 
 // LogFunc forwards a container log line to the host as it is produced; the Service wraps it

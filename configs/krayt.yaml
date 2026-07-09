@@ -33,3 +33,18 @@ questions:                      # agent -> human questions (§6.13)
 
 agent:
   adapter: none                 # none | claude-code | gemini-cli (Phase 5)
+
+# Container hardening (§6.10, §10). Defaults are already least-privilege — all capabilities
+# dropped, containerd's seccomp profile applied, enforced non-root, writable rootfs — so this
+# whole block is optional. Config-file only (no CLI flags in v1).
+container:
+  # Re-grant specific capabilities on top of the drop-all default (CAP_ prefix optional).
+  # Denylisted and never grantable: CAP_SETUID, CAP_SETGID, CAP_SETPCAP, CAP_SYS_ADMIN,
+  # CAP_NET_ADMIN, CAP_NET_RAW, CAP_DAC_READ_SEARCH, CAP_BPF, CAP_SYS_PTRACE — these would
+  # re-open the egress bypass or the VM. Use `network.mode: full` for open networking instead.
+  capabilities:
+    - net_bind_service          # e.g. bind :80/:443 as a non-root process
+  seccomp: default              # default (containerd profile) | unconfined (drop the filter)
+  # Opt-in read-only rootfs (default false). Incompatible with images that write to their own
+  # rootfs / $HOME (the reference agent images do). When true, only /tmp and /run are writable.
+  readonly_rootfs: false

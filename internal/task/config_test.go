@@ -76,6 +76,74 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
+func TestLoadConfigContainer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "krayt.yaml")
+	content := "image: my-agent:latest\n" +
+		"container:\n" +
+		"  capabilities:\n    - net_bind_service\n    - CAP_CHOWN\n" +
+		"  seccomp: unconfined\n" +
+		"  readonly_rootfs: true\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := task.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(c.Container.Capabilities) != 2 || c.Container.Seccomp != "unconfined" {
+		t.Errorf("container = %+v", c.Container)
+	}
+	// The pointer distinguishes an explicit value from unset.
+	if c.Container.ReadonlyRootfs == nil || !*c.Container.ReadonlyRootfs {
+		t.Errorf("readonly_rootfs = %v, want true", c.Container.ReadonlyRootfs)
+	}
+}
+
+func TestLoadConfigContainerReadonlyUnsetVsFalse(t *testing.T) {
+	dir := t.TempDir()
+	// Unset: the pointer stays nil so the CLI can tell "not specified" from "false".
+	unsetPath := filepath.Join(dir, "unset.yaml")
+	if err := os.WriteFile(unsetPath, []byte("image: a:latest\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := task.LoadConfig(unsetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Container.ReadonlyRootfs != nil {
+		t.Errorf("unset readonly_rootfs should be nil, got %v", *c.Container.ReadonlyRootfs)
+	}
+	// Explicit false: the pointer is non-nil pointing at false.
+	falsePath := filepath.Join(dir, "false.yaml")
+	if err := os.WriteFile(falsePath, []byte("image: a:latest\ncontainer:\n  readonly_rootfs: false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err = task.LoadConfig(falsePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Container.ReadonlyRootfs == nil || *c.Container.ReadonlyRootfs {
+		t.Errorf("explicit false should be non-nil false, got %v", c.Container.ReadonlyRootfs)
+	}
+}
+
+// TestExampleConfigParses guards the shipped configs/krayt.yaml against the config schema +
+// validators (KnownFields, seccomp mode, capability allow/deny-list) so the documented example
+// can't drift out of sync with the code.
+func TestExampleConfigParses(t *testing.T) {
+	c, err := task.LoadConfig(filepath.Join("..", "..", "configs", "krayt.yaml"))
+	if err != nil {
+		t.Fatalf("example config does not parse: %v", err)
+	}
+	if _, err := task.ParseSeccompMode(c.Container.Seccomp); err != nil {
+		t.Errorf("example container.seccomp invalid: %v", err)
+	}
+	if _, err := task.NormalizeCapabilities(c.Container.Capabilities); err != nil {
+		t.Errorf("example container.capabilities invalid: %v", err)
+	}
+}
+
 func TestLoadConfigRejectsUnknownKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.yaml")
