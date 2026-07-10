@@ -413,6 +413,22 @@ is the simplest correct choice. Enforcement layers:
   endpoints must be allowlisted alongside the inference endpoint (§6.14); an
   OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key, so it can need
   a wider list.
+- **Resolved-IP guard (SSRF / DNS-rebinding).** The host-string allowlist is not enough on its
+  own: an allowlisted name (or, in `full`, any name) could resolve to an internal address, and the
+  VM's NAT reaches the host network. So after the proxy resolves an upstream name, it checks the
+  **resolved IP** — on *every* A/AAAA answer and every connection attempt, via the dialer's
+  `Control` hook, covering both the CONNECT tunnel dial and the plain-HTTP transport dial:
+  - **Always refused, in every mode** (including `full`): loopback (`127.0.0.0/8`, `::1`),
+    link-local (`169.254.0.0/16`, `fe80::/10`), the cloud **metadata** IP `169.254.169.254`, the
+    unspecified address (`0.0.0.0`, `::`), and multicast.
+  - **Refused unless `mode: full`:** private / ULA ranges — `10.0.0.0/8`, `172.16.0.0/12`,
+    `192.168.0.0/16`, the `100.64.0.0/10` CGNAT range, and `fc00::/7`.
+  - Public addresses are allowed (still subject to the host allowlist above). The check is
+    **fail-closed**: an address that cannot be parsed is refused. A refusal returns a `403`.
+
+  Because the *resolved* IP is what's checked (not the requested name), this also mitigates
+  **DNS-rebinding** to internal addresses. Note that `full` mode still exposes the **host LAN**
+  (the private ranges) by design — link-local/loopback/metadata stay blocked even there.
 - **Isolated as a swappable, memory-safety-critical component.** The proxy is a **standalone
   in-guest process** (`krayt-proxy`, run as its own `proxyd` uid) — a separate binary, not
   linked into the guest-agent — sitting behind a stable contract on both ends: the guest-agent
