@@ -344,3 +344,133 @@ func TestGuestGitConfigInjectionInert(t *testing.T) {
 		t.Errorf("changes.patch missing the real edit:\n%s", patchBytes)
 	}
 }
+
+// TestSecretConfinementInArtifacts is the on-metal proof of the §6.8/§10 secret-confinement
+// extension (finding: redaction only covered live logs). It cannot run in a cloud agent — it
+// needs virtualization hardware, the base VM image, and a linux/arm64 NON-ROOT probe image that
+// leaks its mounted credential three ways. The unit tests
+// (`internal/orchestrator`: TestSecretRedactedInReportAndFlaggedInPatch, TestSecretRedactedInQuestion;
+// `internal/secrets`: TestScanKeys) already prove the guest logic against the fake provider; this
+// confirms it end-to-end through real containerd + the tmpfs `/run/secrets` mount. See HUMAN_TODO.md.
+//
+// KRAYT_SECRETS_IMAGE must be a linux/arm64, non-root image whose entrypoint reads
+// `/run/secrets/ANTHROPIC_API_KEY` (value $K) and then:
+//   - writes `/output/report.md` containing $K (e.g. "key is $K"),
+//   - writes a tracked source file, e.g. `/workspace/config.txt` = "api_key=$K",
+//   - asks via `krayt-ask --choices "use $K,skip" "Use the key $K?"` (may ignore the answer),
+//   - exits 0.
+//
+// Run:
+//
+//	KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img \
+//	KRAYT_SECRETS_IMAGE=ghcr.io/you/krayt-secrets-probe:latest \
+//	  go test -tags 'integration darwin' -run TestSecretConfinementInArtifacts -v ./internal/orchestrator/
+func TestSecretConfinementInArtifacts(t *testing.T) {
+	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
+	image := os.Getenv("KRAYT_SECRETS_IMAGE")
+	if kernel == "" || initrd == "" || rootfs == "" || image == "" {
+		t.Skip("set KRAYT_KERNEL, KRAYT_INITRD, KRAYT_ROOTFS, KRAYT_SECRETS_IMAGE to run")
+	}
+	cmdline := os.Getenv("KRAYT_CMDLINE")
+	if cmdline == "" {
+		cmdline = "console=hvc0 root=/dev/vda"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// The value the probe image will read from /run/secrets and (carelessly) spray around. It must
+	// be distinctive so the assertions below can look for it verbatim.
+	const secretVal = "sk-ant-integration-secret-0123456789"
+	secretsFile := filepath.Join(t.TempDir(), "secrets.env")
+	if err := os.WriteFile(secretsFile, []byte("ANTHROPIC_API_KEY="+secretVal+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
+	imgSrc, err := imagestore.Remote(image)
+	if err != nil {
+		t.Fatalf("imagestore.Remote: %v", err)
+	}
+	img, err := imagestore.Acquire(ctx, imgSrc, image, t.TempDir())
+	if err != nil {
+		t.Fatalf("imagestore.Acquire: %v", err)
+	}
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	spec := task.RunSpec{
+		ID: "run_secret_confine", ImageRef: image, RepoPath: src, BundleDepth: 1,
+		TaskPrompt:  []byte("leak the secret three ways"),
+		SecretsPath: secretsFile,
+		// Wait mode so the ask_human prompt is persisted to questions/<id>.json; a short per-question
+		// timeout sentinels it (default on-timeout = continue) so the run never blocks with no human.
+		Questions: task.QuestionsPolicy{Mode: task.QuestionWait, Timeout: 20 * time.Second},
+		Resources: task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
+	}
+	deps := orchestrator.Deps{
+		Provider: vfkit.New("", t.TempDir()),
+		BaseVM:   provider.VMSpec{Kernel: kernel, Initrd: initrd, RootFS: rootfs, Cmdline: cmdline},
+		Image:    img,
+		LogOut:   os.Stderr,
+	}
+	res, err := orchestrator.Run(ctx, deps, spec, runDir)
+	if err != nil {
+		t.Fatalf("orchestrator.Run: %v", err)
+	}
+
+	// report.md (agent notes, folded by the host) is redacted in the guest.
+	rep, err := os.ReadFile(filepath.Join(runDir, "report.md"))
+	if err != nil {
+		t.Fatalf("read report.md: %v", err)
+	}
+	if strings.Contains(string(rep), secretVal) {
+		t.Errorf("secret value leaked into report.md:\n%s", rep)
+	}
+
+	// The persisted ask_human question is redacted (prompt + choices crossed the bridge).
+	qs, err := orchestrator.ReadQuestions(runDir)
+	if err != nil || len(qs) == 0 {
+		t.Fatalf("expected a persisted question; got %+v (err %v)", qs, err)
+	}
+	if strings.Contains(qs[0].Prompt, secretVal) {
+		t.Errorf("secret leaked into the persisted question prompt: %q", qs[0].Prompt)
+	}
+	for _, c := range qs[0].Choices {
+		if strings.Contains(c, secretVal) {
+			t.Errorf("secret leaked into a persisted choice: %q", c)
+		}
+	}
+
+	// changes.patch is byte-exact (secret present, NOT redacted) but flagged in Safety…
+	patchBytes, err := os.ReadFile(res.PatchPath)
+	if err != nil {
+		t.Fatalf("read changes.patch: %v", err)
+	}
+	if !strings.Contains(string(patchBytes), secretVal) {
+		t.Errorf("changes.patch should be byte-exact with the secret present; got:\n%s", patchBytes)
+	}
+	flagged := false
+	for _, s := range res.Safety {
+		if strings.Contains(s, "ANTHROPIC_API_KEY") && strings.Contains(s, "changes.patch") {
+			flagged = true
+		}
+	}
+	if !flagged {
+		t.Errorf("Safety should flag the secret in the patch; got %v", res.Safety)
+	}
+
+	// …and the value never reaches meta.json (or secret-scan.json, which names the key only).
+	meta, err := os.ReadFile(filepath.Join(runDir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(meta), secretVal) {
+		t.Errorf("secret value leaked into meta.json")
+	}
+	scan, err := os.ReadFile(filepath.Join(runDir, "secret-scan.json"))
+	if err != nil {
+		t.Fatalf("secret-scan.json missing: %v", err)
+	}
+	if !strings.Contains(string(scan), "ANTHROPIC_API_KEY") || strings.Contains(string(scan), secretVal) {
+		t.Errorf("secret-scan.json should name the key only; got: %s", scan)
+	}
+}

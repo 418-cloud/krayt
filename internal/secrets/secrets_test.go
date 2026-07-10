@@ -77,3 +77,34 @@ func TestRedactorEmpty(t *testing.T) {
 		t.Errorf("empty redactor changed input: %s", got)
 	}
 }
+
+func TestScanKeys(t *testing.T) {
+	vals := map[string]string{
+		"ANTHROPIC_API_KEY": "sk-ant-123",
+		"TOKEN":             "tok-xyz",
+		"UNUSED":            "never-present",
+		"EMPTY":             "", // ignored: an empty value would match everywhere
+	}
+
+	// A full value present in the buffer reports exactly its key; other keys stay silent.
+	got := secrets.ScanKeys(vals, []byte("config: key=sk-ant-123 here"))
+	if len(got) != 1 || got[0] != "ANTHROPIC_API_KEY" {
+		t.Fatalf("ScanKeys = %v, want [ANTHROPIC_API_KEY]", got)
+	}
+
+	// Two values present → both keys, sorted for determinism.
+	got = secrets.ScanKeys(vals, []byte("tok-xyz and sk-ant-123"))
+	if len(got) != 2 || got[0] != "ANTHROPIC_API_KEY" || got[1] != "TOKEN" {
+		t.Fatalf("ScanKeys = %v, want [ANTHROPIC_API_KEY TOKEN]", got)
+	}
+
+	// No value present → no keys; the empty-valued key never matches.
+	if got := secrets.ScanKeys(vals, []byte("nothing sensitive here")); got != nil {
+		t.Fatalf("ScanKeys = %v, want nil", got)
+	}
+
+	// Documented limitation: a value that never appears whole is not detected (mirrors Redact).
+	if got := secrets.ScanKeys(vals, []byte("sk-ant-\n123 split across a boundary")); got != nil {
+		t.Fatalf("ScanKeys on a split value = %v, want nil (whole-value scan only)", got)
+	}
+}
