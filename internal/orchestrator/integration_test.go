@@ -278,9 +278,13 @@ func TestRootImageFailsClosed(t *testing.T) {
 //   - exits 0.
 //
 // After the run, the guest's root git ran `add -A` + `diff` during patch generation. If the fix
-// regressed, fsmonitor/textconv would have executed as root and created the sentinel, which would
-// appear in changes.patch. The test asserts the sentinel is ABSENT from the patch (root code never
-// ran) while the normal edit IS present (the patch is still faithful).
+// regressed, fsmonitor/textconv would have executed as root and created the sentinel file, which
+// `git add -A` would then stage as its own new-file entry in changes.patch. The test asserts that
+// entry is ABSENT (root code never ran) while the normal edit IS present (the patch is still
+// faithful). It checks for the sentinel's own diff header rather than a bare substring match on
+// "PWNED_BY_ROOT", because pwn.sh's own source necessarily contains that path as text — pwn.sh
+// itself always lands in the patch as a normal added file, and a loose substring check would
+// false-positive on that, not on the sentinel actually having run.
 func TestGuestGitConfigInjectionInert(t *testing.T) {
 	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
 	image := os.Getenv("KRAYT_GITCONFIG_IMAGE")
@@ -324,9 +328,10 @@ func TestGuestGitConfigInjectionInert(t *testing.T) {
 	if err != nil || len(patchBytes) == 0 {
 		t.Fatalf("changes.patch missing/empty: err=%v", err)
 	}
-	// The escape sentinel must NOT be in the patch — root git never executed the injected config.
-	if strings.Contains(string(patchBytes), "PWNED_BY_ROOT") {
-		t.Fatalf("container→guest-root escape: injected git config executed as root (sentinel present)\n%s", patchBytes)
+	// The sentinel FILE (not just pwn.sh's source text, which always contains this path) must not
+	// be a new-file entry in the patch — that would mean root git ran the injected config.
+	if strings.Contains(string(patchBytes), "diff --git a/PWNED_BY_ROOT b/PWNED_BY_ROOT") {
+		t.Fatalf("container→guest-root escape: injected git config executed as root (sentinel file present)\n%s", patchBytes)
 	}
 	// The patch is still faithful — the normal edit landed.
 	if !strings.Contains(string(patchBytes), "greeting.txt") {
