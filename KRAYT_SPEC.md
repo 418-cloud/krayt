@@ -909,6 +909,15 @@ container:
   readonly_rootfs: false        # opt-in read-only rootfs (default false; see §8.2 caveat)
 ```
 
+**Two tracked files, two purposes.** `configs/krayt.yaml` is the generic, fully-annotated
+template above — copy it as a starting point for any task. The repo-root `krayt.yaml` is a
+second, deliberately tracked file: krayt's own shared dev config for dogfooding krayt on this
+repo (pins the `krayt-dev` image, Claude model/effort, and this repo's network allowlist); with
+no explicit `--config`, a run auto-loads `<repo>/krayt.yaml` if present (§8.3), so every
+contributor gets the same starting point. It carries no secret material — `secrets:` only names a
+path, and the file it points at is itself gitignored — so tracking it is safe; a real credential
+must never be inlined into its `env:` block.
+
 **`container.capabilities` denylist.** These are **never** grantable, even if named, and the
 config is rejected at load if one appears: `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`,
 `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_DAC_READ_SEARCH`, `CAP_BPF`,

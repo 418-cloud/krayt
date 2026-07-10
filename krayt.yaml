@@ -1,8 +1,11 @@
-# krayt.yaml — local run defaults, auto-loaded from <repo>/krayt.yaml (§8.1/§8.3), so
-# `krayt run --task <file>` picks these up without the long flag list. Any flag overrides the
-# matching value here.
+# krayt.yaml — tracked, shared dev config for dogfooding krayt on its own repo, auto-loaded from
+# <repo>/krayt.yaml (§8.1/§8.3) so `krayt run --task <file>` picks these up without the long flag
+# list. Any flag overrides the matching value here. Every krayt contributor gets the same starting
+# point: the known-good krayt-dev image, model/effort, and this repo's own network allowlist.
 #
-# PERSONAL/local config (gitignored): it pins a specific dev-image build + your secrets path.
+# `secrets:` below only names a path — the file it points at (secrets.env) is gitignored and this
+# file carries no secret value. Never inline a real credential into this file's `env:` block;
+# per-task secrets belong only in that gitignored secrets.env (§6.8).
 # `task:` is intentionally omitted so you always pass --task per run.
 
 image: ghcr.io/418-cloud/krayt-dev:sha-7ca7cc7
