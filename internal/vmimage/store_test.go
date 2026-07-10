@@ -78,10 +78,17 @@ func TestPullExtractsAndVerifies(t *testing.T) {
 func TestPullRejectsDigestMismatch(t *testing.T) {
 	src, ref, _ := fakeArtifact(t)
 	wrong := digest.FromString("not-the-image")
+	dest := filepath.Join(t.TempDir(), "dest")
 
-	_, err := vmimage.Pull(context.Background(), src, ref, wrong, t.TempDir())
+	_, err := vmimage.Pull(context.Background(), src, ref, wrong, dest)
 	if err == nil {
 		t.Fatal("expected digest mismatch error, got nil")
+	}
+	// A rejected artifact must not leave extracted content behind (§CVE-2026-50163: oras-go's
+	// file store can write to disk before this function's caller ever sees the mismatch, so a
+	// leftover destDir would keep whatever was extracted from a bad/tampered artifact).
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("destDir %s should have been removed after a digest mismatch; stat err = %v", dest, statErr)
 	}
 }
 
