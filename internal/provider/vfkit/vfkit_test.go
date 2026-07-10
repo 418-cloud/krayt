@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -179,17 +180,42 @@ func TestEnsureSockRoot(t *testing.T) {
 			t.Fatal("ensureSockRoot accepted a symlink root; want refusal")
 		}
 	})
+
+	// The root is shared across every VM the same user boots (sockRoot() has no per-VM
+	// component), so concurrent `krayt run` invocations race ensureSockRoot on a fresh path:
+	// one wins the Mkdir, the rest must see EEXIST and fall back to validating what now
+	// exists — not fail outright.
+	t.Run("concurrent creators all succeed on a fresh root (EEXIST race)", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "krayt-root")
+		const n = 50
+		var wg sync.WaitGroup
+		errs := make([]error, n)
+		wg.Add(n)
+		for i := range n {
+			go func(i int) {
+				defer wg.Done()
+				errs[i] = ensureSockRoot(root)
+			}(i)
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("goroutine %d: ensureSockRoot: %v", i, err)
+			}
+		}
+	})
 }
 
 func TestNewSockDirFreshRoot(t *testing.T) {
-	// Point the root at a throwaway path so the test never touches a real /tmp/krayt-*.
+	// Exercise the real newSockDirAt (what newSockDir calls against sockRoot()) so a
+	// regression there — e.g. dropping the ensureSockRoot call, or the "vm-" prefix — is
+	// actually caught here, rather than only on a real Mac via newSockDir's one call site
+	// (vfkit.go's Create, which needs a real VM boot). Point it at a throwaway path so the
+	// test never touches the real /tmp/krayt-*.
 	root := filepath.Join(t.TempDir(), "krayt-root")
-	if err := ensureSockRoot(root); err != nil {
-		t.Fatalf("ensureSockRoot: %v", err)
-	}
-	d, err := os.MkdirTemp(root, "vm-")
+	d, err := newSockDirAt(root)
 	if err != nil {
-		t.Fatalf("MkdirTemp under verified root: %v", err)
+		t.Fatalf("newSockDirAt: %v", err)
 	}
 	fi, err := os.Lstat(d)
 	if err != nil {

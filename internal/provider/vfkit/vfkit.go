@@ -149,7 +149,15 @@ func sockRoot() string {
 	return "/tmp/krayt-" + strconv.Itoa(os.Getuid())
 }
 
-// newSockDir creates a unique short-pathed directory for a VM's control + REST sockets.
+// newSockDir creates a unique short-pathed directory for a VM's control + REST sockets under
+// this user's socket root (sockRoot). See newSockDirAt for the root-parameterized logic (kept
+// separate so tests can exercise it against a throwaway root instead of the real /tmp/krayt-*).
+func newSockDir() (string, error) {
+	return newSockDirAt(sockRoot())
+}
+
+// newSockDirAt creates a unique short-pathed directory for a VM's control + REST sockets under
+// root.
 //
 // The socket root guards a VM's REST control socket (lifecycle: stop/kill) and vsock
 // control channel, so it must not be a directory another local user controls. We verify or
@@ -157,8 +165,7 @@ func sockRoot() string {
 // owner/mode untouched): if the root already exists it must be a real directory (not a
 // symlink into an attacker target), owned by this uid, mode exactly 0700 — otherwise we
 // fail closed and let the human remove/fix it. We never chmod/chown a dir we don't own.
-func newSockDir() (string, error) {
-	root := sockRoot()
+func newSockDirAt(root string) (string, error) {
 	if err := ensureSockRoot(root); err != nil {
 		return "", err
 	}
@@ -179,6 +186,12 @@ func ensureSockRoot(root string) error {
 		// Mkdir (not MkdirAll) fails if root exists, incl. as a symlink, so we never
 		// follow a pre-placed link into an attacker-controlled target.
 		if err := os.Mkdir(root, 0o700); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				// Lost a race with a concurrent creator (root is shared across every VM this
+				// user boots, §6.12) — re-validate whatever now exists rather than failing a
+				// legitimate concurrent `krayt run` on a spurious EEXIST.
+				return ensureSockRoot(root)
+			}
 			return fmt.Errorf("vfkit: create socket root: %w", err)
 		}
 		return nil
