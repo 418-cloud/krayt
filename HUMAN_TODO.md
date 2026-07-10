@@ -657,6 +657,41 @@ below block only that on-hardware confirmation.
   sandbox; this hardware assertion is the final on-metal confirmation of finding #2, mirroring the
   existing hardening/egress probe handoffs.
 
+## [Security review] Confirm the hardened vfkit socket root on real hardware (harden-vfkit-socket-dir) — DONE ✅
+- Resolved: all three confirmations passed on Apple Silicon against the new per-user
+  `/tmp/krayt-<uid>` root. `TestBootHello` (10.52s) — guest-agent ready, control socket round-trips
+  cleanly over the new path. `TestEndToEndRealVM` (13.70s, `hack/gitconfig-probe` image,
+  `docker.io/tjololo/test-krayt:git-conf-probe`) — boots, runs, produces a valid `changes.patch`.
+  Fail-closed check — with `/tmp/krayt-501` pre-created `0777`, the same `TestEndToEndRealVM` command
+  correctly **refused** before booting: `vfkit: socket root /tmp/krayt-501 is not a private directory
+  owned by this user (mode 777, uid 501); refusing to place VM control sockets there — remove or fix
+  it`; after removing the hostile dir, a normal run succeeded again. The actual new security property
+  (fail-closed on a hostile pre-existing root) is now confirmed on real hardware, not just unit-tested.
+- Task: `docs/ai-tasks/harden-vfkit-socket-dir.md` — finding: the vfkit socket root was created with
+  `os.MkdirAll("/tmp/krayt", 0700)`, a no-op that would silently reuse a hostile pre-existing dir on a
+  shared macOS host. Fixed (offline, `//go:build darwin`): the root is now per-user
+  (`/tmp/krayt-<uid>`) and **verified or created** by `ensureSockRoot` (`internal/provider/vfkit/vfkit.go`)
+  — `os.Mkdir` (fails on a pre-placed symlink) when absent; when present it must be a real directory
+  owned by the current uid with mode exactly `0700`, else krayt fails closed with a clear error. Never
+  chmod/chowns a dir it doesn't own. The per-VM dir stays an atomic `0700` `MkdirTemp`.
+- What's proven offline (no VM): the directory logic is host-runnable and covered by
+  `TestEnsureSockRoot` (fresh create / idempotent-good / world-writable-refused / symlink-refused) and
+  `TestNewSockDirFreshRoot` (0700 `vm-…` subdir under a verified root). `go build ./...`,
+  `GOOS=darwin GOARCH=arm64 go build ./...`, `go vet`, and `golangci-lint run` all pass in the sandbox.
+- Why the agent can't fully verify: the socket **bind/dial** themselves need a real vfkit VM. Confirm on
+  the Apple-Silicon Mac that a normal run still boots + round-trips control over the new
+  `/tmp/krayt-<uid>` path — i.e. the existing `TestBootHello` / `TestEndToEndRealVM` still pass (the path
+  is still well under the 104-byte `sun_path` limit, e.g. `/tmp/krayt-501/vm-XXXXXXXX/control.sock`).
+- Exact steps/commands: on the Mac, re-run the standard boot/e2e integration tests (same env as the other
+  handoffs): `go test -tags 'integration darwin' -run 'TestBootHello|TestEndToEndRealVM' -v
+  ./internal/orchestrator/`. Optionally, sanity-check the fail-closed path by pre-creating a bad root
+  (`mkdir -m 777 /tmp/krayt-$(id -u)`) and confirming a run refuses with the "not a private directory"
+  error, then removing it.
+- Verify success by: the boot/e2e tests still pass over the new per-user socket root; the pre-created
+  `0777` root is rejected with the clear error rather than reused.
+- Blocking: no — pure host-side dir hardening, unit-tested; this is only the on-metal confirmation that
+  the path change doesn't regress boot. **No image rebuild** (the change is host-side, in the provider).
+
 ## [Security remediation — redact-secrets-in-artifacts] End-to-end secret confinement on real hardware — DONE ✅
 - Resolved: `TestSecretConfinementInArtifacts` **PASSED** on Apple Silicon (33.10s) against the
   `hack/secrets-probe` image (`docker.io/tjololo/test-krayt:secrets-probe`, uid 1000). The probe read

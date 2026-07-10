@@ -118,6 +118,91 @@ func TestCreateSparse(t *testing.T) {
 	}
 }
 
+func TestEnsureSockRoot(t *testing.T) {
+	uid := os.Getuid()
+
+	t.Run("creates a fresh 0700 self-owned root", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "krayt-root")
+		if err := ensureSockRoot(root); err != nil {
+			t.Fatalf("ensureSockRoot on fresh path: %v", err)
+		}
+		fi, err := os.Lstat(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fi.IsDir() {
+			t.Fatalf("root %s is not a directory", root)
+		}
+		if fi.Mode().Perm() != 0o700 {
+			t.Errorf("root mode = %o, want 0700", fi.Mode().Perm())
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != uid {
+			t.Errorf("root uid = %d, want %d", st.Uid, uid)
+		}
+	})
+
+	t.Run("accepts an already-correct root (idempotent)", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "krayt-root")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureSockRoot(root); err != nil {
+			t.Fatalf("ensureSockRoot on good root: %v", err)
+		}
+	})
+
+	t.Run("refuses a world-writable pre-existing root", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "krayt-root")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Chmod separately: Mkdir's mode is masked by umask, so set it explicitly.
+		if err := os.Chmod(root, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureSockRoot(root); err == nil {
+			t.Fatal("ensureSockRoot accepted a 0777 root; want refusal")
+		}
+	})
+
+	t.Run("refuses a symlink at the root path (not followed)", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target") // a valid 0700 dir the link points at
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		root := filepath.Join(dir, "krayt-root")
+		if err := os.Symlink(target, root); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureSockRoot(root); err == nil {
+			t.Fatal("ensureSockRoot accepted a symlink root; want refusal")
+		}
+	})
+}
+
+func TestNewSockDirFreshRoot(t *testing.T) {
+	// Point the root at a throwaway path so the test never touches a real /tmp/krayt-*.
+	root := filepath.Join(t.TempDir(), "krayt-root")
+	if err := ensureSockRoot(root); err != nil {
+		t.Fatalf("ensureSockRoot: %v", err)
+	}
+	d, err := os.MkdirTemp(root, "vm-")
+	if err != nil {
+		t.Fatalf("MkdirTemp under verified root: %v", err)
+	}
+	fi, err := os.Lstat(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		t.Errorf("per-VM sock dir = mode %o (isDir=%v), want a 0700 dir", fi.Mode().Perm(), fi.IsDir())
+	}
+	if base := filepath.Base(d); !strings.HasPrefix(base, "vm-") {
+		t.Errorf("per-VM sock dir %q does not have the vm- prefix", base)
+	}
+}
+
 // roundTripFunc lets a test stand in for vfkit's REST server without binding a socket.
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

@@ -16,6 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/crc-org/vfkit/pkg/config"
@@ -138,21 +140,62 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 	}, nil
 }
 
-// sockRoot is a short base directory for per-VM unix sockets. /tmp is short on macOS (a
-// symlink to /private/tmp), unlike $TMPDIR, keeping socket paths under the 104-byte
-// sockaddr_un limit.
-const sockRoot = "/tmp/krayt"
+// sockRoot returns the short base directory for this user's per-VM unix sockets. /tmp is
+// short on macOS (a symlink to /private/tmp), unlike $TMPDIR, keeping socket paths under
+// the 104-byte sockaddr_un limit (§6.12). The uid suffix gives each user their own root so
+// two users on a shared host never collide on the same directory — "/tmp/krayt-501" is
+// still far under the limit, leaving ample room for the "vm-XXXXXXXX/control.sock" tail.
+func sockRoot() string {
+	return "/tmp/krayt-" + strconv.Itoa(os.Getuid())
+}
 
 // newSockDir creates a unique short-pathed directory for a VM's control + REST sockets.
+//
+// The socket root guards a VM's REST control socket (lifecycle: stop/kill) and vsock
+// control channel, so it must not be a directory another local user controls. We verify or
+// create it ourselves rather than os.MkdirAll (a no-op that leaves a pre-existing dir's
+// owner/mode untouched): if the root already exists it must be a real directory (not a
+// symlink into an attacker target), owned by this uid, mode exactly 0700 — otherwise we
+// fail closed and let the human remove/fix it. We never chmod/chown a dir we don't own.
 func newSockDir() (string, error) {
-	if err := os.MkdirAll(sockRoot, 0o700); err != nil {
-		return "", fmt.Errorf("vfkit: create socket root: %w", err)
+	root := sockRoot()
+	if err := ensureSockRoot(root); err != nil {
+		return "", err
 	}
-	d, err := os.MkdirTemp(sockRoot, "vm-")
+	d, err := os.MkdirTemp(root, "vm-")
 	if err != nil {
 		return "", fmt.Errorf("vfkit: create socket dir: %w", err)
 	}
 	return d, nil
+}
+
+// ensureSockRoot makes root a private directory owned by the current user, or fails. It
+// uses Lstat (no symlink following) + os.Mkdir (fails if the path already exists), so a
+// symlink or a foreign-owned/loose-mode directory pre-placed at root is refused rather
+// than trusted.
+func ensureSockRoot(root string) error {
+	fi, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		// Mkdir (not MkdirAll) fails if root exists, incl. as a symlink, so we never
+		// follow a pre-placed link into an attacker-controlled target.
+		if err := os.Mkdir(root, 0o700); err != nil {
+			return fmt.Errorf("vfkit: create socket root: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("vfkit: stat socket root: %w", err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("vfkit: socket root %s: cannot read owner/mode", root)
+	}
+	if !fi.IsDir() || int(st.Uid) != os.Getuid() || fi.Mode().Perm() != 0o700 {
+		return fmt.Errorf("vfkit: socket root %s is not a private directory owned by this user "+
+			"(mode %o, uid %d); refusing to place VM control sockets there — remove or fix it",
+			root, fi.Mode().Perm(), st.Uid)
+	}
+	return nil
 }
 
 // buildConfig assembles the vfkit VirtualMachine: Linux bootloader (kernel+initrd+
