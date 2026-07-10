@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0](https://github.com/418-cloud/krayt/compare/v0.2.0...v0.3.0) (2026-07-10)
+
+
+### Features
+
+* harden container OCI spec — drop capabilities, enforce non-root, seccomp ([#34](https://github.com/418-cloud/krayt/issues/34)) ([52b08bb](https://github.com/418-cloud/krayt/commit/52b08bb8861786062392d53c0563b916475a0b7a))
+
+
+### Bug Fixes
+
+* add proxy ssrf guard ([#40](https://github.com/418-cloud/krayt/issues/40)) ([308775b](https://github.com/418-cloud/krayt/commit/308775baaf1620dd9f1f163855e1b6209661f072))
+* harden vfkit socket root ([#41](https://github.com/418-cloud/krayt/issues/41)) ([8eb31f3](https://github.com/418-cloud/krayt/commit/8eb31f353f797b5546a13d0d93ff05f9464ac1bb))
+* isolate guest patch generation from container-writable .git config ([#36](https://github.com/418-cloud/krayt/issues/36)) ([d6dd145](https://github.com/418-cloud/krayt/commit/d6dd14585ad2009b84c2716dcc228aca5d974c85))
+* redact secrets in report.md and ask_human text, scan patch for l… ([#38](https://github.com/418-cloud/krayt/issues/38)) ([8b00fb0](https://github.com/418-cloud/krayt/commit/8b00fb04b8182f49c1f8067d33a6e3bcbdbcc4ee))
+
+
+### Dependencies
+
+* update gomod non-major dependencies ([#33](https://github.com/418-cloud/krayt/issues/33)) ([e98144f](https://github.com/418-cloud/krayt/commit/e98144fab480a2d64d504e07990c406fedd4e3df))
+* update pinned vmimage digest to latest version ([#43](https://github.com/418-cloud/krayt/issues/43)) ([a4cb69e](https://github.com/418-cloud/krayt/commit/a4cb69e412b38b1d43d86f8c053c3584d4f3216f))
+
 ## [0.2.0](https://github.com/418-cloud/krayt/compare/v0.1.2...v0.2.0) (2026-07-06)
 
 

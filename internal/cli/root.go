@@ -9,7 +9,7 @@ import (
 // Version is the krayt CLI version, reported by `krayt version` / `krayt --version`.
 // release-please bumps the literal on each release via the x-release-please-version annotation —
 // keep the annotation on the same line as the value.
-var Version = "0.2.0" // x-release-please-version
+var Version = "0.3.0" // x-release-please-version
 
 // NewRootCmd builds the root command tree.
 func NewRootCmd() *cobra.Command {
