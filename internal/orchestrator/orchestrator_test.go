@@ -330,6 +330,44 @@ func TestRunTimeout(t *testing.T) {
 	}
 }
 
+// TestRunTimeoutDuringSetup covers the same wall-clock timeout, but forced to fire before the
+// container ever starts — during WaitReady/pushImage/pushCode/etc. (§7 step 2-3) — instead of
+// during the container's own run. This used to surface as a raw, confusing error (e.g. a
+// killed `git bundle create` subprocess if pushCode's timing lost the race against a longer
+// timeout) instead of the same clean TimedOut result a run-phase timeout already got. A
+// deadline this tight has elapsed before any step runs, so — unlike racing a real subprocess —
+// this deterministically exercises the setup-phase path rather than depending on machine speed.
+func TestRunTimeoutDuringSetup(t *testing.T) {
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	img := minimalImage(context.Background(), t)
+
+	guestRoot := t.TempDir()
+	p := &fake.Provider{Register: func(s *grpc.Server) {
+		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(blockingRunner{}), guest.WithRoot(guestRoot)))
+	}}
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	spec := task.RunSpec{
+		ID: "run_setup_timeout", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"),
+		Resources:  task.Resources{Timeout: 1 * time.Nanosecond},
+	}
+	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Provider: p, Image: img}, spec, runDir)
+	if err != nil {
+		t.Fatalf("Run (setup-phase timeout should not be an error): %v", err)
+	}
+	if !res.TimedOut {
+		t.Error("expected TimedOut = true")
+	}
+	b, err := os.ReadFile(filepath.Join(runDir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b, []byte(`"timed_out": true`)) {
+		t.Errorf("meta.json should record timed_out: true; got %s", b)
+	}
+}
+
 // secretRunner simulates an agent that reads the mounted secret and (carelessly) logs it.
 type secretRunner struct {
 	secret string

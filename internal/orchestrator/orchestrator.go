@@ -141,6 +141,11 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	}
 	defer func() { _ = client.Close() }()
 	if _, err := client.WaitReady(ctx, bootTimeout, 200*time.Millisecond); err != nil {
+		// A run wall-clock timeout shorter than bootTimeout can also expire here, before any
+		// push step runs — same class of gap as pushImage/pushCode/etc. below (§6.1).
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
 		return nil, err
 	}
 
@@ -171,11 +176,21 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	rec.State = StateRunning
 	_ = writeRecord(runDir, rec)
 
-	// 3. Push inputs: image (incremental), code bundle, task, secrets.
+	// 3. Push inputs: image (incremental), code bundle, task, secrets. A wall-clock timeout
+	// can expire mid-step here just as easily as during the container's run (e.g. a slow
+	// `git bundle create` in pushCode outliving the budget) — isWallClockTimeout catches that
+	// so it is reported the same clean way as a timeout during streamRun, not as a raw
+	// killed-subprocess/context error (§6.1).
 	if err := pushImage(ctx, client, deps.Image); err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
 		return nil, err
 	}
 	if err := pushCode(ctx, client, spec); err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
 		return nil, err
 	}
 	if _, err := client.Agent.PushTask(ctx, &pb.TaskSpec{
@@ -185,13 +200,22 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		SeccompUnconfined: spec.Container.SeccompUnconfined,
 		ReadonlyRootfs:    spec.Container.ReadonlyRootfs,
 	}); err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
 		return nil, fmt.Errorf("orchestrator: push task: %w", err)
 	}
 	knownSecretKeys, err := pushSecrets(ctx, client, spec.SecretsPath)
 	if err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
 		return nil, err
 	}
 	if err := setNetworkPolicy(ctx, client, spec.Network); err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
 		return nil, err
 	}
 
@@ -331,11 +355,13 @@ func setNetworkPolicy(ctx context.Context, client *controlclient.Client, np task
 	return nil
 }
 
-// isWallClockTimeout reports whether a Start-stream error is the run's wall-clock timeout
-// rather than a real failure. ctx.Err() can lag the stream teardown under load — the deadline
-// timer may fire just after gRPC observes the expiry and RST_STREAMs the stream — so we also
-// accept a DeadlineExceeded RPC status (set atomically by gRPC at failure time) or a deadline
-// that has already elapsed. A plain cancellation (Ctrl-C) is not a timeout and stays an error.
+// isWallClockTimeout reports whether an error from any run-context-bound step — the Start
+// stream, or an earlier push (image/code/task/secrets/network) — is the run's wall-clock
+// timeout rather than a real failure. ctx.Err() can lag under load (the deadline timer may
+// fire just after gRPC observes the expiry and RST_STREAMs the stream, or after a subprocess
+// like `git bundle create` gets SIGKILLed by ctx's cancellation) — so we also accept a
+// DeadlineExceeded RPC status (set atomically by gRPC at failure time) or a deadline that has
+// already elapsed. A plain cancellation (Ctrl-C) is not a timeout and stays an error.
 func isWallClockTimeout(ctx context.Context, err error) bool {
 	if ctx.Err() == context.DeadlineExceeded || status.Code(err) == codes.DeadlineExceeded {
 		return true
@@ -344,6 +370,19 @@ func isWallClockTimeout(ctx context.Context, err error) bool {
 		return true
 	}
 	return false
+}
+
+// earlyTimeoutResult builds the Result for a wall-clock timeout that fired before the
+// container ever started — during the image/code/task/secrets/network push steps (§7 step 3).
+// It mirrors the shape streamRun produces for a timeout during the container's run (§6.1), so
+// both are reported identically: TimedOut, no error, sentinel exit code, nothing to collect.
+func earlyTimeoutResult(runDir string) *Result {
+	return &Result{
+		RunDir:    runDir,
+		ExitCode:  -1,
+		TimedOut:  true,
+		PatchPath: filepath.Join(runDir, "changes.patch"),
+	}
 }
 
 // controlSocketer is implemented by a VM that exposes its host-side control socket path, so a
