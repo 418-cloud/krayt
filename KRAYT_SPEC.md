@@ -717,6 +717,16 @@ symmetric across the two backends, so the `Provider` hides the difference behind
   namespace to allocate. The `CID` field in `VMSpec` is Firecracker-only.
 - **Security note:** the channel needs no TLS — a vsock link reaches exactly one VM and is
   not on any network. `insecure` transport credentials are correct here, not a shortcut.
+- **Socket-root hardening (vfkit, macOS):** the host unix sockets that bridge the vsock
+  control channel and vfkit's REST lifecycle API live under a short base directory
+  (`/tmp/krayt-<uid>`, per-user) — short because `sockaddr_un.sun_path` is capped at 104
+  bytes and `$TMPDIR` is too long. Because `/tmp` is shared, the provider **verifies or
+  creates** this root on every run: if it does not exist it is created with `os.Mkdir`
+  (0700; fails, rather than following, on a symlink pre-placed at the path); if it already
+  exists it must be a real directory owned by the current uid with mode exactly `0700`, or
+  krayt **fails closed** with a clear error rather than placing control sockets under a
+  directory another local user controls. krayt never chmod/chowns a directory it does not
+  own. The per-VM socket dir inside it is an atomic `0700` `MkdirTemp`.
 
 ### 6.13 Agent → human questions (`ask_human`)
 An **optional, asynchronous** way for the agent to pause and ask the human a question, get
