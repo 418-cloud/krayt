@@ -13,9 +13,9 @@ const (
 	// PinnedRef is the default registry reference, pinned by digest so it resolves to
 	// exactly the boot-tested image regardless of tag. The registry is interchangeable;
 	// any OCI-compliant registry works (ghcr.io is the convenient default, §11.4).
-	PinnedRef = "ghcr.io/418-cloud/krayt-vmimage@sha256:88cb8a8d026e7a965676963cf869da4657b3f75a0f868a07ffddbb0fd55edf14"
+	PinnedRef = "ghcr.io/418-cloud/krayt-vmimage@sha256:b284251687fec591ab73d3ea8a17bc55d5e00b1e26bdfcb2afa623b0943d6e38"
 
 	// PinnedDigest is the expected manifest digest; Pull verifies the pulled artifact
-	// against it (§11.4). This is v0.2.0-rc1
-	PinnedDigest digest.Digest = "sha256:88cb8a8d026e7a965676963cf869da4657b3f75a0f868a07ffddbb0fd55edf14"
+	// against it (§11.4). This is v0.2.0-rc4
+	PinnedDigest digest.Digest = "sha256:b284251687fec591ab73d3ea8a17bc55d5e00b1e26bdfcb2afa623b0943d6e38"
 )
