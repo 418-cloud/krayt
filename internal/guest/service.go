@@ -75,7 +75,6 @@ type Service struct {
 	netPolicy  NetworkPolicy     // received network policy (§6.6)
 	baseline   string            // recorded baseline commit, set during Start (§6.7)
 	bridge     *ask.Bridge       // active run's question bridge; Answer routes to it (§6.13)
-	redactor   *secrets.Redactor // active run's redactor (logs, report.md, question text), built in Start (§6.8)
 }
 
 // eventSender serializes Sends on the Start stream: the runner's stdout/stderr forwarders and
@@ -267,9 +266,6 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		return err
 	}
 	redactor := secrets.NewRedactor(secrets.Values(secretVals))
-	s.mu.Lock()
-	s.redactor = redactor
-	s.mu.Unlock()
 
 	// Ingest: verify + clone the bundle, set identity, record + tag the baseline (§6.7).
 	baseline, err := patch.Ingest(ctx, bundlePath, workspace, patch.DefaultIdentity)
@@ -533,9 +529,15 @@ func mergeEnv(base, add map[string]string) map[string]string {
 }
 
 // buildArtifacts writes changes.patch and, if the agent committed, commits.bundle into the
-// output dir (§6.7). It also scans the byte-exact patch for secret values and, on a hit, writes
-// the secret-scan.json marker naming the matched KEYS (§6.8) — the patch itself is never
+// output dir (§6.7). It also scans the byte-exact patch for secret values and writes the
+// secret-scan.json marker naming the matched KEYS, if any (§6.8) — the patch itself is never
 // redacted, since mutating hunks would break `git apply`; the host warns in Safety instead.
+//
+// outputDir is rbind-mounted read-write into the (untrusted, §10) container as /output, so the
+// agent could plant its own secret-scan.json there before exiting. writeSecretScan is therefore
+// called unconditionally — even when the scan finds nothing — so this guest-authoritative write,
+// which only happens after the container has already exited, always overwrites any such plant
+// rather than leaving it in place when the real scan comes up empty.
 func (s *Service) buildArtifacts(ctx context.Context, patchGitDir, workspace, outputDir string, secretVals map[string]string) error {
 	diff, err := patch.Diff(ctx, patchGitDir, workspace, patch.BaselineTag)
 	if err != nil {
@@ -544,10 +546,8 @@ func (s *Service) buildArtifacts(ctx context.Context, patchGitDir, workspace, ou
 	if err := os.WriteFile(filepath.Join(outputDir, fileChangesPatch), diff, 0o644); err != nil {
 		return fmt.Errorf("guest: write patch: %w", err)
 	}
-	if keys := secrets.ScanKeys(secretVals, diff); len(keys) > 0 {
-		if err := writeSecretScan(outputDir, keys); err != nil {
-			return err
-		}
+	if err := writeSecretScan(outputDir, secrets.ScanKeys(secretVals, diff)); err != nil {
+		return err
 	}
 	if _, err := patch.BundleCommits(ctx, patchGitDir, workspace, patch.BaselineTag, filepath.Join(outputDir, fileCommitsBundle)); err != nil {
 		return err
