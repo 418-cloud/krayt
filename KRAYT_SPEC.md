@@ -569,8 +569,26 @@ plus a digest), consistent with the digest discipline already used for the OCI a
 - Read from a **per-task secrets file** (e.g. `secrets.env` or `secrets.yaml`).
 - Transferred over the encrypted-by-isolation vsock channel.
 - Mounted in the container on **tmpfs** at `/run/secrets/` (and/or injected as env).
-- **Never** written to the VM's persistent disk image; **never** logged (redacted in logs).
+- **Never** written to the VM's persistent disk image.
 - Destroyed with the VM.
+
+**Redaction scope (all in the guest, so no secret value crosses the vsock un-redacted).** The
+guest builds one `Redactor` per run from the secret values (§6.5) and applies it to everything
+the agent controls that the host will keep:
+- **Live container logs** — each stdout/stderr line is redacted before it is streamed as a
+  `RunEvent`. This is line/chunk-oriented, so a value split across two chunks is a known,
+  accepted miss (see §10 residuals); it only affects live logs.
+- **`report.md`** — the agent-written `/output/report.md` is redacted in place after the run,
+  before it is collected, so the notes the host folds into the final report carry no value.
+- **`ask_human` prompt + choices** — redacted at the bridge boundary before the question leaves
+  the VM, covering both the live display and the persisted `questions/<id>.json`. Answers come
+  from the human (host side), not the agent, so they are not a leak path.
+- **`changes.patch` is scanned, NOT redacted.** Rewriting hunk bytes would corrupt the diff and
+  break `git apply`, so the patch is left byte-exact. Instead the guest scans it for secret
+  values and, on a hit, writes a `secret-scan.json` marker naming the matched **keys only**
+  (never the values, §8.4); the host raises a Safety warning per key in `report.md`/`meta.json`
+  so the human reviews before applying. Whole-buffer scan, so unlike live logs there is no
+  split-chunk gap here.
 
 Agent model-provider credentials (e.g. Claude Code's `ANTHROPIC_API_KEY` or
 `CLAUDE_CODE_OAUTH_TOKEN`) ride this same mechanism — see agent authentication (§6.14) for
@@ -949,6 +967,7 @@ Every run produces a self-contained directory the human reviews from:
 ├── commits.bundle    # optional: reverse range bundle of the agent's commits (§6.7), if returned
 ├── report.md         # human-readable summary (see below)
 ├── meta.json         # machine-readable run record (schema below)
+├── secret-scan.json  # optional: present only if a secret value appears in changes.patch (§6.8)
 ├── questions/        # one <qid>.json per agent question + its answer (§6.13), if any
 └── logs/
     ├── agent.log     # container stdout/stderr (merged, timestamped)
@@ -996,8 +1015,20 @@ Every run produces a self-contained directory the human reviews from:
 <agent-provided notes from /output/report.md, if any>
 ```
 
-Secrets never appear in any of these files (redaction per §6.8). `krayt ls` reads
-`meta.json`; `krayt patch`/`apply` read `changes.patch`.
+Secret **values** never appear in `report.md`, `meta.json`, the question records, or
+`secret-scan.json` — the guest redacts the report and question text and scans (not redacts) the
+patch (§6.8). The one exception is `changes.patch` itself: it is left byte-exact so `git apply`
+works, so a secret an agent wrote into a tracked file *is* present there. When that happens the
+guest emits `secret-scan.json`:
+
+```json
+{ "patch_contains_secret_keys": ["ANTHROPIC_API_KEY"] }
+```
+
+— naming the matched secret **keys only** (never the values) — and the host adds a **Safety**
+warning per key to `report.md`/`meta.json` (e.g. *"changes.patch contains the value of secret
+ANTHROPIC_API_KEY — review before applying"*), so the human catches it before applying. `krayt
+ls` reads `meta.json`; `krayt patch`/`apply` read `changes.patch`.
 
 ---
 
@@ -1105,7 +1136,7 @@ exposed.
 | Repo ingest | git bundle cloned in-guest — source `.git/hooks` are never executed or imported, and the guest commits under a throwaway krayt bot identity. The workspace `.git` is left container-writable (so the agent can commit) but is **never trusted by the root guest-agent's git**: patch generation runs against a root-only `patchgit` snapshot with `core.fsmonitor`/`core.hooksPath` force-cleared and `--no-textconv`, so container-written `.git/config`/hooks/attributes cannot execute as root (§6.7, finding #2) |
 | Network egress | Default-deny + allowlist proxy; per-task opt-in to widen. The L3 lock keys egress on proxyd's uid, which the container **cannot** reach because `CAP_SETUID`/`SETGID` are dropped and it runs non-root — so the allowlist is unbypassable (§6.6, §6.10) |
 | Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
-| Secrets | tmpfs only, never on disk, redacted from logs, destroyed with VM |
+| Secrets | tmpfs only, never on disk, destroyed with VM; **redacted in the guest** from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted** (redacting hunks would break `git apply`); a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
 | Persistence | CoW disk destroyed on teardown; fresh VM per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
 
@@ -1134,6 +1165,13 @@ exposed.
   isolated `patchgit` patch generation — §6.10, §6.7) are therefore the primary mitigations, not one
   layer among several defense-in-depth controls. Host-side NAT/firewall filtering on macOS/vfkit is
   impractical for v1; a host backstop is a possible future follow-up task.
+- Secret redaction coverage — the guest redacts every artifact it can safely rewrite (live
+  logs, `report.md`, `ask_human` prompt/choices, §6.8). Two known, accepted gaps: (1) live-log
+  redaction is chunk-oriented, so a secret value split across two log chunks is not caught — it
+  affects only the streamed logs, since `report.md` and the patch are scanned as whole buffers;
+  (2) `changes.patch` is left byte-exact (redacting hunks would break `git apply`), so a secret
+  an agent wrote into a tracked file *is* present there — this is surfaced, not hidden, via the
+  `secret-scan.json` marker and a per-key Safety warning for the human's pre-apply review (§8.4).
 - Resource exhaustion — bounded by per-VM CPU/mem/disk + wall-clock timeout.
 - Auth-credential blast radius — a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) is tied to
   a personal/seat plan and is less granularly revocable than a scoped API key; exposing one

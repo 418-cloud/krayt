@@ -9,6 +9,7 @@ package orchestrator
 import (
 	"archive/tar"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -186,7 +187,8 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	}); err != nil {
 		return nil, fmt.Errorf("orchestrator: push task: %w", err)
 	}
-	if err := pushSecrets(ctx, client, spec.SecretsPath); err != nil {
+	knownSecretKeys, err := pushSecrets(ctx, client, spec.SecretsPath)
+	if err != nil {
 		return nil, err
 	}
 	if err := setNetworkPolicy(ctx, client, spec.Network); err != nil {
@@ -224,6 +226,12 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 			for _, f := range patch.Lint(b) {
 				rec.Safety = append(rec.Safety, f.Path+": "+f.Reason)
 			}
+		}
+		// The guest cannot redact changes.patch (mutating hunks breaks `git apply`), so it
+		// records which secret KEYS it found in the patch (values never leave the VM, §6.8);
+		// surface each as a Safety warning for the human's pre-apply review (§8.4).
+		for _, k := range secretPatchKeys(runDir, knownSecretKeys) {
+			rec.Safety = append(rec.Safety, "changes.patch contains the value of secret "+k+" — review before applying")
 		}
 		res.Safety = rec.Safety
 	}
@@ -286,19 +294,26 @@ func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSp
 }
 
 // pushSecrets loads the per-task secrets file (if any) and pushes it to the guest, which
-// holds it in memory and materializes it on tmpfs at /run/secrets (§6.8).
-func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath string) error {
+// holds it in memory and materializes it on tmpfs at /run/secrets (§6.8). It returns the secret
+// KEY NAMES (never values) the host loaded, so the caller can later cross-check anything the
+// guest reports about them (secretPatchKeys) against a set the host determined independently of
+// the guest/container.
+func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath string) ([]string, error) {
 	if secretsPath == "" {
-		return nil
+		return nil, nil
 	}
 	values, err := secrets.Load(secretsPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := client.Agent.PushSecrets(ctx, &pb.SecretsBundle{Values: values}); err != nil {
-		return fmt.Errorf("orchestrator: push secrets: %w", err)
+		return nil, fmt.Errorf("orchestrator: push secrets: %w", err)
 	}
-	return nil
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	return keys, nil
 }
 
 // setNetworkPolicy translates the task's egress policy to the proto and sends it (§6.6).
@@ -516,4 +531,48 @@ func hasDotDotPrefix(rel string) bool {
 func fileExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && !fi.IsDir()
+}
+
+// secretScanFile is the guest's marker (§6.8) naming the secret KEYS whose value appears in
+// changes.patch. The guest never writes the values, so the file is harmless in the run dir; the
+// host turns each key into a Safety warning (§8.4).
+const secretScanFile = "secret-scan.json"
+
+// secretPatchKeys reads the guest's secret-scan.json (collected with the other artifacts) and
+// returns the secret KEYS whose value the guest found in changes.patch. Absent/unreadable →
+// none (a run with no secret in the patch, the common case).
+//
+// secret-scan.json lives in the guest's outputDir, which is rbind-mounted read-write into the
+// (untrusted, §10) container as /output. The guest's own post-run scan is meant to be the
+// authoritative last writer there, but as defense in depth this does not trust the file's
+// contents outright: reported keys are filtered against knownKeys — the secret names the host
+// itself loaded for this run (pushSecrets), independent of anything the guest/container
+// reports — and deduplicated. So a malformed or maliciously planted file can at worst produce a
+// false-positive warning naming a real configured secret, never an arbitrary, huge, or
+// attacker-chosen string.
+func secretPatchKeys(runDir string, knownKeys []string) []string {
+	b, err := os.ReadFile(filepath.Join(runDir, secretScanFile))
+	if err != nil {
+		return nil
+	}
+	var s struct {
+		PatchContainsSecretKeys []string `json:"patch_contains_secret_keys"`
+	}
+	if json.Unmarshal(b, &s) != nil {
+		return nil
+	}
+	known := make(map[string]bool, len(knownKeys))
+	for _, k := range knownKeys {
+		known[k] = true
+	}
+	seen := make(map[string]bool, len(s.PatchContainsSecretKeys))
+	var keys []string
+	for _, k := range s.PatchContainsSecretKeys {
+		if !known[k] || seen[k] {
+			continue
+		}
+		seen[k] = true
+		keys = append(keys, k)
+	}
+	return keys
 }

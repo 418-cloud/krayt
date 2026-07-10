@@ -112,6 +112,27 @@ func (r *Redactor) Redact(b []byte) []byte {
 	return out
 }
 
+// ScanKeys reports which secret KEYS have their value present verbatim in b, so a caller can
+// warn about a secret that reached an artifact it cannot safely redact — notably changes.patch,
+// where mutating hunks would break `git apply` (§6.8, §8.4). It returns key NAMES only (never
+// values), sorted for determinism, so the result is safe to write into a host artifact. Empty
+// values are ignored (they would match everywhere). Like Redact, the scan is substring-based
+// over the whole buffer, so a value that never appears whole is not detected — acceptable
+// because callers scan complete files, not streamed chunks.
+func ScanKeys(values map[string]string, b []byte) []string {
+	var keys []string
+	for k, v := range values {
+		if v == "" {
+			continue
+		}
+		if bytes.Contains(b, []byte(v)) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // Values returns the secret values, for building a Redactor on the guest from a received
 // SecretsBundle.
 func Values(m map[string]string) []string {
