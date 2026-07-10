@@ -9,6 +9,7 @@ package orchestrator
 import (
 	"archive/tar"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -224,6 +225,12 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 			for _, f := range patch.Lint(b) {
 				rec.Safety = append(rec.Safety, f.Path+": "+f.Reason)
 			}
+		}
+		// The guest cannot redact changes.patch (mutating hunks breaks `git apply`), so it
+		// records which secret KEYS it found in the patch (values never leave the VM, §6.8);
+		// surface each as a Safety warning for the human's pre-apply review (§8.4).
+		for _, k := range secretPatchKeys(runDir) {
+			rec.Safety = append(rec.Safety, "changes.patch contains the value of secret "+k+" — review before applying")
 		}
 		res.Safety = rec.Safety
 	}
@@ -516,4 +523,26 @@ func hasDotDotPrefix(rel string) bool {
 func fileExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && !fi.IsDir()
+}
+
+// secretScanFile is the guest's marker (§6.8) naming the secret KEYS whose value appears in
+// changes.patch. The guest never writes the values, so the file is harmless in the run dir; the
+// host turns each key into a Safety warning (§8.4).
+const secretScanFile = "secret-scan.json"
+
+// secretPatchKeys reads the guest's secret-scan.json (collected with the other artifacts) and
+// returns the secret KEYS whose value the guest found in changes.patch. Absent/unreadable →
+// none (a run with no secret in the patch, the common case).
+func secretPatchKeys(runDir string) []string {
+	b, err := os.ReadFile(filepath.Join(runDir, secretScanFile))
+	if err != nil {
+		return nil
+	}
+	var s struct {
+		PatchContainsSecretKeys []string `json:"patch_contains_secret_keys"`
+	}
+	if json.Unmarshal(b, &s) != nil {
+		return nil
+	}
+	return s.PatchContainsSecretKeys
 }

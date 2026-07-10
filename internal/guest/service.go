@@ -10,7 +10,9 @@ package guest
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -37,6 +39,11 @@ const chunkSize = 1 << 20 // 1 MiB
 const (
 	fileChangesPatch  = "changes.patch"
 	fileCommitsBundle = "commits.bundle"
+	// fileSecretScan names the marker the guest writes when a secret VALUE appears in the
+	// (un-redactable) changes.patch; it lists matched secret KEYS only (§6.8, §8.4).
+	fileSecretScan = "secret-scan.json"
+	// fileReport is the agent-authored notes file the guest redacts before collection (§6.8).
+	fileReport = "report.md"
 )
 
 // containerPolicy is the guest-held copy of the per-task container hardening policy (§6.10),
@@ -68,6 +75,7 @@ type Service struct {
 	netPolicy  NetworkPolicy     // received network policy (§6.6)
 	baseline   string            // recorded baseline commit, set during Start (§6.7)
 	bridge     *ask.Bridge       // active run's question bridge; Answer routes to it (§6.13)
+	redactor   *secrets.Redactor // active run's redactor (logs, report.md, question text), built in Start (§6.8)
 }
 
 // eventSender serializes Sends on the Start stream: the runner's stdout/stderr forwarders and
@@ -259,6 +267,9 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		return err
 	}
 	redactor := secrets.NewRedactor(secrets.Values(secretVals))
+	s.mu.Lock()
+	s.redactor = redactor
+	s.mu.Unlock()
 
 	// Ingest: verify + clone the bundle, set identity, record + tag the baseline (§6.7).
 	baseline, err := patch.Ingest(ctx, bundlePath, workspace, patch.DefaultIdentity)
@@ -303,8 +314,20 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	// ways — the container connects to a unix socket (AskSocket, used by the Phase-5
 	// front-ends) and, for in-process fake runners, RunConfig.Ask calls it directly.
 	bridge := ask.NewBridge(func(id, prompt string, choices []string) error {
+		// Redact secret values from the agent-authored prompt/choices before they leave the VM
+		// (§6.8). The host persists what it receives (questions/<id>.json), so redaction must
+		// happen here at the boundary, not on display. Answers come from the human, not the
+		// agent, so they are not a secret-leak path.
+		rprompt := string(redactor.Redact([]byte(prompt)))
+		var rchoices []string
+		if len(choices) > 0 { // keep nil when there are no choices (matches the un-redacted shape)
+			rchoices = make([]string, len(choices))
+			for i, c := range choices {
+				rchoices[i] = string(redactor.Redact([]byte(c)))
+			}
+		}
 		return es.send(&pb.RunEvent{Kind: &pb.RunEvent_Question{Question: &pb.Question{
-			Id: id, Prompt: prompt, Choices: choices,
+			Id: id, Prompt: rprompt, Choices: rchoices,
 		}}})
 	})
 	// When a question is answered (by any path — Answer RPC, cross-process `krayt answer`, or the
@@ -372,11 +395,18 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		}}})
 	}
 
-	// Build the patch + optional reverse bundle from the recorded baseline (§6.7).
-	if err := s.buildArtifacts(ctx, patchGitDir, workspace, outputDir); err != nil && !timedOut {
+	// Build the patch + optional reverse bundle from the recorded baseline (§6.7), and scan the
+	// patch for secret values (warn, never mutate it — §6.8).
+	if err := s.buildArtifacts(ctx, patchGitDir, workspace, outputDir, secretVals); err != nil && !timedOut {
 		return es.send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
 			ExitCode: int32(exitCode), Error: err.Error(),
 		}}})
+	}
+	// Redact secret values from the agent-written report.md before it is collected (§6.8): the
+	// agent controls that file, so a copied credential is scrubbed inside the VM rather than
+	// reaching the host artifacts. Skipped on timeout, where the host does not collect anyway.
+	if !timedOut {
+		redactReportFile(filepath.Join(outputDir, fileReport), redactor)
 	}
 	return es.send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
 		ExitCode: int32(exitCode), TimedOut: timedOut,
@@ -503,8 +533,10 @@ func mergeEnv(base, add map[string]string) map[string]string {
 }
 
 // buildArtifacts writes changes.patch and, if the agent committed, commits.bundle into the
-// output dir (§6.7).
-func (s *Service) buildArtifacts(ctx context.Context, patchGitDir, workspace, outputDir string) error {
+// output dir (§6.7). It also scans the byte-exact patch for secret values and, on a hit, writes
+// the secret-scan.json marker naming the matched KEYS (§6.8) — the patch itself is never
+// redacted, since mutating hunks would break `git apply`; the host warns in Safety instead.
+func (s *Service) buildArtifacts(ctx context.Context, patchGitDir, workspace, outputDir string, secretVals map[string]string) error {
 	diff, err := patch.Diff(ctx, patchGitDir, workspace, patch.BaselineTag)
 	if err != nil {
 		return err
@@ -512,10 +544,55 @@ func (s *Service) buildArtifacts(ctx context.Context, patchGitDir, workspace, ou
 	if err := os.WriteFile(filepath.Join(outputDir, fileChangesPatch), diff, 0o644); err != nil {
 		return fmt.Errorf("guest: write patch: %w", err)
 	}
+	if keys := secrets.ScanKeys(secretVals, diff); len(keys) > 0 {
+		if err := writeSecretScan(outputDir, keys); err != nil {
+			return err
+		}
+	}
 	if _, err := patch.BundleCommits(ctx, patchGitDir, workspace, patch.BaselineTag, filepath.Join(outputDir, fileCommitsBundle)); err != nil {
 		return err
 	}
 	return nil
+}
+
+// secretScan is the secret-scan.json marker: the KEYS whose value appears verbatim in
+// changes.patch (§6.8, §8.4). It carries key NAMES only — never values — so it is safe to leave
+// in the collected run dir; the host turns each key into a Safety warning.
+type secretScan struct {
+	PatchContainsSecretKeys []string `json:"patch_contains_secret_keys"`
+}
+
+// writeSecretScan records which secret keys were found in the patch. Key names are not secret;
+// the values (which are) are never written.
+func writeSecretScan(outputDir string, keys []string) error {
+	b, err := json.MarshalIndent(secretScan{PatchContainsSecretKeys: keys}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("guest: marshal secret scan: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, fileSecretScan), b, 0o644); err != nil {
+		return fmt.Errorf("guest: write secret scan: %w", err)
+	}
+	return nil
+}
+
+// redactReportFile rewrites the agent-written report.md in place with secret values redacted
+// (§6.8). A missing/unreadable file is ignored (no report, nothing to leak). If the redacted
+// bytes cannot be written back, the file is removed rather than collected in the clear — the
+// confinement guarantee (no secret value on a host artifact) beats keeping a report we could not
+// scrub. A run is not failed on this path: the value is still caught in logs and flagged if it
+// reached the patch.
+func redactReportFile(path string, r *secrets.Redactor) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	red := r.Redact(b)
+	if bytes.Equal(red, b) {
+		return // nothing to redact; leave the agent's report byte-exact
+	}
+	if err := os.WriteFile(path, red, 0o644); err != nil {
+		_ = os.Remove(path) // fail closed: never collect the un-redacted report
+	}
 }
 
 // CollectArtifacts streams the output dir back to the host as a tar (§6.5, §6.7): the

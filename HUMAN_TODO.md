@@ -656,3 +656,43 @@ below block only that on-hardware confirmation.
   for `linux/arm64`, `go vet -tags 'integration darwin'`, and `go test -race ./...` all pass in the
   sandbox; this hardware assertion is the final on-metal confirmation of finding #2, mirroring the
   existing hardening/egress probe handoffs.
+
+## [Security remediation — redact-secrets-in-artifacts] End-to-end secret confinement on real hardware
+- Needed: run the gated integration test `TestSecretConfinementInArtifacts` in
+  `internal/orchestrator/integration_test.go` on an Apple-Silicon Mac, with a linux/arm64 NON-ROOT
+  probe image that leaks its mounted credential three ways. This is the on-metal proof of the
+  §6.8/§10 fix (redaction previously covered live logs only): `report.md` + `ask_human` prompt/choices
+  are redacted in the guest, while `changes.patch` is left byte-exact but flagged in Safety.
+- Why the agent can't: needs virtualization hardware, the base VM image (containerd + git +
+  `krayt-ask`), and a purpose-built probe image — none available in the cloud sandbox (§14, §11.6).
+  The guest logic is already proven against the fake provider by the unit tests
+  `TestSecretRedactedInReportAndFlaggedInPatch` + `TestSecretRedactedInQuestion`
+  (`internal/orchestrator`) and `TestScanKeys` (`internal/secrets`).
+- Exact steps/commands: use the ready-made probe in `hack/secrets-probe/` (self-contained image +
+  full runbook in its README) — it's the secrets-confinement analogue of `hack/krayt-ask-probe`.
+  1. Build/publish the linux/arm64, **non-root** probe image:
+     ```
+     cd hack/secrets-probe
+     docker buildx build --platform linux/arm64 -t <your-registry>/krayt-secrets-probe:latest --push .
+     ```
+     Its entrypoint reads `K=$(cat /run/secrets/ANTHROPIC_API_KEY)` and then, in one run:
+     - `printf 'Authenticate with the key %s before running.\n' "$K" > /output/report.md`
+     - `printf 'api_key=%s\n' "$K" > /workspace/config.txt`   (a tracked file → lands in changes.patch)
+     - `krayt-ask --choices "use $K,skip" "Use the key $K?"` (the answer may be ignored)
+     - `exit 0`
+  2. Run (short per-question timeout auto-sentinels the ask so the run doesn't block on a human),
+     with `KRAYT_SECRETS_IMAGE` set to the pushed ref:
+     ```
+     KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img \
+     KRAYT_SECRETS_IMAGE=ghcr.io/you/krayt-secrets-probe:latest \
+       go test -tags 'integration darwin' -run TestSecretConfinementInArtifacts -v ./internal/orchestrator/
+     ```
+- Verify success by: the test PASSES — in the run dir, `report.md` and the `questions/<id>.json`
+  record do **not** contain the secret value (they carry `[REDACTED]` instead); `changes.patch`
+  contains the value verbatim (byte-exact, so `git apply` still works); `secret-scan.json` names
+  `ANTHROPIC_API_KEY` but never the value; and `meta.json`/`report.md` Safety carries
+  "changes.patch contains the value of secret ANTHROPIC_API_KEY — review before applying".
+- Blocking: no — all offline checks pass in the sandbox (`go build ./...`,
+  `GOOS=linux GOARCH=arm64 go build ./...`, `go test -race ./...`, `golangci-lint run`, and
+  `GOOS=darwin GOARCH=arm64 go vet -tags 'integration darwin' ./internal/orchestrator/`); this is the
+  final on-metal confirmation, mirroring the existing hardening/egress/gitconfig probe handoffs.
