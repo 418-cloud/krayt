@@ -657,7 +657,16 @@ below block only that on-hardware confirmation.
   sandbox; this hardware assertion is the final on-metal confirmation of finding #2, mirroring the
   existing hardening/egress probe handoffs.
 
-## [Security remediation — redact-secrets-in-artifacts] End-to-end secret confinement on real hardware
+## [Security remediation — redact-secrets-in-artifacts] End-to-end secret confinement on real hardware — DONE ✅
+- Resolved: `TestSecretConfinementInArtifacts` **PASSED** on Apple Silicon (33.10s) against the
+  `hack/secrets-probe` image (`docker.io/tjololo/test-krayt:secrets-probe`, uid 1000). The probe read
+  `ANTHROPIC_API_KEY` from `/run/secrets`, wrote it into `/output/report.md` and
+  `/workspace/config.txt`, and called `krayt-ask` — which hit the test's 20s per-question timeout and
+  returned the no-answer sentinel, so the probe proceeded and exited 0. All assertions held:
+  `report.md` and the persisted `questions/<id>.json` prompt were redacted; `changes.patch` carried
+  the secret byte-exact (not redacted, so `git apply` still works) and the run's Safety notes flagged
+  it; `meta.json` never contained the value; `secret-scan.json` named `ANTHROPIC_API_KEY` only. This
+  is the on-metal confirmation of the §6.8/§10 fix — closes this handoff.
 - Needed: run the gated integration test `TestSecretConfinementInArtifacts` in
   `internal/orchestrator/integration_test.go` on an Apple-Silicon Mac, with a linux/arm64 NON-ROOT
   probe image that leaks its mounted credential three ways. This is the on-metal proof of the
