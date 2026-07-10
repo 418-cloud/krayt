@@ -72,6 +72,14 @@ func Open(ref string) (oras.ReadOnlyTarget, error) {
 // Pull copies the artifact at ref from src into destDir, verifies the resolved manifest
 // digest matches want (when non-empty), and returns the extracted Image. oras verifies
 // every blob digest during the copy, so a corrupted layer fails here too (§11.4).
+//
+// oras.Copy extracts to disk as it goes, before this function ever checks want — so on a
+// copy error or a digest mismatch, destDir may already hold content from the rejected
+// artifact. Both paths remove destDir rather than leave it behind, matching
+// imagestore.Acquire's existing pattern (leaving a half-written/rejected extraction on disk
+// risks it being mistaken for good content on a later look, and is exactly the kind of
+// leftover CVE-2026-50163 — a hardlink path-traversal bug fixed upstream in oras-go v2.6.2 —
+// warns against trusting).
 func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.Digest, destDir string) (*Image, error) {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return nil, fmt.Errorf("vmimage: create dest dir: %w", err)
@@ -84,9 +92,11 @@ func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.
 
 	desc, err := oras.Copy(ctx, src, ref, fs, ref, oras.DefaultCopyOptions)
 	if err != nil {
+		_ = os.RemoveAll(destDir)
 		return nil, fmt.Errorf("vmimage: pull %q: %w", ref, err)
 	}
 	if want != "" && desc.Digest != want {
+		_ = os.RemoveAll(destDir)
 		return nil, fmt.Errorf("vmimage: digest mismatch for %q: got %s, want %s", ref, desc.Digest, want)
 	}
 

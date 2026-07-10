@@ -44,7 +44,7 @@
         version = "0.0.0-dev";
         src = ../.; # repo root (go.mod, internal/, cmd/)
         subPackages = [ "cmd/krayt-agent" "cmd/krayt-proxy" "cmd/krayt-ask" ];
-        vendorHash = "sha256-eFyNMjEHRHCAKtswmZjiwAbe4OxsqyMLsNstja6SG9w=";
+        vendorHash = "sha256-uQ56QZdktOJ2WIvbj7ndbEXaXgRzKTpOCKoSC0NNz2k=";
         env.CGO_ENABLED = "0";
       };
 
