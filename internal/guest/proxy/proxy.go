@@ -136,10 +136,12 @@ var cgnat = netip.MustParsePrefix("100.64.0.0/10")
 // link-local check, but named explicitly to make the intent unmissable).
 var metadataIP = netip.MustParseAddr("169.254.169.254")
 
-// blockedAddrMsg is the operator-facing 403 body for a target that resolved into a blocked
-// range (§6.6).
+// blockedAddrMsg is the operator-facing 403 body for a target checkDialAddr refused (§6.6) —
+// worded generically since the block covers loopback/link-local/multicast/unspecified/metadata
+// and (mode-dependent) private/CGNAT ranges, and can fire for a request host that was already an
+// IP literal (no resolution involved).
 func blockedAddrMsg(host string) string {
-	return "krayt: egress to " + host + " resolves to a blocked (internal/link-local) address"
+	return "krayt: egress to " + host + " targets a blocked address range"
 }
 
 // checkDialAddr is the post-resolution SSRF guard (§6.6). It runs on the *resolved* ip:port
