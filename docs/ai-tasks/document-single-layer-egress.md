@@ -8,16 +8,21 @@ autonomously. This is a documentation-only task — no code.**
 **Finding (Medium) — no host-level egress backstop.** The vfkit VM is given a NAT NIC with full
 host-network reachability (`internal/provider/vfkit/vfkit.go:175-178`,
 `config.VirtioNetNew("")`), and **all** egress restriction lives *inside* the guest (the nftables
-lock + the allowlist proxy). There is no hypervisor/host firewall. Consequently, any in-guest bypass
-— a container that assumes the proxyd uid (see `fix-egress-allowlist-bypass.md`) or a guest-root
-escape that flushes nftables (see `fix-guest-git-config-rce.md`) — yields unrestricted network access
-with nothing else to stop it. The VM boundary protects the *host*; it provides **no defense-in-depth
-for the egress allowlist**.
+lock + the allowlist proxy). There is no hypervisor/host firewall. The two concrete bypasses that
+originally motivated this finding — a container assuming the proxyd uid, and a guest-root escape via
+container-writable `.git` config — are now **closed** (dropped `CAP_SETUID`/`CAP_SETGID` + enforced
+non-root, see `harden-container-oci-spec.md` and `fix-egress-allowlist-bypass.md`; isolated root-only
+`patchgit`, see `fix-guest-git-config-rce.md`). That does not remove the architectural gap: the fix
+for both lives entirely *inside* the guest, so any **future** in-guest regression — a misconfigured
+capability opt-in, an unknown containerd/kernel escape, a new code path that reintroduces either bug
+— still has **nothing backstopping it** at the host/hypervisor layer. The VM boundary protects the
+*host*; it provides **no defense-in-depth for the egress allowlist itself**.
 
 **Decision (already made):** for v1 this is documented as an accepted single-layer design rather than
 implemented as a host-side control (host-side NAT filtering on macOS/vfkit is impractical for v1).
-This task records the residual risk accurately so the in-guest hardening tasks are understood as
-load-bearing. A future host backstop can be a separate task.
+This task records the residual risk accurately so the in-guest hardening controls are understood as
+load-bearing and irreplaceable — not merely one layer among several. A future host backstop can be a
+separate task.
 
 ## Goal
 

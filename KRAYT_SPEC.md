@@ -359,7 +359,9 @@ container per VM, so the VM boundary *is* the network boundary and host-networki
 is the simplest correct choice. Enforcement layers:
 
 - **VM interface:** one NAT interface (vz NAT device / Firecracker tap), brought up by
-  the NixOS network config.
+  the NixOS network config. **This interface applies no filtering of its own** — vfkit/the
+  Virtualization.framework NAT device forwards whatever the guest sends; the hypervisor is not a
+  firewall.
 - **L7 allowlist:** a small **HTTP/HTTPS CONNECT forward proxy** (hand-rolled, or
   `elazarl/goproxy`) runs in the guest as a dedicated uid (e.g. `proxyd`). It checks the
   `CONNECT` host and plain-HTTP `Host` against the per-task allowlist.
@@ -421,6 +423,11 @@ is the simplest correct choice. Enforcement layers:
   adversarial network input**, that isolation makes it the natural candidate for a future
   **memory-safe reimplementation** (e.g. Rust/Zig): drop in a binary that honors the same
   flags + env + uid contract and neither the agnostic core nor the guest-agent changes.
+- **Single-layer, in-guest only.** The L7 proxy and the L3 nftables lock above are the *entire*
+  egress enforcement — there is no host/hypervisor-level firewall backstopping them (§10). Both
+  depend on the container-hardening controls in §6.10 (dropped `CAP_SETUID`/`CAP_SETGID`, enforced
+  non-root) to stay unbypassable from inside the guest; if those controls ever regress, nothing
+  outside the guest stops the resulting egress.
 
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
@@ -1150,6 +1157,14 @@ exposed.
   `changes.patch` could still add files like `.git/hooks/*` or build scripts that run on the
   **host** after apply; reviewing the diff before `git apply` is the control, and a
   `--strip-hooks` / lint pass on patches is a possible future addition.
+- **Egress control is single-layer (in-guest).** The host applies no network filtering — the
+  allowlist is enforced entirely by the in-VM L7 proxy + L3 nftables lock (§6.6). A *future*
+  regression that let a container assume the proxyd uid, or a guest-root escape that flushed
+  nftables, would defeat the allowlist with no backstop; nothing outside the guest would catch it.
+  The container-hardening controls (dropped `CAP_SETUID`/`CAP_SETGID`, enforced non-root, seccomp,
+  isolated `patchgit` patch generation — §6.10, §6.7) are therefore the primary mitigations, not one
+  layer among several defense-in-depth controls. Host-side NAT/firewall filtering on macOS/vfkit is
+  impractical for v1; a host backstop is a possible future follow-up task.
 - Secret redaction coverage — the guest redacts every artifact it can safely rewrite (live
   logs, `report.md`, `ask_human` prompt/choices, §6.8). Two known, accepted gaps: (1) live-log
   redaction is chunk-oriented, so a secret value split across two log chunks is not caught — it
