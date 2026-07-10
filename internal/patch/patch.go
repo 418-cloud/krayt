@@ -14,6 +14,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,16 +222,56 @@ func Ingest(ctx context.Context, bundlePath, workspaceDir string, id Identity) (
 	return baseline, nil
 }
 
-// Diff produces changes.patch: everything in workspaceDir since the baseline, whether the
-// agent committed or only edited the working tree. We stage all changes into the (throwaway
-// guest) index and diff that against the baseline, so an agent that edits a file without
-// committing — the common case — still yields a non-empty patch. This is broader than
-// §6.7's `git diff baseline..HEAD`, which would miss uncommitted edits (see SPEC flag).
-func Diff(ctx context.Context, workspaceDir, baselineRef string) ([]byte, error) {
-	if _, err := runGit(ctx, workspaceDir, "add", "-A"); err != nil {
+// SetupPatchGit snapshots the pristine, root-only git dir used for guest patch generation
+// (§6.7, §10 finding #2). It copies workspaceDir/.git — as freshly cloned by Ingest, before
+// the container ever runs — into patchGitDir, which the guest keeps OUTSIDE the workspace,
+// never bind-mounts into the container, and never makes container-writable. Diff/BundleCommits
+// then resolve the baseline and run git against THIS dir (with the workspace as a detached
+// work tree), so a container that later rewrites the workspace's `.git/config`, `.git/hooks/*`,
+// or `.gitattributes` can never get the root guest-agent's git to trust or execute it. The copy
+// is pristine because `git clone` generates the config/hooks itself — none of it comes from the
+// untrusted source repo, and the container has not run yet. patchGitDir must not already exist:
+// this is asserted explicitly (rather than left as a caller invariant) because copyTree only
+// overwrites paths present in the source — a stale pre-existing patchGitDir (e.g. a future
+// refactor that reuses a guest root across runs) could silently leave old hooks/config behind,
+// reintroducing the exact trust problem this snapshot exists to prevent.
+func SetupPatchGit(workspaceDir, patchGitDir string) error {
+	srcGit := filepath.Join(workspaceDir, ".git")
+	if info, err := os.Stat(srcGit); err != nil {
+		return fmt.Errorf("patch: snapshot patchgit: source %s: %w", srcGit, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("patch: snapshot patchgit: source %s is not a directory", srcGit)
+	}
+	if _, err := os.Lstat(patchGitDir); err == nil {
+		return fmt.Errorf("patch: snapshot patchgit: %s already exists", patchGitDir)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("patch: snapshot patchgit: stat %s: %w", patchGitDir, err)
+	}
+	if err := copyTree(srcGit, patchGitDir); err != nil {
+		return fmt.Errorf("patch: snapshot patchgit: %w", err)
+	}
+	return nil
+}
+
+// Diff produces changes.patch: everything in the workspace working tree since the baseline,
+// whether the agent committed or only edited the working tree. It runs entirely against the
+// root-only patchGitDir (§6.7, §10 finding #2) — the container-writable `workspace/.git` is
+// never trusted — with the workspace as a detached GIT_WORK_TREE. The baseline is resolved and
+// the index seeded from patchGitDir, so a container that rewrote refs/tags in `workspace/.git`
+// cannot change what we diff against. We seed the index from the baseline, stage all working-tree
+// changes, then diff the index against the baseline, so an agent that edits a file without
+// committing — the common case — still yields a non-empty patch (broader than §6.7's
+// `git diff baseline..HEAD`, which would miss uncommitted edits). `--no-textconv` plus the
+// force-cleared knobs (patchGenGitArgs) neutralize any diff-driver/fsmonitor/hook execution.
+func Diff(ctx context.Context, patchGitDir, workspaceDir, baselineRef string) ([]byte, error) {
+	env := patchGenEnv(patchGitDir, workspaceDir)
+	if _, err := runGitEnv(ctx, env, patchGenGitArgs("read-tree", baselineRef)...); err != nil {
+		return nil, fmt.Errorf("patch: seed baseline index: %w", err)
+	}
+	if _, err := runGitEnv(ctx, env, patchGenGitArgs("add", "-A")...); err != nil {
 		return nil, fmt.Errorf("patch: stage changes: %w", err)
 	}
-	out, err := runGitRaw(ctx, workspaceDir, "diff", "--cached", "--binary", baselineRef)
+	out, err := runGitRawEnv(ctx, env, patchGenGitArgs("diff", "--cached", "--binary", "--no-textconv", baselineRef)...)
 	if err != nil {
 		return nil, fmt.Errorf("patch: diff vs baseline: %w", err)
 	}
@@ -237,23 +279,36 @@ func Diff(ctx context.Context, workspaceDir, baselineRef string) ([]byte, error)
 }
 
 // BundleCommits writes the optional reverse range bundle of the agent's new commits
-// (baselineRef..HEAD) to outBundle, so multi-commit work applies faithfully on the host
-// via `git fetch` (§6.7). It returns false (and writes nothing) when the agent made no
-// commits — HEAD still equals the baseline — in which case changes.patch is the only
-// artifact. A range bundle is correct here because the host already has the baseline.
-func BundleCommits(ctx context.Context, workspaceDir, baselineRef, outBundle string) (bool, error) {
-	head, err := runGit(ctx, workspaceDir, "rev-parse", "HEAD")
-	if err != nil {
-		return false, fmt.Errorf("patch: rev-parse HEAD: %w", err)
-	}
-	base, err := runGit(ctx, workspaceDir, "rev-parse", baselineRef)
+// (baseline..HEAD) to outBundle, so multi-commit work applies faithfully on the host via
+// `git fetch` (§6.7). It returns false (and writes nothing) when the agent made no commits —
+// HEAD still equals the baseline — in which case changes.patch is the only artifact.
+//
+// The baseline is resolved from the root-only patchGitDir (so a container that moved the
+// workspace's `krayt-baseline` tag can't skew the range), while HEAD and the objects come from
+// the container-writable `workspace/.git` (untrusted, but `git bundle create` runs no hooks,
+// fsmonitor, or textconv — and patchGenGitArgs force-clears those knobs regardless). The
+// resolved baseline SHA still exists in `workspace/.git` because it is an ancestor of the
+// agent's HEAD. commits.bundle stays best-effort; a corrupt workspace `.git` only fails this
+// optional artifact, never the security-critical changes.patch (which never trusts it).
+func BundleCommits(ctx context.Context, patchGitDir, workspaceDir, baselineRef, outBundle string) (bool, error) {
+	base, err := runGitEnv(ctx, patchGenEnv(patchGitDir, workspaceDir), patchGenGitArgs("rev-parse", baselineRef)...)
 	if err != nil {
 		return false, fmt.Errorf("patch: rev-parse baseline: %w", err)
 	}
-	if strings.TrimSpace(head) == strings.TrimSpace(base) {
+	wsEnv := patchGenEnv(filepath.Join(workspaceDir, ".git"), workspaceDir)
+	head, err := runGitEnv(ctx, wsEnv, patchGenGitArgs("rev-parse", "HEAD")...)
+	if err != nil {
+		return false, fmt.Errorf("patch: rev-parse HEAD: %w", err)
+	}
+	baseSHA, headSHA := strings.TrimSpace(base), strings.TrimSpace(head)
+	if headSHA == baseSHA {
 		return false, nil // no new commits; nothing to bundle
 	}
-	if _, err := runGit(ctx, workspaceDir, "bundle", "create", outBundle, baselineRef+"..HEAD"); err != nil {
+	// `git bundle create` needs a NAMED ref on the positive side to advertise (a bare SHA yields
+	// "Refusing to create empty bundle"), so pass `HEAD`; the negative boundary is the baseline
+	// SHA resolved from the root-only patchgit, so a container that moved the workspace tag can't
+	// widen or empty the range.
+	if _, err := runGitEnv(ctx, wsEnv, patchGenGitArgs("bundle", "create", outBundle, baseSHA+"..HEAD")...); err != nil {
 		return false, fmt.Errorf("patch: create commits bundle: %w", err)
 	}
 	return true, nil
@@ -400,6 +455,12 @@ func runGitRaw(ctx context.Context, dir string, args ...string) ([]byte, error) 
 // for the non-mutating dirty capture) and returns its raw stdout (callers trim as needed).
 // No working directory is set; the location is controlled entirely by the git env vars.
 func runGitEnv(ctx context.Context, extraEnv []string, args ...string) (string, error) {
+	out, err := runGitRawEnv(ctx, extraEnv, args...)
+	return string(out), err
+}
+
+// runGitRawEnv is runGitEnv without trimming, for commands whose stdout is binary (diff/bundle).
+func runGitRawEnv(ctx context.Context, extraEnv []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -411,7 +472,74 @@ func runGitEnv(ctx context.Context, extraEnv []string, args ...string) (string, 
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+		return nil, fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
 	}
-	return stdout.String(), nil
+	return stdout.Bytes(), nil
+}
+
+// patchGenGitArgs prepends the config knobs that are force-cleared on EVERY guest
+// patch-generation git invocation so no repo-local config can execute code as root (§6.7,
+// §10 finding #2): `core.fsmonitor=` disables the fsmonitor program run on index refresh and
+// `core.hooksPath=/dev/null` disables all hooks. A command-line `-c` beats any value a
+// container-written `.git/config` might carry. A fresh slice is returned each call so callers
+// can append safely.
+func patchGenGitArgs(extra ...string) []string {
+	return append([]string{"-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"}, extra...)
+}
+
+// patchGenEnv isolates a patch-generation git run to the root-only gitDir with workTree as a
+// detached work tree, and neutralizes every out-of-repo config/attribute source (§6.7, §10):
+// GIT_CONFIG_GLOBAL=/dev/null drops global config and GIT_ATTR_NOSYSTEM=1 drops system
+// attributes (runGitRawEnv already sets GIT_CONFIG_NOSYSTEM=1). Only the pristine patchgit
+// config — which the container never touched — is honored.
+func patchGenEnv(gitDir, workTree string) []string {
+	return []string{
+		"GIT_DIR=" + gitDir,
+		"GIT_WORK_TREE=" + workTree,
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_ATTR_NOSYSTEM=1",
+	}
+}
+
+// copyTree recursively copies src to dst, creating dirs 0700 and files 0600 (root-only), and
+// skipping symlinks/special files. A freshly-cloned `.git` contains only regular files and
+// dirs, so nothing worth copying is skipped; refusing symlinks keeps the copy from following a
+// link out of the tree. dst must not already exist as a populated tree.
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		switch {
+		case d.IsDir():
+			return os.MkdirAll(target, 0o700)
+		case d.Type().IsRegular():
+			return copyFile(p, target)
+		default:
+			return nil
+		}
+	})
+}
+
+// copyFile copies a single regular file to dst, 0600.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }

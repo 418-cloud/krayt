@@ -261,3 +261,80 @@ func TestRootImageFailsClosed(t *testing.T) {
 		t.Fatalf("error should name the non-root requirement; got %v", err)
 	}
 }
+
+// TestGuestGitConfigInjectionInert is the real-VM proof that a container cannot use its writable
+// `/workspace/.git` to make the ROOT guest-agent's git execute attacker-controlled config (§6.7,
+// §10 finding #2 — the container→guest-root escape). The guest generates the patch from a root-only
+// `patchgit` snapshot with `core.fsmonitor`/`core.hooksPath` force-cleared and `--no-textconv`, so
+// the injected config must be inert.
+//
+// KRAYT_GITCONFIG_IMAGE must be a linux/arm64, non-root image whose entrypoint (see HUMAN_TODO.md
+// for the exact contract):
+//   - writes an executable `/workspace/pwn.sh` that, if it ever runs, creates a sentinel file
+//     `/workspace/PWNED_BY_ROOT` (a path that would land in the collected changes.patch);
+//   - appends `[core]\n\tfsmonitor = /workspace/pwn.sh` (and a `[diff "evil"] textconv = /workspace/pwn.sh`
+//     driver) to `/workspace/.git/config`, plus `* diff=evil` to `/workspace/.gitattributes`;
+//   - makes one normal tracked edit (e.g. append to an existing file);
+//   - exits 0.
+//
+// After the run, the guest's root git ran `add -A` + `diff` during patch generation. If the fix
+// regressed, fsmonitor/textconv would have executed as root and created the sentinel file, which
+// `git add -A` would then stage as its own new-file entry in changes.patch. The test asserts that
+// entry is ABSENT (root code never ran) while the normal edit IS present (the patch is still
+// faithful). It checks for the sentinel's own diff header rather than a bare substring match on
+// "PWNED_BY_ROOT", because pwn.sh's own source necessarily contains that path as text — pwn.sh
+// itself always lands in the patch as a normal added file, and a loose substring check would
+// false-positive on that, not on the sentinel actually having run.
+func TestGuestGitConfigInjectionInert(t *testing.T) {
+	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
+	image := os.Getenv("KRAYT_GITCONFIG_IMAGE")
+	if kernel == "" || initrd == "" || rootfs == "" || image == "" {
+		t.Skip("set KRAYT_KERNEL, KRAYT_INITRD, KRAYT_ROOTFS, KRAYT_GITCONFIG_IMAGE to run")
+	}
+	cmdline := os.Getenv("KRAYT_CMDLINE")
+	if cmdline == "" {
+		cmdline = "console=hvc0 root=/dev/vda"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
+	imgSrc, err := imagestore.Remote(image)
+	if err != nil {
+		t.Fatalf("imagestore.Remote: %v", err)
+	}
+	img, err := imagestore.Acquire(ctx, imgSrc, image, t.TempDir())
+	if err != nil {
+		t.Fatalf("imagestore.Acquire: %v", err)
+	}
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	spec := task.RunSpec{
+		ID: "run_gitconfig", ImageRef: image, RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("inject git config"),
+		Resources:  task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
+	}
+	deps := orchestrator.Deps{
+		Provider: vfkit.New("", t.TempDir()),
+		BaseVM:   provider.VMSpec{Kernel: kernel, Initrd: initrd, RootFS: rootfs, Cmdline: cmdline},
+		Image:    img,
+		LogOut:   os.Stderr,
+	}
+	res, err := orchestrator.Run(ctx, deps, spec, runDir)
+	if err != nil {
+		t.Fatalf("orchestrator.Run: %v", err)
+	}
+	patchBytes, err := os.ReadFile(res.PatchPath)
+	if err != nil || len(patchBytes) == 0 {
+		t.Fatalf("changes.patch missing/empty: err=%v", err)
+	}
+	// The sentinel FILE (not just pwn.sh's source text, which always contains this path) must not
+	// be a new-file entry in the patch — that would mean root git ran the injected config.
+	if strings.Contains(string(patchBytes), "diff --git a/PWNED_BY_ROOT b/PWNED_BY_ROOT") {
+		t.Fatalf("container→guest-root escape: injected git config executed as root (sentinel file present)\n%s", patchBytes)
+	}
+	// The patch is still faithful — the normal edit landed.
+	if !strings.Contains(string(patchBytes), "greeting.txt") {
+		t.Errorf("changes.patch missing the real edit:\n%s", patchBytes)
+	}
+}

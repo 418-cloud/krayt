@@ -45,11 +45,17 @@ func TestRoundTrip(t *testing.T) {
 		t.Errorf("origin remote not dropped, remotes = %q", out)
 	}
 
+	// Snapshot the root-only patchgit as the guest does, before the agent touches the tree.
+	pg := filepath.Join(t.TempDir(), "patchgit")
+	if err := patch.SetupPatchGit(ws, pg); err != nil {
+		t.Fatalf("SetupPatchGit: %v", err)
+	}
+
 	// Agent edits one tracked file and adds a new one — without committing.
 	writeFile(t, filepath.Join(ws, "greeting.txt"), "hello world\n")
 	writeFile(t, filepath.Join(ws, "new.txt"), "fresh\n")
 
-	patchBytes, err := patch.Diff(ctx, ws, patch.BaselineTag)
+	patchBytes, err := patch.Diff(ctx, pg, ws, patch.BaselineTag)
 	if err != nil {
 		t.Fatalf("Diff: %v", err)
 	}
@@ -72,6 +78,33 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(target, "new.txt")); got != "fresh\n" {
 		t.Errorf("new.txt after apply = %q, want %q", got, "fresh\n")
+	}
+}
+
+// TestSetupPatchGitRejectsExistingDir asserts SetupPatchGit refuses to run against a
+// patchGitDir that already exists, rather than silently merging copyTree's writes onto
+// whatever is already there. This matters for security-critical code (§6.7, §10 finding #2):
+// copyTree only overwrites paths present in the source, so a stale pre-existing patchGitDir
+// (e.g. from a future refactor that reuses a guest root across runs) could otherwise leave old
+// hooks/config behind, reintroducing the trust problem this snapshot exists to prevent.
+func TestSetupPatchGitRejectsExistingDir(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	pg := filepath.Join(t.TempDir(), "patchgit")
+	if err := patch.SetupPatchGit(ws, pg); err != nil {
+		t.Fatalf("first SetupPatchGit: %v", err)
+	}
+	if err := patch.SetupPatchGit(ws, pg); err == nil {
+		t.Fatal("SetupPatchGit against an already-existing patchGitDir succeeded, want an error")
 	}
 }
 
@@ -98,8 +131,12 @@ func TestIngestOutsideGitRepo(t *testing.T) {
 	if baseline == "" {
 		t.Fatal("empty baseline")
 	}
+	pg := filepath.Join(t.TempDir(), "patchgit")
+	if err := patch.SetupPatchGit(ws, pg); err != nil {
+		t.Fatalf("SetupPatchGit: %v", err)
+	}
 	writeFile(t, filepath.Join(ws, "a.txt"), "2\n")
-	if got, err := patch.Diff(ctx, ws, patch.BaselineTag); err != nil || len(got) == 0 {
+	if got, err := patch.Diff(ctx, pg, ws, patch.BaselineTag); err != nil || len(got) == 0 {
 		t.Fatalf("Diff from non-repo cwd: err=%v len=%d", err, len(got))
 	}
 }
@@ -117,10 +154,14 @@ func TestBundleCommits(t *testing.T) {
 	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
+	pg := filepath.Join(t.TempDir(), "patchgit")
+	if err := patch.SetupPatchGit(ws, pg); err != nil {
+		t.Fatalf("SetupPatchGit: %v", err)
+	}
 
 	// No commit yet → no reverse bundle.
 	out := filepath.Join(t.TempDir(), "commits.bundle")
-	has, err := patch.BundleCommits(ctx, ws, patch.BaselineTag, out)
+	has, err := patch.BundleCommits(ctx, pg, ws, patch.BaselineTag, out)
 	if err != nil {
 		t.Fatalf("BundleCommits (no commit): %v", err)
 	}
@@ -132,7 +173,7 @@ func TestBundleCommits(t *testing.T) {
 	writeFile(t, filepath.Join(ws, "a.txt"), "2\n")
 	git(t, ws, "add", "-A")
 	git(t, ws, "commit", "--quiet", "-m", "agent change")
-	has, err = patch.BundleCommits(ctx, ws, patch.BaselineTag, out)
+	has, err = patch.BundleCommits(ctx, pg, ws, patch.BaselineTag, out)
 	if err != nil {
 		t.Fatalf("BundleCommits (commit): %v", err)
 	}
@@ -265,9 +306,13 @@ func TestRoundTripMultiCommitMerge(t *testing.T) {
 				t.Errorf("feature.txt = %q, want merged HEAD tree", got)
 			}
 
+			pg := filepath.Join(t.TempDir(), "patchgit")
+			if err := patch.SetupPatchGit(ws, pg); err != nil {
+				t.Fatalf("SetupPatchGit: %v", err)
+			}
 			// Edit → diff → apply onto a fresh checkout of the source.
 			writeFile(t, filepath.Join(ws, "base.txt"), "edited\n")
-			patchBytes, err := patch.Diff(ctx, ws, patch.BaselineTag)
+			patchBytes, err := patch.Diff(ctx, pg, ws, patch.BaselineTag)
 			if err != nil || len(patchBytes) == 0 {
 				t.Fatalf("Diff: err=%v len=%d", err, len(patchBytes))
 			}
@@ -307,6 +352,108 @@ func TestCreateBundleMultiCommitIncludeDirty(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(ws, "feature.txt")); got != "feature\n" {
 		t.Errorf("feature.txt = %q, want committed merge state", got)
+	}
+}
+
+// TestDiffConfigInjectionInert is the regression for §10 finding #2 (container→guest-root
+// escape). A container with a writable `workspace/.git` writes a malicious `.git/config`
+// (`core.fsmonitor` → a script that drops a sentinel) and a malicious `.gitattributes` +
+// `[diff "evil"] textconv` driver, then the guest generates the patch. Because Diff runs against
+// the root-only patchgit (snapshotted pristine) with fsmonitor/hooks force-cleared and
+// --no-textconv, no attacker script runs and the diff is still correct for the real edit.
+func TestDiffConfigInjectionInert(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	// Guest snapshots the pristine patchgit at ingest, before the container runs.
+	pg := filepath.Join(t.TempDir(), "patchgit")
+	if err := patch.SetupPatchGit(ws, pg); err != nil {
+		t.Fatalf("SetupPatchGit: %v", err)
+	}
+
+	// Now the untrusted container writes attack payloads into the writable workspace .git.
+	sentinel := filepath.Join(t.TempDir(), "pwned")
+	pwn := filepath.Join(t.TempDir(), "pwn.sh")
+	writeFile(t, pwn, "#!/bin/sh\ntouch "+sentinel+"\n")
+	if err := os.Chmod(pwn, 0o755); err != nil {
+		t.Fatalf("chmod pwn: %v", err)
+	}
+	// core.fsmonitor is invoked on index refresh (git add -A); [diff "evil"] textconv would run on
+	// a diff of a file marked `diff=evil` by .gitattributes.
+	appendFile(t, filepath.Join(ws, ".git", "config"),
+		"[core]\n\tfsmonitor = "+pwn+"\n[diff \"evil\"]\n\ttextconv = "+pwn+"\n")
+	writeFile(t, filepath.Join(ws, ".gitattributes"), "* diff=evil\n")
+
+	// Agent makes a normal edit.
+	writeFile(t, filepath.Join(ws, "greeting.txt"), "hello world\n")
+
+	patchBytes, err := patch.Diff(ctx, pg, ws, patch.BaselineTag)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("attacker script executed: sentinel %s exists (err=%v)", sentinel, err)
+	}
+	// The real edit is still captured (plus the added .gitattributes), and the diff applies.
+	if !bytes.Contains(patchBytes, []byte("hello world")) {
+		t.Errorf("diff missing the real edit:\n%s", patchBytes)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if out, err := exec.Command("git", "clone", "--quiet", src, target).CombinedOutput(); err != nil {
+		t.Fatalf("clone target: %v\n%s", err, out)
+	}
+	patchFile := filepath.Join(t.TempDir(), "changes.patch")
+	writeFile(t, patchFile, string(patchBytes))
+	if err := patch.Apply(ctx, target, patchFile, false); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := readFile(t, filepath.Join(target, "greeting.txt")); got != "hello world\n" {
+		t.Errorf("greeting.txt after apply = %q, want %q", got, "hello world\n")
+	}
+}
+
+// TestDiffBaselineTamperInert asserts the baseline is resolved from the root-only patchgit, not
+// the container-writable workspace .git: even after the container deletes/rewrites the
+// `krayt-baseline` tag in the workspace, Diff still diffs against the true recorded baseline.
+func TestDiffBaselineTamperInert(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	pg := filepath.Join(t.TempDir(), "patchgit")
+	if err := patch.SetupPatchGit(ws, pg); err != nil {
+		t.Fatalf("SetupPatchGit: %v", err)
+	}
+
+	// Container edits a file, commits over the baseline, and moves/deletes the workspace tag so a
+	// naive diff against `krayt-baseline` in the workspace would use the wrong (moved) baseline.
+	writeFile(t, filepath.Join(ws, "greeting.txt"), "hello world\n")
+	git(t, ws, "add", "-A")
+	git(t, ws, "commit", "--quiet", "-m", "agent commit")
+	git(t, ws, "tag", "-f", patch.BaselineTag, "HEAD") // move the tag onto the new commit
+
+	patchBytes, err := patch.Diff(ctx, pg, ws, patch.BaselineTag)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	// If the baseline had been read from the tampered workspace tag (now == HEAD's tree), the diff
+	// would be empty. Resolved from patchgit, it still shows the real change.
+	if !bytes.Contains(patchBytes, []byte("hello world")) {
+		t.Errorf("baseline tamper skewed the diff (empty/wrong):\n%s", patchBytes)
 	}
 }
 
@@ -372,6 +519,18 @@ func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func appendFile(t *testing.T, path, content string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.WriteString(content); err != nil {
+		t.Fatalf("append %s: %v", path, err)
 	}
 }
 
