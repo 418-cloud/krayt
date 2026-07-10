@@ -230,9 +230,24 @@ func Ingest(ctx context.Context, bundlePath, workspaceDir string, id Identity) (
 // work tree), so a container that later rewrites the workspace's `.git/config`, `.git/hooks/*`,
 // or `.gitattributes` can never get the root guest-agent's git to trust or execute it. The copy
 // is pristine because `git clone` generates the config/hooks itself — none of it comes from the
-// untrusted source repo, and the container has not run yet. patchGitDir must not already exist.
+// untrusted source repo, and the container has not run yet. patchGitDir must not already exist:
+// this is asserted explicitly (rather than left as a caller invariant) because copyTree only
+// overwrites paths present in the source — a stale pre-existing patchGitDir (e.g. a future
+// refactor that reuses a guest root across runs) could silently leave old hooks/config behind,
+// reintroducing the exact trust problem this snapshot exists to prevent.
 func SetupPatchGit(workspaceDir, patchGitDir string) error {
-	if err := copyTree(filepath.Join(workspaceDir, ".git"), patchGitDir); err != nil {
+	srcGit := filepath.Join(workspaceDir, ".git")
+	if info, err := os.Stat(srcGit); err != nil {
+		return fmt.Errorf("patch: snapshot patchgit: source %s: %w", srcGit, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("patch: snapshot patchgit: source %s is not a directory", srcGit)
+	}
+	if _, err := os.Lstat(patchGitDir); err == nil {
+		return fmt.Errorf("patch: snapshot patchgit: %s already exists", patchGitDir)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("patch: snapshot patchgit: stat %s: %w", patchGitDir, err)
+	}
+	if err := copyTree(srcGit, patchGitDir); err != nil {
 		return fmt.Errorf("patch: snapshot patchgit: %w", err)
 	}
 	return nil

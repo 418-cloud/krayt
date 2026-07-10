@@ -81,6 +81,33 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSetupPatchGitRejectsExistingDir asserts SetupPatchGit refuses to run against a
+// patchGitDir that already exists, rather than silently merging copyTree's writes onto
+// whatever is already there. This matters for security-critical code (§6.7, §10 finding #2):
+// copyTree only overwrites paths present in the source, so a stale pre-existing patchGitDir
+// (e.g. from a future refactor that reuses a guest root across runs) could otherwise leave old
+// hooks/config behind, reintroducing the trust problem this snapshot exists to prevent.
+func TestSetupPatchGitRejectsExistingDir(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	pg := filepath.Join(t.TempDir(), "patchgit")
+	if err := patch.SetupPatchGit(ws, pg); err != nil {
+		t.Fatalf("first SetupPatchGit: %v", err)
+	}
+	if err := patch.SetupPatchGit(ws, pg); err == nil {
+		t.Fatal("SetupPatchGit against an already-existing patchGitDir succeeded, want an error")
+	}
+}
+
 // TestIngestOutsideGitRepo guards the regression where `git bundle verify` failed in the
 // guest with "need a repository to verify a bundle": it is a repository command, but the
 // guest-agent's cwd is not a repo. The other tests masked this by running inside the krayt
