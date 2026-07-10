@@ -10,11 +10,14 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -71,7 +74,18 @@ func HandRolled(p Policy) http.Handler {
 
 // HandRolledDNS is HandRolled with an explicit DNS server (the krayt-proxy --dns flag).
 func HandRolledDNS(p Policy, dnsServer string) http.Handler {
-	d := &net.Dialer{Timeout: dialTimeout, Resolver: resolverVia(dnsServer)}
+	// Control fires once per resolved address the dialer tries, just before connect, with
+	// the resolved ip:port — so the post-resolution SSRF guard (checkDialAddr, §6.6) covers
+	// every A/AAAA answer and every Happy-Eyeballs attempt, closing the DNS-rebinding window
+	// (the resolved IP is checked, not the name). This one dialer backs both the CONNECT
+	// tunnel dial and the HTTP transport dial, so both paths are guarded.
+	d := &net.Dialer{
+		Timeout:  dialTimeout,
+		Resolver: resolverVia(dnsServer),
+		Control: func(_, address string, _ syscall.RawConn) error {
+			return checkDialAddr(p.Mode, address)
+		},
+	}
 	tr := &http.Transport{
 		DialContext:           d.DialContext,
 		ForceAttemptHTTP2:     true,
@@ -110,6 +124,56 @@ func resolverVia(dnsServer string) *net.Resolver {
 	}
 }
 
+// errBlockedAddr marks a dial refused by the post-resolution SSRF guard (§6.6). Wrapped so
+// the address is preserved for logs while the handler can errors.Is it to a clear 403.
+var errBlockedAddr = errors.New("krayt: dial target resolves to a blocked address")
+
+// cgnat is the RFC 6598 shared-address (carrier-grade NAT) range, which netip's IsPrivate
+// does not cover; it is treated like a private range (blocked unless mode == full).
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// metadataIP is the cloud instance-metadata address, always refused (also caught by the
+// link-local check, but named explicitly to make the intent unmissable).
+var metadataIP = netip.MustParseAddr("169.254.169.254")
+
+// blockedAddrMsg is the operator-facing 403 body for a target checkDialAddr refused (§6.6) —
+// worded generically since the block covers loopback/link-local/multicast/unspecified/metadata
+// and (mode-dependent) private/CGNAT ranges, and can fire for a request host that was already an
+// IP literal (no resolution involved).
+func blockedAddrMsg(host string) string {
+	return "krayt: egress to " + host + " targets a blocked address range"
+}
+
+// checkDialAddr is the post-resolution SSRF guard (§6.6). It runs on the *resolved* ip:port
+// of every upstream dial and refuses:
+//   - always, in every mode: loopback, link-local (uni/multicast), the cloud metadata IP,
+//     the unspecified address, and multicast;
+//   - unless mode == full: RFC 1918 / RFC 4193 (ULA) private ranges and the RFC 6598 CGNAT
+//     range.
+//
+// It is fail-closed: an unparseable address is refused. It does not consult the host-string
+// allowlist — that check already ran in the handler; this guard is strictly additional.
+func checkDialAddr(mode, address string) error {
+	host := address
+	if h, _, err := net.SplitHostPort(address); err == nil {
+		host = h
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("%w: unparseable address %q", errBlockedAddr, address)
+	}
+	ip = ip.Unmap() // treat IPv4-mapped IPv6 (::ffff:a.b.c.d) as its IPv4 form
+	switch {
+	case ip.IsLoopback(), ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(),
+		ip.IsMulticast(), ip.IsUnspecified(), ip == metadataIP:
+		return fmt.Errorf("%w: %s (loopback/link-local/metadata)", errBlockedAddr, ip)
+	}
+	if mode != ModeFull && (ip.IsPrivate() || cgnat.Contains(ip)) {
+		return fmt.Errorf("%w: %s (private range, allowed only in full mode)", errBlockedAddr, ip)
+	}
+	return nil
+}
+
 type handler struct {
 	mode      string
 	allow     map[string]bool
@@ -146,6 +210,10 @@ func (h *handler) allowed(host string) bool {
 func (h *handler) connect(w http.ResponseWriter, r *http.Request) {
 	upstream, err := h.dial(r.Context(), "tcp", r.Host)
 	if err != nil {
+		if errors.Is(err, errBlockedAddr) {
+			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
+			return
+		}
 		http.Error(w, "krayt: upstream dial failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -175,6 +243,10 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 	r.RequestURI = "" // must be cleared before re-sending as a client request
 	resp, err := h.transport.RoundTrip(r)
 	if err != nil {
+		if errors.Is(err, errBlockedAddr) {
+			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
+			return
+		}
 		http.Error(w, "krayt: upstream request failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
