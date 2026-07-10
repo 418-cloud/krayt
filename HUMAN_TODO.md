@@ -561,6 +561,28 @@ below block only that on-hardware confirmation.
   are the final on-metal confirmation of findings #1/#3, mirroring the existing egress-probe
   handoff. `fix-egress-allowlist-bypass.md` depends on this task and shares the setuid regression.
 
+## [Security review] Prove + lock the egress allowlist vs. the proxyd-uid bypass (finding #1) — DONE ✅ (no new hardware run)
+- Task: `docs/ai-tasks/fix-egress-allowlist-bypass.md` — the egress finding's dedicated plan, run
+  after `harden-container-oci-spec.md` merged (commit `52b08bb`). Verifies the bypass is closed,
+  annotates the L3 lock, adds the regression guard, and documents the real invariant.
+- Code walk (offline, complete): with the hardened OCI spec applied there is **no path** for the
+  container to reach proxyd's uid — `internal/guest/runner/containerd_linux.go` `securitySpecOpts`
+  drops **all** caps (`oci.WithCapabilities(cfg.AddCapabilities)`, empty ⇒ drop-all) incl.
+  `CAP_SETUID`/`SETGID`, clears ambient (`withClearAmbient`), and `withEnforceNonRoot` fails the run
+  on a uid-0 image; the caps denylist (`internal/task`) also rejects re-granting the setuid class
+  via opt-in. So `setuid(proxyd)` is `EPERM` and the `skuid "proxyd"` L3 lock holds.
+- What shipped this task (offline only — **no image rebuild, no new hardware run needed**): the
+  misleading `firewall_linux.go` comment now states the real invariant (unbypassable only because
+  caps dropped + non-root; single-netns assumption); a new offline unit guard
+  `TestEgressRulesetShape` (`internal/guest/proxy`) asserts the ruleset keeps `inet` family +
+  `policy drop` + loopback/`skuid`/`ct` accepts; `KRAYT_SPEC.md` §6.6/§10 tightened.
+- On-hardware regression: **already green**, no re-run required — it is the union of two tests that
+  passed on Apple Silicon against image v0.2.0-rc1 (see the two entries above): `TestContainerHardening`
+  proved `setuid(proxyd 998)=EPERM`, and `TestEgressEnforcement` proved allowlisted-reach-via-proxy +
+  non-allowlisted-drop + raw-socket-drop. If the base image or the OCI-spec/nftables code changes,
+  re-run both on the Mac (commands in those entries) to re-confirm.
+- Blocking: no.
+
 ## [Security review] Normalize the protobuf codegen version comment (make proto) — DONE ✅
 - Resolved: `make proto` re-run with the pinned Nix toolchain; `internal/protocol/pb/krayt.pb.go`
   now reads the canonical `protoc v7.34.1` header, and `git diff HEAD` on the generated files is

@@ -108,6 +108,12 @@ func TestEndToEndRealVM(t *testing.T) {
 // egress and exits 0 only when: HTTPS to KRAYT_ALLOW_HOST via HTTPS_PROXY succeeds, HTTPS to
 // a non-allowlisted host fails, and a raw TCP connect (ignoring HTTP(S)_PROXY) to a
 // non-allowlisted host:443 fails. See HUMAN_TODO.md for the probe-image contract.
+//
+// Together with TestContainerHardening's setuid(proxyd)=EPERM assertion, this is the on-hardware
+// egress-allowlist-bypass regression for finding #1 (fix-egress-allowlist-bypass.md): the direct
+// non-allowlisted connect being dropped proves the L3 `skuid "proxyd"` lock holds, and the EPERM
+// proves the container cannot assume proxyd's uid to satisfy it. The cheap offline counterpart is
+// TestEgressRulesetShape in internal/guest/proxy.
 func TestEgressEnforcement(t *testing.T) {
 	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
 	image := os.Getenv("KRAYT_NETPROBE_IMAGE")
