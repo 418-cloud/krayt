@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/418-cloud/krayt/compare/v0.3.0...v0.3.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* patch oras-go hardlink CVE-2026-50163, clean up rejected image p… ([#45](https://github.com/418-cloud/krayt/issues/45)) ([d315d9d](https://github.com/418-cloud/krayt/commit/d315d9db2fc8e93cd419d02da38e59173d848b91))
+* report a wall-clock timeout during setup as timed_out, not a raw error ([#47](https://github.com/418-cloud/krayt/issues/47)) ([a33141b](https://github.com/418-cloud/krayt/commit/a33141bf2034ebab5dd44fa996db01a952c78817))
+
 ## [0.3.0](https://github.com/418-cloud/krayt/compare/v0.2.0...v0.3.0) (2026-07-10)
 
 
