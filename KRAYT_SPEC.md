@@ -481,6 +481,12 @@ is handled by skipping `read-tree`/`-p` and committing the temp-index tree as a 
 - `git clone /tmp/repo.bundle /workspace`, then **record the baseline immediately** —
   `git -C /workspace rev-parse HEAD`, tagged `krayt-baseline` — *before* the agent runs. The
   final diff is computed against this recorded baseline, not `HEAD~1`.
+- **Snapshot a root-only `patchgit`** — copy the pristine `/workspace/.git` (as just cloned,
+  before the container runs) to a `patchgit` dir *outside* the workspace, root-owned `0700`,
+  never bind-mounted into the container and never made container-writable. Patch generation
+  (below) runs against `patchgit`, so the workspace `.git` — which is deliberately left
+  container-writable so the agent can `git commit` — is never trusted by the root guest-agent's
+  git (§10 finding #2).
 - Optionally drop the `origin` remote (it points at the now-deleted temp bundle file).
 
 **Patch out (primary) + optional commit bundle.** On completion the deliverable is, as
@@ -498,6 +504,33 @@ faithfully on the host via `git fetch /output/commits.bundle`. A range bundle is
 `krayt-baseline..HEAD` prerequisites are satisfiable. The commit bundle is **optional and
 additive**: `changes.patch` stays the primary human-review artifact and the review ergonomics
 are unchanged.
+
+**Patch generation is isolated from the container-writable `.git` (§10 finding #2).** Because the
+agent commits inside the container, `/workspace/.git` is left writable and is therefore
+attacker-controlled — a container can overwrite `.git/config`, `.git/hooks/*`, or `.gitattributes`.
+Since the guest-agent runs `git` **as root**, it must **never** trust that config: a
+`[core] fsmonitor = …` or a diff-driver `textconv`/external `command` would otherwise execute as
+root when the guest runs `git add`/`git diff` (a container→guest-root escape). So the guest
+generates the patch entirely against the root-only **`patchgit`** dir (the pristine `.git`
+snapshotted at ingest), with the workspace as a detached work tree, and force-clears the dangerous
+knobs on every invocation:
+
+```
+GIT_DIR=$ROOT/patchgit  GIT_WORK_TREE=/workspace \
+GIT_CONFIG_NOSYSTEM=1  GIT_CONFIG_GLOBAL=/dev/null  GIT_ATTR_NOSYSTEM=1 \
+git -c core.fsmonitor= -c core.hooksPath=/dev/null read-tree krayt-baseline
+git -c core.fsmonitor= -c core.hooksPath=/dev/null add -A
+git -c core.fsmonitor= -c core.hooksPath=/dev/null diff --cached --binary --no-textconv krayt-baseline
+```
+
+The baseline is resolved from `patchgit` (root-only), so a container that moves the workspace
+`krayt-baseline` tag cannot skew the diff; the command-line `-c` knobs win over any repo-local
+config; `--no-textconv` and the empty `core.hooksPath`/`core.fsmonitor` neutralize any
+diff-driver/hook/fsmonitor execution; and system/global config plus system attributes are all
+disabled. `commits.bundle` reads the agent's commits from the untrusted workspace `.git` — safe
+because `git bundle create` runs no hooks/fsmonitor/textconv — but its baseline boundary is the SHA
+resolved from `patchgit`, and it stays best-effort (a corrupt workspace `.git` never affects the
+security-critical `changes.patch`).
 
 **Integrity.** The bundle is a single artifact, hashable and checkable (`git bundle verify`
 plus a digest), consistent with the digest discipline already used for the OCI artifact
@@ -1047,7 +1080,7 @@ exposed.
 |---|---|
 | Host kernel | Not shared — full VM boundary |
 | Host filesystem | No live mount; input via git bundle, output via reviewed patch |
-| Repo ingest | git bundle cloned in-guest — source `.git/hooks` are never executed or imported, and the guest commits under a throwaway krayt bot identity (§6.7) |
+| Repo ingest | git bundle cloned in-guest — source `.git/hooks` are never executed or imported, and the guest commits under a throwaway krayt bot identity. The workspace `.git` is left container-writable (so the agent can commit) but is **never trusted by the root guest-agent's git**: patch generation runs against a root-only `patchgit` snapshot with `core.fsmonitor`/`core.hooksPath` force-cleared and `--no-textconv`, so container-written `.git/config`/hooks/attributes cannot execute as root (§6.7, finding #2) |
 | Network egress | Default-deny + allowlist proxy; per-task opt-in to widen. The L3 lock keys egress on proxyd's uid, which the container **cannot** reach because `CAP_SETUID`/`SETGID` are dropped and it runs non-root — so the allowlist is unbypassable (§6.6, §6.10) |
 | Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
 | Secrets | tmpfs only, never on disk, redacted from logs, destroyed with VM |
@@ -1060,8 +1093,13 @@ exposed.
   cannot assume proxyd's uid to satisfy the `skuid` L3 lock).
 - Container-runtime / guest-kernel bugs — blast radius minimized by the least-privilege OCI
   spec (dropped caps, seccomp, no-new-privs, non-root) inside the already-isolated VM (§6.10).
-- Malicious patch content (e.g. `.git/hooks`, build scripts) — reviewing the diff
-  before apply is the control; consider a `--strip-hooks` / lint pass on patches later.
+- Malicious patch content (e.g. `.git/hooks`, build scripts) applied on the **host** — the
+  source repo's hooks are already never run in-guest, and now the *guest's own* root git no
+  longer trusts container-written `.git` config/hooks/attributes either (patch generation is
+  isolated in the root-only `patchgit`, §6.7 / finding #2). What remains is that the emitted
+  `changes.patch` could still add files like `.git/hooks/*` or build scripts that run on the
+  **host** after apply; reviewing the diff before `git apply` is the control, and a
+  `--strip-hooks` / lint pass on patches is a possible future addition.
 - Resource exhaustion — bounded by per-VM CPU/mem/disk + wall-clock timeout.
 - Auth-credential blast radius — a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) is tied to
   a personal/seat plan and is less granularly revocable than a scoped API key; exposing one

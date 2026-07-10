@@ -582,3 +582,39 @@ below block only that on-hardware confirmation.
 - Verify success by: `git diff` shows just the header comment normalized; `go build ./...` and
   `go test -race ./...` still pass.
 - Blocking: no — cosmetic; the committed generated code is functionally correct.
+
+## [Security review] Run the guest git-config-injection escape test on a Mac (finding #2)
+- Needed: on the Apple-Silicon Mac + vfkit (same host as the other integration tests), run the new
+  gated test that proves a container cannot make the ROOT guest-agent's git execute attacker-written
+  `.git` config — the container→guest-root escape of §10 finding #2:
+  `TestGuestGitConfigInjectionInert` in `internal/orchestrator/integration_test.go`. The unit tests
+  (`internal/patch`: `TestDiffConfigInjectionInert`, `TestDiffBaselineTamperInert`) already prove the
+  patch-generation isolation on the host; this is the end-to-end on-metal confirmation through a real
+  containerd + the writable-`/workspace` bind mount.
+- Why the agent can't: needs virtualization hardware, the base VM image (git + containerd), and a
+  purpose-built linux/arm64 probe image — none available in the cloud sandbox (§14, §11.6).
+- Exact steps/commands:
+  1. Build/publish a linux/arm64, **non-root** probe image and set `KRAYT_GITCONFIG_IMAGE`. Its
+     entrypoint must, in `/workspace` (bind-mounted rw):
+     - write an executable `/workspace/pwn.sh` whose body is
+       `#!/bin/sh` + `touch /workspace/PWNED_BY_ROOT` (the sentinel path lands in changes.patch);
+     - append the injection to the writable git config and attributes:
+       `printf '[core]\n\tfsmonitor = /workspace/pwn.sh\n[diff "evil"]\n\ttextconv = /workspace/pwn.sh\n' >> /workspace/.git/config`
+       and `printf '* diff=evil\n' > /workspace/.gitattributes`;
+     - make one normal tracked edit (e.g. `printf 'hello world\n' > /workspace/greeting.txt`);
+     - `exit 0`.
+  2. Run:
+     ```
+     KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img \
+     KRAYT_GITCONFIG_IMAGE=ghcr.io/you/krayt-gitconfig-probe:latest \
+       go test -tags 'integration darwin' \
+       -run TestGuestGitConfigInjectionInert -v ./internal/orchestrator/
+     ```
+- Verify success by: the test PASSES — `changes.patch` is produced, does **not** contain
+  `PWNED_BY_ROOT` (the injected fsmonitor/textconv never ran as root), and still carries the normal
+  `greeting.txt` edit. As an extra manual check on the same run, `nft list ruleset` inside the guest
+  still shows the egress lock and no secret was exfiltrated (root code never executed to flush it).
+- Blocking: no — the Go changes, the two `internal/patch` injection/tamper unit tests, `go build`
+  for `linux/arm64`, `go vet -tags 'integration darwin'`, and `go test -race ./...` all pass in the
+  sandbox; this hardware assertion is the final on-metal confirmation of finding #2, mirroring the
+  existing hardening/egress probe handoffs.

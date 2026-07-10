@@ -242,6 +242,7 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		return err
 	}
 	workspace := filepath.Join(root, "workspace")
+	patchGitDir := filepath.Join(root, "patchgit")
 	outputDir := filepath.Join(root, "output")
 	if err := os.MkdirAll(outputDir, 0o777); err != nil {
 		return fmt.Errorf("guest: create output dir: %w", err)
@@ -264,8 +265,16 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	if err != nil {
 		return err
 	}
+	// Snapshot the pristine, root-only patchgit BEFORE relaxing the tree (§6.7, §10 finding #2):
+	// patch generation runs against this copy, so the container-writable workspace `.git` (config,
+	// hooks, attributes) is never trusted or executed by the root guest-agent's git.
+	if err := patch.SetupPatchGit(workspace, patchGitDir); err != nil {
+		return fmt.Errorf("guest: set up patchgit: %w", err)
+	}
 	// Ingest clones the bundle as root; relax the tree so the non-root container can edit it
-	// (§8.2). .git stays root-owned, so the guest's own git (run as root) is unaffected.
+	// (§8.2). This intentionally leaves `.git` writable too, so the agent can `git commit` inside
+	// the container; that writable `.git` is deliberately UNtrusted — patch generation is isolated
+	// in the root-only patchgit above, so no container-written git config runs as root.
 	if err := makeContainerWritable(workspace); err != nil {
 		return fmt.Errorf("guest: make workspace writable: %w", err)
 	}
@@ -364,7 +373,7 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	}
 
 	// Build the patch + optional reverse bundle from the recorded baseline (§6.7).
-	if err := s.buildArtifacts(ctx, workspace, outputDir); err != nil && !timedOut {
+	if err := s.buildArtifacts(ctx, patchGitDir, workspace, outputDir); err != nil && !timedOut {
 		return es.send(&pb.RunEvent{Kind: &pb.RunEvent_Status{Status: &pb.Status{
 			ExitCode: int32(exitCode), Error: err.Error(),
 		}}})
@@ -427,9 +436,17 @@ func (s *Service) writeSecrets(vals map[string]string) (string, error) {
 // makeContainerWritable relaxes a directory tree so the NON-ROOT container uid (§8.2) can read,
 // traverse, and write it. The guest runs as root and ingests /workspace root-owned, but the
 // agent runs non-root (Claude Code and others refuse uid 0) and must edit the tree. Exposure is
-// bounded to the ephemeral single-container VM. The .git owner is left as root, so the guest's
-// own git (run as root) still works; the agent's git needs `safe.directory`, set by the
-// adapter/entrypoint.
+// bounded to the ephemeral single-container VM.
+//
+// This relaxes `.git` too, on purpose: the agent commits inside the container, so its `.git`
+// must be writable. That makes the workspace `.git` (config, hooks, attributes) attacker-writable
+// and therefore UNtrusted — a root guest-agent running git there could be tricked into executing
+// container-written config (fsmonitor/hooks/textconv), the container→guest-root escape of §10
+// finding #2. The fix is not to lock `.git` down (that breaks commits) but to isolate patch
+// generation: patch.SetupPatchGit copied the pristine `.git` to a root-only patchgit dir before
+// this call, and patch.Diff/BundleCommits run git against THAT dir with the dangerous knobs
+// force-cleared, never trusting the writable workspace `.git` (§6.7). The agent's own git in the
+// container needs `safe.directory`, set by the adapter/entrypoint.
 func makeContainerWritable(root string) error {
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -487,15 +504,15 @@ func mergeEnv(base, add map[string]string) map[string]string {
 
 // buildArtifacts writes changes.patch and, if the agent committed, commits.bundle into the
 // output dir (§6.7).
-func (s *Service) buildArtifacts(ctx context.Context, workspace, outputDir string) error {
-	diff, err := patch.Diff(ctx, workspace, patch.BaselineTag)
+func (s *Service) buildArtifacts(ctx context.Context, patchGitDir, workspace, outputDir string) error {
+	diff, err := patch.Diff(ctx, patchGitDir, workspace, patch.BaselineTag)
 	if err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(outputDir, fileChangesPatch), diff, 0o644); err != nil {
 		return fmt.Errorf("guest: write patch: %w", err)
 	}
-	if _, err := patch.BundleCommits(ctx, workspace, patch.BaselineTag, filepath.Join(outputDir, fileCommitsBundle)); err != nil {
+	if _, err := patch.BundleCommits(ctx, patchGitDir, workspace, patch.BaselineTag, filepath.Join(outputDir, fileCommitsBundle)); err != nil {
 		return err
 	}
 	return nil
