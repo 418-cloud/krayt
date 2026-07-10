@@ -157,6 +157,8 @@ Reproducible, ready-to-run examples live under `hack/` — most notably `hack/cl
 | `KRAYT_SPEC.md` | The complete implementation spec — architecture, protocol, phases, acceptance criteria. The source of truth. |
 | `CLAUDE.md` | Working agreement Claude Code reads each session (rules, phase discipline, handoff protocol). |
 | `HUMAN_TODO.md` | Handoff log the agent maintains for steps a human must do (created during development). |
+| `SECURITY.md` | Threat model pointer + how to privately report a vulnerability. |
+| `CONTRIBUTING.md` | How to get set up, code/commit conventions, and what a PR should include. |
 | `images/` | Nix flake for the micro-VM image (CI-built). |
 | `internal/` | The implementation (see §9 of the spec for package layout). |
 | `cmd/` | Binaries: `krayt` (CLI), `krayt-agent` (guest), `krayt-proxy` (egress), `krayt-ask` (question front-end + MCP server). |
