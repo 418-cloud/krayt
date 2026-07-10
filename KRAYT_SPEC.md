@@ -376,9 +376,24 @@ is the simplest correct choice. Enforcement layers:
     }
   }
   ```
-  Because the container does *not* run as `proxyd`, its only path out is via the proxy
-  (set through `HTTP_PROXY`/`HTTPS_PROXY`); direct sockets are dropped. This closes the
-  raw-socket bypass that a pure proxy-env approach would leave open.
+  The lock is in the **`inet` family**, so it covers IPv4 and IPv6 alike. Because the
+  container's only path out is via the proxy (set through `HTTP_PROXY`/`HTTPS_PROXY`), its
+  direct sockets are dropped — closing the raw-socket bypass a pure proxy-env approach would
+  leave open.
+
+  **The lock depends on the container being unable to assume the `proxyd` uid.** The
+  `skuid "proxyd"` accept is unbypassable *only because* the container OCI spec drops
+  `CAP_SETUID`/`CAP_SETGID` and enforces non-root (§6.10) — otherwise a container process
+  could read `proxyd`'s numeric uid from `/proc/net/tcp` (the listener's owner is visible in
+  the shared netns) or brute-force the small system-uid range, `setuid()` to it, and egress
+  under the accept, bypassing the L7 allowlist (finding #1, closed by the hardened spec).
+  The uid rule is the load-bearing L3 control; the dropped caps + non-root are what make it hold.
+
+  **Single-netns assumption.** This `output`-hook rule is correct only while the container
+  shares the **VM's** network namespace (`oci.WithHostNamespace`, one container per VM) — the
+  VM boundary is the network boundary, so the container's sockets traverse this hook. A future
+  change that gives the container its own netns would move its traffic out of `output`'s view
+  and require a `forward` chain instead.
 - **Container env:** launched with `HTTP_PROXY` / `HTTPS_PROXY` pointing at the proxy and
   `NO_PROXY=localhost,127.0.0.1` (the lowercase `http_proxy` / `https_proxy` / `no_proxy`
   forms are set too, for tools that only read those).
@@ -1088,9 +1103,13 @@ exposed.
 | Patch application | Always manual; human reviews diff before `git apply` |
 
 **Residual considerations to document:**
-- Proxy-bypass via raw sockets (mitigated by default-deny egress) and via **setuid to proxyd**
-  (mitigated by dropping `CAP_SETUID`/`SETGID` and enforcing non-root, §6.10 — the container
-  cannot assume proxyd's uid to satisfy the `skuid` L3 lock).
+- Proxy-bypass via raw sockets is caught by the default-deny `skuid "proxyd"` L3 lock (§6.6). The
+  real historical gap was not the raw socket itself but **uid assumption**: the container kept
+  `CAP_SETUID`, so it could `setuid()` to proxyd (uid learned from `/proc/net/tcp` in the shared
+  netns) and satisfy the `skuid` accept — bypassing the allowlist entirely. That is now closed by
+  the hardened OCI spec dropping `CAP_SETUID`/`SETGID` and enforcing non-root (§6.10); the `skuid`
+  rule is unbypassable only while that holds. Regression-guarded by the `egressRuleset`-shape unit
+  test and, on hardware, by the `setuid(proxyd)=EPERM` + allowlist-enforcement integration tests.
 - Container-runtime / guest-kernel bugs — blast radius minimized by the least-privilege OCI
   spec (dropped caps, seccomp, no-new-privs, non-root) inside the already-isolated VM (§6.10).
 - Malicious patch content (e.g. `.git/hooks`, build scripts) applied on the **host** — the
