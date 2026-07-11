@@ -18,7 +18,8 @@ func newApplyCmd() *cobra.Command {
 		Short: "git apply a run's changes.patch onto the host repo (after review)",
 		Long: "Applies .krayt/runs/<run-id>/changes.patch onto the host repo with `git apply`. " +
 			"Review the diff first — nothing auto-applies (§6.7).",
-		Args: cobra.ExactArgs(1),
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs(nil),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repoAbs, err := filepath.Abs(repo)
 			if err != nil {

@@ -19,10 +19,11 @@ func newQuestionsCmd() *cobra.Command {
 	var repo, sortMode string
 	var pendingOnly bool
 	cmd := &cobra.Command{
-		Use:     "questions <run-id>",
-		Aliases: []string{"q"},
-		Short:   "List a run's agent questions and answers (§6.13)",
-		Args:    cobra.ExactArgs(1),
+		Use:               "questions <run-id>",
+		Aliases:           []string{"q"},
+		Short:             "List a run's agent questions and answers (§6.13)",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs(nil),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := validateSort(sortMode); err != nil {
 				return err
@@ -92,20 +93,25 @@ func newQuestionsCmd() *cobra.Command {
 	cmd.Flags().StringVar(&repo, "repo", ".", "repo whose .krayt state to read")
 	cmd.Flags().BoolVar(&pendingOnly, "pending-only", false, "show only unanswered questions")
 	cmd.Flags().StringVar(&sortMode, "sort", "asked", "order: asked (oldest-first) | pending-first | pending-last")
+	_ = cmd.RegisterFlagCompletionFunc("sort", cobra.FixedCompletions(sortModes, cobra.ShellCompDirectiveNoFileComp))
 	return cmd
 }
 
 // isPending reports whether a question is still awaiting an answer.
 func isPending(q orchestrator.QuestionRecord) bool { return q.AnswerAt == "" }
 
+// sortModes is the authoritative set of valid --sort values, shared by validation and shell
+// completion so the two can't drift.
+var sortModes = []string{"asked", "pending-first", "pending-last"}
+
 // validateSort keeps the set of valid --sort values authoritative here.
 func validateSort(mode string) error {
-	switch mode {
-	case "asked", "pending-first", "pending-last":
-		return nil
-	default:
-		return fmt.Errorf("invalid --sort %q (want asked, pending-first, or pending-last)", mode)
+	for _, m := range sortModes {
+		if mode == m {
+			return nil
+		}
 	}
+	return fmt.Errorf("invalid --sort %q (want asked, pending-first, or pending-last)", mode)
 }
 
 // selectQuestions applies --pending-only and --sort. ReadQuestions returns oldest-first, and the

@@ -65,6 +65,20 @@ func newAnswerCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&repo, "repo", ".", "repo whose .krayt state to read")
 	cmd.Flags().BoolVar(&noAnswer, "no-answer", false, "send the 'no answer' sentinel instead of a response")
+	// answer is positionally polymorphic: complete <run-id> at position 0 (only waiting runs, the
+	// state answer acts on) and the run's pending <question-id> at position 1; the response is free
+	// text (§6.13).
+	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) == 0 {
+			return completeRunIDs(func(rec orchestrator.RunRecord, _ *cobra.Command) bool {
+				return rec.State == orchestrator.StateWaiting
+			})(cmd, args, toComplete)
+		}
+		if len(args) == 1 {
+			return completeQuestionIDs(cmd, args, toComplete)
+		}
+		return nil, cobra.ShellCompDirectiveNoFileComp // args[2] (the response) is free text
+	}
 	return cmd
 }
 

@@ -1403,6 +1403,17 @@ work is the same either way.
 with `--detach`, the already-read stdin bytes are spooled to a file in the run dir and handed to
 the detached supervisor child, since its stdin is gone after it re-execs (§6.2).
 
+**Shell completion.** cobra's built-in `krayt completion <bash|zsh|fish|powershell>` statically
+completes command and flag names. On top of that, the run-scoped commands (`apply`, `logs`,
+`attach`, `stop`, `rm`, `patch`, `questions`, `answer`) dynamically complete `<run-id>` from
+`.krayt/` state under `--repo`, each filtered to the runs it can act on (`stop`/`attach` → live
+runs, `rm` → finished unless `--force`, `answer` → `waiting`), and `answer` also completes the
+run's pending `<question-id>`. `run`'s enum flags (`--net`, `--on-question`, `--on-question-timeout`,
+`--agent`) and `questions --sort` complete their fixed value sets from the same constants that
+validate them; `run`'s `--image`/`--allow` complete from this repo's run history. Untrusted
+agent-originated text (question prompts) is sanitized (§6.13) before appearing in a completion
+description.
+
 ---
 
 ## 14. Milestone Roadmap

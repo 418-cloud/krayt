@@ -148,6 +148,34 @@ krayt apply <run-id>          # … then apply it to your repo if you're satisfi
 Reproducible, ready-to-run examples live under `hack/` — most notably `hack/claude-code/`
 (a real Claude Code agent) and `hack/krayt-ask-probe/` (the question channel).
 
+### Shell completion
+
+krayt ships tab-completion for your shell. Load it once:
+
+```sh
+# bash (needs Homebrew bash-completion@2, or source it from ~/.bashrc)
+krayt completion bash > "$(brew --prefix)/etc/bash_completion.d/krayt"
+# zsh (macOS default shell)
+krayt completion zsh > "${fpath[1]}/_krayt"
+# fish
+krayt completion fish > ~/.config/fish/completions/krayt.fish
+```
+
+Completion covers command and flag names (static), plus **dynamic** values read from the
+host on demand:
+
+- **`<run-id>`** for `apply`/`logs`/`attach`/`stop`/`rm`/`patch`/`questions`/`answer`, each
+  filtered to the runs that command can act on (e.g. `stop` offers only live runs, `rm` only
+  finished ones unless `--force` is set) and annotated with the run's state and image.
+- **`<question-id>`** for `answer`, from the run's pending questions.
+- **`--net`/`--on-question`/`--on-question-timeout`/`--agent`/`questions --sort`** — their exact
+  fixed value sets.
+- **`--image`/`--allow`** for `run`, drawn from this repo's own run history (merged with a small
+  set of well-known egress domains for `--allow`).
+
+Repo-scoped completions read the same `.krayt/` state the commands do, so they honor `--repo`
+(default `.`).
+
 ---
 
 ## Repo orientation

@@ -110,6 +110,93 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.DurationVar(&f.questionTimeout, "question-timeout", 10*time.Minute, "per-question wait timeout")
 	fl.StringVar(&f.onQuestionTimeout, "on-question-timeout", "sentinel", "on question timeout: sentinel | abort")
 	fl.StringVar(&f.agent, "agent", "none", "agent adapter: none | claude-code | gemini-cli")
+
+	// Dynamic shell completion for run's flag values (§13). Enum flags complete their fixed value
+	// sets, sourced from the same constants Parse*/Get validate against so completion can't drift;
+	// --image/--allow complete from this repo's run history. RegisterFlagCompletionFunc only errors
+	// on an unknown flag name or a double-registration — both programmer errors caught immediately
+	// by any test/run — so the errors are safely discarded, matching this codebase's other
+	// best-effort `_ = ...` writes.
+	_ = cmd.RegisterFlagCompletionFunc("net", cobra.FixedCompletions(
+		[]string{string(task.NetworkAllowlist), string(task.NetworkFull), string(task.NetworkNone)},
+		cobra.ShellCompDirectiveNoFileComp))
+	_ = cmd.RegisterFlagCompletionFunc("on-question", cobra.FixedCompletions(
+		[]string{string(task.QuestionFail), string(task.QuestionWait)},
+		cobra.ShellCompDirectiveNoFileComp))
+	_ = cmd.RegisterFlagCompletionFunc("on-question-timeout", cobra.FixedCompletions(
+		[]string{string(task.OnTimeoutSentinel), string(task.OnTimeoutAbort)},
+		cobra.ShellCompDirectiveNoFileComp))
+	_ = cmd.RegisterFlagCompletionFunc("agent", cobra.FixedCompletions(
+		adapter.Names(), cobra.ShellCompDirectiveNoFileComp))
+	_ = cmd.RegisterFlagCompletionFunc("image", completeImageRef)
+	_ = cmd.RegisterFlagCompletionFunc("allow", completeAllowDomain)
+}
+
+// wellKnownAllowDomains seeds --allow completion with domains already documented in this repo
+// as common egress needs (KRAYT_SPEC.md §6.6 line 409, hack/krayt-dev/README.md lines 70/116).
+// Not authoritative or exhaustive — a completion convenience layered under the repo's own run
+// history, which always takes priority.
+var wellKnownAllowDomains = []string{
+	"api.anthropic.com",
+	"generativelanguage.googleapis.com",
+	"proxy.golang.org",
+	"sum.golang.org",
+	"cache.nixos.org",
+	"github.com",
+	"codeload.github.com",
+}
+
+// completeImageRef completes --image with the distinct ImageRef values from this repo's run
+// history, most-recently-used first (ImageRef is the raw --image string a prior run used).
+func completeImageRef(cmd *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+	repo, _ := cmd.Flags().GetString("repo")
+	sd, err := stateDir(repo)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	recs, err := orchestrator.List(sd)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, rec := range recs { // already newest-first
+		if rec.ImageRef == "" || seen[rec.ImageRef] {
+			continue
+		}
+		seen[rec.ImageRef] = true
+		out = append(out, rec.ImageRef)
+	}
+	return out, cobra.ShellCompDirectiveNoFileComp
+}
+
+// completeAllowDomain completes --allow with the union of this repo's run-history allow domains
+// (newest-first) and the well-known seed list, deduplicated. History takes priority.
+func completeAllowDomain(cmd *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+	seen := map[string]bool{}
+	var out []string
+	add := func(d string) {
+		if d == "" || seen[d] {
+			return
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	if repo, _ := cmd.Flags().GetString("repo"); repo != "" {
+		if sd, err := stateDir(repo); err == nil {
+			if recs, err := orchestrator.List(sd); err == nil {
+				for _, rec := range recs {
+					for _, d := range rec.Network.Allow {
+						add(d)
+					}
+				}
+			}
+		}
+	}
+	for _, d := range wellKnownAllowDomains {
+		add(d)
+	}
+	return out, cobra.ShellCompDirectiveNoFileComp
 }
 
 func runRun(cmd *cobra.Command, f *runFlags) error {
