@@ -8,7 +8,7 @@
 # per-task secrets belong only in that gitignored secrets.env (§6.8).
 # `task:` is intentionally omitted so you always pass --task per run.
 
-image: ghcr.io/418-cloud/krayt-dev:sha-7ca7cc7
+image: ghcr.io/418-cloud/krayt-dev:sha-d315d9d
 secrets: secrets.env
 env:
   CLAUDE_MODEL: claude-opus-4-8
