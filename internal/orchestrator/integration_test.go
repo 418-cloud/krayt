@@ -1,26 +1,42 @@
-//go:build integration && darwin
+//go:build integration
 
-// Real-VM integration test for the Phase 2 "Done when": on a real Apple-Silicon Mac with
-// vfkit, `krayt` boots the base image, pushes a trivial user image + a repo snapshot, runs
-// the container, and collects a changes.patch that applies cleanly to the host repo (§14).
-// This cannot run in a cloud agent — it needs virtualization hardware, a base VM image
-// whose closure includes git + containerd (§11.6), and a trivial user image that edits a
-// file in /workspace — so it is gated behind the `integration` build tag and run by a
-// human / CI on a Mac. See HUMAN_TODO.md.
+// Real-VM integration test for the Phase 2 "Done when": on real virtualization hardware,
+// `krayt` boots the base image, pushes a trivial user image + a repo snapshot, runs the
+// container, and collects a changes.patch that applies cleanly to the host repo (§14).
 //
-// Run:
+// This runs against BOTH backends, unchanged. The test body is provider-agnostic — it is the
+// same orchestrator, protocol, patch and secrets code on either OS (§6.3) — so the only
+// platform-specific thing here is which Provider gets constructed, and that lives behind
+// newTestProvider() in integration_provider_{darwin,linux}_test.go. Phase 7's "Done when" is
+// exactly this: these tests passing on Linux/firecracker with nothing but that seam swapped.
+//
+// It needs virtualization hardware, a base VM image whose closure includes git + containerd
+// (§11.6), and a trivial user image that edits a file in /workspace, so it is gated behind the
+// `integration` build tag. On macOS that means a human on an Apple-Silicon Mac (see
+// HUMAN_TODO.md); on Linux any host with /dev/kvm will do, including CI.
+//
+// Run (macOS/vfkit):
 //
 //	KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img \
 //	KRAYT_IMAGE=ghcr.io/you/trivial-edit-agent:latest \
-//	  go test -tags 'integration darwin' -run TestEndToEndRealVM -v ./internal/orchestrator/
+//	  go test -tags integration -run TestEndToEndRealVM -v ./internal/orchestrator/
+//
+// Run (Linux/firecracker — the test binary needs CAP_NET_ADMIN for the VM's tap device):
+//
+//	go test -c -tags integration -o /tmp/orch.test ./internal/orchestrator/
+//	sudo setcap cap_net_admin+ep /tmp/orch.test
+//	KRAYT_KERNEL=… KRAYT_INITRD=… KRAYT_ROOTFS=… KRAYT_IMAGE=… \
+//	  /tmp/orch.test -test.run TestEndToEndRealVM -test.v
 package orchestrator_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,7 +44,6 @@ import (
 	"github.com/418-cloud/krayt/internal/orchestrator"
 	"github.com/418-cloud/krayt/internal/patch"
 	"github.com/418-cloud/krayt/internal/provider"
-	"github.com/418-cloud/krayt/internal/provider/vfkit"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
@@ -70,7 +85,7 @@ func TestEndToEndRealVM(t *testing.T) {
 		Resources:   task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
 	}
 	deps := orchestrator.Deps{
-		Provider: vfkit.New("", t.TempDir()),
+		Provider: newTestProvider(t),
 		BaseVM: provider.VMSpec{
 			Kernel:  kernel,
 			Initrd:  initrd,
@@ -147,7 +162,7 @@ func TestEgressEnforcement(t *testing.T) {
 		Resources:  task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
 	}
 	deps := orchestrator.Deps{
-		Provider: vfkit.New("", t.TempDir()),
+		Provider: newTestProvider(t),
 		BaseVM:   provider.VMSpec{Kernel: kernel, Initrd: initrd, RootFS: rootfs, Cmdline: cmdline},
 		Image:    img,
 		LogOut:   os.Stderr,
@@ -206,7 +221,7 @@ func TestContainerHardening(t *testing.T) {
 		Resources:  task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
 	}
 	deps := orchestrator.Deps{
-		Provider: vfkit.New("", t.TempDir()),
+		Provider: newTestProvider(t),
 		BaseVM:   provider.VMSpec{Kernel: kernel, Initrd: initrd, RootFS: rootfs, Cmdline: cmdline},
 		Image:    img,
 		LogOut:   os.Stderr,
@@ -254,7 +269,7 @@ func TestRootImageFailsClosed(t *testing.T) {
 		Resources:  task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
 	}
 	deps := orchestrator.Deps{
-		Provider: vfkit.New("", t.TempDir()),
+		Provider: newTestProvider(t),
 		BaseVM:   provider.VMSpec{Kernel: kernel, Initrd: initrd, RootFS: rootfs, Cmdline: cmdline},
 		Image:    img,
 		LogOut:   os.Stderr,
@@ -321,7 +336,7 @@ func TestGuestGitConfigInjectionInert(t *testing.T) {
 		Resources:  task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
 	}
 	deps := orchestrator.Deps{
-		Provider: vfkit.New("", t.TempDir()),
+		Provider: newTestProvider(t),
 		BaseVM:   provider.VMSpec{Kernel: kernel, Initrd: initrd, RootFS: rootfs, Cmdline: cmdline},
 		Image:    img,
 		LogOut:   os.Stderr,
@@ -407,7 +422,7 @@ func TestSecretConfinementInArtifacts(t *testing.T) {
 		Resources: task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
 	}
 	deps := orchestrator.Deps{
-		Provider: vfkit.New("", t.TempDir()),
+		Provider: newTestProvider(t),
 		BaseVM:   provider.VMSpec{Kernel: kernel, Initrd: initrd, RootFS: rootfs, Cmdline: cmdline},
 		Image:    img,
 		LogOut:   os.Stderr,
@@ -472,5 +487,114 @@ func TestSecretConfinementInArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(string(scan), "ANTHROPIC_API_KEY") || strings.Contains(string(scan), secretVal) {
 		t.Errorf("secret-scan.json should name the key only; got: %s", scan)
+	}
+}
+
+// TestConcurrentRealVMs is the on-hardware counterpart of TestConcurrentRuns (which proves the
+// same property against the fakeProvider): several runs execute at once, each in its own VM,
+// and each comes back with a patch for its own repo and nobody else's.
+//
+// On the firecracker backend this is also the regression test for the provider's per-VM
+// resource allocation, which has no macOS analogue: every VM needs its own tap device, its own
+// /30, its own vsock CID and its own unix sockets, all handed out atomically (§6.12,
+// firecracker/tap.go). Get any of that wrong and the failure is not a crash — it is two VMs
+// quietly sharing a network or a control channel, which is exactly the kind of bug that would
+// otherwise surface as a mysteriously cross-contaminated patch.
+func TestConcurrentRealVMs(t *testing.T) {
+	kernel := os.Getenv("KRAYT_KERNEL")
+	initrd := os.Getenv("KRAYT_INITRD")
+	rootfs := os.Getenv("KRAYT_ROOTFS")
+	image := os.Getenv("KRAYT_IMAGE")
+	if kernel == "" || initrd == "" || rootfs == "" || image == "" {
+		t.Skip("set KRAYT_KERNEL, KRAYT_INITRD, KRAYT_ROOTFS, KRAYT_IMAGE to run")
+	}
+	cmdline := os.Getenv("KRAYT_CMDLINE")
+	if cmdline == "" {
+		cmdline = "console=hvc0 root=/dev/vda"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cacheRoot := t.TempDir()
+	imgSrc, err := imagestore.Remote(image)
+	if err != nil {
+		t.Fatalf("imagestore.Remote: %v", err)
+	}
+	img, err := imagestore.Acquire(ctx, imgSrc, image, cacheRoot)
+	if err != nil {
+		t.Fatalf("imagestore.Acquire: %v", err)
+	}
+
+	const runs = 3
+	type result struct {
+		src   string
+		patch string
+		err   error
+	}
+	results := make([]result, runs)
+
+	var wg sync.WaitGroup
+	for i := range runs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each run gets a repo with distinct content, so a patch that leaked from another
+			// VM cannot apply here — isolation is checked by construction, not by inspection.
+			marker := fmt.Sprintf("run-%d-marker\n", i)
+			src := newRepo(t, map[string]string{"greeting.txt": marker})
+			results[i].src = src
+
+			runDir := filepath.Join(t.TempDir(), "run")
+			spec := task.RunSpec{
+				ID:          fmt.Sprintf("run_concurrent_%d", i),
+				ImageRef:    image,
+				RepoPath:    src,
+				BundleDepth: 1,
+				TaskPrompt:  []byte("make a trivial edit"),
+				Resources:   task.Resources{CPUs: 2, MemoryMiB: 2048, DiskGiB: 10, Timeout: 8 * time.Minute},
+			}
+			deps := orchestrator.Deps{
+				Provider: newTestProvider(t),
+				BaseVM: provider.VMSpec{
+					Kernel:  kernel,
+					Initrd:  initrd,
+					RootFS:  rootfs,
+					Cmdline: cmdline,
+				},
+				Image:  img,
+				LogOut: os.Stderr,
+			}
+			res, err := orchestrator.Run(ctx, deps, spec, runDir)
+			if err != nil {
+				results[i].err = err
+				return
+			}
+			results[i].patch = res.PatchPath
+		}()
+	}
+	wg.Wait()
+
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("run %d: %v", i, r.err)
+		}
+		b, err := os.ReadFile(r.patch)
+		if err != nil || len(b) == 0 {
+			t.Fatalf("run %d: changes.patch missing/empty: %v", i, err)
+		}
+		// The patch must carry THIS run's marker: proof the VMs did not share a workspace.
+		if want := fmt.Sprintf("run-%d-marker", i); !strings.Contains(string(b), want) {
+			t.Errorf("run %d: patch does not mention %q — patches crossed between VMs:\n%s", i, want, b)
+		}
+		// And it must still apply cleanly to its own repo.
+		target := filepath.Join(t.TempDir(), fmt.Sprintf("target-%d", i))
+		if out, err := exec.Command("git", "clone", "--quiet", r.src, target).CombinedOutput(); err != nil {
+			t.Fatalf("run %d: clone target: %v\n%s", i, err, out)
+		}
+		if err := patch.Apply(ctx, target, r.patch, false); err != nil {
+			t.Fatalf("run %d: krayt apply failed: %v", i, err)
+		}
+		t.Logf("run %d: patch applies cleanly to its own repo", i)
 	}
 }

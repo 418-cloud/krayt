@@ -240,7 +240,7 @@ type VMSpec struct {
     ID        string
     Kernel    string // path to vmlinuz (or EFI image)
     RootFS    string // path to the BASE rootfs image; provider makes a CoW clone per run
-    CID       uint32 // vsock guest CID — Firecracker only; ignored by the vz provider (see §6.12)
+    CID       uint32 // vsock guest CID — Firecracker only; ignored by the vfkit/vz providers (§6.12)
     CPUs      int
     MemoryMiB uint64
     DiskGiB   uint64
@@ -277,8 +277,22 @@ type VM interface {
 - **`internal/provider/vz`** (fallback, not built in v1): embeds `Code-Hex/vz/v3` directly
   in-process for a zero-runtime-dependency, fully-controllable path. Swap target if vfkit's
   API ever becomes a control ceiling. Same `Provider`/`VM` interface — no other code changes.
-- **`internal/provider/firecracker`** (later): same interface over `firecracker-go-sdk`;
-  here `CID` is meaningful and the host connects via `AF_VSOCK` to that CID.
+- **`internal/provider/firecracker`** (v1, Linux): same interface over Firecracker/KVM. `Create`
+  clones the raw rootfs, allocates the VM's tap device + vsock CID, and `Start` launches the
+  `firecracker` binary as a subprocess configured over its **REST API on a unix socket** — the
+  same subprocess+REST idiom as the vfkit provider, hand-rolled rather than pulled from
+  `firecracker-go-sdk` (§9.1). Three things differ materially from vfkit:
+  - **CoW clone:** there is no `clonefile(2)`. `Create` uses the `FICLONE` ioctl (reflink) where
+    the filesystem supports it — Btrfs, or XFS with `reflink=1` — and falls back to a
+    sparse-aware copy where it does not. **ext4 has no reflink support at all**, so on the
+    common Linux setup each VM costs a real copy of the base rootfs (~2 GiB); putting krayt's
+    run dir on XFS/Btrfs makes clones O(1) with no code change. Firecracker takes raw block
+    devices only, so a qcow2 backing file is not an option.
+  - **vsock:** a unix socket plus the `CONNECT` handshake, not `AF_VSOCK` — see §6.12.
+  - **Networking:** Firecracker has **no built-in NAT device and no DHCP server** (vfkit has
+    both). The provider creates a tap device per VM, gives it its own `/30`, and passes the
+    guest its address on the kernel command line; the host needs one-time setup for this. See
+    §6.6.
 
 > Everything outside this package is platform-agnostic.
 
@@ -382,6 +396,31 @@ is the simplest correct choice. Enforcement layers:
   the NixOS network config. **This interface applies no filtering of its own** — vfkit/the
   Virtualization.framework NAT device forwards whatever the guest sends; the hypervisor is not a
   firewall.
+- **Host side of the wire — the one real asymmetry between backends (Phase 7).** vfkit hands the
+  VM a NAT'd NIC with a DHCP server built in, so a macOS host needs no setup. **Firecracker
+  provides neither**: it gives the VM a bare tap device and nothing else. So on Linux the
+  *provider* owns the host end:
+  - **tap + subnet per VM.** Each VM gets its own tap device and its own `/30` out of
+    `172.16.0.0/16` (host `.1`, guest `.2`), rather than a shared bridge — so two concurrent
+    runs share no L2 segment and cannot see each other's traffic (§10). Allocation is guarded by
+    an flock'd slot file, because `krayt run --detach` means several krayt *processes* can be
+    booting VMs at once (§6.2).
+  - **Address delivery.** With no DHCP server, the guest's address travels on the kernel command
+    line (`ifname=`/`ip=`/`nameserver=`, dracut syntax). Note that the *kernel's* `ip=`
+    autoconfiguration does **not** read it — that needs `CONFIG_IP_PNP`, which the nixpkgs kernel
+    does not set, so the kernel ignores the parameter silently. It is consumed in userspace by
+    **`systemd-network-generator`**, which the image enables (§11.6); it writes the corresponding
+    `.network`/`.link` files before networkd starts. The vfkit path is untouched: with no `ip=`
+    on the cmdline nothing is generated and the image's DHCP unit applies as before.
+  - **One-time host setup, not per-run privilege.** Creating a tap needs `CAP_NET_ADMIN`, and
+    routing guests out needs IP forwarding + a NAT masquerade rule. These are granted once
+    (`hack/linux-net-setup.sh`: a `setcap cap_net_admin+ep` file capability on the krayt binary,
+    so krayt does **not** run as root, plus the forwarding/masquerade rules) and checked by
+    `krayt doctor`. The tap is handed to the invoking uid (`TUNSETOWNER`) so the *firecracker*
+    process itself needs no capabilities at all.
+  - **None of this weakens the guest's egress policy.** What a container may reach is still
+    decided inside the VM by the allowlist proxy + the nftables `skuid "proxyd"` lock below,
+    identically on both backends. The host setup only provides the wire.
 - **L7 allowlist:** a small **HTTP/HTTPS CONNECT forward proxy** (hand-rolled, or
   `elazarl/goproxy`) runs in the guest as a dedicated uid (e.g. `proxyd`). It checks the
   `CONNECT` host and plain-HTTP `Host` against the per-task allowlist.
@@ -741,11 +780,28 @@ symmetric across the two backends, so the `Provider` hides the difference behind
 - **Host side — direct vz (macOS fallback):** if embedding `Code-Hex/vz/v3`, the host
   connects through the per-VM `VZVirtioSocketDevice` (`device.Connect(1024)` → `net.Conn`)
   instead of a unix socket. Same `DialControl` contract, different innards.
-- **Host side — Firecracker (Linux):** the host *does* use `AF_VSOCK`, connecting to the
-  guest `CID` from `VMSpec`. Same `DialControl` signature again.
-- **Why no CID management on macOS:** with vfkit each VM has its own `socketURL`, and with
-  direct vz each VM owns its own `VZVirtioSocketDevice` — either way there is no shared CID
-  namespace to allocate. The `CID` field in `VMSpec` is Firecracker-only.
+- **Host side — Firecracker (Linux):** the host does **not** use `AF_VSOCK`. Firecracker
+  deliberately bypasses the host's vhost stack and mediates between an **`AF_UNIX` socket on
+  the host** and `AF_VSOCK` in the guest, so a host→guest connection is a unix dial to the
+  device's `uds_path` followed by a text **handshake**: send `CONNECT <port>\n`, read back
+  `OK <assigned_hostside_port>\n` (or the connection is closed, if nothing is listening on
+  that port in the guest yet). `DialControl` performs the handshake and hands the caller the
+  post-ack `net.Conn`, so everything above it still sees a plain gRPC transport. *(Verified
+  against Firecracker v1.16.1, `docs/vsock.md`. Earlier drafts of this spec claimed an
+  `AF_VSOCK` connect to the guest CID; that was wrong.)*
+- **Why no CID management anywhere:** with vfkit each VM has its own `socketURL`, with direct
+  vz each VM owns its own `VZVirtioSocketDevice`, and with Firecracker each VM owns its own
+  `uds_path` — **on none of the three backends is there a shared host CID namespace to
+  allocate**, and CIDs cannot collide between VMs. `VMSpec.CID` is the guest's context ID and
+  is meaningful only to Firecracker (which requires one in its vsock config); the firecracker
+  provider still hands out a unique CID per VM, but for traceability, not isolation. What
+  actually isolates two concurrent VMs is the per-VM unix socket.
+- **Host→guest bridging (Firecracker):** `krayt answer`/`stop` reach a *running* VM from a
+  separate process by dialing the socket path recorded from `VM.ControlSocket()` with a bare
+  `net.Dial("unix", …)` (§6.2, §6.13) — no handshake. So the firecracker provider does not
+  expose firecracker's raw `uds_path` as its `ControlSocket()`; it runs a small in-provider
+  listener that accepts plain connections and splices each to a freshly handshaken one. The
+  handshake stays inside the provider, which is the point of the seam.
 - **Security note:** the channel needs no TLS — a vsock link reaches exactly one VM and is
   not on any network. `insecure` transport credentials are correct here, not a shortcut.
 - **Socket-root hardening (vfkit, macOS):** the host unix sockets that bridge the vsock
@@ -1143,7 +1199,7 @@ at implementation time; major versions shown where they matter.)
 | macOS VM backend (v1) | `github.com/crc-org/vfkit` (`pkg/config` + REST) | drives a signed vfkit subprocess; pure-Go host (no cgo); pin version |
 | macOS VM backend (fallback) | `github.com/Code-Hex/vz/v3` | direct in-process embedding; cgo + macOS SDK; used only if the vz provider is built |
 | Guest vsock listener | `github.com/mdlayher/vsock` | `vsock.Listen` → `net.Listener` for gRPC (guest, linux) |
-| Linux VM backend (Phase 7) | `github.com/firecracker-microvm/firecracker-go-sdk` | host `AF_VSOCK` to guest CID |
+| Linux VM backend (Phase 7) | *none — hand-rolled REST client over Firecracker's API unix socket* | **decided in Phase 7, superseding `firecracker-go-sdk`.** The SDK's last tagged release is v1.0.0 (Aug 2022) — using it means pinning a `main` pseudo-version — and it drags `go-openapi` + CNI/containernetworking into krayt's `go.mod`, which `buildGoModule` then vendors into the guest image (§11.1) for no runtime benefit. The API surface krayt needs is six `PUT`s (`/machine-config`, `/boot-source`, `/drives/{id}`, `/network-interfaces/{id}`, `/vsock`, `/actions`); driving it directly mirrors what the vfkit provider already does with vfkit's REST API and **adds no new dependencies at all**, so the guest image's `vendorHash` is unchanged. Verified against the Firecracker v1.16.1 API spec. |
 | gRPC | `google.golang.org/grpc` + `google.golang.org/protobuf` | control protocol (§6.5) |
 | Proto codegen | `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc` | or `buf`; run via Nix/CI |
 | Container runtime client | `github.com/containerd/containerd/v2/client` | guest, drives containerd (§6.10) |
@@ -1393,9 +1449,28 @@ must produce and guarantee:
   ingest/diff, **`e2fsprogs` + `util-linux`** to format + mount the per-run scratch disk
   (§6.10), and the **`krayt-proxy`** binary run as the dedicated **`proxyd`** user for the
   egress proxy (§6.6). No editors, no shells beyond what systemd needs, no package manager.
-- **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — vfkit boots
-  raw/ISO, not qcow2), all `aarch64-linux`, packaged as the OCI artifact in §11.5. vfkit
-  boots them via its Linux bootloader (kernel + initrd + cmdline) or EFI.
+- **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — neither backend
+  takes qcow2), built for **both** `aarch64-linux` and `x86_64-linux` and packaged as the OCI
+  artifacts in §11.5 (one per arch, under arch-suffixed tags — krayt pulls this as a plain OCI
+  artifact with oras, so the arch is chosen by the host, not by a registry platform match).
+  One flake, one NixOS config, two systems.
+- **The x86_64 (firecracker) boot contract differs from the aarch64 (vfkit) one** in three ways
+  that are easy to get wrong and fail obscurely:
+  1. **The kernel must be an uncompressed ELF `vmlinux`.** Firecracker's x86_64 loader cannot
+     boot the `bzImage` that `system.boot.loader.kernelFile` names — upstream's own CI kernels
+     are `vmlinux-*` ELF binaries for this reason. nixpkgs ships the ELF as `vmlinux` in the
+     kernel's **`dev` output**; the flake strips it (379 MiB → ~55 MiB, debug info only) and
+     publishes it as `vmlinuz`. The kernel has `CONFIG_PVH=y`, so Firecracker finds the PVH
+     entry note.
+  2. **virtio-MMIO, not virtio-PCI.** Firecracker has no PCI bus, so `virtio_mmio` must be in
+     `boot.initrd.availableKernelModules` or root will not mount. (Both transports are listed;
+     the unused one simply never matches a device.)
+  3. **Console is `ttyS0`** (8250 serial), not vfkit's `hvc0` virtio-console. The provider
+     normalises this itself, so a `VMSpec` written for either backend boots on both.
+- **`systemd-network-generator` must be enabled** (it ships with systemd but is off by default).
+  It is what turns the firecracker provider's cmdline `ip=`/`ifname=` into networkd config; see
+  §6.6. Without it the guest boots fine and answers `Hello` with **no network address at all** —
+  a silent failure, so it has its own on-hardware regression test.
 - **Boot contract (what the host relies on):** within N seconds of `VM.Start` (vfkit
   process up + VM booted), the guest-agent is listening on vsock port `1024` (bridged to the
   host `socketURL`) and answers `Hello`. The host treats a successful `Hello` as "VM ready";
@@ -1585,11 +1660,12 @@ Both items need a `.proto`/image change, so they share one guest image rebuild a
 - [x] Guest **"question resolved"** `RunEvent` (§6.13): emitted when `bridge.Answer` delivers, so the host flips `waiting`→`running` precisely on answer instead of holding `waiting` until the run ends. *(`RunEvent.Resolved` added to the proto + regenerated; `ask.Bridge.OnResolved` → guest emit; host tracks outstanding questions and resumes at zero — fires for every answer path (Answer RPC / cross-process `krayt answer` / timeout sentinel). Host-proven by `TestQuestionResolvedResumes` + `TestBridgeOnResolved`; existing waiting-state tests still pass. On-VM confirmation rides the shared Phase-6 image rebuild.)*
 - [x] **Done when:** on a rebuilt image with the adapter + `--on-question=wait`, an agent's `ask_human` **MCP tool call** round-trips to `krayt answer`, and the run flips `waiting`→`running` precisely when the answer lands (not on the next log line). ✅ **Verified on Apple Silicon (base image v0.0.0-rc17):** Claude Code registered the MCP server, called `ask_human` (run → `waiting`, question "PostgreSQL or SQLite?" persisted), `krayt answer … PostgreSQL` round-tripped the answer, `krayt ls` **directly showed the run flip `waiting`→`running`** on the answer (the guest `Resolved` event), Claude implemented the chosen DB (`db.py` + `psycopg`), and finished `done` (exit 0) — the full §6.13 premium path. Host logic proven by `TestQuestionResolvedResumes` + `TestAskHumanHandler`.
 
-### Phase 7 — Linux backend (parity)
-- [ ] `firecracker` provider behind the same `Provider` interface (`CID`-based vsock).
-- [ ] `/dev/kvm` detection + graceful messaging in `doctor`.
-- [ ] Reuse guest-agent, protocol, patch, secrets, orchestrator unchanged.
-- [ ] **Done when:** the Phase 2 end-to-end test passes unmodified on a Linux host via the firecracker provider. **[HUMAN: Linux host with `/dev/kvm`]**
+### Phase 7 — Linux backend (parity) ✅
+- [x] `firecracker` provider behind the same `Provider` interface. *(`internal/provider/firecracker`, `//go:build linux`. Subprocess + REST-over-unix-socket, hand-rolled — no new deps (§9.1). vsock is a unix dial + `CONNECT <port>` handshake, **not** `AF_VSOCK` — §6.12 corrected. CoW = `FICLONE` with a sparse-copy fallback (ext4 has no reflink). Per-VM tap + `/30` + flock'd slot allocation, since firecracker supplies no NAT/DHCP — §6.6.)*
+- [x] `/dev/kvm` detection + graceful messaging in `doctor`. *(Checks read/write **access**, not just presence: being in the `kvm` group does nothing until a new login session, which is the failure everyone actually hits. Plus firecracker binary+version, `/dev/net/tun`, `CAP_NET_ADMIN`, and host NAT.)*
+- [x] Reuse guest-agent, protocol, patch, secrets, orchestrator unchanged. *(Not one line changed in any of them. The only edit outside `internal/provider/firecracker` + `internal/cli` (per-OS wiring) is the x86_64 image in `images/flake.nix` and a build-tagged `newTestProvider()` seam in the integration tests.)*
+- [x] x86_64 VM image. *(Same flake, both systems. ELF `vmlinux` + `virtio_mmio` + `systemd-network-generator` — see §11.6.)*
+- [x] **Done when:** the Phase 2 end-to-end test passes unmodified on a Linux host via the firecracker provider. ✅ **Verified on real hardware** (GCP VM, nested virt, Intel VT-x): `TestEndToEndRealVM` — the Phase 2 test, body and assertions byte-identical, with only the provider construction swapped — boots the x86_64 image under Firecracker v1.16.1, streams in the image + repo bundle, runs the agent container, and returns a `changes.patch` that `patch.Apply` lands cleanly on a fresh clone (exit 0). Also green: `TestBootHello` (`Hello` round-trips over the vsock handshake), `TestGuestNetwork`, and `TestConcurrentRealVMs` (3 simultaneous VMs, unique taps/CIDs, patches provably not crossed, every tap reaped on teardown).
 
 ---
 
