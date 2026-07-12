@@ -1284,8 +1284,8 @@ Linux/NixOS images **on a Mac requires a Linux builder**. Resolution:
   never share state.
 - **Update:** bump the flake input/lock → CI rebuilds → push new OCI artifact → bump the
   pinned digest in `krayt`. Fully auditable in git.
-- **Reclaim:** the base image is cached per digest under `~/.cache/krayt/vmimage/<digest>/`
-  and, like the user-image cache (§6.11), never cleaned up on its own. `krayt image ls/rm/prune`
+- **Reclaim:** the base image is cached per digest under `<user-cache-dir>/krayt/vmimage/<digest>/`
+  (from `os.UserCacheDir()`; typically `~/.cache/krayt/...` on Linux and `~/Library/Caches/krayt/...` on macOS) and, like the user-image cache (§6.11), never cleaned up on its own. `krayt image ls/rm/prune`
   manage both caches together (§6.11); the base-image side of the retention policy is simply
   *keep the pinned digest, drop the rest* — `krayt run` only ever reads the pinned digest's
   directory, so any other vmimage entry (an old pin, or a stale sanitized-ref dir) is dead
