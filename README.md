@@ -144,9 +144,9 @@ krayt apply <run-id>          # … then apply it to your repo if you're satisfi
   with `krayt ls`/`attach` and answer questions later.
 - Flags can live in a `krayt.yaml` instead (see `configs/`); each run leaves a self-contained
   `.krayt/runs/<id>/` with `changes.patch`, `report.md`, `meta.json`, and logs.
-- **Disk cache.** Base VM images and agent images are cached on the host under
-  `~/.cache/krayt/` (`vmimage/` and `imagestore/`), keyed by digest — a multi-GB agent image
-  rebuilt on every commit accumulates there. `krayt image ls` shows what's cached and its size,
+- **Disk cache.** Base VM images and agent images are cached on the host under `<user-cache-dir>/krayt/`
+  (`~/.cache/krayt/` on many Linux distros; `~/Library/Caches/krayt/` on macOS), in `vmimage/` and `imagestore/`, keyed by digest — a multi-GB agent image
+  rebuilt on every commit accumulates there.
   `krayt image rm <digest>` drops one, and `krayt image prune` bulk-reclaims (keeping the pinned
   base image and anything a running run still needs). VMs themselves are fully ephemeral, so this
   host cache is the only thing that grows.
