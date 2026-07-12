@@ -25,35 +25,32 @@ log`/PR history and `docs/ai-tasks/README.md`, not here. This file only tracks w
 
 ---
 
-## [Phase 7] Publish the x86_64 base VM image + make the pinned digest per-arch
+## [Phase 7] Publish the multi-arch base VM image and re-pin
 
 **Blocking:** `krayt run` / `krayt image pull` on Linux. **Not** blocking Phase 7's "Done when"
 (the integration tests take the image via `KRAYT_KERNEL`/`KRAYT_INITRD`/`KRAYT_ROOTFS`, so they
 run against a locally-built image and pass today).
 
-**What's wrong:** `internal/vmimage/pinned.go` pins a *single* digest, and it is the **aarch64**
-artifact (`ghcr.io/418-cloud/krayt-vmimage@sha256:a0c489cd…`). There is no notion of architecture
-in it. On an x86_64 Linux host, `krayt image pull` therefore fetches the arm64 image and `krayt
-run` hands Firecracker an arm64 kernel, which fails in a thoroughly confusing way. `krayt doctor`
-currently reports only "base VM image not cached".
+**What's wrong:** the currently pinned digest (`sha256:a0c489cd…`) is the **aarch64** artifact.
+On x86_64 that pull yields an arm64 kernel, and Firecracker fails on it in a thoroughly confusing
+way.
 
-**Why I didn't just fix it:** it means changing `internal/vmimage` (+ the `image pull/ls/prune`
-commands that consume it), which is the OS-agnostic core I was asked to leave alone. It needs a
-decision, then a publish.
+**The code side is done and verified.** `internal/vmimage` now resolves a multi-arch OCI index to
+the host's architecture at pull time, so pinning stays **one ref + one digest with no architecture
+in it** — the index's — rather than needing per-`GOARCH` constants. Verified end to end against a
+real registry: index digest pinned → `krayt image pull` → correct amd64 artifact on disk (the
+arm64 entry provably not fetched) → boots and answers Hello. Unit-covered by
+`TestPullSelectsHostArchFromIndex` / `TestPullRejectsIndexWithoutHostArch`; a pre-index
+single-arch artifact still pulls unchanged, so nothing breaks in the meantime.
 
-**What I already did:**
-- `images/flake.nix` builds **both** systems (`aarch64-linux`, `x86_64-linux`) from one config.
-- `.github/workflows/image.yml` is now an arch matrix: it builds on native arm64 **and** x86_64
-  runners and pushes arch-suffixed tags (`…:<tag>-arm64`, `…:<tag>-amd64`), printing each digest
-  as a `::notice`.
+`.github/workflows/image.yml` builds both arches on native runners, pushes each with an OCI image
+config declaring its platform, gathers them into one index, and asserts the index entries actually
+carry `platform` before printing the digest to pin.
 
-**What you need to do:**
-1. Run the `vm-image` workflow (tag or `workflow_dispatch` with `publish: true`) — it needs GHCR
-   push credentials, which I don't have.
-2. Decide the pinning shape (suggestion: `PinnedRef`/`PinnedDigest` become per-`GOARCH`, with a
-   `Pinned()` accessor that fails closed with a clear message on an arch with no published image,
-   rather than silently pulling the wrong one).
-3. Paste both digests from the workflow's `::notice` output into `internal/vmimage/pinned.go`.
+**What you need to do:** run the `vm-image` workflow (tag, or `workflow_dispatch` with
+`publish: true`) — it needs GHCR push credentials, which I don't have — then paste the index
+digest from its `::notice` output into `internal/vmimage/pinned.go` (`PinnedRef` + `PinnedDigest`,
+both the same index digest). That is the whole change.
 
 ---
 

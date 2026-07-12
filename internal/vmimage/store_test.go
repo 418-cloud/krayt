@@ -3,11 +3,15 @@ package vmimage_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content"
@@ -113,4 +117,105 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// multiArchArtifact packs a multi-arch base image: one artifact per architecture, gathered under
+// an OCI image index whose entries carry a platform. The index digest is the single thing krayt
+// pins (§11.5); which arch actually gets pulled is decided at pull time from the host.
+//
+// Each arch's payload is distinct ("KERNEL-<arch>") so a test can prove not just that the pull
+// succeeded but that it extracted the RIGHT one — the failure mode worth guarding against is a
+// silent wrong-arch pull, which would surface much later as an unbootable VM.
+func multiArchArtifact(t *testing.T, arches ...string) (oras.ReadOnlyTarget, string, digest.Digest) {
+	t.Helper()
+	ctx := context.Background()
+	store := memory.New()
+
+	manifests := make([]ocispec.Descriptor, 0, len(arches))
+	for _, arch := range arches {
+		layer := func(mediaType, title string, data []byte) ocispec.Descriptor {
+			desc := content.NewDescriptorFromBytes(mediaType, data)
+			desc.Annotations = map[string]string{ocispec.AnnotationTitle: title}
+			if err := store.Push(ctx, desc, bytes.NewReader(data)); err != nil {
+				t.Fatalf("push %s: %v", title, err)
+			}
+			return desc
+		}
+		layers := []ocispec.Descriptor{
+			layer(vmimage.MediaTypeKernel, vmimage.FileKernel, []byte("KERNEL-"+arch)),
+			layer(vmimage.MediaTypeInitrd, vmimage.FileInitrd, []byte("INITRD-"+arch)),
+			layer(vmimage.MediaTypeRootFS, vmimage.FileRootFS, []byte("ROOTFS-"+arch)),
+		}
+		m, err := oras.PackManifest(ctx, store, oras.PackManifestVersion1_1,
+			"application/vnd.krayt.vmimage", oras.PackManifestOptions{Layers: layers})
+		if err != nil {
+			t.Fatalf("pack manifest (%s): %v", arch, err)
+		}
+		// The platform on the INDEX ENTRY is what selection matches on — these are artifacts with
+		// custom media types, so there is no image config to infer an architecture from.
+		m.Platform = &ocispec.Platform{OS: "linux", Architecture: arch}
+		manifests = append(manifests, m)
+	}
+
+	idx := ocispec.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ocispec.MediaTypeImageIndex,
+		Manifests: manifests,
+	}
+	raw, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal index: %v", err)
+	}
+	desc := content.NewDescriptorFromBytes(ocispec.MediaTypeImageIndex, raw)
+	if err := store.Push(ctx, desc, bytes.NewReader(raw)); err != nil {
+		t.Fatalf("push index: %v", err)
+	}
+	const ref = "multi"
+	if err := store.Tag(ctx, desc, ref); err != nil {
+		t.Fatalf("tag index: %v", err)
+	}
+	return store, ref, desc.Digest
+}
+
+// TestPullSelectsHostArchFromIndex is the multi-arch pin (§11.5): one pinned index digest,
+// resolved to this host's architecture at pull time. It asserts the pull extracts THIS arch's
+// content and, critically, that the digest check still validates against the INDEX digest — the
+// thing pinned in pinned.go — even though oras.Copy internally descends to a child manifest.
+func TestPullSelectsHostArchFromIndex(t *testing.T) {
+	other := "arm64"
+	if runtime.GOARCH == "arm64" {
+		other = "amd64"
+	}
+	src, ref, indexDigest := multiArchArtifact(t, runtime.GOARCH, other)
+
+	dest := filepath.Join(t.TempDir(), "dest")
+	img, err := vmimage.Pull(context.Background(), src, ref, indexDigest, dest)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	// The host's arch, not the other one.
+	if got, want := readFile(t, img.Kernel), "KERNEL-"+runtime.GOARCH; got != want {
+		t.Errorf("pulled the wrong architecture: kernel = %q, want %q", got, want)
+	}
+	// The reported digest must remain the index's — that is what pinned.go pins and what a user
+	// would compare against, not the per-arch child oras.Copy actually descended into.
+	if img.Digest != indexDigest.String() {
+		t.Errorf("Image.Digest = %s, want the pinned index digest %s", img.Digest, indexDigest)
+	}
+}
+
+// TestPullRejectsIndexWithoutHostArch: an index that has no variant for this host must fail with
+// a clear error rather than pull someone else's architecture and hand the provider a kernel it
+// cannot boot.
+func TestPullRejectsIndexWithoutHostArch(t *testing.T) {
+	src, ref, indexDigest := multiArchArtifact(t, "mips64") // deliberately not this host
+	dest := filepath.Join(t.TempDir(), "dest")
+
+	_, err := vmimage.Pull(context.Background(), src, ref, indexDigest, dest)
+	if err == nil {
+		t.Fatal("expected a no-matching-architecture error, got nil")
+	}
+	if !strings.Contains(err.Error(), "linux/"+runtime.GOARCH) {
+		t.Errorf("error should name the missing architecture; got: %v", err)
+	}
 }

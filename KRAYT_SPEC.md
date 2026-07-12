@@ -1450,10 +1450,18 @@ must produce and guarantee:
   (§6.10), and the **`krayt-proxy`** binary run as the dedicated **`proxyd`** user for the
   egress proxy (§6.6). No editors, no shells beyond what systemd needs, no package manager.
 - **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — neither backend
-  takes qcow2), built for **both** `aarch64-linux` and `x86_64-linux` and packaged as the OCI
-  artifacts in §11.5 (one per arch, under arch-suffixed tags — krayt pulls this as a plain OCI
-  artifact with oras, so the arch is chosen by the host, not by a registry platform match).
-  One flake, one NixOS config, two systems.
+  takes qcow2), built for **both** `aarch64-linux` and `x86_64-linux` from one flake and one
+  NixOS config, and published as a **single multi-arch OCI index** (§11.5). krayt pins the
+  *index* digest — one `PinnedRef`, one `PinnedDigest`, no architecture anywhere in the pin —
+  and resolves it to the arch it can boot at pull time (`vmimage.selectPlatform`): arm64 for
+  vfkit, amd64 for firecracker.
+  - **The per-arch artifacts must carry an OCI image config declaring `{"architecture":…,
+    "os":"linux"}`** (`oras push --config`). This is easy to miss and fails in an ugly way:
+    these are *artifacts* with custom media types, not container images, so nothing else carries
+    an architecture. Without the config, `oras manifest index create` cannot infer a platform,
+    the index entries get a null `platform`, and selection then matches **nothing on any host** —
+    a broken pull for everyone, from an index that published perfectly cleanly. CI asserts the
+    platforms are present rather than trusting it.
 - **The x86_64 (firecracker) boot contract differs from the aarch64 (vfkit) one** in three ways
   that are easy to get wrong and fail obscurely:
   1. **The kernel must be an uncompressed ELF `vmlinux`.** Firecracker's x86_64 loader cannot
