@@ -13,6 +13,8 @@ can act on it. Name them descriptively in kebab-case after the outcome (e.g.
 | [`task-prompt-from-stdin.md`](./task-prompt-from-stdin.md) | Add `krayt run --task -` to read the task prompt from stdin (host-side CLI only; no image rebuild). | ✅ Done |
 | [`prune-cached-images.md`](./prune-cached-images.md) | Add `krayt image ls/rm/prune` to list, remove, and bulk-reclaim the host-side vmimage + container image caches, which grow unbounded today. | ✅ Done — new `internal/imagecache` shared over both roots; `ls`/`rm`/`prune` with the pinned/in-use/age retention policy + `.krayt-last-used` sentinel, unit-tested offline (`internal/{imagecache,cli}`) |
 | [`shell-completion.md`](./shell-completion.md) | Add shell tab-completion for run IDs, question IDs (`answer`), and enum/history-based flag values (`--net`, `--agent`, `--image`, `--allow`, …). | ✅ Done — dynamic `ValidArgsFunction`/`RegisterFlagCompletionFunc` on the run-scoped commands + `run` flags, filtered per command, unit-tested offline (`internal/cli/complete_test.go`) |
+| [`preflight-host-resources.md`](./preflight-host-resources.md) | `krayt run` refuses to boot a VM when live host free RAM/disk can't cover `--memory`/`--disk` + a safety margin, instead of dying opaquely mid-run under resource pressure. | 📋 Not started |
+| [`defer-running-state-until-code-captured.md`](./defer-running-state-until-code-captured.md) | Move the `state: running` transition to after the code snapshot is captured, closing a window where "running" is visible before it's actually safe to mutate the host repo. | 📋 Not started |
 
 ## Security-review remediation (from the pre-release secure code review)
 
