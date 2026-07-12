@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/418-cloud/krayt/compare/v0.3.1...v0.4.0) (2026-07-12)
+
+
+### Features
+
+* image list and prune operations ([#51](https://github.com/418-cloud/krayt/issues/51)) ([018e645](https://github.com/418-cloud/krayt/commit/018e64573fbf16d1e926e3b0210a2a7c77bc12e0))
+* perform a preflight resource check before kraty run start ([#54](https://github.com/418-cloud/krayt/issues/54)) ([3d6b7bd](https://github.com/418-cloud/krayt/commit/3d6b7bd036609fb128ecfdd9227bf0a1bad783b6))
+* shell completion for krayt commands ([#49](https://github.com/418-cloud/krayt/issues/49)) ([b4ed097](https://github.com/418-cloud/krayt/commit/b4ed097e07e42a3802836bd22d623f6d54f51aa9))
+
+
+### Bug Fixes
+
+* defer running state until repo pushed to agent ([#53](https://github.com/418-cloud/krayt/issues/53)) ([3b57f9e](https://github.com/418-cloud/krayt/commit/3b57f9eba6ca0b9c7bc18ceaed01662a2f30d922))
+
 ## [0.3.1](https://github.com/418-cloud/krayt/compare/v0.3.0...v0.3.1) (2026-07-10)
 
 
