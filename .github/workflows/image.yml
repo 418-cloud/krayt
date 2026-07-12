@@ -106,15 +106,21 @@ jobs:
       # container images, so nothing else carries an architecture: without a config declaring one,
       # `oras manifest index create` cannot infer a platform, the index entries come out with a
       # null platform, and krayt's selection then matches nothing at all.
+      #
+      # The config is written to RUNNER_TEMP and passed by absolute path, NOT created next to the
+      # artifacts: `result` is a symlink into /nix/store, which is read-only (dr-xr-xr-x root), so
+      # writing it there fails with "config.json: Permission denied". oras only reads the layer
+      # files from the cwd, so pointing --config elsewhere is all that is needed.
       - name: Push OCI artifact + record digest
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#vmimage-}" # vmimage-v1.2.0 -> v1.2.0 (the repo name namespaces it)
           [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && tag="manual-${GITHUB_SHA::12}"
           ref="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage:${tag}-${{ matrix.arch }}"
+          config="${RUNNER_TEMP}/oci-config-${{ matrix.arch }}.json"
+          printf '{"architecture":"%s","os":"linux"}' "${{ matrix.arch }}" > "$config"
           cd result
-          echo '{"architecture":"${{ matrix.arch }}","os":"linux"}' > config.json
-          oras push --config config.json:application/vnd.oci.image.config.v1+json "$ref" \
+          oras push --config "${config}:application/vnd.oci.image.config.v1+json" "$ref" \
             vmlinuz:application/vnd.krayt.kernel \
             initrd:application/vnd.krayt.initrd \
             rootfs.img:application/vnd.krayt.rootfs
