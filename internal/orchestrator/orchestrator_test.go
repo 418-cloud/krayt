@@ -120,8 +120,9 @@ func TestEndToEndRun(t *testing.T) {
 }
 
 // interceptingService wraps guest.Service to signal onPushCode synchronously right as the
-// PushCode stream starts arriving — the same point in the real flow where spec.RepoPath has
-// definitely not yet been fully captured (pushCode is still in progress on the host side too).
+// PushCode stream starts arriving — after pushCode has already built the bundle from
+// spec.RepoPath (patch.CreateBundle, orchestrator.go), but before the transfer of that bundle
+// to the guest has completed, so `state: running` must not be externally visible yet.
 type interceptingService struct {
 	*guest.Service
 	onPushCode func()
