@@ -46,7 +46,7 @@ jobs:
 
       # determinate-nix-action pins the installed Nix version (nix-installer-action
       # always grabs the newest Nix even when the action is pinned).
-      - uses: DeterminateSystems/determinate-nix-action@629b284231c2a82554b724e357e47fc6020833c8 # v3.21.2
+      - uses: DeterminateSystems/determinate-nix-action@c70cb8ae92d68c66953db28a26a63db1665bc837 # v3.21.5
 
       - name: Build VM image
         run: nix build ./images#vmImage --print-build-logs
@@ -67,7 +67,7 @@ jobs:
       packages: write # push to GHCR
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: DeterminateSystems/determinate-nix-action@629b284231c2a82554b724e357e47fc6020833c8 # v3.21.2
+      - uses: DeterminateSystems/determinate-nix-action@c70cb8ae92d68c66953db28a26a63db1665bc837 # v3.21.5
 
       - name: Build VM image
         run: nix build ./images#vmImage --print-build-logs
