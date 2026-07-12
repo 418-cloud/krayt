@@ -12,7 +12,7 @@ can act on it. Name them descriptively in kebab-case after the outcome (e.g.
 | [`build-krayt-dev-image.md`](./build-krayt-dev-image.md) | Build the multi-arch `krayt-dev` agent image (Claude Code + the krayt dev toolchain) and its GHCR publish workflow, for dogfooding krayt on krayt. | ✅ Done — `dev-image` workflow builds + pushes to GHCR on every `main` push (native per-arch runners, merged into a multi-arch manifest) |
 | [`task-prompt-from-stdin.md`](./task-prompt-from-stdin.md) | Add `krayt run --task -` to read the task prompt from stdin (host-side CLI only; no image rebuild). | ✅ Done |
 | [`prune-cached-images.md`](./prune-cached-images.md) | Add `krayt image ls/rm/prune` to list, remove, and bulk-reclaim the host-side vmimage + container image caches, which grow unbounded today. | 📋 Not started |
-| [`shell-completion.md`](./shell-completion.md) | Add shell tab-completion for run IDs, question IDs (`answer`), and enum/history-based flag values (`--net`, `--agent`, `--image`, `--allow`, …). | 📋 Not started |
+| [`shell-completion.md`](./shell-completion.md) | Add shell tab-completion for run IDs, question IDs (`answer`), and enum/history-based flag values (`--net`, `--agent`, `--image`, `--allow`, …). | ✅ Done — dynamic `ValidArgsFunction`/`RegisterFlagCompletionFunc` on the run-scoped commands + `run` flags, filtered per command, unit-tested offline (`internal/cli/complete_test.go`) |
 
 ## Security-review remediation (from the pre-release secure code review)
 

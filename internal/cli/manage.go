@@ -71,9 +71,10 @@ func newLsCmd() *cobra.Command {
 func newLogsCmd() *cobra.Command {
 	var repo string
 	cmd := &cobra.Command{
-		Use:   "logs <run-id>",
-		Short: "Print a run's persisted logs",
-		Args:  cobra.ExactArgs(1),
+		Use:               "logs <run-id>",
+		Short:             "Print a run's persisted logs",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs(nil),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sd, err := stateDir(repo)
 			if err != nil {
@@ -94,9 +95,10 @@ func newLogsCmd() *cobra.Command {
 func newAttachCmd() *cobra.Command {
 	var repo string
 	cmd := &cobra.Command{
-		Use:   "attach <run-id>",
-		Short: "Live-stream a running agent's logs (until it finishes or Ctrl-C)",
-		Args:  cobra.ExactArgs(1),
+		Use:               "attach <run-id>",
+		Short:             "Live-stream a running agent's logs (until it finishes or Ctrl-C)",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs(func(rec orchestrator.RunRecord, _ *cobra.Command) bool { return !rec.Terminal() }),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sd, err := stateDir(repo)
 			if err != nil {
@@ -120,9 +122,10 @@ func newAttachCmd() *cobra.Command {
 func newStopCmd() *cobra.Command {
 	var repo string
 	cmd := &cobra.Command{
-		Use:   "stop <run-id>",
-		Short: "Stop a running run (signals its supervisor to tear the VM down)",
-		Args:  cobra.ExactArgs(1),
+		Use:               "stop <run-id>",
+		Short:             "Stop a running run (signals its supervisor to tear the VM down)",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs(func(rec orchestrator.RunRecord, _ *cobra.Command) bool { return !rec.Terminal() }),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sd, err := stateDir(repo)
 			if err != nil {
@@ -158,6 +161,13 @@ func newRmCmd() *cobra.Command {
 		Use:   "rm <run-id>",
 		Short: "Remove a finished run's artifacts",
 		Args:  cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs(func(rec orchestrator.RunRecord, cmd *cobra.Command) bool {
+			if rec.Terminal() {
+				return true
+			}
+			force, _ := cmd.Flags().GetBool("force")
+			return force
+		}),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sd, err := stateDir(repo)
 			if err != nil {
@@ -186,9 +196,10 @@ func newRmCmd() *cobra.Command {
 func newPatchCmd() *cobra.Command {
 	var repo string
 	cmd := &cobra.Command{
-		Use:   "patch <run-id>",
-		Short: "Print the path to a run's changes.patch",
-		Args:  cobra.ExactArgs(1),
+		Use:               "patch <run-id>",
+		Short:             "Print the path to a run's changes.patch",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeRunIDs(nil),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sd, err := stateDir(repo)
 			if err != nil {

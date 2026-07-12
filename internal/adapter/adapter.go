@@ -54,6 +54,11 @@ func Get(name string) (Adapter, error) {
 	}
 }
 
+// Names lists every valid adapter name (the config/flag values Get accepts), for shell
+// completion. Keep in sync with Get's switch — small enough that duplication here is the
+// simplest way to keep both colocated and reviewable together.
+func Names() []string { return []string{"none", "claude-code", "gemini-cli"} }
+
 // askEnv is the shared krayt-ask wiring: when the run pauses for questions, tell the in-image
 // krayt-ask binary which socket to reach (§6.13). Universal across adapters — krayt-ask is the
 // lowest-common-denominator front-end.
