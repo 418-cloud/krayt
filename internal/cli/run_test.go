@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -157,4 +158,57 @@ func TestRunRunEmptyPrompt(t *testing.T) {
 			t.Fatalf("runRun err = %v, want a task-prompt-is-empty error", err)
 		}
 	})
+}
+
+// TestRunRunResourcePreflightRejectsOversizedRequest checks that a --memory request no real host
+// could satisfy is refused before any provider/image code runs (no seam exists to assert
+// newRunDeps/acquireUserImage were never reached, so the specific returned error is the proof: it
+// must be the resource-preflight error, not a later provider/image error). The preflight is a
+// no-op off macOS by design (resources_other.go), so this only exercises real rejection on darwin.
+func TestRunRunResourcePreflightRejectsOversizedRequest(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("resource preflight is a no-op off macOS by design (see resources_other.go)")
+	}
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "task.md")
+	if err := os.WriteFile(taskFile, []byte("do the thing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var f runFlags
+	cmd := newTestRunCmd(&f)
+	if err := cmd.ParseFlags([]string{
+		"--image", "img:1", "--task", taskFile, "--repo", dir, "--memory", "999999999999",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := runRun(cmd, &f)
+	if err == nil || !strings.Contains(err.Error(), "insufficient free memory") {
+		t.Fatalf("runRun err = %v, want an insufficient-free-memory resource preflight error", err)
+	}
+	if !strings.Contains(err.Error(), "--skip-resource-check") {
+		t.Errorf("runRun err = %q, want it to mention --skip-resource-check", err.Error())
+	}
+}
+
+// TestRunRunResourcePreflightBypassedBySkipFlag checks that --skip-resource-check bypasses the
+// preflight entirely, on every platform: the same oversized request must never fail with the
+// resource-preflight error once the flag is set (it may still fail later for other reasons, e.g.
+// no provider on this host — that's fine and untested here).
+func TestRunRunResourcePreflightBypassedBySkipFlag(t *testing.T) {
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "task.md")
+	if err := os.WriteFile(taskFile, []byte("do the thing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var f runFlags
+	cmd := newTestRunCmd(&f)
+	if err := cmd.ParseFlags([]string{
+		"--image", "img:1", "--task", taskFile, "--repo", dir, "--memory", "999999999999", "--skip-resource-check",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := runRun(cmd, &f)
+	if err != nil && strings.Contains(err.Error(), "insufficient free memory") {
+		t.Fatalf("runRun err = %v, want --skip-resource-check to bypass the resource preflight", err)
+	}
 }

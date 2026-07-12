@@ -177,6 +177,19 @@ type QuestionsPolicy struct {
 Resolution order (§8.3): built-in defaults → config file → flags. The orchestrator
 derives the `VMSpec` (§6.3) from `RunSpec.Resources` + the pinned base image.
 
+**Host resource preflight.** Before booting a VM, `krayt run` compares live host free RAM and
+free disk against `spec.Resources.MemoryMiB`/`DiskGiB` plus a fixed safety margin
+(`memMarginMiB = 2048`, `diskMarginGiB = 5`) reserved for the host OS and other processes, and
+refuses to start — no VM created — if it doesn't fit. This is a host-wide, live-measurement
+check (macOS only, via `vm_stat` for free memory and `syscall.Statfs` on the cache directory for
+free disk; a no-op elsewhere, since the only real backend today, vfkit, is macOS-only), distinct
+from and unrelated to `--max-concurrency`'s per-`.krayt` run-count limit (§6.2): it catches
+oversubscription across *all* runs on the host, from any repo, not just this repo's own runs.
+`--skip-resource-check` bypasses it for a user who knows better. The error names the actual free
+vs. needed vs. margin numbers so it's actionable without reading source. Added after a real
+incident: two concurrent runs on a 16GB Mac exhausted host RAM/disk and one died ~11 minutes in
+with an opaque gRPC EOF instead of failing fast at start (`docs/ai-tasks/preflight-host-resources.md`).
+
 ### 6.2 Orchestrator (`internal/orchestrator`)
 - Owns the set of active runs (map keyed by run ID).
 - Allocates a unique run ID per VM (and a vsock CID on the Firecracker backend only; §6.12).
@@ -1422,6 +1435,7 @@ must produce and guarantee:
 krayt run     [--image] [--task] [--repo] [--config] [--secrets]
                  [--net allowlist|full|none] [--allow domain ...]
                  [--cpus] [--memory] [--disk] [--timeout] [--detach]
+                 [--skip-resource-check]
                  [--on-question wait|fail] [--question-timeout DUR] [--on-question-timeout sentinel|abort]
 krayt ls                       # list active/recent runs (shows `waiting` runs)
 krayt attach  <run-id>         # live-stream a running agent's logs
