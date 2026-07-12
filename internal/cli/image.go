@@ -15,7 +15,7 @@ import (
 func newImageCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "image",
-		Short: "Manage the base micro-VM image",
+		Short: "Manage cached base-VM and container images",
 	}
 	cmd.AddCommand(newImagePullCmd())
 	cmd.AddCommand(newImageLsCmd())
