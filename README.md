@@ -174,6 +174,8 @@ host on demand:
   filtered to the runs that command can act on (e.g. `stop` offers only live runs, `rm` only
   finished ones unless `--force` is set) and annotated with the run's state and image.
 - **`<question-id>`** for `answer`, from the run's pending questions.
+- **`<digest>`** for `image rm`, from the cached images in both cache roots (full digest as the
+  completion value), annotated with each image's kind and size (and `(pinned)` for the base image).
 - **`--net`/`--on-question`/`--on-question-timeout`/`--agent`/`questions --sort`** — their exact
   fixed value sets.
 - **`--image`/`--allow`** for `run`, drawn from this repo's own run history (merged with a small

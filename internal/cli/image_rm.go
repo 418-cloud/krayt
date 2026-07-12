@@ -17,7 +17,8 @@ func newImageRmCmd() *cobra.Command {
 			"prefix (docker-rmi style), searching both cache roots. Refuses the pinned base VM " +
 			"image unless --force (removing it just makes the next `krayt run` ask you to " +
 			"`krayt image pull` again).",
-		Args: cobra.ExactArgs(1),
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeCachedImageDigests,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ci, err := resolveCachedImage(args[0])
 			if err != nil {

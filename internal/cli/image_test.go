@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/418-cloud/krayt/internal/imagecache"
 	"github.com/418-cloud/krayt/internal/orchestrator"
 	"github.com/418-cloud/krayt/internal/vmimage"
@@ -82,6 +84,45 @@ func TestImageLs(t *testing.T) {
 		if strings.Contains(line, "(pinned)") && !strings.Contains(line, "vmimage") {
 			t.Errorf("(pinned) on a non-vmimage row: %q", line)
 		}
+	}
+}
+
+func TestImageRmCompletion(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("KRAYT_CACHE_DIR", base)
+	pinned := pinnedHex(t)
+	seedCacheEntry(t, base, "vmimage", pinned, 1024)
+	seedCacheEntry(t, base, "imagestore", digRecent, 2048)
+
+	cmd := newImageRmCmd()
+	comps, dir := cmd.ValidArgsFunction(cmd, nil, "")
+	if dir != cobra.ShellCompDirectiveNoFileComp {
+		t.Errorf("directive = %v, want NoFileComp", dir)
+	}
+
+	// The completion value is the full encoded digest, annotated with kind, size, and the
+	// pinned mark on the base image only.
+	want := map[string]string{
+		pinned:    "vmimage, 1.0KiB (pinned)",
+		digRecent: "container, 2.0KiB",
+	}
+	got := map[string]string{}
+	for _, c := range comps {
+		id, desc, _ := strings.Cut(c, "\t")
+		got[id] = desc
+	}
+	for id, desc := range want {
+		if got[id] != desc {
+			t.Errorf("completion for %s = %q, want %q", id[:12], got[id], desc)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %d completions, want %d: %v", len(got), len(want), comps)
+	}
+
+	// Once the single positional arg is present, no further suggestions.
+	if comps, dir := cmd.ValidArgsFunction(cmd, []string{pinned}, ""); comps != nil || dir != cobra.ShellCompDirectiveNoFileComp {
+		t.Errorf("second-arg completion = (%v, %v), want (nil, NoFileComp)", comps, dir)
 	}
 }
 

@@ -1445,7 +1445,9 @@ completes command and flag names. On top of that, the run-scoped commands (`appl
 `attach`, `stop`, `rm`, `patch`, `questions`, `answer`) dynamically complete `<run-id>` from
 `.krayt/` state under `--repo`, each filtered to the runs it can act on (`stop`/`attach` → live
 runs, `rm` → finished unless `--force`, `answer` → `waiting`), and `answer` also completes the
-run's pending `<question-id>`. `run`'s enum flags (`--net`, `--on-question`, `--on-question-timeout`,
+run's pending `<question-id>`. `image rm` completes `<digest>` from the cached images in both
+cache roots (offering the full digest so a pick is unambiguously removable), annotated with each
+image's kind and size and `(pinned)` for the base image. `run`'s enum flags (`--net`, `--on-question`, `--on-question-timeout`,
 `--agent`) and `questions --sort` complete their fixed value sets from the same constants that
 validate them; `run`'s `--image`/`--allow` complete from this repo's run history. Untrusted
 agent-originated text (question prompts) is sanitized (§6.13) before appearing in a completion
