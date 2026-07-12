@@ -142,6 +142,10 @@ krayt apply <run-id>          # … then apply it to your repo if you're satisfi
   unattended runs non-blocking.
 - **Park & walk away:** add `--detach` and the run survives the terminal closing — track it
   with `krayt ls`/`attach` and answer questions later.
+- **Resource preflight (macOS):** before booting, `krayt run` checks live host free RAM/disk
+  against `--memory`/`--disk` plus a safety margin and refuses to start (no VM created) if the
+  host can't afford it — so an oversubscribed host fails fast instead of dying opaquely mid-run.
+  Pass `--skip-resource-check` to bypass.
 - Flags can live in a `krayt.yaml` instead (see `configs/`); each run leaves a self-contained
   `.krayt/runs/<id>/` with `changes.patch`, `report.md`, `meta.json`, and logs.
 - **Disk cache.** Base VM images and agent images are cached on the host under `<user-cache-dir>/krayt/`

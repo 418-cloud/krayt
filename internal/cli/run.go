@@ -62,6 +62,8 @@ type runFlags struct {
 	detach       bool
 	maxConc      int
 
+	skipResourceCheck bool
+
 	onQuestion        string        // fail | wait (§6.13)
 	questionTimeout   time.Duration // per-question wait limit
 	onQuestionTimeout string        // sentinel | abort
@@ -106,6 +108,7 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.DurationVar(&f.timeout, "timeout", 30*time.Minute, "wall-clock run timeout")
 	fl.BoolVar(&f.detach, "detach", false, "run in the background: a detached supervisor owns the VM to completion, so this command returns immediately and the run survives the terminal closing (§6.2). Track it with krayt ls/attach/answer")
 	fl.IntVar(&f.maxConc, "max-concurrency", 0, "max concurrent runs sharing this repo's .krayt (0 = unbounded); enforced across processes")
+	fl.BoolVar(&f.skipResourceCheck, "skip-resource-check", false, "skip the host free-RAM/disk preflight check before booting the VM")
 	fl.StringVar(&f.onQuestion, "on-question", "fail", "agent question mode: fail (autonomous) | wait (pause for input)")
 	fl.DurationVar(&f.questionTimeout, "question-timeout", 10*time.Minute, "per-question wait timeout")
 	fl.StringVar(&f.onQuestionTimeout, "on-question-timeout", "sentinel", "on question timeout: sentinel | abort")
@@ -277,6 +280,20 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	// are enabled — under the user's env, which wins.
 	if err := applyAdapter(&spec, f.agent); err != nil {
 		return err
+	}
+
+	// Refuse to boot a VM the host can't actually afford (2026-07-11 incident: two concurrent
+	// runs on a 16GB Mac starved the host of RAM/disk and one died 11 minutes in with an opaque
+	// gRPC EOF). Compares live free host RAM/disk against this run's request before any VM/image
+	// work begins, so a detached run fails fast in the parent rather than silently in the child.
+	if !f.skipResourceCheck {
+		freeMemMiB, freeDiskGiB, err := hostFreeResources()
+		if err != nil {
+			return fmt.Errorf("resource preflight: %w", err)
+		}
+		if err := checkHostResources(freeMemMiB, freeDiskGiB, spec.Resources.MemoryMiB, spec.Resources.DiskGiB); err != nil {
+			return err
+		}
 	}
 
 	// --detach: hand the run to a session-detached supervisor child and return, so the run
