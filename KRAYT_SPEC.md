@@ -185,6 +185,13 @@ derives the `VMSpec` (§6.3) from `RunSpec.Resources` + the pinned base image.
 - Tracks run state including a **`waiting`** state when the agent has asked a question and
   `mode: wait` is set (§6.13); waiting runs still own a live VM and count against concurrency.
 - Persists run metadata + artifacts under the project's `.krayt/runs/<id>/` (§8.4).
+- **`running` means the code snapshot is already captured.** The transition to `running` is
+  written only after the code bundle (§6.7) has been built from the host repo and streamed to
+  the guest — not merely once the VM has booted. Before that point the state is `starting`: the
+  VM may be booting, or the image/code transfer may still be in progress, and the host repo must
+  not be assumed to have been read yet. This makes `running`, as observed externally via
+  `meta.json`/`krayt ls`, the reliable signal that it is safe to mutate the host repo (checkout a
+  branch, commit, rebase) without affecting this run's snapshot.
 
 **Run supervision — daemon-less, process-agnostic.** krayt has **no central daemon**. Each
 run is driven by a self-contained supervision loop that writes *all* run state to
