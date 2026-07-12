@@ -111,7 +111,7 @@ func validateSort(mode string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("invalid --sort %q (want asked, pending-first, or pending-last)", mode)
+	return fmt.Errorf("invalid --sort %q (want %s)", mode, strings.Join(sortModes, ", "))
 }
 
 // selectQuestions applies --pending-only and --sort. ReadQuestions returns oldest-first, and the
