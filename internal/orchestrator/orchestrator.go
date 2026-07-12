@@ -173,9 +173,6 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		})
 		defer deps.OnClient(spec.ID, nil)
 	}
-	rec.State = StateRunning
-	_ = writeRecord(runDir, rec)
-
 	// 3. Push inputs: image (incremental), code bundle, task, secrets. A wall-clock timeout
 	// can expire mid-step here just as easily as during the container's run (e.g. a slow
 	// `git bundle create` in pushCode outliving the budget) — isWallClockTimeout catches that
@@ -193,6 +190,11 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		}
 		return nil, err
 	}
+	// The code snapshot is now fixed (§6.7) — from this point on it is safe for the host repo
+	// to be mutated (checkout/commit/rebase) without affecting this run, so `running` becomes
+	// externally visible only now, not before pushImage/pushCode (§6.2).
+	rec.State = StateRunning
+	_ = writeRecord(runDir, rec)
 	if _, err := client.Agent.PushTask(ctx, &pb.TaskSpec{
 		Prompt:            spec.TaskPrompt,
 		Env:               spec.Env,

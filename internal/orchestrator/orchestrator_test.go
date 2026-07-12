@@ -119,6 +119,69 @@ func TestEndToEndRun(t *testing.T) {
 	}
 }
 
+// interceptingService wraps guest.Service to signal onPushCode synchronously right as the
+// PushCode stream starts arriving — the same point in the real flow where spec.RepoPath has
+// definitely not yet been fully captured (pushCode is still in progress on the host side too).
+type interceptingService struct {
+	*guest.Service
+	onPushCode func()
+}
+
+func (s *interceptingService) PushCode(stream pb.GuestAgent_PushCodeServer) error {
+	if s.onPushCode != nil {
+		s.onPushCode()
+	}
+	return s.Service.PushCode(stream)
+}
+
+// TestStateNotRunningUntilCodeCaptured is the regression proof for §6.2: `state: running` must
+// not be externally visible until pushCode has returned, because that is the point after which
+// the host repo can be safely mutated without affecting this run's code snapshot.
+func TestStateNotRunningUntilCodeCaptured(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	img := minimalImage(ctx, t)
+	runner := &editingRunner{edits: map[string]string{"a.txt": "2\n"}}
+	guestRoot := t.TempDir()
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	var stateAtPushCode string
+	svc := &interceptingService{
+		Service: guest.NewService(guest.WithRunner(runner), guest.WithRoot(guestRoot)),
+		onPushCode: func() {
+			rec, err := orchestrator.ReadRecord(runDir)
+			if err != nil {
+				t.Errorf("ReadRecord during PushCode: %v", err)
+				return
+			}
+			stateAtPushCode = rec.State
+		},
+	}
+	p := &fake.Provider{Register: func(s *grpc.Server) { pb.RegisterGuestAgentServer(s, svc) }}
+
+	spec := task.RunSpec{
+		ID: "run_state_order", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"), Resources: task.Resources{CPUs: 2, MemoryMiB: 2048},
+	}
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img}, spec, runDir); err != nil {
+		t.Fatalf("orchestrator.Run: %v", err)
+	}
+
+	if stateAtPushCode != orchestrator.StateStarting {
+		t.Errorf("state during PushCode = %q, want %q (code must be captured before \"running\" is externally visible)",
+			stateAtPushCode, orchestrator.StateStarting)
+	}
+	final, err := orchestrator.ReadRecord(runDir)
+	if err != nil {
+		t.Fatalf("ReadRecord final: %v", err)
+	}
+	if final.State != orchestrator.StateDone {
+		t.Errorf("final state = %q, want %q", final.State, orchestrator.StateDone)
+	}
+}
+
 // TestContainerPolicyReachesRunner proves the per-task container hardening policy (§6.10, §10)
 // travels host → guest end to end: RunSpec.Container is pushed in the TaskSpec proto and threaded
 // into the guest.RunConfig the Runner receives. The containerd Runner turns these into OCI spec
