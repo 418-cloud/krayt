@@ -25,6 +25,8 @@ import (
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/credentials"
 	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"github.com/418-cloud/krayt/internal/imagecache"
 )
 
 // Image is a user OCI image acquired into the host's local OCI layout cache. The layout
@@ -71,6 +73,7 @@ func Acquire(ctx context.Context, src oras.ReadOnlyTarget, ref, cacheRoot string
 
 	// Cache hit when the layout already has an index.json for this digest.
 	if _, err := os.Stat(filepath.Join(dir, "index.json")); err == nil {
+		_ = imagecache.Touch(dir) // best-effort last-used bookkeeping for `krayt image ls/prune`
 		return &Image{Ref: ref, Digest: desc.Digest.String(), Dir: dir}, nil
 	}
 
@@ -87,6 +90,7 @@ func Acquire(ctx context.Context, src oras.ReadOnlyTarget, ref, cacheRoot string
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("imagestore: copy %q: %w", ref, err)
 	}
+	_ = imagecache.Touch(dir) // best-effort last-used bookkeeping for `krayt image ls/prune`
 	return &Image{Ref: ref, Digest: got.Digest.String(), Dir: dir}, nil
 }
 

@@ -144,6 +144,12 @@ krayt apply <run-id>          # … then apply it to your repo if you're satisfi
   with `krayt ls`/`attach` and answer questions later.
 - Flags can live in a `krayt.yaml` instead (see `configs/`); each run leaves a self-contained
   `.krayt/runs/<id>/` with `changes.patch`, `report.md`, `meta.json`, and logs.
+- **Disk cache.** Base VM images and agent images are cached on the host under `<user-cache-dir>/krayt/`
+  (`~/.cache/krayt/` on many Linux distros; `~/Library/Caches/krayt/` on macOS), in `vmimage/` and `imagestore/`, keyed by digest — a multi-GB agent image
+  rebuilt on every commit accumulates there.
+  `krayt image rm <digest>` drops one, and `krayt image prune` bulk-reclaims (keeping the pinned
+  base image and anything a running run still needs). VMs themselves are fully ephemeral, so this
+  host cache is the only thing that grows.
 
 Reproducible, ready-to-run examples live under `hack/` — most notably `hack/claude-code/`
 (a real Claude Code agent) and `hack/krayt-ask-probe/` (the question channel).
@@ -168,6 +174,8 @@ host on demand:
   filtered to the runs that command can act on (e.g. `stop` offers only live runs, `rm` only
   finished ones unless `--force` is set) and annotated with the run's state and image.
 - **`<question-id>`** for `answer`, from the run's pending questions.
+- **`<digest>`** for `image rm`, from the cached images in both cache roots (full digest as the
+  completion value), annotated with each image's kind and size (and `(pinned)` for the base image).
 - **`--net`/`--on-question`/`--on-question-timeout`/`--agent`/`questions --sort`** — their exact
   fixed value sets.
 - **`--image`/`--allow`** for `run`, drawn from this repo's own run history (merged with a small

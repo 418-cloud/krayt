@@ -75,6 +75,20 @@ func TestPullExtractsAndVerifies(t *testing.T) {
 	}
 }
 
+// TestPullTouchesLastUsed asserts Pull writes .krayt-last-used after a successful pull — the
+// last-used signal `krayt image ls/prune` read for the base VM image cache.
+func TestPullTouchesLastUsed(t *testing.T) {
+	src, ref, want := fakeArtifact(t)
+	dest := t.TempDir()
+
+	if _, err := vmimage.Pull(context.Background(), src, ref, want, dest); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, ".krayt-last-used")); err != nil {
+		t.Fatalf("Pull did not create the last-used sentinel: %v", err)
+	}
+}
+
 func TestPullRejectsDigestMismatch(t *testing.T) {
 	src, ref, _ := fakeArtifact(t)
 	wrong := digest.FromString("not-the-image")

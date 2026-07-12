@@ -15,9 +15,12 @@ import (
 func newImageCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "image",
-		Short: "Manage the base micro-VM image",
+		Short: "Manage cached base-VM and container images",
 	}
 	cmd.AddCommand(newImagePullCmd())
+	cmd.AddCommand(newImageLsCmd())
+	cmd.AddCommand(newImageRmCmd())
+	cmd.AddCommand(newImagePruneCmd())
 	return cmd
 }
 
@@ -77,18 +80,43 @@ func runImagePull(cmd *cobra.Command, ref string, want digest.Digest) error {
 	return err
 }
 
-// cacheDir returns the local cache directory for a base image, keyed by digest when
-// known (otherwise by a sanitized ref) so different images never collide.
-func cacheDir(ref string, want digest.Digest) (string, error) {
+// krayCacheBase is the root under which all of krayt's host-side caches live (vmimage,
+// imagestore, vms). It is `os.UserCacheDir()` in production; the KRAYT_CACHE_DIR env var
+// overrides it so tests (and anyone wanting a non-default location) can point every cache
+// at one directory. Read consistently by cacheDir, acquireUserImage, and imageCacheRoots.
+func krayCacheBase() (string, error) {
+	if d := os.Getenv("KRAYT_CACHE_DIR"); d != "" {
+		return d, nil
+	}
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve cache dir: %w", err)
+	}
+	return base, nil
+}
+
+// cacheDir returns the local cache directory for a base image, keyed by digest when
+// known (otherwise by a sanitized ref) so different images never collide.
+func cacheDir(ref string, want digest.Digest) (string, error) {
+	base, err := krayCacheBase()
+	if err != nil {
+		return "", err
 	}
 	key := want.Encoded()
 	if key == "" {
 		key = sanitizeRef(ref)
 	}
 	return filepath.Join(base, "krayt", "vmimage", key), nil
+}
+
+// imageCacheRoots returns the two digest-keyed cache roots `krayt image ls/rm/prune` operate
+// over: the base VM image cache (vmimage, §11.4) and the user-image cache (imagestore, §6.11).
+func imageCacheRoots() (vmimageRoot, imagestoreRoot string, err error) {
+	base, err := krayCacheBase()
+	if err != nil {
+		return "", "", err
+	}
+	return filepath.Join(base, "krayt", "vmimage"), filepath.Join(base, "krayt", "imagestore"), nil
 }
 
 func sanitizeRef(ref string) string {

@@ -61,6 +61,32 @@ func completeQuestionIDs(cmd *cobra.Command, args []string, _ string) ([]string,
 	return out, cobra.ShellCompDirectiveNoFileComp
 }
 
+// completeCachedImageDigests completes args[0] of `image rm <digest>` with the full encoded
+// digest of every cached image (both cache roots), annotated with "<kind>, <size>" and
+// "(pinned)" for the pinned base image. The full digest is offered so a selection is always
+// unambiguous and directly removable.
+func completeCachedImageDigests(_ *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if len(args) >= 1 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	imgs, err := listCachedImages()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var out []string
+	for _, ci := range imgs {
+		if ci.entry.Digest == "" {
+			continue
+		}
+		desc := ci.kind + ", " + humanSize(ci.entry.SizeB)
+		if ci.pinned {
+			desc += " (pinned)"
+		}
+		out = append(out, cobra.CompletionWithDesc(digestEncoded(ci.entry.Digest), desc))
+	}
+	return out, cobra.ShellCompDirectiveNoFileComp
+}
+
 // truncate shortens s for a completion description so one long value can't break the shell's
 // completion-list formatting.
 func truncate(s string, maxLen int) string {

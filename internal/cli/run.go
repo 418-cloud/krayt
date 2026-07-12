@@ -379,9 +379,9 @@ func applyAdapter(spec *task.RunSpec, name string) error {
 
 // acquireUserImage pulls the user image into the host cache and returns it (§6.11).
 func acquireUserImage(cmd *cobra.Command, ref string) (*imagestore.Image, error) {
-	base, err := os.UserCacheDir()
+	base, err := krayCacheBase()
 	if err != nil {
-		return nil, fmt.Errorf("resolve cache dir: %w", err)
+		return nil, err
 	}
 	cacheRoot := filepath.Join(base, "krayt", "imagestore")
 	src, err := imagestore.Remote(ref)
