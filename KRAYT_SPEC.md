@@ -693,6 +693,17 @@ Key properties:
   becomes genuinely usable for tasks needing no runtime network, and there is no "VM
   needs registry egress just to start" caveat anywhere.
 
+**Cache management (`krayt image ls/rm/prune`).** The digest-keyed host cache grows
+unbounded — a multi-GB agent image rebuilt every commit leaves a directory per digest, and
+nothing reclaims them. `krayt image ls` lists both host caches (this one plus the base VM
+image, §11.4) in one table — kind, short digest, best-effort ref, recursive size, and
+**last used**; `krayt image rm <digest>` removes one by full digest or unambiguous hex prefix;
+`krayt image prune` bulk-reclaims under a retention policy (§11.4). Each cache entry carries a
+`.krayt-last-used` sentinel file whose mtime is the last-used signal: `Acquire` refreshes it
+on **both** the fresh-pull and cache-hit paths (best-effort — a touch failure never fails
+acquisition, it only makes the `ls` timestamp stale), and `ls`/`prune` fall back to the
+directory mtime when the sentinel is absent (an image cached before this existed).
+
 ### 6.12 vsock transport & gRPC wiring (the host/guest asymmetry)
 This is the subtlest cross-platform detail and the easiest to get wrong. vsock is **not**
 symmetric across the two backends, so the `Provider` hides the difference behind
@@ -1273,6 +1284,28 @@ Linux/NixOS images **on a Mac requires a Linux builder**. Resolution:
   never share state.
 - **Update:** bump the flake input/lock → CI rebuilds → push new OCI artifact → bump the
   pinned digest in `krayt`. Fully auditable in git.
+- **Reclaim:** the base image is cached per digest under `~/.cache/krayt/vmimage/<digest>/`
+  and, like the user-image cache (§6.11), never cleaned up on its own. `krayt image ls/rm/prune`
+  manage both caches together (§6.11); the base-image side of the retention policy is simply
+  *keep the pinned digest, drop the rest* — `krayt run` only ever reads the pinned digest's
+  directory, so any other vmimage entry (an old pin, or a stale sanitized-ref dir) is dead
+  weight and pruned unconditionally.
+
+**Retention policy (`krayt image prune`).** Removes everything outside these keeps, deleting
+by default (no `--dry-run` needed to take effect):
+- **base VM image:** keep **only** the entry matching the pinned digest; every other vmimage
+  entry is removed unconditionally. `--all` never removes the pinned entry — use
+  `krayt image rm --force <digest>` for that one specifically.
+- **container image:** keep it if **either** (a) it was last used within `--older-than`
+  (default `24h`), **or** (b) its digest matches the image of a **non-terminal** run under
+  `--repo` (default `.`) whose recorded `image_ref` is *itself* a digest reference
+  (`…@sha256:<hex>`, direct string match — a tag-based ref can't be resolved to a cache digest
+  offline and relies on the age floor instead; a known, documented gap).
+- `--all` bypasses **both** container-kind protections (age + in-use). `--dry-run` reports
+  exactly what would be removed/kept and why, and the reclaimable total, without deleting.
+`krayt image rm <digest>` accepts a full digest or an unambiguous hex prefix (docker-rmi
+style) and errors — without deleting anything — on no match, an ambiguous prefix, or the
+pinned base image without `--force`.
 
 > Fallback if Nix ever becomes friction: `mkosi` (systemd's image builder) is the
 > next-best declarative option — gentler, reasonably reproducible — at the cost of
@@ -1392,6 +1425,10 @@ krayt patch   <run-id>         # print/locate the run's changes.patch
 krayt apply   <run-id>         # helper: git apply the patch onto the host (after review)
 krayt stop    <run-id>         # stop + destroy a run's VM
 krayt rm      <run-id>         # remove run artifacts
+krayt image pull  [--ref] [--digest]                 # pull + verify the base VM image (§11.4)
+krayt image ls                                       # list cached base-VM + container images with size/last-used
+krayt image rm    <digest> [--force]                 # remove one cached image by digest/prefix (--force for the pinned base)
+krayt image prune [--repo] [--older-than DUR] [--all] [--dry-run]   # bulk-reclaim cache disk under the retention policy
 krayt doctor                   # check host prereqs (vfkit installed+runnable on macOS; /dev/kvm on linux)
 ```
 

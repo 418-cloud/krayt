@@ -20,6 +20,8 @@ import (
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/credentials"
 	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"github.com/418-cloud/krayt/internal/imagecache"
 )
 
 // Artifact file names, carried as org.opencontainers.image.title annotations on the OCI
@@ -110,6 +112,7 @@ func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.
 	if err := img.verifyFiles(); err != nil {
 		return nil, err
 	}
+	_ = imagecache.Touch(destDir) // best-effort last-used bookkeeping for `krayt image ls/prune`
 	return img, nil
 }
 

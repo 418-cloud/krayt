@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -92,6 +93,53 @@ func TestAcquireExportCache(t *testing.T) {
 	}
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Errorf("cache was rewritten on second Acquire (sentinel gone): %v", err)
+	}
+}
+
+// TestAcquireTouchesLastUsed asserts Acquire writes .krayt-last-used on the fresh-pull path
+// and refreshes it (mtime advances) on the cache-hit path — the last-used signal ls/prune read.
+func TestAcquireTouchesLastUsed(t *testing.T) {
+	ctx := context.Background()
+	src := memory.New()
+
+	configDesc := push(ctx, t, src, ocispec.MediaTypeImageConfig, []byte(`{"architecture":"arm64","os":"linux"}`))
+	layerDesc := push(ctx, t, src, ocispec.MediaTypeImageLayer, []byte("a fake layer"))
+	manifestBlob, _ := json.Marshal(ocispec.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    configDesc,
+		Layers:    []ocispec.Descriptor{layerDesc},
+	})
+	manifestDesc := push(ctx, t, src, ocispec.MediaTypeImageManifest, manifestBlob)
+	if err := src.Tag(ctx, manifestDesc, "latest"); err != nil {
+		t.Fatalf("tag: %v", err)
+	}
+
+	cache := t.TempDir()
+	img, err := imagestore.Acquire(ctx, src, "latest", cache)
+	if err != nil {
+		t.Fatalf("Acquire (fresh): %v", err)
+	}
+	sentinel := filepath.Join(img.Dir, ".krayt-last-used")
+	fi, err := os.Stat(sentinel)
+	if err != nil {
+		t.Fatalf("fresh Acquire did not create the last-used sentinel: %v", err)
+	}
+	// Rewind the sentinel so the cache-hit refresh is observable regardless of clock resolution.
+	rewound := fi.ModTime().Add(-time.Hour)
+	if err := os.Chtimes(sentinel, rewound, rewound); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	if _, err := imagestore.Acquire(ctx, src, "latest", cache); err != nil {
+		t.Fatalf("Acquire (cache hit): %v", err)
+	}
+	fi2, err := os.Stat(sentinel)
+	if err != nil {
+		t.Fatalf("stat sentinel after cache hit: %v", err)
+	}
+	if !fi2.ModTime().After(rewound) {
+		t.Errorf("cache-hit Acquire did not refresh last-used mtime: %v not after %v", fi2.ModTime(), rewound)
 	}
 }
 
