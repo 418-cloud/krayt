@@ -114,19 +114,56 @@ func netAdminCheck() checkResult {
 	return c
 }
 
-// natCheck reports whether the host is set up to route the guests' traffic out: IP forwarding
-// plus a masquerade rule for krayt's subnet. That is one-time host state, not something krayt
-// configures per run, so a missing rule is a warning rather than a failure — a task that needs
-// no egress runs fine without it, and what the guest is *allowed* to reach is enforced in-VM by
-// the proxy either way (§6.6).
+// natUnit is the systemd unit hack/linux-net-setup.sh installs to apply krayt's nftables rules at
+// boot. The rules live only in the kernel otherwise, so this unit is what makes them survive one.
+const natUnit = "krayt-nat.service"
+
+// natCheck reports whether the host is set up to route the guests' traffic out. That takes two
+// things — IPv4 forwarding, and krayt's nftables masquerade/forward rules — and both are one-time
+// host state, not something krayt configures per run. A gap is a warning rather than a failure: a
+// task that needs no egress runs fine without it, and what a guest is *allowed* to reach is
+// enforced in-VM by the proxy either way (§6.6).
+//
+// Checking ip_forward alone would be worse than not checking at all, because it reports [ok] in
+// exactly the two cases most likely to be broken. Forwarding is already on for anything running
+// Docker, so on its own it says nothing about krayt. And krayt's rules live only in the kernel
+// until krayt-nat.service re-applies them, so on a rebooted host forwarding is still on (it is
+// persisted via sysctl.d) while the masquerade is gone — a host that looks configured and whose
+// guests silently have no network.
+//
+// The rules themselves cannot be read from here: listing nftables needs CAP_NET_ADMIN, and krayt's
+// is a *file* capability, which a child `nft` process would not inherit. So we check the unit that
+// owns them, which any user may query. One blind spot remains, and it is worth naming rather than
+// papering over: if someone flushes the tables by hand while the unit stays active, this still
+// reports [ok].
 func natCheck() checkResult {
 	c := checkResult{name: "host NAT for guest egress", optional: true}
+
 	fwd, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
 	if err != nil || strings.TrimSpace(string(fwd)) != "1" {
-		c.detail = "IP forwarding is off, so guests cannot reach the network — " +
-			"run hack/linux-net-setup.sh once"
+		c.detail = "IPv4 forwarding is off, so guests cannot reach the network — " +
+			"run `sudo hack/linux-net-setup.sh` once"
 		return c
 	}
+
+	// `systemctl is-active` exits non-zero when the unit is not active, so a non-nil err is the
+	// normal way it says "inactive". The state it prints is the answer; only a missing systemctl
+	// is a real error.
+	out, err := exec.Command("systemctl", "is-active", natUnit).CombinedOutput()
+	if errors.Is(err, exec.ErrNotFound) {
+		c.detail = "IPv4 forwarding is on, but this host has no systemd, so krayt cannot confirm its " +
+			"NAT rules are applied — check them by hand (see hack/linux-net-setup.sh)"
+		return c
+	}
+	if state := strings.TrimSpace(string(out)); state != "active" {
+		c.detail = fmt.Sprintf("IPv4 forwarding is on, but %s is %q, so krayt's NAT masquerade is not "+
+			"applied and guests have no egress — forwarding alone is not enough, and the rules do not "+
+			"survive a reboot without this unit. Run `sudo hack/linux-net-setup.sh` once",
+			natUnit, state)
+		return c
+	}
+
 	c.ok = true
+	c.detail = "IPv4 forwarding on, " + natUnit + " active"
 	return c
 }
