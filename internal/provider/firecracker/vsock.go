@@ -14,6 +14,10 @@ import (
 // "OK 4294967295\n" is 14 bytes; 64 is generous.
 const maxAckLen = 64
 
+// handshakeTimeout bounds the CONNECT handshake. A var, not a const, only so the test that covers
+// the stalled-peer case does not have to sleep for it.
+var handshakeTimeout = 10 * time.Second
+
 // dialVsock opens a host→guest vsock channel through firecracker.
 //
 // This is the detail §6.12 gets wrong, so it is worth stating precisely. Firecracker does
@@ -42,11 +46,24 @@ func dialVsock(ctx context.Context, uds string, port uint32) (net.Conn, error) {
 		return nil, fmt.Errorf("firecracker vsock: dial %s: %w", uds, err)
 	}
 
-	// Honour ctx for the handshake itself: a firecracker that accepts the unix connection but
-	// never answers must not hang the caller forever.
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
+	// Bound the handshake ALWAYS, not just when ctx happens to carry a deadline.
+	//
+	// In practice firecracker answers immediately or closes the connection (it closes when nothing
+	// is listening on the port, which is the normal state while the VM is still booting). But
+	// "in practice" is doing too much work there: bridge.handle dials with context.Background(),
+	// so with no deadline of our own, a firecracker that accepted the connection and then said
+	// nothing would block readAck forever. That is not a stray goroutine — the bridge only
+	// registers the guest connection for shutdown *after* the handshake, so close() cannot reach
+	// it, and close() is called from VM.Destroy. Teardown would hang and leak the VM, its tap
+	// device and its multi-GiB rootfs clone. Never trust the peer to end a wait for you.
+	//
+	// Take whichever bound comes first, so a caller with a tight deadline still wins and one with
+	// a long-running ctx (WaitReady's minutes-long boot poll) does not lose the bound entirely.
+	deadline := time.Now().Add(handshakeTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
 	}
+	_ = conn.SetDeadline(deadline)
 
 	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", port); err != nil {
 		_ = conn.Close()
