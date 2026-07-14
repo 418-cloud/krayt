@@ -65,8 +65,9 @@ Common to both platforms:
 - **One-time host setup:** `sudo hack/linux-net-setup.sh`. Firecracker, unlike vfkit, has no
   built-in NAT device or DHCP server, so krayt has to create and address a tap device per VM.
   The script grants krayt `CAP_NET_ADMIN` as a **file capability** (so krayt does *not* run as
-  root) and installs IP forwarding + a NAT masquerade rule for the guests' subnet. It does not
-  loosen the guest's egress policy — what a container may reach is still enforced inside the VM.
+  root), enables IP forwarding, and installs krayt's NAT/forward rules as `krayt-nat.service` so
+  they survive a reboot. It does not loosen the guest's egress policy — what a container may
+  reach is still enforced inside the VM.
 
 Run **`krayt doctor`** after setup on either platform; it checks each of the above and tells you
 exactly what to do about anything missing.
@@ -77,8 +78,6 @@ exactly what to do about anything missing.
 > **XFS or Btrfs** that is a reflink — instant, and it costs no disk. **ext4 has no reflink
 > support**, so the clone falls back to a full ~2 GiB copy per VM. Everything works either way,
 > but putting `~/.cache/krayt` on XFS/Btrfs makes runs start faster and use far less disk.
-
-Run `krayt doctor` after setup; it verifies host prerequisites (vfkit present + runnable).
 
 ### 2. Regenerate protocol code (only when editing `internal/protocol/krayt.proto`)
 Provided by the dev shell — no per-tool installs:
@@ -128,7 +127,7 @@ All marked _(verify current)_ — confirm against the linked page, since names/v
 ```bash
 git clone <your-fork> krayt && cd krayt
 # tier-1 prereqs installed? confirm:
-go build ./...        # OS-agnostic core + macOS provider compile
+go build ./...        # OS-agnostic core + this host's VM provider (vfkit on macOS, firecracker on Linux)
 go test ./...         # unit tests via the fake VM provider (no real VM needed)
 go run ./cmd/krayt doctor
 
