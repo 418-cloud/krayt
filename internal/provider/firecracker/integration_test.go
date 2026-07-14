@@ -87,8 +87,9 @@ func TestBootHello(t *testing.T) {
 // TestGuestNetwork asserts the guest actually configured the NIC the provider gave it.
 //
 // This is worth a test of its own because the failure is silent. Firecracker supplies no DHCP
-// server, so the guest gets its address from the kernel `ip=` parameter the provider appends
-// and the image's krayt.net=static networkd unit then leaves alone (tap.go, images/flake.nix).
+// server, so the guest gets its address from the `ifname=`/`ip=` cmdline the provider appends,
+// which systemd-network-generator turns into networkd config in the guest — NOT the kernel, whose
+// own `ip=` autoconfiguration is compiled out (tap.go, images/flake.nix).
 // If any link in that chain breaks, the guest simply comes up with no address — and because
 // krayt-agent only *wants* network-online.target, the VM still boots and still answers Hello.
 // Everything would look fine right up until a task tried to reach the network.

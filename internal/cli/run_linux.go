@@ -15,8 +15,8 @@ import (
 // defaultCmdline is the Linux kernel command line for the base image. Firecracker gives the
 // guest an 8250 serial port rather than vfkit's virtio-console, so the console is ttyS0, and
 // the rootfs is the first virtio-blk disk (§11.6). The provider appends the rest — the per-VM
-// `ip=` autoconf for its tap device, and the krayt.net token that selects the image's static
-// networking — since only it knows the tap's address (§6.6).
+// `ifname=`/`ip=`/`nameserver=` that address the guest's NIC — since only it knows which tap the
+// VM is wired to (§6.6).
 const defaultCmdline = "console=ttyS0 root=/dev/vda"
 
 // newRunDeps builds the Linux run dependencies: the firecracker provider plus the cached,

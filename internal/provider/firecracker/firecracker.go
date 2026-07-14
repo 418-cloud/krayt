@@ -21,9 +21,18 @@
 //
 //   - Networking. Firecracker has no built-in NAT device: it gives the VM a bare tap
 //     interface and nothing else — no DHCP server. The provider therefore creates the tap,
-//     addresses it, and hands the guest its address on the kernel cmdline via the kernel's
-//     `ip=` autoconf (see tap.go). The in-guest egress proxy + nftables lock (§6.6) run
-//     unchanged; this is only about getting an IP onto the wire.
+//     addresses it, and passes the guest its address on the kernel cmdline in dracut's
+//     `ip=`/`ifname=` form (see tap.go).
+//
+//     Note *who reads that cmdline*, because the obvious answer is wrong and it is the first
+//     place you would look when the guest comes up with no address: NOT the kernel. Kernel-level
+//     IP autoconfiguration needs CONFIG_IP_PNP, which the nixpkgs kernel does not set, so the
+//     kernel ignores the parameter silently. It is applied in userspace by
+//     systemd-network-generator, which the image enables (§11.6). Debug that layer, not the
+//     kernel's.
+//
+//     The in-guest egress proxy + nftables lock (§6.6) run unchanged; this is only about getting
+//     an IP onto the wire.
 package firecracker
 
 import (

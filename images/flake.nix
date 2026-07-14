@@ -16,7 +16,7 @@
   #   x86_64-linux  -> firecracker on Linux/KVM. Boots an *uncompressed ELF* vmlinux (it
   #                    cannot boot a bzImage), virtio-MMIO, console on ttyS0, and no DHCP
   #                    server at all — the provider hands the guest its address on the
-  #                    kernel cmdline instead (see the krayt.net=static unit below).
+  #                    kernel cmdline instead (see systemd-network-generator below).
   description = "krayt base micro-VM image (kernel + initrd + raw rootfs)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -234,8 +234,8 @@
 
           # The default kernel command line for this arch's provider. The host may override it
           # (VMSpec.Cmdline), and the firecracker provider always does — it has to append the
-          # per-VM `ip=` autoconf for the tap device (§6.6). `krayt.net=static` is what selects
-          # the 05-krayt-static networkd unit above.
+          # per-VM `ifname=`/`ip=`/`nameserver=` that address the guest's NIC, which only it knows
+          # (§6.6). Those are read by systemd-network-generator, not by the kernel (see above).
           cmdline =
             if isX86 then
               "init=${nixos.config.system.build.toplevel}/init console=ttyS0 reboot=k panic=1 root=/dev/vda"

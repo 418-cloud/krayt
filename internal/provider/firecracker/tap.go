@@ -35,9 +35,10 @@ const (
 	// this leaves ample room for the index.
 	tapPrefix = "krayt"
 
-	// guestIface is the kernel's name for the VM's NIC at `ip=` autoconf time, before udev
-	// has a chance to rename it. Firecracker's virtio-mmio NIC has no stable device path, so
-	// it stays eth0; the image's networkd unit matches "en* eth*" either way.
+	// guestIface is the name the guest's NIC is pinned to. The provider passes
+	// `ifname=<name>:<mac>`, which systemd-network-generator turns into a .link file that renames
+	// the device by MAC before networkd runs — so the generated .network's [Match] cannot miss it,
+	// whatever predictable-interface-naming would otherwise have called it.
 	guestIface = "eth0"
 )
 
