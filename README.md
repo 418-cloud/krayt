@@ -18,21 +18,21 @@ need on your machine* and *how to get started*. Architecture and rationale live 
 
 ## Platform reality (read first)
 
-krayt is a **macOS / Apple Silicon** project for v1. The macOS VM provider (vfkit) and **all
-integration tests require real Apple-Silicon hardware** — they cannot run in a cloud agent
-or CI, because Apple's Virtualization.framework only runs on Apple hardware. The Linux
-backend (Firecracker) is designed for but not built in v1.
+krayt runs on **macOS / Apple Silicon** (vfkit) and on **Linux / KVM** (Firecracker), behind one
+`Provider` interface. Everything above that seam — orchestrator, control protocol, guest agent,
+patch generation, secrets, egress policy — is the same code on both.
 
 What this means in practice:
 - The OS-agnostic core (most of the codebase) builds and unit-tests anywhere via a fake VM provider.
-- Anything that boots a real VM — the vfkit provider, the image boot test, end-to-end runs —
-  must happen on your Mac.
+- **macOS integration tests need real Apple-Silicon hardware.** They cannot run in CI or a cloud
+  agent, because Apple's Virtualization.framework only runs on Apple hardware.
+- **Linux integration tests need any host with `/dev/kvm`** — a bare-metal box, or a cloud VM with
+  nested virtualization enabled. They *can* run in CI.
 
-**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64**
-— the supported, tested target — and **darwin/amd64**, which compiles and *should* run on Intel
-Macs via Virtualization.framework but is **not tested** (arm64 is what we verify). **Linux
-binaries will follow once the Firecracker backend lands (Phase 7)**; until then `krayt run` is
-macOS-only. Verify a download against the release's `checksums.txt`.
+**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64** —
+the primary, tested target — and **darwin/amd64**, which compiles and *should* run on Intel Macs
+via Virtualization.framework but is **not tested**. Verify a download against the release's
+`checksums.txt`.
 
 ---
 
@@ -43,16 +43,41 @@ provided by a Nix dev shell, so in practice you install **Go, vfkit, and (option
 — everything else comes from `nix develop`.
 
 ### 1. Build & run krayt (everyone)
-- **macOS 13+** on Apple Silicon — _(verify current; vfkit needs 12+, some features 13/14+)_
+
+Common to both platforms:
 - **Go** — current stable _(verify current)_
-- **vfkit** — `brew install vfkit` _(verify current formula name)_. Carries the
-  virtualization entitlement, so **krayt itself needs no code-signing**.
 - **git**
 - **Claude Code** — if you're driving development with the agent (see below)
 
+**On macOS:**
+- **macOS 13+** on Apple Silicon — _(verify current; vfkit needs 12+, some features 13/14+)_
+- **vfkit** — `brew install vfkit` _(verify current formula name)_. Carries the
+  virtualization entitlement, so **krayt itself needs no code-signing**.
+
+**On Linux:**
+- **KVM** — `/dev/kvm` must exist *and be writable by you*. Add yourself to the `kvm` group
+  (`sudo usermod -aG kvm $USER`) and then **start a new login session** — group membership only
+  takes effect at login, so an existing shell keeps getting "permission denied". On a cloud VM,
+  make sure nested virtualization is enabled.
+- **firecracker** — download a release from
+  [firecracker-microvm/firecracker](https://github.com/firecracker-microvm/firecracker/releases)
+  and put it on your `PATH`.
+- **One-time host setup:** `sudo hack/linux-net-setup.sh`. Firecracker, unlike vfkit, has no
+  built-in NAT device or DHCP server, so krayt has to create and address a tap device per VM.
+  The script grants krayt `CAP_NET_ADMIN` as a **file capability** (so krayt does *not* run as
+  root), enables IP forwarding, and installs krayt's NAT/forward rules as `krayt-nat.service` so
+  they survive a reboot. It does not loosen the guest's egress policy — what a container may
+  reach is still enforced inside the VM.
+
+Run **`krayt doctor`** after setup on either platform; it checks each of the above and tells you
+exactly what to do about anything missing.
+
 > No `protoc` here — generated protocol code is checked into the repo.
 
-Run `krayt doctor` after setup; it verifies host prerequisites (vfkit present + runnable).
+> **Filesystem tip (Linux):** krayt gives each VM a copy-on-write clone of the base rootfs. On
+> **XFS or Btrfs** that is a reflink — instant, and it costs no disk. **ext4 has no reflink
+> support**, so the clone falls back to a full ~2 GiB copy per VM. Everything works either way,
+> but putting `~/.cache/krayt` on XFS/Btrfs makes runs start faster and use far less disk.
 
 ### 2. Regenerate protocol code (only when editing `internal/protocol/krayt.proto`)
 Provided by the dev shell — no per-tool installs:
@@ -102,7 +127,7 @@ All marked _(verify current)_ — confirm against the linked page, since names/v
 ```bash
 git clone <your-fork> krayt && cd krayt
 # tier-1 prereqs installed? confirm:
-go build ./...        # OS-agnostic core + macOS provider compile
+go build ./...        # OS-agnostic core + this host's VM provider (vfkit on macOS, firecracker on Linux)
 go test ./...         # unit tests via the fake VM provider (no real VM needed)
 go run ./cmd/krayt doctor
 

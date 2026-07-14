@@ -9,6 +9,12 @@ Because it runs as uid 1000, a success also confirms the non-root fixes (socket 
 workspace write). It's the `krayt-ask`-binary analogue of `ask-probe` (which used its own socket
 client); use whichever you like.
 
+> **Published by CI.** `.github/workflows/probe-images.yml` builds every probe multi-arch
+> (`linux/amd64` + `linux/arm64`) into one package, with the probe type as the tag:
+> `ghcr.io/<owner>/krayt-probe:{probe}`. Use that rather than building by hand — the manual steps
+> below remain valid for iterating on the probe itself. Note the arch: the Linux/firecracker
+> backend needs `amd64`, the macOS/vfkit backend `arm64`, and CI publishes both.
+
 ## Prerequisites
 - Apple-Silicon Mac with `krayt` built (`go build -o bin/krayt ./cmd/krayt`).
 - The base micro-VM image **rebuilt + re-pinned** with the krayt-ask mount + the non-root fixes

@@ -23,6 +23,12 @@ hardware regression is point-blank obvious from `krayt ls` (the `EXIT` column) o
 
 See also `../root-probe/`, the negative control (`KRAYT_ROOT_IMAGE`) for the same test suite.
 
+> **Published by CI.** `.github/workflows/probe-images.yml` builds every probe multi-arch
+> (`linux/amd64` + `linux/arm64`) into one package, with the probe type as the tag:
+> `ghcr.io/<owner>/krayt-probe:{probe}`. Use that rather than building by hand — the manual steps
+> below remain valid for iterating on the probe itself. Note the arch: the Linux/firecracker
+> backend needs `amd64`, the macOS/vfkit backend `arm64`, and CI publishes both.
+
 ## Prerequisites
 - Apple-Silicon Mac with the `krayt` binary built (`go build -o bin/krayt ./cmd/krayt`).
 - The base micro-VM image already built + pinned (same one the other integration tests use).
