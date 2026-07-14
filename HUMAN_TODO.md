@@ -15,9 +15,14 @@ verified on hardware — see `docs/ai-tasks/README.md` for the fix-by-fix status
 
 **Phase 7 (Linux/firecracker) is complete and verified on real hardware** — a Linux host with
 `/dev/kvm` (nested virt), not a Mac. The Phase 2 end-to-end test passes unmodified through the
-firecracker provider, plus Hello, guest-network and 3-way concurrency checks. Notably this phase
-needed *no* human hardware handoff: unlike the vfkit path, a Linux/KVM host can be driven by the
-coding agent directly.
+firecracker provider, plus Hello, guest-network, 3-way concurrency, and the whole Phase 3 security
+suite. A **real Claude Code agent run** completed on Linux (`run_26018248`), and the same pinned
+multi-arch image digest was confirmed still working on Apple Silicon — so krayt is now genuinely
+dual-backend, verified from both sides.
+
+Notably this phase needed *no* human hardware handoff for the agent-driven parts: unlike the vfkit
+path, a Linux/KVM host can be driven directly, which also means the Linux integration suite can run
+in CI.
 
 The detailed phase-by-phase and finding-by-finding history that used to live in this file has been
 pruned to keep it short and current — it was all resolved, and the record of *how* lives in `git
@@ -80,13 +85,18 @@ needs GHCR push credentials.
 
 ---
 
-## [Phase 7] Real-agent (Claude Code) run on Linux — needs a token
+## [Phase 7] Real-agent (Claude Code) run on Linux — ✅ DONE
 
-**Non-blocking.** `krayt-dev` is already built multi-arch by `dev-image.yml`, so an amd64 image
-should exist, but actually running Claude Code inside it needs a live
-`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` (§6.14). Deliberately left as a human step.
+Verified by a human on the Linux/firecracker host: `run_26018248`, image
+`ghcr.io/418-cloud/krayt-dev:sha-d315d9d` (the amd64 variant, selected automatically), real Claude
+Code agent, `network: allowlist`, `questions_mode: wait` — exit 0 in 2m30s with a clean
+`changes.patch` (+2/-0) and a full §8.4 `report.md` + `meta.json`.
 
-This is the Phase 5/6 dogfood path (real agent → patch + report + meta; `ask_human` MCP round-trip
-→ `krayt answer`), which is verified on Apple Silicon but not yet on Linux/firecracker. The
-machinery it rides on — container runtime, egress, secrets, question channel — is all green on
-Linux, so this is expected to work; it has simply not been run.
+Worth noting what that run incidentally proves, beyond "the adapter works": the agent had to reach
+`api.anthropic.com` **through the egress proxy** to do anything at all. A real agent completing a
+task is therefore a stronger end-to-end proof of the §6.6 allowlist than `hack/netprobe` is — the
+allowlist had to *permit* the right host, not merely block the wrong ones.
+
+Also confirmed by the human: krayt still works on Apple Silicon against the same pinned digest, so
+the one multi-arch index resolves correctly on **both** backends. That is the whole point of the
+§11.5 index pin, now demonstrated from both sides rather than argued.
