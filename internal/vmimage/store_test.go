@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -217,5 +218,91 @@ func TestPullRejectsIndexWithoutHostArch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "linux/"+runtime.GOARCH) {
 		t.Errorf("error should name the missing architecture; got: %v", err)
+	}
+}
+
+// twoFacedTarget answers the same reference with a different manifest each time it is resolved —
+// a moving tag, or a registry that lies. Everything else (Fetch/Exists) is served honestly from a
+// store that holds BOTH artifacts, so whichever manifest wins is genuinely pullable.
+type twoFacedTarget struct {
+	oras.ReadOnlyTarget // backing store, holds both artifacts
+
+	mu     sync.Mutex
+	calls  int
+	first  ocispec.Descriptor // handed out on the first Resolve
+	second ocispec.Descriptor // handed out on every Resolve after that
+}
+
+func (t *twoFacedTarget) Resolve(_ context.Context, _ string) (ocispec.Descriptor, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.calls++
+	if t.calls == 1 {
+		return t.first, nil
+	}
+	return t.second, nil
+}
+
+// TestPullVerifiesTheArtifactItActuallyCopies is the regression for a TOCTOU in the digest pin.
+//
+// The digest is a supply-chain control (§11.4): it is what makes "krayt image pull" trustworthy
+// against a registry that has been tampered with. That guarantee only holds if the digest checked
+// is the digest of the bytes extracted. It is easy to get this subtly wrong, because oras.Copy
+// resolves the reference itself, internally: verifying a *separately* resolved descriptor leaves a
+// window where a moving tag can answer the check with one manifest and the copy with another, so
+// krayt would extract content it never verified while reporting the digest it did.
+//
+// Here the target hands out the good artifact on the first resolve and a substituted one on every
+// resolve after, so a Pull that resolves twice will verify the good digest and then extract the
+// bad content. The assertion is not "an error happened" but the invariant itself: whatever ends up
+// on disk must be the artifact whose digest was verified.
+func TestPullVerifiesTheArtifactItActuallyCopies(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+
+	pack := func(marker string) ocispec.Descriptor {
+		t.Helper()
+		layer := func(mediaType, title string, data []byte) ocispec.Descriptor {
+			desc := content.NewDescriptorFromBytes(mediaType, data)
+			desc.Annotations = map[string]string{ocispec.AnnotationTitle: title}
+			if err := store.Push(ctx, desc, bytes.NewReader(data)); err != nil {
+				t.Fatalf("push %s: %v", title, err)
+			}
+			return desc
+		}
+		layers := []ocispec.Descriptor{
+			layer(vmimage.MediaTypeKernel, vmimage.FileKernel, []byte("KERNEL-"+marker)),
+			layer(vmimage.MediaTypeInitrd, vmimage.FileInitrd, []byte("INITRD-"+marker)),
+			layer(vmimage.MediaTypeRootFS, vmimage.FileRootFS, []byte("ROOTFS-"+marker)),
+		}
+		m, err := oras.PackManifest(ctx, store, oras.PackManifestVersion1_1,
+			"application/vnd.krayt.vmimage", oras.PackManifestOptions{Layers: layers})
+		if err != nil {
+			t.Fatalf("pack manifest (%s): %v", marker, err)
+		}
+		return m
+	}
+
+	good := pack("good")
+	substituted := pack("substituted")
+
+	src := &twoFacedTarget{ReadOnlyTarget: store, first: good, second: substituted}
+	dest := filepath.Join(t.TempDir(), "dest")
+
+	// Pin the good artifact — exactly what pinned.go does.
+	img, err := vmimage.Pull(ctx, src, "moving-tag", good.Digest, dest)
+	if err != nil {
+		// Refusing the pull outright is a perfectly acceptable outcome; extracting unverified
+		// content is not. Nothing more to check.
+		return
+	}
+
+	if got := readFile(t, img.Kernel); got != "KERNEL-good" {
+		t.Fatalf("Pull extracted content it never verified: kernel = %q, want %q. The digest was "+
+			"checked against one manifest and the copy took another — the digest pin is not "+
+			"protecting the bytes on disk.", got, "KERNEL-good")
+	}
+	if img.Digest != good.Digest.String() {
+		t.Errorf("Image.Digest = %s, want the verified digest %s", img.Digest, good.Digest)
 	}
 }

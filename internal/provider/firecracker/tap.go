@@ -76,6 +76,7 @@ func allocSlot(preferredCID uint32) (*netSlot, error) {
 		return nil, fmt.Errorf("create slot dir: %w", err)
 	}
 
+	var busy int
 	for i := range uint32(maxSlots) {
 		f, err := os.OpenFile(filepath.Join(dir, fmt.Sprintf("%d.lock", i)), os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
@@ -90,11 +91,25 @@ func allocSlot(preferredCID uint32) (*netSlot, error) {
 		if preferredCID != 0 {
 			s.cid = preferredCID
 		}
-		if err := s.createTAP(); err != nil {
-			_ = f.Close()
+		err = s.createTAP()
+		if err == nil {
+			return s, nil
+		}
+		_ = f.Close() // release the slot lock we just took
+
+		// EBUSY means the slot's tap device still has something attached to it while its lock is
+		// free — an orphaned firecracker whose krayt process died. That is one unusable slot, not
+		// a reason to refuse the whole run, so step over it. Anything else (EPERM, no /dev/net/tun)
+		// is a real fault that would recur on every slot, and failing 256 times before saying so
+		// would only bury the cause.
+		if !errors.Is(err, unix.EBUSY) {
 			return nil, err
 		}
-		return s, nil
+		busy++
+	}
+	if busy > 0 {
+		return nil, fmt.Errorf("no free network slot: all %d are taken, %d of them by a tap device "+
+			"still in use by an orphaned process (check for stray `firecracker` processes)", maxSlots, busy)
 	}
 	return nil, fmt.Errorf("no free network slot (%d VMs already running)", maxSlots)
 }
@@ -168,7 +183,15 @@ func (s *netSlot) createTAP() error {
 	}
 	ifr.SetUint16(unix.IFF_TAP | unix.IFF_NO_PI)
 	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
-		return fmt.Errorf("create tap %s (needs CAP_NET_ADMIN — see `krayt doctor`): %w", s.tapName(), err)
+		// Name the actual cause. Blaming CAP_NET_ADMIN unconditionally sends someone chasing a
+		// permissions problem that isn't there when the real answer is a leftover device — and the
+		// error has to keep wrapping the errno, because allocSlot decides whether to step over
+		// this slot by testing for EBUSY.
+		if errors.Is(err, unix.EPERM) {
+			return fmt.Errorf("create tap %s: %w (krayt needs CAP_NET_ADMIN — see `krayt doctor`)",
+				s.tapName(), err)
+		}
+		return fmt.Errorf("create tap %s: %w", s.tapName(), err)
 	}
 	// Persist the device so it outlives this fd: firecracker attaches to it by name, and a
 	// tap can only carry one attached fd, so we must let go of ours before it starts.

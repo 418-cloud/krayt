@@ -134,9 +134,10 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 		return nil, fmt.Errorf("firecracker: create scratch disk: %w", err)
 	}
 
-	// One atomic allocation covers the tap device, the /30 that addresses it, and the vsock
-	// CID — the tap's kernel-global name is what makes it safe across concurrent processes
-	// (see allocSlot).
+	// One allocation covers the tap device, the /30 that addresses it, and the vsock CID. It is
+	// guarded by an flock'd slot file, which is what makes it safe across concurrent krayt
+	// *processes* (`--detach` re-execs a supervisor per run) — not the tap's name, which cannot
+	// serve as the lock. See allocSlot.
 	slot, err = allocSlot(spec.CID)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker: allocate network slot: %w", err)
@@ -315,6 +316,22 @@ type vm struct {
 
 	cmd    *exec.Cmd
 	bridge *bridge
+
+	// exited is closed by the single reaper goroutine once cmd has been waited on; exitErr holds
+	// what Wait returned and is safe to read after exited closes. Exactly one goroutine ever calls
+	// cmd.Wait() — see reap. Everything that needs the process's death waits on this channel
+	// instead of calling Wait itself, which is what keeps a slow Stop and a follow-up kill from
+	// racing each other inside os/exec.
+	exited  chan struct{}
+	exitErr error
+}
+
+// reap is the sole owner of cmd.Wait(). exec.Cmd.Wait must not be called twice, let alone
+// concurrently — it mutates the Cmd's ProcessState — so both wait() and kill() observe the
+// process's death through the channel this closes rather than reaping it themselves.
+func (v *vm) reap() {
+	v.exitErr = v.cmd.Wait()
+	close(v.exited)
 }
 
 // LogPaths returns the firecracker and guest-console log paths, for diagnostics. Firecracker
@@ -368,6 +385,8 @@ func (v *vm) Start(ctx context.Context) error {
 	// across runs (exec.Cmd only closes files it created itself).
 	_ = logf.Close()
 	v.cmd = cmd
+	v.exited = make(chan struct{})
+	go v.reap()
 
 	if err := v.configureAndBoot(ctx); err != nil {
 		// A half-configured firecracker is useless and would otherwise linger as an orphan.
@@ -460,27 +479,30 @@ func (v *vm) Stop(ctx context.Context) error {
 	return nil
 }
 
-// wait reaps the firecracker process, bounded by ctx.
+// wait blocks until the firecracker process exits, bounded by ctx. It does NOT reap the process
+// itself — the reaper goroutine owns cmd.Wait() — so giving up here leaves nothing dangling and
+// a subsequent kill() is safe.
 func (v *vm) wait(ctx context.Context) error {
 	if v.cmd == nil {
 		return nil
 	}
-	done := make(chan error, 1)
-	go func() { done <- v.cmd.Wait() }()
 	select {
-	case err := <-done:
+	case <-v.exited:
+		err := v.exitErr
 		v.cmd = nil
 		if err != nil && !isExpectedExit(err) {
 			return fmt.Errorf("firecracker: process exit: %w", err)
 		}
 		return nil
 	case <-ctx.Done():
+		// The process is still running. Leave v.cmd set so the caller can kill it; the reaper is
+		// still waiting on it and will publish the exit through v.exited when it dies.
 		return ctx.Err()
 	}
 }
 
-// kill terminates firecracker and reaps it. It is the teardown path of last resort, so it
-// signals the whole process group and does not give up on a slow exit.
+// kill terminates firecracker and waits for it to die. It is the teardown path of last resort, so
+// it signals the whole process group and does not give up on a slow exit.
 func (v *vm) kill() error {
 	if v.cmd == nil || v.cmd.Process == nil {
 		return nil
@@ -489,7 +511,10 @@ func (v *vm) kill() error {
 	if err := syscall.Kill(-v.cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 		_ = v.cmd.Process.Kill()
 	}
-	_ = v.cmd.Wait()
+	// Wait for the reaper, rather than calling cmd.Wait() here. This is the whole point of the
+	// reaper: the graceful path (Stop -> wait) can time out and hand over to kill() while its own
+	// wait is still in flight, and a second cmd.Wait() would then race the first inside os/exec.
+	<-v.exited
 	v.cmd = nil
 	return nil
 }

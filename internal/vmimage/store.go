@@ -88,26 +88,6 @@ func Open(ref string) (oras.ReadOnlyTarget, error) {
 // leftover CVE-2026-50163 — a hardlink path-traversal bug fixed upstream in oras-go v2.6.2 —
 // warns against trusting).
 func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.Digest, destDir string) (*Image, error) {
-	// Verify the pinned digest BEFORE anything is written, against the descriptor the ref
-	// resolves to.
-	//
-	// It has to happen before the copy, not after, because the artifact may be a multi-arch
-	// index (§11.5): oras.Copy applies CopyOptions.MapRoot and then returns the *mapped* root,
-	// so with platform selection in play the descriptor it hands back is the per-arch child
-	// manifest — not the index we pinned. Checking that against `want` would compare the wrong
-	// digest and reject every good pull. The index digest is the pin (it is what PinnedDigest
-	// names), so it is the thing that must match.
-	//
-	// Doing it first is also strictly safer than the previous order: a rejected artifact now
-	// never reaches the disk at all, rather than being extracted and then deleted.
-	root, err := src.Resolve(ctx, ref)
-	if err != nil {
-		return nil, fmt.Errorf("vmimage: resolve %q: %w", ref, err)
-	}
-	if want != "" && root.Digest != want {
-		return nil, fmt.Errorf("vmimage: digest mismatch for %q: got %s, want %s", ref, root.Digest, want)
-	}
-
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return nil, fmt.Errorf("vmimage: create dest dir: %w", err)
 	}
@@ -117,10 +97,30 @@ func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.
 	}
 	defer func() { _ = fs.Close() }()
 
+	// Verify the pinned digest, and pick this host's architecture, in the SAME hook — on the root
+	// that oras.Copy itself resolved.
+	//
+	// Both halves of that matter. Resolving the reference separately and checking *that* would be
+	// a TOCTOU: oras.Copy resolves the reference again internally, so for a moving tag a registry
+	// could answer the check with one manifest and the copy with another, and we would extract
+	// content we never verified while reporting the digest we did. Checking Copy's *return value*
+	// instead does not work either, because with platform selection in play it returns the mapped
+	// per-arch child, not the index we pinned (§11.5). MapRoot is the one place that sees exactly
+	// the root being copied, before a single blob is fetched — so verify there.
+	var root ocispec.Descriptor
 	opts := oras.DefaultCopyOptions
-	opts.MapRoot = selectPlatform
+	opts.MapRoot = func(ctx context.Context, src content.ReadOnlyStorage, desc ocispec.Descriptor) (ocispec.Descriptor, error) {
+		if want != "" && desc.Digest != want {
+			return ocispec.Descriptor{}, fmt.Errorf("digest mismatch for %q: got %s, want %s", ref, desc.Digest, want)
+		}
+		root = desc
+		return selectPlatform(ctx, src, desc)
+	}
 
 	if _, err := oras.Copy(ctx, src, ref, fs, ref, opts); err != nil {
+		// MapRoot runs before any blob is fetched, so a rejected artifact has not reached the disk
+		// — but a copy that failed partway through has, and either way destDir must not survive as
+		// something a later look could mistake for good content.
 		_ = os.RemoveAll(destDir)
 		return nil, fmt.Errorf("vmimage: pull %q: %w", ref, err)
 	}
