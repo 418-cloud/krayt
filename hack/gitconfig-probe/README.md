@@ -30,6 +30,12 @@ snapshot (taken pristine, before this container ever runs) with `core.fsmonitor`
 b/PWNED_BY_ROOT` entry (the injected config never ran as root, so the sentinel file was never
 created) while the normal `greeting.txt` edit **is** present (the patch is still faithful).
 
+> **Published by CI.** `.github/workflows/probe-images.yml` builds every probe multi-arch
+> (`linux/amd64` + `linux/arm64`) into one package, with the probe type as the tag:
+> `ghcr.io/<owner>/krayt-probe:{probe}`. Use that rather than building by hand — the manual steps
+> below remain valid for iterating on the probe itself. Note the arch: the Linux/firecracker
+> backend needs `amd64`, the macOS/vfkit backend `arm64`, and CI publishes both.
+
 ## Prerequisites
 - Apple-Silicon Mac with the `krayt` binary built (`go build -o bin/krayt ./cmd/krayt`).
 - The base micro-VM image already built + pinned (same one the other integration tests use).

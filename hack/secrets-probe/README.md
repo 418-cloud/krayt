@@ -17,6 +17,12 @@ Exits 0 regardless of the answer (or lack of one) — this probe is about what l
 decision. It's the secrets-confinement analogue of `../krayt-ask-probe`; same shape (Alpine,
 uid 1000, shells out to `krayt-ask`).
 
+> **Published by CI.** `.github/workflows/probe-images.yml` builds every probe multi-arch
+> (`linux/amd64` + `linux/arm64`) into one package, with the probe type as the tag:
+> `ghcr.io/<owner>/krayt-probe:{probe}`. Use that rather than building by hand — the manual steps
+> below remain valid for iterating on the probe itself. Note the arch: the Linux/firecracker
+> backend needs `amd64`, the macOS/vfkit backend `arm64`, and CI publishes both.
+
 ## Prerequisites
 - Apple-Silicon Mac with `krayt` built (`go build -o bin/krayt ./cmd/krayt`).
 - The base micro-VM image with the secret-confinement fix (redacted report/question handling)

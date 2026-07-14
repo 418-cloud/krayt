@@ -1,0 +1,144 @@
+name: probe-images
+
+# Builds + publishes the hardware-verification probe images (hack/*-probe, hack/netprobe) as
+# multi-arch images, so the on-hardware integration suites can run on BOTH backends: arm64 under
+# vfkit on Apple Silicon, amd64 under firecracker on Linux/KVM (§6.3, §14 Phase 7).
+#
+# These are throwaway "agent" images that assert krayt's security controls from inside the
+# container — egress allowlist + the nftables L3 lock, the least-privilege OCI spec, enforced
+# non-root, git-config injection inertness, secret confinement — plus the §6.13 question channel.
+# They are the difference between claiming those controls hold and having run them, so they need to
+# exist for every architecture we support, not just the one the author happened to be sitting at.
+# (Before Phase 7 two of them hardcoded GOARCH=arm64, which silently produced an arm64 binary
+# inside an amd64 image: an exec-format failure at run time, not at build.)
+#
+# All seven live in ONE package — ghcr.io/<owner>/krayt-probe — with the probe type as the tag
+# (`:netprobe`, `:hardening-probe`, …), rather than seven separate packages. These are internal
+# test fixtures with no value to an end user, so seven entries in the org's package list would be
+# noise; it also means ONE package to make public rather than seven. Variants-as-tags is ordinary
+# practice (`python:3.12-slim`, `node:20-alpine`).
+#
+# Because the tag slot now carries the probe type, each probe also gets an immutable
+# `:<probe>-sha-<short>` tag — the moving `:<probe>` tag is what the tests reference, and the sha
+# tag is what you pin to reproduce a specific run.
+#
+# Unlike dev-image.yml, these build multi-arch in ONE job rather than on native runners per arch.
+# That is deliberate and safe here: the Go probes cross-compile (their build stage is pinned to
+# $BUILDPLATFORM and only the output arch changes, so no emulation happens at all), and the alpine
+# probes' one RUN step is an `adduser`. There is nothing worth spinning up a second runner for.
+# krayt-dev needs native runners because it compiles Go toolchains from source; these do not.
+#
+# PRs build without pushing, to validate the Dockerfiles. main/dispatch push.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hack/netprobe/**"
+      - "hack/ask-probe/**"
+      - "hack/hardening-probe/**"
+      - "hack/root-probe/**"
+      - "hack/gitconfig-probe/**"
+      - "hack/secrets-probe/**"
+      - "hack/krayt-ask-probe/**"
+      - ".github/workflows/probe-images.yml"
+  pull_request:
+    paths:
+      - "hack/netprobe/**"
+      - "hack/ask-probe/**"
+      - "hack/hardening-probe/**"
+      - "hack/root-probe/**"
+      - "hack/gitconfig-probe/**"
+      - "hack/secrets-probe/**"
+      - "hack/krayt-ask-probe/**"
+      - ".github/workflows/probe-images.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: probe-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/krayt-probe
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        probe:
+          # Used by the orchestrator's real-VM integration suite (internal/orchestrator):
+          - netprobe # KRAYT_NETPROBE_IMAGE   — egress allowlist + the raw-socket L3 lock (§6.6)
+          - hardening-probe # KRAYT_HARDENING_IMAGE  — caps/seccomp/no-new-privs/setuid(proxyd)=EPERM (§6.10)
+          - root-probe # KRAYT_ROOT_IMAGE       — negative control: a root image must FAIL the run (§8.2)
+          - gitconfig-probe # KRAYT_GITCONFIG_IMAGE  — guest git-config injection stays inert (finding #2)
+          - secrets-probe # KRAYT_SECRETS_IMAGE    — secrets never reach the artifacts (§6.8)
+          # Used for manual on-hardware checks of the question channel (§6.13):
+          - ask-probe
+          - krayt-ask-probe
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # only exercised outside pull_request (below)
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Needed only by the alpine-based probes, whose single RUN step (`adduser`) executes in the
+      # TARGET architecture. The Go probes never touch this: their build stage is pinned to
+      # $BUILDPLATFORM and cross-compiles via GOARCH=$TARGETARCH.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The probe type IS the tag (see the header). The moving `:<probe>` tag is what the
+      # integration suite references; `:<probe>-sha-<short>` is the immutable one to pin a run to.
+      - name: Tags
+        id: tags
+        run: echo "sha=${{ matrix.probe }}-sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build + push ${{ matrix.probe }} (linux/amd64 + linux/arm64)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: hack/${{ matrix.probe }}
+          file: hack/${{ matrix.probe }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ matrix.probe }}
+            ${{ env.IMAGE }}:${{ steps.tags.outputs.sha }}
+          # No attestations. buildx would otherwise add provenance/SBOM manifests to the list,
+          # which show up as `unknown/unknown` platform entries and extra blobs. krayt's imagestore
+          # copies the WHOLE image graph with no platform filter (internal/imagestore, oras.Copy
+          # with DefaultCopyOptions) and streams it into the VM over vsock, so every manifest in
+          # the list is bytes pushed into the guest for nothing. Keep the list to exactly the two
+          # platforms krayt can actually run.
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=probe-${{ matrix.probe }}
+          cache-to: type=gha,mode=max,scope=probe-${{ matrix.probe }}
+
+      # A single-arch push would not fail here — it would fail much later and far away, as a probe
+      # image that mysteriously refuses to run on one of the two backends. Assert the manifest list
+      # really carries both platforms while we still have the context to say why.
+      - name: Assert the published image is multi-arch
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:${{ steps.tags.outputs.sha }}"
+          platforms="$(docker buildx imagetools inspect "$ref" --raw \
+            | jq -r '[.manifests[].platform | select(.) | "\(.os)/\(.architecture)"] | sort | unique | join(",")')"
+          echo "$ref -> $platforms"
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error title=${{ matrix.probe }}::expected linux/amd64,linux/arm64 but got '${platforms}'"
+            exit 1
+          fi

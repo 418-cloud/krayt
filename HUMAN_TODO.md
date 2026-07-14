@@ -71,11 +71,25 @@ What that run turned up, and what is now fixed in-tree:
   arm64 binary inside an amd64 image (an exec-format failure at run time, not at build). Both now
   use `TARGETARCH`.
 
-**What's left for you:** the probe images are only in a local registry on the test host. To make
-this reproducible in CI (and it *can* run in CI now — unlike the vfkit path, a Linux runner with
-`/dev/kvm` needs no special hardware), they need publishing multi-arch, the way `dev-image.yml`
-already does for `krayt-dev`. Wiring `hack/*-probe` + `hack/netprobe` into a build/publish matrix
-needs GHCR push credentials.
+**What's left for you:** `.github/workflows/probe-images.yml` now builds and publishes all seven
+probes multi-arch (`linux/amd64` + `linux/arm64`) on any change to `hack/*-probe/` or
+`hack/netprobe/`, asserting each published manifest really carries both platforms. They land in
+**one** package with the probe type as the tag — `ghcr.io/<owner>/krayt-probe:{netprobe,
+hardening-probe, root-probe, gitconfig-probe, secrets-probe, ask-probe, krayt-ask-probe}` — rather
+than seven packages of internal test fixtures cluttering the org. Each also gets an immutable
+`:{probe}-sha-<short>` tag to pin a specific run to.
+
+The workflow has not run yet — it needs to land on `main` (or a `workflow_dispatch`), which is
+yours. Two things to check the first time:
+1. **GHCR packages default to private.** `imagestore.Remote` falls back to anonymous auth, so a
+   private image gives a 401 on the test host and the suite fails. Flip the single `krayt-probe`
+   package to public, or `docker login ghcr.io` where the suite runs.
+2. **`KRAYT_ALLOW_HOST` must match netprobe's baked-in `ENV`** (`example.com` by default) — the run
+   does not forward the network policy into the container, so the two have to agree or the probe
+   correctly reports the allowlisted host unreachable (exit 21).
+
+Once published, the Linux security suite can run in CI on any runner with `/dev/kvm` — unlike the
+vfkit path, it needs no special hardware.
 
 ---
 

@@ -14,13 +14,20 @@ so the allowlisted host is baked into the image as an `ENV` (default `example.co
 `KRAYT_ALLOW_HOST` to the same value, or the probe will correctly report the allowlisted host as
 unreachable and exit 21.
 
-## Build + run
+## Run it
+
+CI publishes every probe multi-arch (`linux/amd64` + `linux/arm64`) into one package, with the
+probe type as the tag (`.github/workflows/probe-images.yml`), so there is nothing to build:
 
 ```sh
-# amd64 (Linux/firecracker)
-podman build --platform linux/amd64 -t <registry>/krayt-netprobe:latest -f hack/netprobe/Dockerfile hack/netprobe
-
 KRAYT_KERNEL=…/vmlinuz KRAYT_INITRD=…/initrd KRAYT_ROOTFS=…/rootfs.img \
-KRAYT_NETPROBE_IMAGE=<registry>/krayt-netprobe:latest KRAYT_ALLOW_HOST=example.com \
+KRAYT_NETPROBE_IMAGE=ghcr.io/418-cloud/krayt-probe:netprobe KRAYT_ALLOW_HOST=example.com \
   go test -tags integration -run TestEgressEnforcement -v ./internal/orchestrator/
+```
+
+To iterate on the probe itself, build it locally and push it anywhere the test host can pull from:
+
+```sh
+podman build --platform linux/amd64 -t <registry>/krayt-probe:netprobe \
+  -f hack/netprobe/Dockerfile hack/netprobe
 ```
