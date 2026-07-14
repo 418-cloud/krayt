@@ -30,32 +30,26 @@ log`/PR history and `docs/ai-tasks/README.md`, not here. This file only tracks w
 
 ---
 
-## [Phase 7] Publish the multi-arch base VM image and re-pin
+## [Phase 7] Publish the multi-arch base VM image and re-pin — ✅ DONE
 
-**Blocking:** `krayt run` / `krayt image pull` on Linux. **Not** blocking Phase 7's "Done when"
-(the integration tests take the image via `KRAYT_KERNEL`/`KRAYT_INITRD`/`KRAYT_ROOTFS`, so they
-run against a locally-built image and pass today).
+Published and pinned:
+`ghcr.io/418-cloud/krayt-vmimage@sha256:68bc9efe9b649cc79309ff11925ed8d8e3c5c6dc14b272ae8e07f1c32cb07661`
+(v0.3.0-rc1) — a genuine multi-arch OCI index carrying both `linux/amd64` and `linux/arm64`, each
+entry with its `platform` set.
 
-**What's wrong:** the currently pinned digest (`sha256:a0c489cd…`) is the **aarch64** artifact.
-On x86_64 that pull yields an arm64 kernel, and Firecracker fails on it in a thoroughly confusing
-way.
+`internal/vmimage` resolves that index to the host's architecture at pull time, so the pin stays
+**one ref + one digest with no architecture in it** rather than needing per-`GOARCH` constants.
 
-**The code side is done and verified.** `internal/vmimage` now resolves a multi-arch OCI index to
-the host's architecture at pull time, so pinning stays **one ref + one digest with no architecture
-in it** — the index's — rather than needing per-`GOARCH` constants. Verified end to end against a
-real registry: index digest pinned → `krayt image pull` → correct amd64 artifact on disk (the
-arm64 entry provably not fetched) → boots and answers Hello. Unit-covered by
-`TestPullSelectsHostArchFromIndex` / `TestPullRejectsIndexWithoutHostArch`; a pre-index
-single-arch artifact still pulls unchanged, so nothing breaks in the meantime.
+Verified from both sides against the real published artifact: on Linux, `krayt image pull` (no
+arguments) fetched the amd64 variant anonymously from ghcr, `krayt doctor` went fully green, and
+the Phase 2 end-to-end + 3-way concurrency tests passed against it under firecracker; on Apple
+Silicon, a human confirmed krayt still works against the same digest. Unit-covered offline by
+`TestPullSelectsHostArchFromIndex` / `TestPullRejectsIndexWithoutHostArch`.
 
 `.github/workflows/image.yml` builds both arches on native runners, pushes each with an OCI image
-config declaring its platform, gathers them into one index, and asserts the index entries actually
-carry `platform` before printing the digest to pin.
-
-**What you need to do:** run the `vm-image` workflow (tag, or `workflow_dispatch` with
-`publish: true`) — it needs GHCR push credentials, which I don't have — then paste the index
-digest from its `::notice` output into `internal/vmimage/pinned.go` (`PinnedRef` + `PinnedDigest`,
-both the same index digest). That is the whole change.
+config declaring its platform, gathers them into one index, and **asserts the index entries carry
+`platform`** before printing the digest — because an index without it publishes perfectly cleanly
+and then matches nothing on any host.
 
 ---
 
