@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/418-cloud/krayt/compare/v0.5.1...v0.5.2) (2026-07-15)
+
+
+### Bug Fixes
+
+* add CI integration tests for Linux using GitHub Actions and improve debugging on failure ([#69](https://github.com/418-cloud/krayt/issues/69)) ([7867fb8](https://github.com/418-cloud/krayt/commit/7867fb83b3a00c05b2578b62929252ff54ca70bc))
+
 ## [0.5.1](https://github.com/418-cloud/krayt/compare/v0.5.0...v0.5.1) (2026-07-15)
 
 
