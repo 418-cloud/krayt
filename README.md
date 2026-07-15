@@ -262,10 +262,13 @@ See `CLAUDE.md` for the full working agreement.
 
 ## Status
 
-Built phase by phase per `KRAYT_SPEC.md` §14. **Phases 0–6 are complete and verified on
-Apple-Silicon hardware** — krayt runs a real coding agent (Claude Code) in an isolated
-micro-VM over an untrusted repo and hands back a reviewable patch, with egress control,
-secrets, concurrency, park-and-walk-away, and an agent↔human question channel.
+Built phase by phase per `KRAYT_SPEC.md` §14. **All eight phases (0–7) are complete and verified
+on real hardware on both backends**, released as
+[`v0.5.0`](https://github.com/418-cloud/krayt/releases/tag/v0.5.0) — krayt runs a real coding
+agent (Claude Code) in an isolated micro-VM over an untrusted repo and hands back a reviewable
+patch, with egress control, secrets, concurrency, park-and-walk-away, and an agent↔human question
+channel, on **both** macOS/vfkit and Linux/firecracker behind the same `Provider` interface. See
+`CHANGELOG.md` for the full release history.
 
 | Phase | What | State |
 |---|---|---|
@@ -276,7 +279,7 @@ secrets, concurrency, park-and-walk-away, and an agent↔human question channel.
 | 4 — Concurrency & UX | `Manager`, `ls`/`attach`/`logs`/`stop`/`rm`, config file, question channel | ✅ |
 | 5 — Polish & orchestration | `report.md`/`meta.json`, patch lint, agent adapters + auth, `krayt-ask`, detached "park & walk away" | ✅ hardware |
 | 6 — `ask_human` MCP + precise resume | in-VM MCP server, `waiting`→`running` on answer | ✅ hardware |
-| 7 — Linux backend (parity) | `firecracker` provider behind the same interface | planned |
+| 7 — Linux backend (parity) | `firecracker` provider behind the same interface | ✅ hardware |
 
 The showcase: a real agent, blocked mid-task on a decision only a human could make, paused,
 asked over MCP, got the answer, and continued with it — all inside the VM with a live
