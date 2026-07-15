@@ -34,6 +34,20 @@ if [ -z "$cred" ]; then
 fi
 echo "[krayt-dev] authenticated via $cred"
 
+# Optional, non-fatal GitHub auth. Unlike the model credential above (Claude Code can't run at
+# all without one, hence exit 78), GH_TOKEN is only needed for tasks that touch a GitHub PR, so
+# its absence must NOT fail the run. When present, hand it to gh's own documented non-interactive
+# auth path, which writes the token to ~/.config/gh/hosts.yml under the agent user's home
+# (/home/agent) — outside /workspace, so it can never leak into changes.patch (which only diffs
+# /workspace). The token's value is redacted from logs/report.md/questions for free, since the
+# host Redactor scrubs every secrets-file value by content, not by key name (internal/secrets).
+if [ -f "$SECRETS_DIR/GH_TOKEN" ]; then
+  gh auth login --with-token < "$SECRETS_DIR/GH_TOKEN"
+  echo "[krayt-dev] authenticated gh via GH_TOKEN"
+else
+  echo "[krayt-dev] no GH_TOKEN in $SECRETS_DIR — gh commands will be unauthenticated"
+fi
+
 if [ ! -f "$TASK_FILE" ]; then
   echo "[krayt-dev] task file $TASK_FILE not found" >&2
   exit 66 # EX_NOINPUT

@@ -7,8 +7,12 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
-**Nothing open.** All three integration-test-runner handoffs are confirmed — two on real
-hardware, and `integration-linux` is now green in CI. Everything else is shipped.
+**Open:** three verifications for the `gh` CLI + `GH_TOKEN` + `fix-pr-review-comments` change need a
+real Docker build, a real fine-grained PAT, and a real krayt run against a real PR — see the three
+`[tooling]` / `[GitHub]` entries at the bottom. None can be done or faked from a cloud agent.
+
+Everything else is shipped: all three integration-test-runner handoffs are confirmed — two on real
+hardware, and `integration-linux` is now green in CI.
 
 Phases 0–7 are complete and released as
 [`v0.5.0`](https://github.com/418-cloud/krayt/releases/tag/v0.5.0) — krayt runs a real coding
@@ -61,3 +65,46 @@ independently, and a `DROP` in any one of them is terminal regardless of what th
 Fixed in `hack/linux-net-setup.sh` (an explicit accept in Docker's own `DOCKER-USER` chain, the
 customization point Docker documents for exactly this) and surfaced in `krayt doctor`'s NAT check
 so a host in this state doesn't look falsely green. Documented in the README's Linux prerequisites.
+
+## [tooling] Build the `krayt-dev` image with the new `gh` CLI layer — ⏳ OPEN
+
+The `gh` CLI install layer was added to `hack/krayt-dev/Dockerfile` (`ARG GH_CLI_VERSION=2.96.0`,
+fetched as a `gh_<version>_linux_<TARGETARCH>.tar.gz` release tarball, same exception pattern as
+`protoc`). This sandbox has no Docker/buildx, so the build itself is unverified. Confirm it builds
+for **both** arches — the asset arch names are Docker's `TARGETARCH` values verbatim
+(`amd64`/`arm64`), no translation, but that's only confirmed against the release asset naming, not a
+real pull:
+
+```sh
+# repo root — the Dockerfile COPYs go.mod/go.sum from here
+docker buildx build --platform linux/arm64 -f hack/krayt-dev/Dockerfile -t krayt-dev:local .
+# and, to prove the amd64 asset URL/path resolves too (slow under QEMU; CI does both natively):
+docker buildx build --platform linux/amd64 -f hack/krayt-dev/Dockerfile -t krayt-dev:local-amd64 .
+```
+
+CI (`.github/workflows/dev-image.yml`) already builds both arches on native runners on any push
+touching `hack/krayt-dev/**`, so merging exercises this — but confirm `gh --version` runs in the
+built image before relying on it. Do **not** fabricate a "builds fine" result.
+
+## [GitHub] Confirm a read-only fine-grained PAT authenticates `gh` and reads PR review comments — ⏳ OPEN
+
+`entrypoint.sh` now runs `gh auth login --with-token < /run/secrets/GH_TOKEN` when `GH_TOKEN` is
+present (non-fatal when absent). Verify, with a **real** fine-grained PAT scoped to this repo with
+exactly **Metadata + Contents + Pull requests: read** (no write):
+
+- `gh auth login --with-token` succeeds with that token;
+- `gh api "repos/{owner}/{repo}/pulls/<n>/comments"` returns the PR's inline **review** comments;
+- the token genuinely **cannot** write (a `gh pr comment`/`gh api -X POST` attempt is refused by
+  GitHub) — the read-only design depends on this being true at the token level.
+
+Needs a real token + a real PR; not provable statically. Never fabricate a token or a result.
+
+## [GitHub] Real run of `docs/common-tasks/fix-pr-review-comments.md` against a real PR — ⏳ OPEN
+
+Run the new reusable task via `krayt run` with live credentials against a real PR that has Copilot
+(or other inline) review comments — from a local checkout of that PR's branch, `--repo .`, with
+`--allow api.anthropic.com,api.github.com` and a `--secrets` file carrying the model credential +
+`GH_TOKEN`. Confirm it: fetches the **review** comments (not just issue comments), triages each
+against the actual code, fixes only real issues, leaves false positives untouched with a specific
+reason, writes the summary table + suggested commit message to `report.md`, and attempts **no**
+GitHub write. Needs an actual run with live credentials — not something provable statically.

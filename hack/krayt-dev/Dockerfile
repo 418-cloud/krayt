@@ -18,6 +18,7 @@ ARG PROTOC_GEN_GO_GRPC_VERSION=v1.6.2
 ARG BUF_VERSION=v1.71.0
 ARG ORAS_VERSION=v1.3.2
 ARG GOLANGCI_LINT_VERSION=v2.12.2
+ARG GH_CLI_VERSION=2.96.0
 
 # git: repo ops + module fetches; curl + ca-certificates: installers/HTTPS; bash: entrypoint +
 # proto-direct.sh; unzip: protoc's release archive is a zip; xz-utils: the Nix installer's tarball
@@ -40,6 +41,17 @@ RUN set -eu; \
  && unzip -q /tmp/protoc.zip -d /usr/local \
  && rm /tmp/protoc.zip \
  && chmod -R a+rX /usr/local/bin/protoc /usr/local/include
+
+# gh CLI, like protoc, has no `go install` story worth relying on, so it's fetched as a prebuilt
+# release tarball. Unlike protoc, gh's asset arch names ARE Docker's TARGETARCH values
+# (amd64/arm64) verbatim — no x86_64/aarch_64 translation needed. Used by the optional GH_TOKEN
+# path in the entrypoint (see README's GH_TOKEN secret) and the fix-pr-review-comments task.
+RUN set -eu; \
+    curl -fsSL -o /tmp/gh.tar.gz \
+      "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" \
+ && tar -xzf /tmp/gh.tar.gz -C /tmp \
+ && install -m 0755 "/tmp/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}/bin/gh" /usr/local/bin/gh \
+ && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}"
 
 # Non-root agent user (uid 1000) — Claude Code refuses uid 0 (§6.14/§8.2). Everything below
 # runs as this user so it owns its own Go/lint caches (see ENV block).
