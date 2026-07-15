@@ -3,7 +3,7 @@ module github.com/418-cloud/krayt
 go 1.26.3
 
 require (
-	github.com/containerd/containerd/v2 v2.3.2
+	github.com/containerd/containerd/v2 v2.3.3
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/crc-org/vfkit v0.6.4
 	github.com/mdlayher/vsock v1.3.0
