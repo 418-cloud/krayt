@@ -1,10 +1,18 @@
 #!/bin/sh
-# edit-probe: the positive control for the real-VM end-to-end suite. It makes a single
-# deterministic, idempotent edit inside the writable /workspace bind mount and exits 0. After the
-# container exits, the guest-agent generates changes.patch from the workspace (internal/patch.Diff);
-# TestEndToEndRealVM asserts that patch is produced and applies cleanly to the host repo, and
-# TestConcurrentRealVMs runs several of these at once. No sentinel/attack logic — this proves the
-# happy path works, not that a control holds.
+# edit-probe: the positive control for the real-VM end-to-end suite. It appends a fixed line to
+# the repo's greeting.txt (creating it if missing) inside the writable /workspace bind mount and
+# exits 0. After the container exits, the guest-agent generates changes.patch from the workspace
+# (internal/patch.Diff); TestEndToEndRealVM asserts that patch is produced and applies cleanly to
+# the host repo.
+#
+# Appending to the EXISTING file — rather than writing an unrelated new one — matters for
+# TestConcurrentRealVMs: it seeds each VM's clone with a per-run marker line in greeting.txt and
+# checks the resulting patch still contains that marker, as proof the VMs' workspaces never
+# crossed ("isolation is checked by construction, not by inspection", per that test's own
+# comment). git's default 3-line diff context carries the untouched marker line straight into the
+# patch alongside the appended edit. A blind overwrite/new-file edit would never carry that marker
+# through, and the isolation check would fail regardless of whether isolation actually held — no
+# sentinel/attack logic here otherwise, this is the happy-path control, not a security probe.
 set -eu
 
 echo "[edit-probe] start (uid=$(id -u))"
@@ -14,9 +22,9 @@ if [ ! -d /workspace ]; then
   exit 10
 fi
 
-# One fixed line in a fixed file. Idempotent: re-running overwrites the same content, so the patch
-# is identical every time (deterministic across the concurrent runs, too).
-printf 'edited by krayt edit-probe\n' > /workspace/EDITED_BY_KRAYT.txt
-echo "[edit-probe] wrote /workspace/EDITED_BY_KRAYT.txt"
+target=/workspace/greeting.txt
+[ -f "$target" ] || : > "$target"
+printf 'edited by krayt edit-probe\n' >> "$target"
+echo "[edit-probe] appended to $target"
 
 echo "[edit-probe] done"
