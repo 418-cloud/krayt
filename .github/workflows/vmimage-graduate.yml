@@ -23,6 +23,7 @@ on:
 
 permissions:
   contents: write # push the graduated tag
+  actions: write # dispatch image.yml's publish job (tag pushes via GITHUB_TOKEN don't trigger it)
 
 jobs:
   graduate:
@@ -52,6 +53,7 @@ jobs:
           fi
 
       - name: Tag the RC's exact commit as the clean release
+        id: tag
         env:
           RC_TAG: ${{ inputs.rc_tag }}
           VERSION: ${{ inputs.version }}
@@ -65,4 +67,13 @@ jobs:
           git tag "$clean_tag" "$sha"
           git push origin "$clean_tag"
 
-          echo "::notice title=vmimage-graduate::Tagged ${clean_tag} at ${sha} (graduated from ${RC_TAG}). image.yml will publish it; once its digest is verified, pin it in internal/vmimage/pinned.go as a fix: commit."
+          echo "tag=$clean_tag" >> "$GITHUB_OUTPUT"
+          echo "::notice title=vmimage-graduate::Tagged ${clean_tag} at ${sha} (graduated from ${RC_TAG}). Triggering image.yml to publish it; once its digest is verified, pin it in internal/vmimage/pinned.go as a fix: commit."
+
+      - name: Trigger image.yml publish for the graduated tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run image.yml --ref "$TAG" -f publish=true -f tag="$TAG"

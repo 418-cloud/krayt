@@ -70,7 +70,7 @@ elif [[ "$last_tag" =~ ^vmimage-v([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)$ ]]; 
 elif [[ "$last_tag" =~ ^vmimage-v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
   major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
 else
-  echo "error: '$last_tag' doesn't look like a vmimage-v* tag (expected vX.Y.Z or vX.Y.Z-rc.N)" >&2
+  echo "error: '$last_tag' doesn't look like a vmimage-v* tag (expected vmimage-vX.Y.Z or vmimage-vX.Y.Z-rc.N)" >&2
   exit 1
 fi
 

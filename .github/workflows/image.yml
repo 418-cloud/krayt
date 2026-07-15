@@ -29,6 +29,10 @@ on:
         description: "Also push the built image to GHCR"
         type: boolean
         default: false
+      tag:
+        description: "vmimage-v* tag to publish under -- set by vmimage-rc.yml/vmimage-graduate.yml after pushing the tag (their tag push can't trigger this workflow's own push trigger, since it's pushed with the default GITHUB_TOKEN); leave blank for ad-hoc manual testing, which publishes as manual-<sha> instead"
+        type: string
+        default: ""
 
 # Cancel superseded runs on the same ref to avoid piling up slow image builds.
 concurrency:
@@ -115,7 +119,14 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#vmimage-}" # vmimage-v1.2.0 -> v1.2.0 (the repo name namespaces it)
-          [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && tag="manual-${GITHUB_SHA::12}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            dispatch_tag="${{ inputs.tag }}"
+            if [ -n "$dispatch_tag" ]; then
+              tag="${dispatch_tag#vmimage-}"
+            else
+              tag="manual-${GITHUB_SHA::12}"
+            fi
+          fi
           ref="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage:${tag}-${{ matrix.arch }}"
           config="${RUNNER_TEMP}/oci-config-${{ matrix.arch }}.json"
           printf '{"architecture":"%s","os":"linux"}' "${{ matrix.arch }}" > "$config"
@@ -152,7 +163,14 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#vmimage-}"
-          [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && tag="manual-${GITHUB_SHA::12}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            dispatch_tag="${{ inputs.tag }}"
+            if [ -n "$dispatch_tag" ]; then
+              tag="${dispatch_tag#vmimage-}"
+            else
+              tag="manual-${GITHUB_SHA::12}"
+            fi
+          fi
           repo="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage"
           oras manifest index create "${repo}:${tag}" "${repo}:${tag}-amd64" "${repo}:${tag}-arm64"
 

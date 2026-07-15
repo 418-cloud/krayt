@@ -51,11 +51,15 @@ tagging flow, purpose-built so a candidate can be boot-tested *before* it become
 2. **An RC auto-publishes.** Pushing that change — either to a PR branch or to `main` — triggers
    `vmimage-rc.yml`, which runs `hack/next-vmimage-tag.sh` and pushes the next
    `vmimage-vX.Y.Z-rc.N` tag (rc → rc+1 off the same series, or stable/no-prior-tag → the next
-   patch's `-rc.1`). Pushing that tag alone is enough to trigger `image.yml`'s existing
-   `push: tags: ["vmimage-v*"]` publish job (a plain prefix match, so no changes were needed there)
-   — it publishes `ghcr.io/418-cloud/krayt-vmimage:vX.Y.Z-rc.N` and prints the ref + digest in a
-   `::notice`. If the guest deps changed, regenerate `flake.nix`'s `vendorHash` first (the build
-   log's `::notice` prints it).
+   patch's `-rc.1`). That push alone does **not** trigger `image.yml`'s
+   `push: tags: ["vmimage-v*"]` job — tags pushed with the default `GITHUB_TOKEN` don't create new
+   workflow runs (GitHub's anti-recursion safeguard; see `release-please.yml`'s note on the same
+   restriction). So `vmimage-rc.yml` explicitly dispatches `image.yml` afterwards via
+   `gh workflow run image.yml --ref <tag> -f publish=true -f tag=<tag>` (`workflow_dispatch` is one
+   of the documented exceptions to that safeguard) — it publishes
+   `ghcr.io/418-cloud/krayt-vmimage:vX.Y.Z-rc.N` and prints the ref + digest in a `::notice`. If the
+   guest deps changed, regenerate `flake.nix`'s `vendorHash` first (the build log's `::notice`
+   prints it).
 
    PR-triggered builds are the actual improvement over building only post-merge: a reviewer can
    pull and boot-test the artifact for the *specific proposed change* before approving it, not only
