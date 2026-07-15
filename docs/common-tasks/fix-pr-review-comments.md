@@ -84,9 +84,12 @@ see the `krayt-dev` README. Regenerate proto if and only if you changed `interna
 
 ## Step 4 — report
 
-When every comment is triaged, write a summary to `/output/report.md` (the `krayt-dev` entrypoint
-tees your final summary there; it becomes the run report's Notes). Include a table with one row per
-review comment:
+When every comment is triaged, put your summary in your **final response** (plain stdout) — do
+**not** use a file-write tool to create or edit `/output/report.md` yourself. The `krayt-dev`
+entrypoint already pipes your entire session's stdout through `tee /output/report.md`; writing the
+file directly races that pipe (two independent writers on the same path) and can truncate or
+corrupt it. Your final response becomes the run report's Notes automatically. Include a table with
+one row per review comment:
 
 | # | File:line | Reviewer | Verdict | Reason |
 |---|---|---|---|---|
