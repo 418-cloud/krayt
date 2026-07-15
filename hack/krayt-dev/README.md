@@ -21,6 +21,11 @@ tees its summary to `/output/report.md`.
 - `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc` + `buf` — krayt's protocol codegen
   toolchain (§9.2), installed without Nix (see below).
 - `oras` — for anyone poking at the vmimage OCI artifacts (§6.11) from inside the sandbox.
+- `gh` — the GitHub CLI, for tasks that read a PR (e.g. triaging its review comments; see
+  `docs/common-tasks/fix-pr-review-comments.md`). Fetched as a prebuilt release tarball like
+  `protoc` (no reliable `go install` path), pinned by `GH_CLI_VERSION`. Authenticated only when the
+  optional `GH_TOKEN` secret is supplied (see **The `GH_TOKEN` secret** and **Egress** below);
+  unauthenticated otherwise.
 - **Nix** (single-user, agent-owned `/nix`, flakes enabled) — so the agent can regenerate the
   guest-agent's `vendorHash` in `images/flake.nix` when a guest dependency changes. See
   **Regenerating vendorHash (Nix)** below.
@@ -31,9 +36,9 @@ tees its summary to `/output/report.md`.
   baked into `GOMODCACHE` at image build time — see **Offline module cache** below.
 
 Tool versions are pinned via Dockerfile `ARG`s (`PROTOC_VERSION`, `PROTOC_GEN_GO_VERSION`,
-`PROTOC_GEN_GO_GRPC_VERSION`, `BUF_VERSION`, `ORAS_VERSION`, `GOLANGCI_LINT_VERSION`) that
-Renovate's custom regex manager (`renovate.json`) tracks against each tool's real upstream
-repo/module, independently of the base image tag.
+`PROTOC_GEN_GO_GRPC_VERSION`, `BUF_VERSION`, `ORAS_VERSION`, `GOLANGCI_LINT_VERSION`,
+`GH_CLI_VERSION`) that Renovate's custom regex manager (`renovate.json`) tracks against each tool's
+real upstream repo/module, independently of the base image tag.
 
 Krayt's own source is **not** `COPY`'d into the image — only `go.mod`/`go.sum` (for the
 module cache prebake). The repo itself arrives at `/workspace` at run time, injected by krayt
@@ -49,6 +54,39 @@ The entrypoint passes `--model` and `--effort` to `claude -p`, taken from the `C
 env:
   CLAUDE_MODEL: claude-opus-4-8
   CLAUDE_EFFORT: max
+```
+
+## The `GH_TOKEN` secret (optional)
+
+Tasks that read a GitHub PR (e.g. `docs/common-tasks/fix-pr-review-comments.md`) authenticate `gh`
+from an **optional** `GH_TOKEN` secret, materialized from `/run/secrets/GH_TOKEN` exactly like the
+model credential above — but, unlike the model credential, its absence is **not** fatal. The
+entrypoint runs `gh auth login --with-token` only when the file is present; when it's absent it logs
+that `gh` will be unauthenticated and continues. `krayt-dev` is used for plenty of tasks that have
+nothing to do with GitHub, so `GH_TOKEN` stays strictly opt-in.
+
+- **Name:** `GH_TOKEN` (one line per key in the `--secrets` file, same as the model credential).
+- **Optional:** never required; leave it out for any non-GitHub task and the run proceeds normally.
+- **Scope — read-only:** a GitHub **fine-grained PAT** scoped to the **krayt repo specifically**,
+  with **Metadata: read**, **Contents: read**, and **Pull requests: read** — and nothing else. This
+  token structurally cannot comment, push, approve, merge, or label; `fix-pr-review-comments.md` is
+  written around that constraint and surfaces every fix only as krayt's own `changes.patch`, never
+  as a GitHub write.
+- **Redaction:** no extra handling needed — the host `Redactor` (`internal/secrets`) scrubs every
+  secrets-file *value* from logs, `report.md`, and question text by content, not by an allowlist of
+  key names, so `GH_TOKEN`'s value gets the same coverage as `ANTHROPIC_API_KEY`. And `gh auth
+  login` writes the token to `~/.config/gh/hosts.yml` under the agent user's home (`/home/agent`),
+  which is outside the `/workspace` mount, so it can't leak into `changes.patch` (which only ever
+  diffs `/workspace`).
+
+**Egress.** Every `gh` / GitHub-API call needs `api.github.com` reachable, so add it to the run's
+`--allow` list (same as the `proxy.golang.org` / `cache.nixos.org` egress callouts elsewhere in this
+README) — without it, `gh auth login` and every `gh api` call fail:
+
+```sh
+krayt run --image ghcr.io/418-cloud/krayt-dev --agent claude-code \
+  --allow api.anthropic.com,api.github.com \
+  --secrets ./secrets.env --task docs/common-tasks/fix-pr-review-comments.md --repo .
 ```
 
 ## Offline module cache
