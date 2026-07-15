@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/418-cloud/krayt/compare/v0.4.0...v0.5.0) (2026-07-15)
+
+
+### Features
+
+* phase 7 firecracker linux backend ([#56](https://github.com/418-cloud/krayt/issues/56)) ([b133125](https://github.com/418-cloud/krayt/commit/b133125f0d739a33ca0fb5884012e77b660a05a4))
+
+
+### Dependencies
+
+* update module github.com/containerd/containerd/v2 to v2.3.3 ([#57](https://github.com/418-cloud/krayt/issues/57)) ([bc0eb21](https://github.com/418-cloud/krayt/commit/bc0eb21af4b0adbd2e8ba782707ffe212f0fd9d3))
+* update vmimage to 0.3.0 and krayt-dev to latest version ([#62](https://github.com/418-cloud/krayt/issues/62)) ([1e93faa](https://github.com/418-cloud/krayt/commit/1e93faaff2a76c950dbcaeab249045b0c7ad04f9))
+
 ## [0.4.0](https://github.com/418-cloud/krayt/compare/v0.3.1...v0.4.0) (2026-07-12)
 
 
