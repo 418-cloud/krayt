@@ -52,10 +52,9 @@ task can be done autonomously)
    (`internal/provider/**`, `internal/orchestrator/**`, `internal/guest/**`, `cmd/krayt-agent/**`,
    `hack/*-probe/**`, `hack/netprobe/**`, `hack/run-integration-tests.sh`, and its own workflow
    file) plus `workflow_dispatch`, the same pattern `image.yml` already uses. Log in to `ghcr.io`
-   with `GITHUB_TOKEN` (`permissions: packages: read`) before running — this makes the job work
-   regardless of whether the `krayt-probe` package has been flipped to public yet (that's a
-   pre-existing, separate `HUMAN_TODO.md` item; do not block this task on it, and do not flip
-   visibility yourself).
+   with `GITHUB_TOKEN` (`permissions: packages: read`) before running anyway, even though
+   `krayt-probe` is now public (confirmed in `HUMAN_TODO.md`) — cheap defense against the package
+   ever going private again, and it's what `krayt-vmimage` pulls already rely on working without.
 
 ## The full env-var contract (catalogued from the source — verify against it, don't re-derive)
 
@@ -158,7 +157,8 @@ go vet ./...
 ```
 If your sandbox happens to have `/dev/kvm` access and network egress to `ghcr.io`, running the
 script for real on Linux is the strongest verification — do it if you can, and report the actual
-result (pass/fail, what you saw), never a guess.
+result (pass/fail, what you saw), never a guess. `krayt-probe` is public, so this no longer needs
+registry credentials — only `/dev/kvm` and network egress gate it.
 
 What you **cannot** verify yourself, and must log to `HUMAN_TODO.md` instead of assuming:
 - **The macOS path** — no Mac in this environment. Log it as a handoff: run
@@ -168,10 +168,11 @@ What you **cannot** verify yourself, and must log to `HUMAN_TODO.md` instead of 
   probe; log the build/push/first-run as a handoff if you can't do it in-sandbox.
 - **The new CI job's first real run** — whether the standard GitHub-hosted Ubuntu runner actually
   exposes usable `/dev/kvm` (it's known to work for some KVM-dependent workflows, e.g. Android
-  emulator actions, but confirm rather than assume) and whether `packages: read` + `GITHUB_TOKEN`
-  is sufficient to pull `krayt-probe` if it's still private. Log the first CI run's outcome; if
-  `/dev/kvm` genuinely isn't available on the hosted runner, say so plainly rather than leaving a
-  job that silently no-ops or reports green without having run anything.
+  emulator actions, but confirm rather than assume). `krayt-probe` being public means image
+  access shouldn't be the blocker, but confirm the pull actually succeeds in CI rather than
+  assuming it from the package's visibility alone. Log the first CI run's outcome; if `/dev/kvm`
+  genuinely isn't available on the hosted runner, say so plainly rather than leaving a job that
+  silently no-ops or reports green without having run anything.
 
 Never fabricate any of the above (a "should work" is not a "ran and passed").
 
@@ -196,5 +197,3 @@ Never fabricate any of the above (a "should work" is not a "ran and passed").
   actually require, the files are the source of truth; flag the conflict rather than guessing.
 - Don't touch `hack/linux-net-setup.sh` or fold its one-time, persistent host setup into the
   per-run script (decision 3 above).
-- Don't flip the `krayt-probe` GHCR package's visibility — that's a separate, pre-existing
-  `HUMAN_TODO.md` item, out of scope here.
