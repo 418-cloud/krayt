@@ -234,6 +234,16 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		TimedOut:  timedOut,
 		PatchPath: filepath.Join(runDir, "changes.patch"),
 	}
+
+	// Copy the guest's serial console log into the run's own (persistent) logs dir now, while
+	// the VM is still alive — the deferred vm.Destroy above removes the VM's directory,
+	// console.log included, before this function returns. This is the only place a
+	// guest-agent- or proxyd-level failure (as opposed to a container-level one, already
+	// covered by logs/agent.log) is visible at all; without copying it out here it is gone the
+	// moment Run returns, unrecoverable by any caller no matter how soon they look.
+	if _, consoleLog := vm.LogPaths(); consoleLog != "" {
+		writeConsoleLog(consoleLog, runDir, spec.SecretsPath)
+	}
 	// 5. Collect artifacts into the run dir (§6.7, §8.4). On a wall-clock timeout the run
 	// context is already dead, so skip collection and just record the timed-out run.
 	if !timedOut {
@@ -340,6 +350,42 @@ func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath 
 		keys = append(keys, k)
 	}
 	return keys, nil
+}
+
+// maxConsoleLog bounds how much of the guest console writeConsoleLog persists per run — the
+// container is untrusted (§6.1), and a run's wall-clock timeout is caller-set with no fixed
+// ceiling, so nothing stops a hostile or merely broken guest from spewing console output for the
+// whole run instead of just at boot. Unbounded, that becomes an unbounded on-disk artifact per
+// run, accumulating across every run a host ever does. Same tail-truncation idiom as
+// firecracker.tailLog (internal/provider/firecracker/firecracker.go) for the same file, just a
+// larger cap: that one folds into a terse boot-failure error string, this one is a persisted
+// diagnostic artifact meant to actually be read.
+const maxConsoleLog = 1 << 20 // 1 MiB
+
+// writeConsoleLog copies the guest's serial console log — proxyd's and krayt-agent's own
+// stdout/stderr, everything logs/agent.log's container-only stream doesn't carry — into the
+// run's persistent logs dir, redacted against the task's secrets. Nothing on this path is
+// designed to ever see a secret value (proxyd and krayt-agent never read /run/secrets; only the
+// container does), but it is a new persisted artifact this stream never had before, so it is
+// redacted defensively rather than resting on that design guarantee alone. Same fail-closed
+// rule as redactReportFile (internal/guest/service.go): if the secret values can't be loaded to
+// redact against, the file is dropped rather than risked in the clear.
+func writeConsoleLog(consoleLogSrc, runDir, secretsPath string) {
+	b, err := os.ReadFile(consoleLogSrc)
+	if err != nil {
+		return
+	}
+	if len(b) > maxConsoleLog {
+		b = b[len(b)-maxConsoleLog:] // keep the tail: closest to whatever the run ended on
+	}
+	if secretsPath != "" {
+		values, err := secrets.Load(secretsPath)
+		if err != nil {
+			return // couldn't confirm what to scrub against; fail closed, write nothing
+		}
+		b = secrets.NewRedactor(secrets.Values(values)).Redact(b)
+	}
+	_ = os.WriteFile(ConsoleLogPath(runDir), b, 0o644)
 }
 
 // setNetworkPolicy translates the task's egress policy to the proto and sends it (§6.6).

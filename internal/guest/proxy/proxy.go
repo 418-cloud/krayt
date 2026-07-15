@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -214,6 +215,12 @@ func (h *handler) connect(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
 			return
 		}
+		// net/http's CONNECT-proxy client path (what every proxy-aware caller, including
+		// hack/netprobe, uses) discards the response body on a non-2xx CONNECT reply — the
+		// caller only ever sees the status text ("Bad Gateway"), never this message. Log it
+		// server-side so the real reason (DNS failure, connection refused, timeout, …) is
+		// visible in the guest-agent log this process's stdout/stderr feeds (§6.6).
+		log.Printf("krayt-proxy: CONNECT %s: upstream dial failed: %v", r.Host, err)
 		http.Error(w, "krayt: upstream dial failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -247,6 +254,7 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
 			return
 		}
+		log.Printf("krayt-proxy: %s %s: upstream request failed: %v", r.Method, requestHost(r), err)
 		http.Error(w, "krayt: upstream request failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}

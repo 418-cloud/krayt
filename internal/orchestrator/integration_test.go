@@ -47,6 +47,29 @@ import (
 	"github.com/418-cloud/krayt/internal/task"
 )
 
+// logConsoleOnFailure prints the guest's serial console log — the guest-agent's own
+// stdout/stderr and anything it execs (proxyd included) — which is not part of
+// logs/agent.log (that file is the container's stdout/stderr only, streamed over the control
+// protocol). orchestrator.Run copies it out of the VM's directory before Destroy removes it,
+// but t.TempDir() still deletes the whole run dir when this test function returns, so a
+// failure that needs it must log it now, in the same -test.v output the failure itself
+// appears in, or it is gone before any human or CI log viewer could ever read it.
+func logConsoleOnFailure(t *testing.T, runDir string) {
+	t.Helper()
+	b, err := os.ReadFile(orchestrator.ConsoleLogPath(runDir))
+	if err != nil || len(b) == 0 {
+		return
+	}
+	// orchestrator.Run already bounds the on-disk file (writeConsoleLog, maxConsoleLog = 1 MiB) —
+	// this is a separate, smaller cap on what actually goes into -test.v/CI output, where even a
+	// few hundred KB of raw kernel/systemd boot text buries the one line anyone's looking for.
+	const maxInline = 64 << 10 // 64 KiB
+	if len(b) > maxInline {
+		b = b[len(b)-maxInline:]
+	}
+	t.Logf("guest console log:\n%s", b)
+}
+
 func TestEndToEndRealVM(t *testing.T) {
 	kernel := os.Getenv("KRAYT_KERNEL")
 	initrd := os.Getenv("KRAYT_INITRD")
@@ -98,6 +121,7 @@ func TestEndToEndRealVM(t *testing.T) {
 
 	res, err := orchestrator.Run(ctx, deps, spec, runDir)
 	if err != nil {
+		logConsoleOnFailure(t, runDir)
 		t.Fatalf("orchestrator.Run: %v", err)
 	}
 	t.Logf("run complete: exit=%d patch=%s", res.ExitCode, res.PatchPath)
@@ -170,13 +194,15 @@ func TestEgressEnforcement(t *testing.T) {
 
 	res, err := orchestrator.Run(ctx, deps, spec, runDir)
 	if err != nil {
+		logConsoleOnFailure(t, runDir)
 		t.Fatalf("orchestrator.Run: %v", err)
 	}
 	// The probe image encodes the expected allow/deny/raw-socket behavior and exits 0 only
 	// when the enforcement is correct.
 	if res.ExitCode != 0 {
+		logConsoleOnFailure(t, runDir)
 		t.Fatalf("egress probe failed (exit %d): allowlisted reach, non-allowlisted block, or "+
-			"raw-socket block did not behave as expected — see logs/agent.log", res.ExitCode)
+			"raw-socket block did not behave as expected — see the guest console log above", res.ExitCode)
 	}
 }
 
@@ -228,11 +254,13 @@ func TestContainerHardening(t *testing.T) {
 	}
 	res, err := orchestrator.Run(ctx, deps, spec, runDir)
 	if err != nil {
+		logConsoleOnFailure(t, runDir)
 		t.Fatalf("orchestrator.Run: %v", err)
 	}
 	if res.ExitCode != 0 {
+		logConsoleOnFailure(t, runDir)
 		t.Fatalf("hardening probe failed (exit %d): caps, non-root, seccomp, no-new-privs, or the "+
-			"setuid(proxyd)=EPERM check did not hold — see logs/agent.log", res.ExitCode)
+			"setuid(proxyd)=EPERM check did not hold — see the guest console log above", res.ExitCode)
 	}
 }
 
@@ -343,6 +371,7 @@ func TestGuestGitConfigInjectionInert(t *testing.T) {
 	}
 	res, err := orchestrator.Run(ctx, deps, spec, runDir)
 	if err != nil {
+		logConsoleOnFailure(t, runDir)
 		t.Fatalf("orchestrator.Run: %v", err)
 	}
 	patchBytes, err := os.ReadFile(res.PatchPath)
@@ -429,6 +458,7 @@ func TestSecretConfinementInArtifacts(t *testing.T) {
 	}
 	res, err := orchestrator.Run(ctx, deps, spec, runDir)
 	if err != nil {
+		logConsoleOnFailure(t, runDir)
 		t.Fatalf("orchestrator.Run: %v", err)
 	}
 
@@ -567,6 +597,7 @@ func TestConcurrentRealVMs(t *testing.T) {
 			}
 			res, err := orchestrator.Run(ctx, deps, spec, runDir)
 			if err != nil {
+				logConsoleOnFailure(t, runDir) // t.Logf is goroutine-safe; t.Fatalf is not, hence results[i].err below
 				results[i].err = err
 				return
 			}

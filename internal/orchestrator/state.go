@@ -155,6 +155,13 @@ func List(stateDir string) ([]RunRecord, error) {
 // LogPath is the persisted container-log path for a run dir.
 func LogPath(runDir string) string { return filepath.Join(runDir, "logs", "agent.log") }
 
+// ConsoleLogPath is the persisted guest serial-console log path for a run dir — the
+// guest-agent's own stdout/stderr (and anything it execs, e.g. proxyd), as opposed to
+// LogPath's container-only stdout/stderr. Populated best-effort by Run before it tears the VM
+// down (provider.VM.LogPaths); may not exist if the provider had nothing to offer (e.g. the
+// fake provider, or a VM that never got far enough to boot).
+func ConsoleLogPath(runDir string) string { return filepath.Join(runDir, "logs", "console.log") }
+
 // FollowLog tails runDir/logs/agent.log, writing new bytes to w as they appear, until the
 // run reaches a terminal state (log then drained) or ctx is canceled. Because it reads the
 // on-disk log, `krayt attach` works for a run supervised by any process (§6.2). poll bounds

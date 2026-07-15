@@ -48,6 +48,15 @@ type VM interface {
 	Stop(ctx context.Context) error
 	Destroy(ctx context.Context) error // also removes the CoW clone
 	ID() string
+
+	// LogPaths returns the provider's own process log and the guest's serial console log, for
+	// diagnostics. The two may point at the same file (vfkit and firecracker both do this
+	// today) or differ. Both paths live under the VM's own run directory, which Destroy
+	// removes — callers that need this after the VM is gone (e.g. to report why a task failed
+	// for a reason the container never saw, like an in-guest proxy/network fault) must read it
+	// before calling Destroy, not after. Either path may be empty if the VM never got far
+	// enough to produce one.
+	LogPaths() (providerLog, consoleLog string)
 }
 
 // ControlPort is the fixed guest vsock port the guest-agent listens on (§6.12).

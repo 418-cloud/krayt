@@ -99,6 +99,10 @@ func (v *vm) Destroy(ctx context.Context) error {
 
 func (v *vm) ID() string { return v.id }
 
+// LogPaths implements provider.VM. The fake VM is an in-process gRPC loopback with no
+// subprocess and no guest console, so there is nothing to point at.
+func (v *vm) LogPaths() (providerLog, consoleLog string) { return "", "" }
+
 // compile-time interface checks.
 var (
 	_ provider.Provider = (*Provider)(nil)

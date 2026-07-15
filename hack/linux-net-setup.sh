@@ -7,7 +7,7 @@
 # should not hold at run time, so it is a one-time root step instead of something the provider
 # does per run.
 #
-# This grants exactly two things:
+# This grants exactly three things:
 #
 #   1. CAP_NET_ADMIN on the krayt binary, as a file capability — so krayt can create and
 #      address each VM's tap device without running as root. (A file capability is not
@@ -16,6 +16,13 @@
 #
 #   2. IP forwarding + a NAT masquerade rule for krayt's subnet, so a guest can reach the
 #      internet through the host's uplink.
+#
+#   3. If Docker is present, an explicit accept for krayt's subnet in Docker's own DOCKER-USER
+#      chain (step 4 below) — Docker sets the netfilter FORWARD hook's policy to DROP at
+#      startup, and that is a SEPARATE base chain from krayt's own (both hook `forward` at the
+#      same priority); nftables evaluates every base chain hooked at a given point
+#      independently, and a DROP in any one of them is terminal no matter what the others
+#      decide.
 #
 # None of this weakens the guest's egress policy: what a container is *allowed* to reach is
 # still enforced inside the VM by the allowlist proxy and the nftables lock (§6.6). This only
@@ -115,6 +122,34 @@ systemctl enable --now krayt-nat.service
 echo "installed NAT masquerade + forward rules for $SUBNET"
 echo "  rules:   /etc/krayt/nat.nft"
 echo "  applied: krayt-nat.service (enabled — survives reboot)"
+
+# 4. Docker's DOCKER-USER chain — the customization point Docker itself documents for exactly
+#    this (docs.docker.com/network/packet-filtering-firewalls/#docker-user): rules there run
+#    before Docker's own, and Docker will never overwrite it. krayt_fwd's own accept rule above
+#    is powerless against Docker's independent FORWARD-drop policy (see the header comment), so
+#    on any host running Docker, this step is not optional — without it, guest egress is
+#    silently dropped even though krayt's own tables, and `krayt doctor`, look fully configured.
+#
+#    Only touch DOCKER-USER if it already exists — i.e., only if Docker itself created it. A
+#    host with no Docker has nothing to work around. Checked before inserted (`iptables -C`), so
+#    re-running this script (e.g. after installing Docker later) does not stack duplicate rules.
+#
+#    Mirrors krayt_fwd's own asymmetry, not a blanket accept in both directions: -s $SUBNET is
+#    unconditional (a guest may always initiate outbound), but -d $SUBNET is restricted to
+#    established/related traffic only (a guest may receive replies to connections it opened, not
+#    unsolicited new inbound). Getting this wrong would make DOCKER-USER's rule strictly more
+#    permissive than the krayt_fwd rule it exists to complement.
+if command -v iptables >/dev/null 2>&1 && iptables -S DOCKER-USER >/dev/null 2>&1; then
+  if ! iptables -C DOCKER-USER -s "$SUBNET" -j ACCEPT 2>/dev/null; then
+    iptables -I DOCKER-USER -s "$SUBNET" -j ACCEPT
+  fi
+  if ! iptables -C DOCKER-USER -d "$SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
+    iptables -I DOCKER-USER -d "$SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  fi
+  echo "Docker detected: inserted DOCKER-USER accept rules for $SUBNET (its default FORWARD-drop policy would otherwise block guest egress)"
+else
+  echo "no Docker DOCKER-USER chain found — nothing to do here"
+fi
 
 echo
 echo "done — now run: krayt doctor"

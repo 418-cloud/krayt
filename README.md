@@ -73,6 +73,14 @@ Common to both platforms:
   root), enables IP forwarding, and installs krayt's NAT/forward rules as `krayt-nat.service` so
   they survive a reboot. It does not loosen the guest's egress policy — what a container may
   reach is still enforced inside the VM.
+- **If Docker is also installed:** it sets the netfilter `FORWARD` chain's default policy to
+  `DROP` at `dockerd` startup — a separate rule set from krayt's own, evaluated independently, so
+  krayt's NAT rules above being correctly in place does not save you: guest egress gets silently
+  dropped by Docker's policy regardless. `hack/linux-net-setup.sh` handles this automatically (an
+  explicit accept in Docker's own `DOCKER-USER` chain, the customization point Docker documents
+  for exactly this), but only for the Docker state that exists *when you run it* — if you install
+  or start Docker afterward, **re-run the script**. This isn't a corner case: it's the default
+  outcome any time Docker and krayt's Linux backend share a host.
 
 Run **`krayt doctor`** after setup on either platform; it checks each of the above and tells you
 exactly what to do about anything missing.
@@ -217,6 +225,27 @@ host on demand:
 
 Repo-scoped completions read the same `.krayt/` state the commands do, so they honor `--repo`
 (default `.`).
+
+### Running the integration tests
+
+The `//go:build integration` suite boots a **real micro-VM per test** (vfkit on Apple Silicon,
+firecracker on Linux/KVM), so it can't run in the ordinary `go test ./...`. One command runs the
+whole suite for your host — it builds `krayt`, runs `krayt doctor` as a preflight, pulls the base
+VM image, defaults every probe image to the CI-published `krayt-probe` tags, and runs the right
+`go test -tags integration` invocations:
+
+```bash
+# macOS (Apple Silicon + vfkit):
+hack/run-integration-tests.sh
+
+# Linux (host with /dev/kvm + firecracker, after `sudo hack/linux-net-setup.sh` once):
+hack/run-integration-tests.sh          # compiles each package, sudo-setcaps it, runs it
+```
+
+No live LLM credential is needed: the end-to-end tests use `hack/edit-probe` (a trivial
+`/workspace`-editing image), not a real agent. Override any `KRAYT_*` env var to point at your own
+image; pass `--run <pattern>` to run a single test while iterating. The per-file header comments in
+each `integration_test.go` remain the authoritative manual fallback for running one test by hand.
 
 ---
 
