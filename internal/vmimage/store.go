@@ -9,12 +9,17 @@ package vmimage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
@@ -92,18 +97,36 @@ func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.
 	}
 	defer func() { _ = fs.Close() }()
 
-	desc, err := oras.Copy(ctx, src, ref, fs, ref, oras.DefaultCopyOptions)
-	if err != nil {
+	// Verify the pinned digest, and pick this host's architecture, in the SAME hook — on the root
+	// that oras.Copy itself resolved.
+	//
+	// Both halves of that matter. Resolving the reference separately and checking *that* would be
+	// a TOCTOU: oras.Copy resolves the reference again internally, so for a moving tag a registry
+	// could answer the check with one manifest and the copy with another, and we would extract
+	// content we never verified while reporting the digest we did. Checking Copy's *return value*
+	// instead does not work either, because with platform selection in play it returns the mapped
+	// per-arch child, not the index we pinned (§11.5). MapRoot is the one place that sees exactly
+	// the root being copied, before a single blob is fetched — so verify there.
+	var root ocispec.Descriptor
+	opts := oras.DefaultCopyOptions
+	opts.MapRoot = func(ctx context.Context, src content.ReadOnlyStorage, desc ocispec.Descriptor) (ocispec.Descriptor, error) {
+		if want != "" && desc.Digest != want {
+			return ocispec.Descriptor{}, fmt.Errorf("digest mismatch for %q: got %s, want %s", ref, desc.Digest, want)
+		}
+		root = desc
+		return selectPlatform(ctx, src, desc)
+	}
+
+	if _, err := oras.Copy(ctx, src, ref, fs, ref, opts); err != nil {
+		// MapRoot runs before any blob is fetched, so a rejected artifact has not reached the disk
+		// — but a copy that failed partway through has, and either way destDir must not survive as
+		// something a later look could mistake for good content.
 		_ = os.RemoveAll(destDir)
 		return nil, fmt.Errorf("vmimage: pull %q: %w", ref, err)
 	}
-	if want != "" && desc.Digest != want {
-		_ = os.RemoveAll(destDir)
-		return nil, fmt.Errorf("vmimage: digest mismatch for %q: got %s, want %s", ref, desc.Digest, want)
-	}
 
 	img := &Image{
-		Digest: desc.Digest.String(),
+		Digest: root.Digest.String(),
 		Dir:    destDir,
 		Kernel: filepath.Join(destDir, FileKernel),
 		Initrd: filepath.Join(destDir, FileInitrd),
@@ -114,6 +137,56 @@ func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.
 	}
 	_ = imagecache.Touch(destDir) // best-effort last-used bookkeeping for `krayt image ls/prune`
 	return img, nil
+}
+
+// selectPlatform resolves a multi-arch base image to the one variant this host can boot.
+//
+// krayt has two VM backends and therefore two guest architectures — arm64 under vfkit on Apple
+// Silicon, amd64 under firecracker on Linux/KVM (§6.3) — so the base image is published as an
+// OCI image index with one artifact per arch (§11.5). Pinning stays a single ref + a single
+// digest (the index's), exactly as it was when there was only one arch; this is what makes that
+// pin arch-transparent.
+//
+// Without this, oras.Copy would walk the whole graph: it would download *both* architectures
+// (~2 GiB each) and extract both into the same directory, where their identical
+// org.opencontainers.image.title annotations (vmlinuz/initrd/rootfs.img) collide.
+//
+// A root that is NOT an index is passed through untouched. That is deliberate and load-bearing:
+// a single-arch artifact carries no platform information at all (it is packed with an empty
+// config, not an OCI image config), so there is nothing to select on and nothing to check. It
+// keeps every pre-index artifact — including the one currently pinned — pulling exactly as before.
+func selectPlatform(ctx context.Context, src content.ReadOnlyStorage, root ocispec.Descriptor) (ocispec.Descriptor, error) {
+	if root.MediaType != ocispec.MediaTypeImageIndex {
+		return root, nil // single-arch artifact: nothing to select
+	}
+
+	raw, err := content.FetchAll(ctx, src, root)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("fetch index: %w", err)
+	}
+	var idx ocispec.Index
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("parse index: %w", err)
+	}
+
+	available := make([]string, 0, len(idx.Manifests))
+	for _, m := range idx.Manifests {
+		// The platform must come from the index entry itself. There is no fallback to the child's
+		// config here — these are artifacts with custom media types, not container images, so they
+		// have no image config to read an architecture out of. CI is what puts it here (§11.5), and
+		// an entry without it can never match.
+		if m.Platform == nil {
+			continue
+		}
+		available = append(available, m.Platform.OS+"/"+m.Platform.Architecture)
+		if m.Platform.OS == "linux" && m.Platform.Architecture == runtime.GOARCH {
+			return m, nil
+		}
+	}
+	return ocispec.Descriptor{}, fmt.Errorf(
+		"base VM image has no linux/%s variant (index %s offers: %s) — the image must be published "+
+			"for this host's architecture; see HUMAN_TODO.md",
+		runtime.GOARCH, root.Digest, strings.Join(available, ", "))
 }
 
 // verifyFiles ensures the artifact contained the three expected files.

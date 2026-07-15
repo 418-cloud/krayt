@@ -40,7 +40,16 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm # native aarch64-linux, no QEMU emulation (§11.5)
+    # One image per backend (§6.3): aarch64 boots under vfkit on Apple Silicon, x86_64 under
+    # firecracker on Linux/KVM. Each is built on a NATIVE runner — no QEMU emulation (§11.5) —
+    # and `./images#vmImage` resolves to that runner's system automatically.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04-arm, arch: arm64, system: aarch64-linux }
+          - { runner: ubuntu-24.04, arch: amd64, system: x86_64-linux }
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -48,7 +57,7 @@ jobs:
       # always grabs the newest Nix even when the action is pinned).
       - uses: DeterminateSystems/determinate-nix-action@c70cb8ae92d68c66953db28a26a63db1665bc837 # v3.21.5
 
-      - name: Build VM image
+      - name: Build VM image (${{ matrix.system }})
         run: nix build ./images#vmImage --print-build-logs
 
       # First run with vendorHash = lib.fakeHash fails here on a hash mismatch — that is
@@ -61,7 +70,13 @@ jobs:
   publish:
     needs: build
     if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish)
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04-arm, arch: arm64, system: aarch64-linux }
+          - { runner: ubuntu-24.04, arch: amd64, system: x86_64-linux }
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write # push to GHCR
@@ -69,7 +84,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: DeterminateSystems/determinate-nix-action@c70cb8ae92d68c66953db28a26a63db1665bc837 # v3.21.5
 
-      - name: Build VM image
+      - name: Build VM image (${{ matrix.system }})
         run: nix build ./images#vmImage --print-build-logs
 
       - name: Log in to GHCR
@@ -80,18 +95,75 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install oras
-        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
 
+      # Each arch is pushed as its own artifact under an arch-suffixed tag; the `index` job below
+      # then gathers both under ONE multi-arch index, and that index's digest is the single thing
+      # pinned in internal/vmimage/pinned.go. krayt resolves the index to the arch it can actually
+      # boot at pull time (vmimage.selectPlatform), so the pin stays arch-transparent.
+      #
+      # The --config is not decoration. These are OCI *artifacts* with custom media types, not
+      # container images, so nothing else carries an architecture: without a config declaring one,
+      # `oras manifest index create` cannot infer a platform, the index entries come out with a
+      # null platform, and krayt's selection then matches nothing at all.
+      #
+      # The config is written to RUNNER_TEMP and passed by absolute path, NOT created next to the
+      # artifacts: `result` is a symlink into /nix/store, which is read-only (dr-xr-xr-x root), so
+      # writing it there fails with "config.json: Permission denied". oras only reads the layer
+      # files from the cwd, so pointing --config elsewhere is all that is needed.
       - name: Push OCI artifact + record digest
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#vmimage-}" # vmimage-v1.2.0 -> v1.2.0 (the repo name namespaces it)
           [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && tag="manual-${GITHUB_SHA::12}"
-          ref="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage:${tag}"
+          ref="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage:${tag}-${{ matrix.arch }}"
+          config="${RUNNER_TEMP}/oci-config-${{ matrix.arch }}.json"
+          printf '{"architecture":"%s","os":"linux"}' "${{ matrix.arch }}" > "$config"
           cd result
-          oras push "$ref" \
+          oras push --config "${config}:application/vnd.oci.image.config.v1+json" "$ref" \
             vmlinuz:application/vnd.krayt.kernel \
             initrd:application/vnd.krayt.initrd \
             rootfs.img:application/vnd.krayt.rootfs
           digest="$(oras manifest fetch "$ref" --descriptor | jq -r .digest)"
-          echo "::notice title=krayt-vmimage::Pin in internal/vmimage/pinned.go -> PinnedRef=$ref  PinnedDigest=$digest"
+          echo "::notice title=krayt-vmimage (${{ matrix.arch }})::pushed $ref  digest=$digest"
+
+  # Gather the per-arch artifacts into one multi-arch index. Its digest is what gets pinned —
+  # a single PinnedRef/PinnedDigest that resolves to arm64 on a Mac (vfkit) and amd64 on Linux
+  # (firecracker), with no architecture anywhere in the pin (§11.5).
+  index:
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install oras
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+
+      - name: Create multi-arch index + record the digest to pin
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#vmimage-}"
+          [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && tag="manual-${GITHUB_SHA::12}"
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage"
+          oras manifest index create "${repo}:${tag}" "${repo}:${tag}-amd64" "${repo}:${tag}-arm64"
+
+          digest="$(oras manifest fetch "${repo}:${tag}" --descriptor | jq -r .digest)"
+
+          # Fail loudly if the entries came out without a platform: the index would publish fine
+          # and then match nothing on every host, turning a CI problem into a user-facing one.
+          platforms="$(oras manifest fetch "${repo}:${tag}" | jq -r '[.manifests[].platform | select(.) | "\(.os)/\(.architecture)"] | sort | join(",")')"
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error title=index platforms::index entries are missing platform info (got: '${platforms}'); krayt cannot select an arch from this. Check the --config on the per-arch pushes."
+            exit 1
+          fi
+
+          echo "::notice title=krayt-vmimage::Pin BOTH in internal/vmimage/pinned.go -> PinnedRef=${repo}@${digest}  PinnedDigest=${digest}  (platforms: ${platforms})"
