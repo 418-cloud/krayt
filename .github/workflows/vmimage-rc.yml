@@ -1,0 +1,62 @@
+name: vmimage-rc
+
+# Auto-publishes the next vmimage-v*-rc.N release-candidate tag on every push that touches the
+# guest/image paths -- from a PR branch (so a reviewer can pull and boot-test the artifact for the
+# *specific proposed change* before approving) or from main (so the candidate is also reachable
+# from mainline history; nothing more special than that). See RELEASING.md ("Releasing a new VM
+# image") for the full RC -> graduate flow this feeds.
+#
+# This workflow NEVER produces a clean (non "-rc.") vmimage-v* tag -- only
+# vmimage-graduate.yml, run manually by a human after a real hardware boot test, does that.
+#
+# Pushing the tag computed here is enough to trigger image.yml's existing
+# `push: tags: ["vmimage-v*"]` publish job (a plain prefix match, so it already covers -rc.N
+# suffixes) -- no changes needed there.
+#
+# Note: pull_request-triggered runs from forks don't get repo secrets by default (a deliberate
+# GitHub safeguard). That doesn't affect this workflow directly (it only pushes a tag with the
+# default GITHUB_TOKEN), but it does mean image.yml's GHCR-push step -- triggered in turn by the
+# tag this pushes -- won't have credentials for a fork-originated tag. See RELEASING.md.
+on:
+  pull_request:
+    paths:
+      - "images/**"
+      - "internal/guest/**"
+      - "cmd/krayt-agent/**"
+      - "cmd/krayt-proxy/**"
+      - "cmd/krayt-ask/**"
+  push:
+    branches: [main]
+    paths:
+      - "images/**"
+      - "internal/guest/**"
+      - "cmd/krayt-agent/**"
+      - "cmd/krayt-proxy/**"
+      - "cmd/krayt-ask/**"
+
+# Global, not per-ref like image.yml's own group: computing "the next tag" is a read-then-write
+# over the repo-wide tag list, so two overlapping runs (e.g. a PR push and a main push landing
+# seconds apart) must queue rather than race onto the same "next" tag. No cancel-in-progress --
+# each queued run needs to actually complete its tag push (or safely no-op on a duplicate) before
+# the next one reads the tag list, not get cancelled mid-computation.
+concurrency:
+  group: vmimage-rc-tag
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the computed rc tag
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # need full tag history to compute the next rc
+
+      - name: Compute + push next vmimage RC tag
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          hack/next-vmimage-tag.sh

@@ -4,9 +4,10 @@ Two independently-versioned artifacts, tied together by a pinned image digest:
 
 - **CLI** (`krayt`) — versioned `vX.Y.Z`, automated by [release-please]. This is what most
   releases are.
-- **VM base image** (`krayt-vmimage`) — versioned on its own `vmimage-v*` tags, released
-  manually because it must be **boot-tested on Apple-Silicon hardware** first (§11.6). Changes
-  rarely (only when the guest-agent, protocol, or image flake changes).
+- **VM base image** (`krayt-vmimage`) — versioned on its own `vmimage-v*` tags. Candidates
+  (`-rc.N`) auto-publish from PR/`main` pushes; graduating one to a clean tag stays a manual step
+  because it must be **boot-tested on Apple-Silicon hardware** first (§11.6). Changes rarely (only
+  when the guest-agent, protocol, or image flake changes).
 
 The CLI pins the image by **digest** in `internal/vmimage/pinned.go`, so the two versions don't
 have to match — the digest is the contract. `krayt version` prints both.
@@ -42,23 +43,74 @@ commit type:
 
 ## Releasing a new VM image (only when the guest/image changed)
 
-Because the image build is a slow, reproducible Nix build and must be verified on real hardware,
-it's a deliberate step:
+The image isn't a release-please package (see below) — it has its own small **RC → graduate**
+tagging flow, purpose-built so a candidate can be boot-tested *before* it becomes pin-eligible:
 
-1. **Build + boot-test.** Trigger `vm-image` (open a PR touching `images/**`/`internal/**`, or
-   `workflow_dispatch`) to build it; boot-test on an Apple-Silicon Mac (`TestBootHello` /
-   end-to-end). If the guest deps changed, regenerate `flake.nix` `vendorHash` first (the build
+1. **Land a change** under any of the watched paths: `images/**`, `internal/guest/**`,
+   `cmd/krayt-agent/**`, `cmd/krayt-proxy/**`, `cmd/krayt-ask/**`.
+2. **An RC auto-publishes.** Pushing that change — either to a PR branch or to `main` — triggers
+   `vmimage-rc.yml`, which runs `hack/next-vmimage-tag.sh` and pushes the next
+   `vmimage-vX.Y.Z-rc.N` tag (rc → rc+1 off the same series, or stable/no-prior-tag → the next
+   patch's `-rc.1`). Pushing that tag alone is enough to trigger `image.yml`'s existing
+   `push: tags: ["vmimage-v*"]` publish job (a plain prefix match, so no changes were needed there)
+   — it publishes `ghcr.io/418-cloud/krayt-vmimage:vX.Y.Z-rc.N` and prints the ref + digest in a
+   `::notice`. If the guest deps changed, regenerate `flake.nix`'s `vendorHash` first (the build
    log's `::notice` prints it).
-2. **Publish.** Push a `vmimage-vI.J.K` tag → `image.yml` publishes
-   `ghcr.io/418-cloud/krayt-vmimage:vI.J.K` and prints the ref + digest in a `::notice`.
-3. **Pin.** Copy that ref + digest into `internal/vmimage/pinned.go` (note the image version in the
-   comment), commit to `main` as **`fix:`** so release-please cuts a CLI release that ships the new
-   pin (a `chore:` here would *not* release, so the pin wouldn't ship). **Never pin a digest you
-   haven't boot-tested.**
-4. The next CLI release then ships pinning the new image.
 
-Publishing (step 2) ≠ pinning (step 3): an image can sit in the registry unused until it's
-verified and pinned.
+   PR-triggered builds are the actual improvement over building only post-merge: a reviewer can
+   pull and boot-test the artifact for the *specific proposed change* before approving it, not only
+   after it's already on `main`. A push to `main` doesn't get special treatment — it's just another
+   trigger for the same RC computation, since merging a PR is a code-review event, not a hardware
+   boot test.
+
+   > **Fork PRs:** `pull_request`-triggered runs from forks don't get repo secrets by default (a
+   > GitHub safeguard), so a fork PR touching these paths won't be able to push the RC tag itself.
+   > Not handled yet — if this project starts taking fork PRs against these paths, gate on
+   > `github.event.pull_request.head.repo.fork == false` or have a maintainer re-run after review.
+
+   It's expected and fine for RC numbers to end up orphaned (an abandoned or rebased PR) — they're
+   throwaway candidate artifacts by design.
+
+3. **Boot-test that specific RC.** Same as before: build via the `vm-image` workflow, or locally
+   `nix build ./images#vmImage` + `TestBootHello` / end-to-end, on an Apple-Silicon Mac.
+4. **Graduate it.** Once you're satisfied, run `vmimage-graduate.yml` (`workflow_dispatch`) with:
+   - `rc_tag` — the exact RC you boot-tested (e.g. `vmimage-v0.5.1-rc.3`).
+   - `version` — the clean version to publish (e.g. `0.5.1`, or `0.6.0` if the accumulated changes
+     warrant more than the RC series' own provisional patch bump — this is the human judgment call
+     that stands in for release-please's conventional-commit inference, made explicitly instead).
+
+   This tags `rc_tag`'s **exact commit** as `vmimage-v<version>` — not whatever `main`'s tip
+   happens to be at dispatch time — which is what makes the boot-test meaningful: the artifact
+   `image.yml` publishes for the graduated tag is built from the exact source you already
+   verified. Because the Nix build is meant to be reproducible, the graduated tag's digest
+   *should* come out identical to the RC's; if it ever doesn't, that's a reproducibility gap worth
+   investigating, not something to route around.
+
+   The RC being graduated should normally already be part of `main`'s history (i.e. its PR has
+   merged). Graduating one that only exists on an unmerged branch is possible but not the expected
+   flow.
+5. **Pin.** Copy the graduated tag's ref + digest into `internal/vmimage/pinned.go` (note the
+   image version in the comment), commit to `main` as **`fix:`** so release-please cuts a CLI
+   release that ships the new pin (a `chore:` here would *not* release, so the pin wouldn't ship).
+   **Never pin a digest you haven't boot-tested** — and only ever pin a *graduated*
+   (`vmimage-vX.Y.Z`, no `-rc`) digest, never an RC's.
+6. The next CLI release then ships pinning the new image.
+
+Publishing an RC (step 2) ≠ graduating (step 4) ≠ pinning (step 5): an image can sit in the
+registry, RC or graduated, unused until it's verified and pinned.
+
+Only `vmimage-graduate.yml`, run manually, ever produces a clean (non-`-rc.`) `vmimage-v*` tag —
+`vmimage-rc.yml` only ever produces `-rc.N` tags, regardless of which branch or event triggered it.
+
+**Why guest/image commits stay `chore:` and the pin commit carries the changelog content:**
+release-please's CLI package watches the *whole repo* with no path exclusions, so a guest commit
+typed `feat:`/`fix:` would count toward the CLI's next version/changelog the moment it lands — not
+when the corresponding vmimage is actually graduated and pinned. Those are now fully decoupled
+events (that's the point of the RC/graduate split), so an early `feat:`/`fix:` on the raw guest
+commit could land in an earlier CLI release than the one that actually ships the pin — a changelog
+entry describing something not yet true. Instead, write the **pin commit** itself descriptively
+(its `fix:` message and body — e.g. summarizing the graduated RC's changes or linking its tag),
+since that's the one commit guaranteed to land in the same CLI release that ships the new digest.
 
 ## Dependency updates
 

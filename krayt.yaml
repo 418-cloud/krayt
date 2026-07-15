@@ -11,7 +11,7 @@
 image: ghcr.io/418-cloud/krayt-dev:sha-0199cc2
 secrets: secrets.env
 env:
-  CLAUDE_MODEL: claude-opus-4-8
+  CLAUDE_MODEL: claude-sonnet-5
   CLAUDE_EFFORT: high
 
 bundle_depth: 0 # full-history bundle
