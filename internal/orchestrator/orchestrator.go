@@ -234,6 +234,18 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		TimedOut:  timedOut,
 		PatchPath: filepath.Join(runDir, "changes.patch"),
 	}
+
+	// Copy the guest's serial console log into the run's own (persistent) logs dir now, while
+	// the VM is still alive — the deferred vm.Destroy above removes the VM's directory,
+	// console.log included, before this function returns. This is the only place a
+	// guest-agent- or proxyd-level failure (as opposed to a container-level one, already
+	// covered by logs/agent.log) is visible at all; without copying it out here it is gone the
+	// moment Run returns, unrecoverable by any caller no matter how soon they look.
+	if _, consoleLog := vm.LogPaths(); consoleLog != "" {
+		if b, rerr := os.ReadFile(consoleLog); rerr == nil {
+			_ = os.WriteFile(ConsoleLogPath(runDir), b, 0o644)
+		}
+	}
 	// 5. Collect artifacts into the run dir (§6.7, §8.4). On a wall-clock timeout the run
 	// context is already dead, so skip collection and just record the timed-out run.
 	if !timedOut {
