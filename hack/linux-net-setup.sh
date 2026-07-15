@@ -133,12 +133,19 @@ echo "  applied: krayt-nat.service (enabled — survives reboot)"
 #    Only touch DOCKER-USER if it already exists — i.e., only if Docker itself created it. A
 #    host with no Docker has nothing to work around. Checked before inserted (`iptables -C`), so
 #    re-running this script (e.g. after installing Docker later) does not stack duplicate rules.
+#
+#    Mirrors krayt_fwd's own asymmetry, not a blanket accept in both directions: -s $SUBNET is
+#    unconditional (a guest may always initiate outbound), but -d $SUBNET is restricted to
+#    established/related traffic only (a guest may receive replies to connections it opened, not
+#    unsolicited new inbound). Getting this wrong would make DOCKER-USER's rule strictly more
+#    permissive than the krayt_fwd rule it exists to complement.
 if command -v iptables >/dev/null 2>&1 && iptables -S DOCKER-USER >/dev/null 2>&1; then
-  for dir in -s -d; do
-    if ! iptables -C DOCKER-USER "$dir" "$SUBNET" -j ACCEPT 2>/dev/null; then
-      iptables -I DOCKER-USER "$dir" "$SUBNET" -j ACCEPT
-    fi
-  done
+  if ! iptables -C DOCKER-USER -s "$SUBNET" -j ACCEPT 2>/dev/null; then
+    iptables -I DOCKER-USER -s "$SUBNET" -j ACCEPT
+  fi
+  if ! iptables -C DOCKER-USER -d "$SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
+    iptables -I DOCKER-USER -d "$SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  fi
   echo "Docker detected: inserted DOCKER-USER accept rules for $SUBNET (its default FORWARD-drop policy would otherwise block guest egress)"
 else
   echo "no Docker DOCKER-USER chain found — nothing to do here"

@@ -254,7 +254,7 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
 			return
 		}
-		log.Printf("krayt-proxy: %s %s: upstream request failed: %v", r.Method, r.Host, err)
+		log.Printf("krayt-proxy: %s %s: upstream request failed: %v", r.Method, requestHost(r), err)
 		http.Error(w, "krayt: upstream request failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}

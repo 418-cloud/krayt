@@ -352,6 +352,16 @@ func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath 
 	return keys, nil
 }
 
+// maxConsoleLog bounds how much of the guest console writeConsoleLog persists per run — the
+// container is untrusted (§6.1), and a run's wall-clock timeout is caller-set with no fixed
+// ceiling, so nothing stops a hostile or merely broken guest from spewing console output for the
+// whole run instead of just at boot. Unbounded, that becomes an unbounded on-disk artifact per
+// run, accumulating across every run a host ever does. Same tail-truncation idiom as
+// firecracker.tailLog (internal/provider/firecracker/firecracker.go) for the same file, just a
+// larger cap: that one folds into a terse boot-failure error string, this one is a persisted
+// diagnostic artifact meant to actually be read.
+const maxConsoleLog = 1 << 20 // 1 MiB
+
 // writeConsoleLog copies the guest's serial console log — proxyd's and krayt-agent's own
 // stdout/stderr, everything logs/agent.log's container-only stream doesn't carry — into the
 // run's persistent logs dir, redacted against the task's secrets. Nothing on this path is
@@ -364,6 +374,9 @@ func writeConsoleLog(consoleLogSrc, runDir, secretsPath string) {
 	b, err := os.ReadFile(consoleLogSrc)
 	if err != nil {
 		return
+	}
+	if len(b) > maxConsoleLog {
+		b = b[len(b)-maxConsoleLog:] // keep the tail: closest to whatever the run ended on
 	}
 	if secretsPath != "" {
 		values, err := secrets.Load(secretsPath)

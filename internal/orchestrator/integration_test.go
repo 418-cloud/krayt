@@ -56,9 +56,18 @@ import (
 // appears in, or it is gone before any human or CI log viewer could ever read it.
 func logConsoleOnFailure(t *testing.T, runDir string) {
 	t.Helper()
-	if b, err := os.ReadFile(orchestrator.ConsoleLogPath(runDir)); err == nil && len(b) > 0 {
-		t.Logf("guest console log:\n%s", b)
+	b, err := os.ReadFile(orchestrator.ConsoleLogPath(runDir))
+	if err != nil || len(b) == 0 {
+		return
 	}
+	// orchestrator.Run already bounds the on-disk file (writeConsoleLog, maxConsoleLog = 1 MiB) —
+	// this is a separate, smaller cap on what actually goes into -test.v/CI output, where even a
+	// few hundred KB of raw kernel/systemd boot text buries the one line anyone's looking for.
+	const maxInline = 64 << 10 // 64 KiB
+	if len(b) > maxInline {
+		b = b[len(b)-maxInline:]
+	}
+	t.Logf("guest console log:\n%s", b)
 }
 
 func TestEndToEndRealVM(t *testing.T) {
