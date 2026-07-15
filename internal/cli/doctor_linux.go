@@ -143,9 +143,6 @@ const natUnit = "krayt-nat.service"
 //     the customization point Docker itself documents for this), but this check has no way to
 //     confirm that rule survived — same CAP_NET_ADMIN blind spot as above — so a host can look
 //     fully [ok] here while guest egress is still silently dropped by Docker underneath it.
-//     Confirmed on real hardware, not theoretical: a CI runner with dockerd running dropped every
-//     bit of krayt's tap-forwarded egress this way. Not specific to that runner or to CI — any
-//     Linux host running both Docker and krayt hits it.
 func natCheck() checkResult {
 	c := checkResult{name: "host NAT for guest egress", optional: true}
 

@@ -22,8 +22,7 @@
 #      startup, and that is a SEPARATE base chain from krayt's own (both hook `forward` at the
 #      same priority); nftables evaluates every base chain hooked at a given point
 #      independently, and a DROP in any one of them is terminal no matter what the others
-#      decide. Not GitHub-Actions-specific or CI-specific — any Linux host running both Docker
-#      and krayt hits this.
+#      decide.
 #
 # None of this weakens the guest's egress policy: what a container is *allowed* to reach is
 # still enforced inside the VM by the allowlist proxy and the nftables lock (§6.6). This only

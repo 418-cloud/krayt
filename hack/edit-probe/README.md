@@ -24,7 +24,7 @@ marker — proof the VMs' workspaces never crossed ("isolation is checked by con
 inspection", per that test's own comment). Appending means the untouched marker line survives into
 `changes.patch` as ordinary diff context; a probe that ignored the repo's content and wrote a
 brand-new file instead would fail that check on every run, regardless of whether isolation
-actually held (this was fixed after exactly that failure mode showed up on a real Mac run).
+actually held.
 
 `hack/run-integration-tests.sh` defaults `KRAYT_IMAGE` to `ghcr.io/418-cloud/krayt-probe:edit-probe`.
 

@@ -106,64 +106,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Diagnostic for the TestEgressEnforcement failure under investigation (HUMAN_TODO.md):
-      # every CI run so far has failed it with a ~10.0s delay before "Bad Gateway", matching
-      # Go's default UDP DNS resolver retry ceiling (2 attempts x 5s) almost to the millisecond —
-      # consistent with the guest's query to 1.1.1.1:53 (internal/guest/proxy.DefaultDNSServer,
-      # hardcoded, no host override) going unanswered. Run BEFORE any KVM/NAT/firecracker setup
-      # below touches the host, on the bare runner network, to tell apart two very different
-      # fixes: if the runner itself can't reach 1.1.1.1:53, the fix is a guest-side resolver
-      # change (needs an image rebuild + hardware boot test, human/CI-gated); if the runner CAN
-      # reach it fine, the bug is in the guest->NAT->host forwarding path instead (fixable in
-      # hack/linux-net-setup.sh, no image rebuild needed). Informational only — never fails the
-      # job, since the integration suite below is what actually needs to pass or fail.
-      - name: Diagnose DNS reachability to 1.1.1.1:53 / 8.8.8.8:53 from the bare runner host
-        continue-on-error: true
-        run: |
-          python3 - <<'EOF'
-          import socket
-          import struct
-          import time
-
-          def build_query(name: str) -> bytes:
-              header = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
-              question = b"".join(
-                  bytes([len(label)]) + label.encode() for label in name.split(".")
-              ) + b"\x00" + struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
-              return header + question
-
-          query = build_query("example.com")
-          for host, port in [("1.1.1.1", 53), ("8.8.8.8", 53)]:
-              # UDP: an actual DNS query/response round trip, not just a socket open (which
-              # would falsely "succeed" for UDP even if every packet is silently dropped).
-              udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-              udp.settimeout(6)
-              start = time.monotonic()
-              try:
-                  udp.sendto(query, (host, port))
-                  data, _ = udp.recvfrom(512)
-                  print(f"[dns-check] UDP {host}:{port} -> {len(data)} bytes in {time.monotonic()-start:.2f}s: OK")
-              except socket.timeout:
-                  print(f"[dns-check] UDP {host}:{port} -> TIMEOUT after {time.monotonic()-start:.2f}s (no response)")
-              except OSError as e:
-                  print(f"[dns-check] UDP {host}:{port} -> ERROR: {e}")
-              finally:
-                  udp.close()
-
-              # TCP:53 connect, as a complementary signal (DNS-over-TCP; also what a real
-              # resolver falls back to on a truncated UDP response).
-              tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-              tcp.settimeout(6)
-              start = time.monotonic()
-              try:
-                  tcp.connect((host, port))
-                  print(f"[dns-check] TCP {host}:{port} -> connected in {time.monotonic()-start:.2f}s: OK")
-              except OSError as e:
-                  print(f"[dns-check] TCP {host}:{port} -> ERROR after {time.monotonic()-start:.2f}s: {e}")
-              finally:
-                  tcp.close()
-          EOF
-
       # krayt-probe (and krayt-vmimage) are public, but log in anyway: cheap insurance against the
       # package ever going private again, and it matches what the vmimage pulls already assume works.
       - name: Log in to GHCR
@@ -207,37 +149,6 @@ jobs:
           sudo modprobe tun || true
           make krayt
           sudo hack/linux-net-setup.sh "$PWD/bin/krayt"
-
-      # Diagnostic, follow-up to the DNS-reachability check above: the bare runner CAN reach
-      # 1.1.1.1:53/8.8.8.8:53 fine, so TestEgressEnforcement's failure is somewhere in the
-      # guest->NAT->host forwarding path, not the runner's external network. Two well-known
-      # candidates, neither exclusive to GH Actions — any Linux host running both Docker and
-      # krayt's firecracker backend could plausibly hit the same thing:
-      #   1. dockerd sets a default-deny FORWARD chain policy at startup, specifically to
-      #      isolate container networking, independent of and not overridden by krayt's own
-      #      krayt_fwd table (nftables evaluates every base chain hooked at a given point
-      #      independently; a DROP in any one of them is terminal regardless of what others
-      #      decide). GH Actions runners have dockerd running by default.
-      #   2. Strict reverse-path filtering (rp_filter) on the tap/primary interface, which
-      #      hack/linux-net-setup.sh does not currently touch.
-      # Dump the actual ruleset right before the suite runs — the same moment the DNS query
-      # would be failing — instead of guessing which (if either) it is. Never fails the job.
-      - name: Diagnose host firewall/forwarding state (Docker interop, rp_filter)
-        continue-on-error: true
-        run: |
-          echo "--- nft ruleset ---"
-          sudo nft list ruleset || echo "(nft list ruleset failed or empty)"
-          echo "--- iptables -S FORWARD (legacy/nft-compat view, if present) ---"
-          sudo iptables -S FORWARD 2>&1 || echo "(iptables not available/applicable)"
-          echo "--- DOCKER-USER chain, if Docker created one ---"
-          sudo iptables -S DOCKER-USER 2>&1 || echo "(no DOCKER-USER chain)"
-          echo "--- rp_filter sysctls ---"
-          for f in /proc/sys/net/ipv4/conf/all/rp_filter /proc/sys/net/ipv4/conf/default/rp_filter /proc/sys/net/ipv4/conf/*/rp_filter; do
-            [ -f "$f" ] && echo "$f = $(cat "$f")"
-          done
-          echo "--- ip forwarding + link state ---"
-          cat /proc/sys/net/ipv4/ip_forward
-          ip -brief link show
 
       - name: Run the integration suite
         run: hack/run-integration-tests.sh
