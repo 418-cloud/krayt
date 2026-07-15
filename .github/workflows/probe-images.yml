@@ -35,6 +35,7 @@ on:
     paths:
       - "hack/netprobe/**"
       - "hack/ask-probe/**"
+      - "hack/edit-probe/**"
       - "hack/hardening-probe/**"
       - "hack/root-probe/**"
       - "hack/gitconfig-probe/**"
@@ -45,6 +46,7 @@ on:
     paths:
       - "hack/netprobe/**"
       - "hack/ask-probe/**"
+      - "hack/edit-probe/**"
       - "hack/hardening-probe/**"
       - "hack/root-probe/**"
       - "hack/gitconfig-probe/**"
@@ -70,6 +72,7 @@ jobs:
       matrix:
         probe:
           # Used by the orchestrator's real-VM integration suite (internal/orchestrator):
+          - edit-probe # KRAYT_IMAGE            — positive control: trivial /workspace edit for TestEndToEndRealVM/TestConcurrentRealVMs (§14 Phase 2)
           - netprobe # KRAYT_NETPROBE_IMAGE   — egress allowlist + the raw-socket L3 lock (§6.6)
           - hardening-probe # KRAYT_HARDENING_IMAGE  — caps/seccomp/no-new-privs/setuid(proxyd)=EPERM (§6.10)
           - root-probe # KRAYT_ROOT_IMAGE       — negative control: a root image must FAIL the run (§8.2)
