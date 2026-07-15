@@ -29,10 +29,15 @@ What this means in practice:
 - **Linux integration tests need any host with `/dev/kvm`** — a bare-metal box, or a cloud VM with
   nested virtualization enabled. They *can* run in CI.
 
-**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64** —
-the primary, tested target — and **darwin/amd64**, which compiles and *should* run on Intel Macs
-via Virtualization.framework but is **not tested**. Verify a download against the release's
-`checksums.txt`.
+**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64**
+and **linux/amd64** — the two tested targets (Apple Silicon/vfkit and Linux-KVM/Firecracker,
+matching what's actually verified on hardware) — and **darwin/amd64**, which compiles and
+*should* run on Intel Macs via Virtualization.framework but is **not tested**. There is no
+**linux/arm64** build yet: the base VM image is backend-tagged, not just arch-tagged (vfkit needs
+a PE `Image`, Firecracker an uncompressed ELF `vmlinux`), and only the vfkit-formatted
+`linux/arm64` variant is published today — a `linux/arm64` `krayt` would resolve to it and fail to
+boot under Firecracker, so it's left unshipped rather than shipped broken. Verify a download
+against the release's `checksums.txt`.
 
 ---
 
