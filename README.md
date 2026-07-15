@@ -218,6 +218,27 @@ host on demand:
 Repo-scoped completions read the same `.krayt/` state the commands do, so they honor `--repo`
 (default `.`).
 
+### Running the integration tests
+
+The `//go:build integration` suite boots a **real micro-VM per test** (vfkit on Apple Silicon,
+firecracker on Linux/KVM), so it can't run in the ordinary `go test ./...`. One command runs the
+whole suite for your host — it builds `krayt`, runs `krayt doctor` as a preflight, pulls the base
+VM image, defaults every probe image to the CI-published `krayt-probe` tags, and runs the right
+`go test -tags integration` invocations:
+
+```bash
+# macOS (Apple Silicon + vfkit):
+hack/run-integration-tests.sh
+
+# Linux (host with /dev/kvm + firecracker, after `sudo hack/linux-net-setup.sh` once):
+hack/run-integration-tests.sh          # compiles each package, sudo-setcaps it, runs it
+```
+
+No live LLM credential is needed: the end-to-end tests use `hack/edit-probe` (a trivial
+`/workspace`-editing image), not a real agent. Override any `KRAYT_*` env var to point at your own
+image; pass `--run <pattern>` to run a single test while iterating. The per-file header comments in
+each `integration_test.go` remain the authoritative manual fallback for running one test by hand.
+
 ---
 
 ## Repo orientation

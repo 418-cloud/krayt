@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch: # lets you run the slow integration job on demand (see integration-linux)
 
 permissions:
   contents: read
@@ -53,3 +54,85 @@ jobs:
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: latest
+
+  # Gate for the slow integration job below. The unit `test`/`lint` jobs run on every PR; the
+  # real-VM suite boots a micro-VM per test, so we only run it when something that can affect it
+  # changed (or on manual dispatch). A tiny filter job keeps that path-scoping out of the
+  # workflow-level `on:` (which would filter ALL jobs, including the always-on unit tests).
+  changes:
+    name: detect integration-affecting changes
+    runs-on: ubuntu-latest
+    outputs:
+      integration: ${{ steps.filter.outputs.integration }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        # Skipped on workflow_dispatch (no diff base); the integration job's `if` runs it anyway then.
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          filters: |
+            integration:
+              - 'internal/provider/**'
+              - 'internal/orchestrator/**'
+              - 'internal/guest/**'
+              - 'cmd/krayt-agent/**'
+              - 'hack/*-probe/**'
+              - 'hack/netprobe/**'
+              - 'hack/run-integration-tests.sh'
+              - '.github/workflows/ci.yml'
+
+  # Real-VM integration suite on Linux/firecracker (§14 Phase 7), driven by the one-command
+  # hack/run-integration-tests.sh. Needs /dev/kvm on the runner — whether the standard hosted
+  # Ubuntu runner exposes a usable one is the thing to confirm on the first run (see HUMAN_TODO.md);
+  # if it doesn't, krayt doctor fails the preflight and this job goes red rather than silently
+  # passing without having booted anything.
+  integration-linux:
+    name: integration (linux/firecracker)
+    needs: changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.integration == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read # pull the base VM image + probe images from GHCR
+    env:
+      FIRECRACKER_VERSION: v1.16.1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # krayt-probe (and krayt-vmimage) are public, but log in anyway: cheap insurance against the
+      # package ever going private again, and it matches what the vmimage pulls already assume works.
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install firecracker
+        run: |
+          set -euo pipefail
+          tgz="firecracker-${FIRECRACKER_VERSION}-x86_64.tgz"
+          url="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/${tgz}"
+          curl -fsSL "$url" -o "$tgz"
+          tar -xzf "$tgz"
+          sudo install "release-${FIRECRACKER_VERSION}-x86_64/firecracker-${FIRECRACKER_VERSION}-x86_64" /usr/local/bin/firecracker
+          firecracker --version | head -1
+
+      # Ensure the tap device node exists (krayt creates each VM's tap over it), then do the one-time
+      # host NAT/forwarding setup the per-run script deliberately does NOT do itself (decision: that
+      # persistent host state is a separate step). It caps the binary we pass, but the script rebuilds
+      # + re-caps ./bin/krayt itself; this call is only here for the NAT/forward + ip_forward state.
+      - name: Host network setup (tun + NAT)
+        run: |
+          set -euo pipefail
+          sudo modprobe tun || true
+          make krayt
+          sudo hack/linux-net-setup.sh "$PWD/bin/krayt"
+
+      - name: Run the integration suite
+        run: hack/run-integration-tests.sh
