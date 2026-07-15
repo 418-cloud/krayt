@@ -5,8 +5,8 @@ A throwaway "agent" image that is the **positive control** for `TestEndToEndReal
 tests need. Its entrypoint (`entrypoint.sh`), running non-root inside the writable `/workspace`
 bind mount:
 
-- writes a single fixed line to a fixed file (`/workspace/EDITED_BY_KRAYT.txt`) — a deterministic,
-  idempotent edit, identical on every run (so the concurrent suite sees the same patch each time);
+- appends a fixed line to the repo's `greeting.txt` (creating it if missing) — a small, real edit
+  to *existing* content, not an unrelated new file;
 - logs what it did to stdout;
 - exits 0.
 
@@ -17,6 +17,14 @@ container, captures the edit into `changes.patch`, and hands back a diff that `k
 cleanly to the host repo. It exists so the integration suite can run end-to-end with **zero live
 LLM credentials** (a real agent image like `hack/claude-code` needs an Anthropic key; this does
 not).
+
+**Why append instead of write a new file:** `TestConcurrentRealVMs` seeds each VM's repo clone
+with a per-run marker line in `greeting.txt` and checks the resulting patch still contains that
+marker — proof the VMs' workspaces never crossed ("isolation is checked by construction, not by
+inspection", per that test's own comment). Appending means the untouched marker line survives into
+`changes.patch` as ordinary diff context; a probe that ignored the repo's content and wrote a
+brand-new file instead would fail that check on every run, regardless of whether isolation
+actually held (this was fixed after exactly that failure mode showed up on a real Mac run).
 
 `hack/run-integration-tests.sh` defaults `KRAYT_IMAGE` to `ghcr.io/418-cloud/krayt-probe:edit-probe`.
 
@@ -51,9 +59,9 @@ On Linux/firecracker the test binary needs `CAP_NET_ADMIN` — see the header of
 `internal/orchestrator/integration_test.go`, or just run `hack/run-integration-tests.sh`.
 
 ## Success looks like
-`TestEndToEndRealVM` passes: `changes.patch` is produced, carries the `EDITED_BY_KRAYT.txt` edit,
-and applies cleanly to the host repo. `TestConcurrentRealVMs` passes with several VMs booting this
-image at once.
+`TestEndToEndRealVM` passes: `changes.patch` is produced, carries the appended `greeting.txt`
+edit, and applies cleanly to the host repo. `TestConcurrentRealVMs` passes with several VMs
+booting this image at once, each patch still containing its own run's marker line.
 
 ## Cleanup
 ```sh
