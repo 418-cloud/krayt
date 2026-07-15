@@ -49,16 +49,24 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Pure-Go (CGO off): one Linux runner cross-builds the macOS binaries. arm64 is the
-      # supported target; amd64 builds but is untested (see README). Linux lands with Phase 7.
-      - name: Build krayt (darwin/arm64, darwin/amd64)
+      # Pure-Go (CGO off): one Linux runner cross-builds every target. darwin/arm64 is the
+      # supported macOS target; darwin/amd64 builds but is untested (see README). linux/amd64 is
+      # the supported Linux target — the only host arch the Firecracker backend has been verified
+      # on (Phase 7, real hardware). No linux/arm64: the base VM image isn't just arch-tagged, it's
+      # backend-tagged (images/flake.nix builds a PE `Image` for vfkit vs. an uncompressed ELF
+      # vmlinux for Firecracker), and the only published linux/arm64 image variant is the
+      # vfkit-formatted one — a linux/arm64 krayt would resolve to it via vmimage.selectPlatform
+      # and fail to boot under Firecracker. Add it once a Firecracker-compatible arm64 image exists.
+      - name: Build krayt (darwin/arm64, darwin/amd64, linux/amd64)
         run: |
           set -euo pipefail
           mkdir -p dist
-          for arch in arm64 amd64; do
-            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+          for target in darwin/arm64 darwin/amd64 linux/amd64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
               go build -trimpath -ldflags "-s -w" -o dist/krayt ./cmd/krayt
-            tar -C dist -czf "dist/krayt_${TAG}_darwin_${arch}.tar.gz" krayt
+            tar -C dist -czf "dist/krayt_${TAG}_${os}_${arch}.tar.gz" krayt
             rm dist/krayt
           done
           (cd dist && sha256sum *.tar.gz > checksums.txt)
