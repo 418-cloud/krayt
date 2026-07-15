@@ -2,7 +2,7 @@
 # Throwaway agent image that proves the least-privilege container OCI spec (§6.10, §10,
 # security-review findings #1/#3) on real hardware. Static binary on scratch, run as a numeric
 # non-root uid -> no libc/base-image variables, fewest unknowns (same shape as ../ask-probe).
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
 WORKDIR /src
 COPY go.mod .
 COPY main.go .
