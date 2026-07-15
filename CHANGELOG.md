@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/418-cloud/krayt/compare/v0.5.0...v0.5.1) (2026-07-15)
+
+
+### Bug Fixes
+
+* build linux/amd64 binary on release ([#65](https://github.com/418-cloud/krayt/issues/65)) ([f730dad](https://github.com/418-cloud/krayt/commit/f730dad775781b56609975fc1dee74c01d7a95a8))
+
 ## [0.5.0](https://github.com/418-cloud/krayt/compare/v0.4.0...v0.5.0) (2026-07-15)
 
 
