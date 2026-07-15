@@ -73,6 +73,14 @@ Common to both platforms:
   root), enables IP forwarding, and installs krayt's NAT/forward rules as `krayt-nat.service` so
   they survive a reboot. It does not loosen the guest's egress policy — what a container may
   reach is still enforced inside the VM.
+- **If Docker is also installed:** it sets the netfilter `FORWARD` chain's default policy to
+  `DROP` at `dockerd` startup — a separate rule set from krayt's own, evaluated independently, so
+  krayt's NAT rules above being correctly in place does not save you: guest egress gets silently
+  dropped by Docker's policy regardless. `hack/linux-net-setup.sh` handles this automatically (an
+  explicit accept in Docker's own `DOCKER-USER` chain, the customization point Docker documents
+  for exactly this), but only for the Docker state that exists *when you run it* — if you install
+  or start Docker afterward, **re-run the script**. This isn't a corner case: it's the default
+  outcome any time Docker and krayt's Linux backend share a host.
 
 Run **`krayt doctor`** after setup on either platform; it checks each of the above and tells you
 exactly what to do about anything missing.

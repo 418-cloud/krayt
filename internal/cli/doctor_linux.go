@@ -133,9 +133,19 @@ const natUnit = "krayt-nat.service"
 //
 // The rules themselves cannot be read from here: listing nftables needs CAP_NET_ADMIN, and krayt's
 // is a *file* capability, which a child `nft` process would not inherit. So we check the unit that
-// owns them, which any user may query. One blind spot remains, and it is worth naming rather than
-// papering over: if someone flushes the tables by hand while the unit stays active, this still
-// reports [ok].
+// owns them, which any user may query. Two blind spots remain, and they are worth naming rather
+// than papering over:
+//   - if someone flushes the tables by hand while the unit stays active, this still reports [ok].
+//   - Docker's own FORWARD-chain policy (DROP by default at dockerd startup) is a separate base
+//     chain from krayt's, hooked at the same nftables priority; a DROP in either is terminal
+//     regardless of the other, so krayt's own accept rules do nothing to help here.
+//     hack/linux-net-setup.sh handles it (an explicit accept in Docker's own DOCKER-USER chain,
+//     the customization point Docker itself documents for this), but this check has no way to
+//     confirm that rule survived — same CAP_NET_ADMIN blind spot as above — so a host can look
+//     fully [ok] here while guest egress is still silently dropped by Docker underneath it.
+//     Confirmed on real hardware, not theoretical: a CI runner with dockerd running dropped every
+//     bit of krayt's tap-forwarded egress this way. Not specific to that runner or to CI — any
+//     Linux host running both Docker and krayt hits it.
 func natCheck() checkResult {
 	c := checkResult{name: "host NAT for guest egress", optional: true}
 
@@ -165,5 +175,24 @@ func natCheck() checkResult {
 
 	c.ok = true
 	c.detail = "IPv4 forwarding on, " + natUnit + " active"
+	if dockerActive() {
+		c.detail += "; Docker is also running — its default FORWARD-chain policy is DROP, a " +
+			"separate base chain from krayt's own that nftables evaluates independently, so guest " +
+			"egress is silently dropped unless hack/linux-net-setup.sh's DOCKER-USER accept rule is " +
+			"in place. Re-run it if Docker was installed/started after the last time you ran it — " +
+			"this check cannot itself confirm the rule survived (listing it needs CAP_NET_ADMIN a " +
+			"child process would not inherit from krayt's file capability, the same blind spot as " +
+			"krayt's own rules above)"
+	}
 	return c
+}
+
+// dockerActive is a best-effort, unprivileged hint for natCheck's Docker note above — never a
+// check failure on its own, since we cannot confirm from here whether DOCKER-USER's accept rule
+// is actually in place (see natCheck's own doc comment on why: reading nftables/iptables state
+// needs CAP_NET_ADMIN a child process does not inherit). False on any error, including no
+// systemd, rather than "unknown" — this is purely informational.
+func dockerActive() bool {
+	out, err := exec.Command("systemctl", "is-active", "docker").CombinedOutput()
+	return err == nil && strings.TrimSpace(string(out)) == "active"
 }
