@@ -242,9 +242,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// covered by logs/agent.log) is visible at all; without copying it out here it is gone the
 	// moment Run returns, unrecoverable by any caller no matter how soon they look.
 	if _, consoleLog := vm.LogPaths(); consoleLog != "" {
-		if b, rerr := os.ReadFile(consoleLog); rerr == nil {
-			_ = os.WriteFile(ConsoleLogPath(runDir), b, 0o644)
-		}
+		writeConsoleLog(consoleLog, runDir, spec.SecretsPath)
 	}
 	// 5. Collect artifacts into the run dir (§6.7, §8.4). On a wall-clock timeout the run
 	// context is already dead, so skip collection and just record the timed-out run.
@@ -352,6 +350,29 @@ func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath 
 		keys = append(keys, k)
 	}
 	return keys, nil
+}
+
+// writeConsoleLog copies the guest's serial console log — proxyd's and krayt-agent's own
+// stdout/stderr, everything logs/agent.log's container-only stream doesn't carry — into the
+// run's persistent logs dir, redacted against the task's secrets. Nothing on this path is
+// designed to ever see a secret value (proxyd and krayt-agent never read /run/secrets; only the
+// container does), but it is a new persisted artifact this stream never had before, so it is
+// redacted defensively rather than resting on that design guarantee alone. Same fail-closed
+// rule as redactReportFile (internal/guest/service.go): if the secret values can't be loaded to
+// redact against, the file is dropped rather than risked in the clear.
+func writeConsoleLog(consoleLogSrc, runDir, secretsPath string) {
+	b, err := os.ReadFile(consoleLogSrc)
+	if err != nil {
+		return
+	}
+	if secretsPath != "" {
+		values, err := secrets.Load(secretsPath)
+		if err != nil {
+			return // couldn't confirm what to scrub against; fail closed, write nothing
+		}
+		b = secrets.NewRedactor(secrets.Values(values)).Redact(b)
+	}
+	_ = os.WriteFile(ConsoleLogPath(runDir), b, 0o644)
 }
 
 // setNetworkPolicy translates the task's egress policy to the proto and sends it (§6.6).
