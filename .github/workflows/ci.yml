@@ -83,10 +83,12 @@ jobs:
               - '.github/workflows/ci.yml'
 
   # Real-VM integration suite on Linux/firecracker (§14 Phase 7), driven by the one-command
-  # hack/run-integration-tests.sh. Needs /dev/kvm on the runner — whether the standard hosted
-  # Ubuntu runner exposes a usable one is the thing to confirm on the first run (see HUMAN_TODO.md);
-  # if it doesn't, krayt doctor fails the preflight and this job goes red rather than silently
-  # passing without having booted anything.
+  # hack/run-integration-tests.sh. Needs /dev/kvm on the runner: the standard hosted Ubuntu runner
+  # DOES expose /dev/kvm, but it's root:kvm 0660 and the runner user isn't in that group — and
+  # since a CI job never gets a fresh login session, `sudo usermod -aG kvm` (krayt doctor's normal
+  # fix) can't take effect here. The "Allow KVM access" step below works around that with a udev
+  # rule instead of group membership. If /dev/kvm were genuinely unavailable, krayt doctor would
+  # still fail the preflight and this job would go red rather than silently passing.
   integration-linux:
     name: integration (linux/firecracker)
     needs: changes
@@ -112,6 +114,20 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # /dev/kvm on the hosted runner is root:kvm 0660; the runner user has no group membership
+      # and, unlike an interactive host, this job never gets a new login session for `usermod
+      # -aG kvm` to take effect. A udev rule making the device world-accessible sidesteps group
+      # membership entirely — the standard fix for KVM-dependent GitHub Actions jobs (also used to
+      # accelerate the Android emulator on hosted runners).
+      - name: Allow KVM access for the runner user
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
 
       - name: Install firecracker
         run: |
