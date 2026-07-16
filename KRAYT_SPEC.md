@@ -630,8 +630,19 @@ resolved from `patchgit`, and it stays best-effort (a corrupt workspace `.git` n
 security-critical `changes.patch`).
 
 **Integrity.** The bundle is a single artifact, hashable and checkable (`git bundle verify`
-plus a digest), consistent with the digest discipline already used for the OCI artifact
-(§6.11) and secrets (§6.8).
+plus a digest). The host digests the exact bundle bytes it streams to the guest — via
+`opencontainers/go-digest` (the `sha256:<hex>` convention already used for the OCI artifact
+(§6.11) and secrets (§6.8)) — and records it as `provenance.bundle_digest` in `meta.json`
+alongside the run's commit provenance (§8.4).
+
+**Provenance.** Because the imported HEAD is usually *not* the user's real HEAD (a snapshot's
+baseline is synthetic, and `include_dirty` folds in a further synthetic commit — only full
+history with no dirty changes bundles the real HEAD as-is), a run records **both** commits,
+distinctly, in `meta.json` (§8.4): `head_sha`, the real `git rev-parse HEAD` at bundle time
+(empty for an unborn HEAD) — permanent and checkoutable — and `bundle_sha`, the commit actually
+imported as `krayt-baseline` and diffed against for `changes.patch`. They coincide only in the
+full-history/no-dirty case; `bundle_depth` and `include_dirty` are recorded alongside so a reader
+can tell whether that equality is expected.
 
 **Known limitations (v1):**
 - **git-LFS:** a bundle carries LFS *pointer* files, not the large objects (which live on an
@@ -1114,12 +1125,26 @@ Every run produces a self-contained directory the human reviews from:
   "exit_code": 0,
   "timed_out": false,
   "patch": { "path": "changes.patch", "files_changed": 7, "insertions": 124, "deletions": 18 },
+  "provenance": {
+    "head_sha": "a1b2c3d4e5f6…",
+    "bundle_sha": "9f8e7d6c5b4a…",
+    "bundle_depth": 1,
+    "include_dirty": false,
+    "bundle_digest": "sha256:…"
+  },
   "questions": [
     { "id": "q1", "prompt": "Target Postgres or SQLite?", "answer": "postgres", "answered_by": "human", "waited_secs": 35 }
   ],
   "error": ""
 }
 ```
+
+`provenance` records what source the run was based on (§6.7): `head_sha` is the real, checkoutable
+`git rev-parse HEAD` at bundle time (empty for an unborn HEAD); `bundle_sha` is the commit actually
+imported as `krayt-baseline` and diffed against for `changes.patch` — equal to `head_sha` only in
+the full-history/no-dirty case, synthetic otherwise. `bundle_depth`/`include_dirty` are the request
+flags that determine whether that equality is expected, and `bundle_digest` is a
+`opencontainers/go-digest` hash of the exact bundle bytes streamed to the guest.
 
 `report.md` — a short, fixed-section human summary (the guest may also write its own to
 `/output/report.md`; if present, the host prefers that and appends the run facts):
@@ -1133,9 +1158,21 @@ Every run produces a self-contained directory the human reviews from:
 ## Changes
 <files_changed> files, +<insertions>/-<deletions>. See changes.patch.
 
+## Provenance
+- Commit: <head_sha>  (bundle: <bundle_sha>, depth: <bundle_depth>, dirty: <yes|no>)
+- Bundle digest: <bundle_digest>
+- Metadata digest (consistency check, not a signature): <sha256 of meta.json>
+
 ## Notes
 <agent-provided notes from /output/report.md, if any>
 ```
+
+The `## Provenance` section appears only when the code bundle was built and streamed (§6.7). The
+**metadata digest** is a `sha256` of the `meta.json` bytes written for this run — a **drift/
+consistency check, not tamper-evidence**: `meta.json` and `report.md` are written back-to-back by
+the same trusted host process, so it cannot detect a deliberate, consistent edit of both. What it
+*does* do is let someone holding `report.md` apart from `meta.json` (e.g. pasted into a ticket)
+confirm the two still match, or notice `meta.json` was later corrupted/overwritten.
 
 Secret **values** never appear in `report.md`, `meta.json`, the question records, or
 `secret-scan.json` — the guest redacts the report and question text and scans (not redacts) the

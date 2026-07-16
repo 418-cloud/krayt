@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/opencontainers/go-digest"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -89,7 +90,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		QuestionMode: string(spec.Questions.Mode),
 		State:        StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
 	}
-	_ = writeRecord(runDir, rec)
+	_, _ = writeRecord(runDir, rec)
 	defer func() {
 		rec.EndedAt = nowStamp()
 		rec.DurationSecs = durationSecs(rec.StartedAt, rec.EndedAt)
@@ -104,8 +105,8 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		rec.Questions = summarizeQuestions(runDir) // §6.13 Q&A summary for the review artifacts
 		// Read any agent-written report.md before overwriting it with the canonical one (§8.4).
 		notes := agentNotes(runDir)
-		_ = writeRecord(runDir, rec)
-		_ = writeReport(runDir, rec, notes)
+		metaDigest, _ := writeRecord(runDir, rec)
+		_ = writeReport(runDir, rec, notes, metaDigest)
 	}()
 
 	// 1. Provision the VM and guarantee teardown.
@@ -184,17 +185,23 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		}
 		return nil, err
 	}
-	if err := pushCode(ctx, client, spec); err != nil {
+	prov, err := pushCode(ctx, client, spec)
+	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
 		return nil, err
 	}
+	// Capture the run's code provenance now that the bundle is built + streamed, before the
+	// StateRunning write, so it survives on disk even if a later step fails and only the deferred
+	// writeReport runs. Left nil (not a zero-value struct) when pushCode never completed, mirroring
+	// how rec.Patch stays nil until a patch is actually collected (§8.4).
+	rec.Provenance = &prov
 	// The code snapshot is now fixed (§6.7) — from this point on it is safe for the host repo
 	// to be mutated (checkout/commit/rebase) without affecting this run, so `running` becomes
 	// externally visible only now, not before pushImage/pushCode (§6.2).
 	rec.State = StateRunning
-	_ = writeRecord(runDir, rec)
+	_, _ = writeRecord(runDir, rec)
 	if _, err := client.Agent.PushTask(ctx, &pb.TaskSpec{
 		Prompt:            spec.TaskPrompt,
 		Env:               spec.Env,
@@ -222,7 +229,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	}
 
 	// 4. Start the container and consume the event stream (logs, questions, terminal status).
-	setState := func(st string) { rec.State = st; _ = writeRecord(runDir, rec) }
+	setState := func(st string) { rec.State = st; _, _ = writeRecord(runDir, rec) }
 	exitCode, timedOut, err := streamRun(ctx, client, spec, deps.LogOut, runDir, setState)
 	if err != nil {
 		return nil, err
@@ -303,11 +310,14 @@ func pushImage(ctx context.Context, client *controlclient.Client, img *imagestor
 	return nil
 }
 
-// pushCode builds the self-contained bundle on the host and streams it (§6.7).
-func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSpec) error {
+// pushCode builds the self-contained bundle on the host and streams it (§6.7), returning the run's
+// code provenance (§8.4): the real + bundled commit SHAs from CreateBundle, the request flags, and a
+// digest of the exact bundle bytes. The digest is computed off the on-disk bundle before PushCode
+// streams it, fulfilling §6.7's Integrity promise with the same go-digest convention as §6.11/§6.8.
+func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSpec) (ProvenanceMeta, error) {
 	tmp, err := os.MkdirTemp("", "krayt-bundle-")
 	if err != nil {
-		return fmt.Errorf("orchestrator: temp bundle dir: %w", err)
+		return ProvenanceMeta{}, fmt.Errorf("orchestrator: temp bundle dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tmp) }()
 	bundle := filepath.Join(tmp, "repo.bundle")
@@ -315,18 +325,33 @@ func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSp
 	// (§6.1/§8.1), and CreateBundle treats depth<=0 as full history. The default of 1 is
 	// applied at the CLI flag (and, in Phase 4, config resolution) — overriding 0 here would
 	// silently defeat an explicit `--bundle-depth 0` request for full history.
-	if err := patch.CreateBundle(ctx, spec.RepoPath, bundle, spec.BundleDepth, spec.IncludeDirty); err != nil {
-		return err
+	br, err := patch.CreateBundle(ctx, spec.RepoPath, bundle, spec.BundleDepth, spec.IncludeDirty)
+	if err != nil {
+		return ProvenanceMeta{}, err
 	}
 	f, err := os.Open(bundle)
 	if err != nil {
-		return err
+		return ProvenanceMeta{}, err
 	}
 	defer func() { _ = f.Close() }()
-	if err := client.PushCode(ctx, f); err != nil {
-		return fmt.Errorf("orchestrator: push code: %w", err)
+	// Digest the bundle bytes now, before streaming — the file is complete on disk at this point.
+	bundleDigest, err := digest.Canonical.FromReader(f)
+	if err != nil {
+		return ProvenanceMeta{}, fmt.Errorf("orchestrator: digest bundle: %w", err)
 	}
-	return nil
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return ProvenanceMeta{}, fmt.Errorf("orchestrator: rewind bundle: %w", err)
+	}
+	if err := client.PushCode(ctx, f); err != nil {
+		return ProvenanceMeta{}, fmt.Errorf("orchestrator: push code: %w", err)
+	}
+	return ProvenanceMeta{
+		HeadSHA:      br.HeadSHA,
+		BundleSHA:    br.BundleSHA,
+		BundleDepth:  spec.BundleDepth,
+		IncludeDirty: spec.IncludeDirty,
+		BundleDigest: bundleDigest.String(),
+	}, nil
 }
 
 // pushSecrets loads the per-task secrets file (if any) and pushes it to the guest, which
