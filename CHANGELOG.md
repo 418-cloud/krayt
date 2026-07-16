@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/418-cloud/krayt/compare/v0.5.2...v0.6.0) (2026-07-16)
+
+
+### Features
+
+* record run provenance (commit SHAs + digests) in meta.json and … ([#76](https://github.com/418-cloud/krayt/issues/76)) ([0dfa534](https://github.com/418-cloud/krayt/commit/0dfa53451879fc19440872bc57215e740f5f5f2c))
+
 ## [0.5.2](https://github.com/418-cloud/krayt/compare/v0.5.1...v0.5.2) (2026-07-15)
 
 
