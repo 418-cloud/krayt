@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/opencontainers/go-digest"
 )
 
 // Run lifecycle states persisted in meta.json (§6.2). `waiting` is set while an agent
@@ -28,25 +30,26 @@ const (
 // stats, questions) plus the operational fields the daemon-less model needs (state, pid,
 // control socket) that the review schema omits.
 type RunRecord struct {
-	ID           string         `json:"id"`
-	ImageRef     string         `json:"image_ref"`
-	RepoPath     string         `json:"repo_path,omitempty"`
-	TaskSummary  string         `json:"task_summary,omitempty"`
-	Network      NetworkMeta    `json:"network"`
-	Resources    ResourceMeta   `json:"resources"`
-	QuestionMode string         `json:"questions_mode,omitempty"`
-	State        string         `json:"state"`
-	StartedAt    string         `json:"started_at,omitempty"`
-	EndedAt      string         `json:"ended_at,omitempty"`
-	DurationSecs int            `json:"duration_secs,omitempty"`
-	ExitCode     int            `json:"exit_code"`
-	TimedOut     bool           `json:"timed_out"`
-	Patch        *PatchMeta     `json:"patch,omitempty"` // nil until a changes.patch is collected
-	Questions    []QuestionMeta `json:"questions,omitempty"`
-	Safety       []string       `json:"safety,omitempty"` // patch-lint findings (§14 Phase 5)
-	Error        string         `json:"error,omitempty"`
-	PID          int            `json:"pid,omitempty"`         // supervising process (for `krayt stop`)
-	CtrlSocket   string         `json:"ctrl_socket,omitempty"` // guest control socket (for `krayt answer`, §6.13)
+	ID           string          `json:"id"`
+	ImageRef     string          `json:"image_ref"`
+	RepoPath     string          `json:"repo_path,omitempty"`
+	TaskSummary  string          `json:"task_summary,omitempty"`
+	Network      NetworkMeta     `json:"network"`
+	Resources    ResourceMeta    `json:"resources"`
+	QuestionMode string          `json:"questions_mode,omitempty"`
+	State        string          `json:"state"`
+	StartedAt    string          `json:"started_at,omitempty"`
+	EndedAt      string          `json:"ended_at,omitempty"`
+	DurationSecs int             `json:"duration_secs,omitempty"`
+	ExitCode     int             `json:"exit_code"`
+	TimedOut     bool            `json:"timed_out"`
+	Patch        *PatchMeta      `json:"patch,omitempty"`      // nil until a changes.patch is collected
+	Provenance   *ProvenanceMeta `json:"provenance,omitempty"` // nil until the code bundle is built + streamed (§6.7)
+	Questions    []QuestionMeta  `json:"questions,omitempty"`
+	Safety       []string        `json:"safety,omitempty"` // patch-lint findings (§14 Phase 5)
+	Error        string          `json:"error,omitempty"`
+	PID          int             `json:"pid,omitempty"`         // supervising process (for `krayt stop`)
+	CtrlSocket   string          `json:"ctrl_socket,omitempty"` // guest control socket (for `krayt answer`, §6.13)
 }
 
 // NetworkMeta is the run's egress policy as recorded in meta.json (§8.4).
@@ -69,6 +72,20 @@ type PatchMeta struct {
 	FilesChanged int    `json:"files_changed"`
 	Insertions   int    `json:"insertions"`
 	Deletions    int    `json:"deletions"`
+}
+
+// ProvenanceMeta records what source a run was based on (§6.7, §8.4). HeadSHA is the real,
+// checkoutable `git rev-parse HEAD` at bundle time; BundleSHA is the commit actually imported as
+// the guest's krayt-baseline and diffed against for changes.patch — equal to HeadSHA only in the
+// full-history/no-dirty case, synthetic otherwise. BundleDepth/IncludeDirty are the request flags
+// that determine whether that equality is expected, so a reader can tell a fidelity gap from a bug.
+// BundleDigest is a digest of the actual bundle bytes streamed to the guest.
+type ProvenanceMeta struct {
+	HeadSHA      string `json:"head_sha,omitempty"`
+	BundleSHA    string `json:"bundle_sha"`
+	BundleDepth  int    `json:"bundle_depth"`
+	IncludeDirty bool   `json:"include_dirty,omitempty"`
+	BundleDigest string `json:"bundle_digest"`
 }
 
 // QuestionMeta is one agent→human Q&A pair summarized for meta.json / report.md (§6.13, §8.4).
@@ -96,23 +113,25 @@ func RunDir(stateDir, id string) string { return filepath.Join(runsDir(stateDir)
 func metaPath(runDir string) string { return filepath.Join(runDir, "meta.json") }
 
 // writeRecord atomically writes a run record to runDir/meta.json (write-temp-then-rename so
-// a concurrent `ls`/`answer` never sees a half-written file).
-func writeRecord(runDir string, rec RunRecord) error {
+// a concurrent `ls`/`answer` never sees a half-written file). It returns a digest of the exact
+// bytes written, so the report writer can surface a meta.json consistency check (§8.4) without a
+// second read-and-rehash that could drift from what's actually on disk.
+func writeRecord(runDir string, rec RunRecord) (digest.Digest, error) {
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
-		return fmt.Errorf("orchestrator: create run dir: %w", err)
+		return "", fmt.Errorf("orchestrator: create run dir: %w", err)
 	}
 	b, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
-		return fmt.Errorf("orchestrator: marshal record: %w", err)
+		return "", fmt.Errorf("orchestrator: marshal record: %w", err)
 	}
 	tmp := metaPath(runDir) + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return fmt.Errorf("orchestrator: write record: %w", err)
+		return "", fmt.Errorf("orchestrator: write record: %w", err)
 	}
 	if err := os.Rename(tmp, metaPath(runDir)); err != nil {
-		return fmt.Errorf("orchestrator: commit record: %w", err)
+		return "", fmt.Errorf("orchestrator: commit record: %w", err)
 	}
-	return nil
+	return digest.FromBytes(b), nil
 }
 
 // ReadRecord reads a run's meta.json.

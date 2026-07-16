@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/opencontainers/go-digest"
 )
 
 // reportName is the human-readable run summary the host writes on completion (§8.4).
@@ -17,7 +19,7 @@ const reportName = "report.md"
 // notes — anything it wrote to /output/report.md, collected into the run dir — are surfaced
 // verbatim (sanitized) under Notes. Called from the run finalizer, so every run, success or
 // failure, leaves a report.
-func writeReport(runDir string, rec RunRecord, agentNotes string) error {
+func writeReport(runDir string, rec RunRecord, agentNotes string, metaDigest digest.Digest) error {
 	var b strings.Builder
 	// Sanitize every externally-sourced field before it lands in a catted artifact. TaskSummary
 	// is already sanitized (summarizeTask); the network allow list comes straight from an
@@ -42,6 +44,24 @@ func writeReport(runDir string, rec RunRecord, agentNotes string) error {
 			rec.Patch.FilesChanged, noun, rec.Patch.Insertions, rec.Patch.Deletions)
 	} else {
 		b.WriteString("No changes.patch was produced.\n")
+	}
+
+	if rec.Provenance != nil {
+		p := rec.Provenance
+		dirty := "no"
+		if p.IncludeDirty {
+			dirty = "yes"
+		}
+		// SHAs and digests are host-computed (git output / content hashes), not agent text, so they
+		// carry no terminal escapes — but the labels are fixed and load-bearing. The metadata-digest
+		// wording is deliberately a drift/consistency check, NOT a signature or tamper-evidence:
+		// meta.json and report.md are written back-to-back from the same in-memory record by the same
+		// trusted host process, so a consistent edit of both can't be detected — this only lets a
+		// report.md held apart from meta.json confirm the two still match (§8.4).
+		b.WriteString("\n## Provenance\n")
+		fmt.Fprintf(&b, "- Commit: %s  (bundle: %s, depth: %d, dirty: %s)\n", p.HeadSHA, p.BundleSHA, p.BundleDepth, dirty)
+		fmt.Fprintf(&b, "- Bundle digest: %s\n", p.BundleDigest)
+		fmt.Fprintf(&b, "- Metadata digest (consistency check, not a signature): %s\n", metaDigest)
 	}
 
 	if len(rec.Safety) > 0 {

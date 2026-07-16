@@ -25,7 +25,7 @@ func TestRoundTrip(t *testing.T) {
 	})
 
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 
@@ -91,7 +91,7 @@ func TestSetupPatchGitRejectsExistingDir(t *testing.T) {
 	ctx := context.Background()
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "ws")
@@ -116,7 +116,7 @@ func TestIngestOutsideGitRepo(t *testing.T) {
 	ctx := context.Background()
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 
@@ -147,7 +147,7 @@ func TestBundleCommits(t *testing.T) {
 	ctx := context.Background()
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "workspace")
@@ -202,7 +202,7 @@ func TestCreateBundleIncludeDirty(t *testing.T) {
 	statusBefore := git(t, src, "status", "--porcelain")
 
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, true); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, true); err != nil {
 		t.Fatalf("CreateBundle includeDirty: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "ws")
@@ -240,7 +240,7 @@ func TestCreateBundleNoDirtyIgnoresUncommitted(t *testing.T) {
 	writeFile(t, filepath.Join(src, "new.txt"), "fresh\n")
 
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "ws")
@@ -266,7 +266,7 @@ func TestCreateBundleIncludeDirtyUnbornHead(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "a.txt"), "content\n")
 
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, dir, bundle, 1, true); err != nil {
+	if _, err := patch.CreateBundle(ctx, dir, bundle, 1, true); err != nil {
 		t.Fatalf("CreateBundle includeDirty unborn: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "ws")
@@ -276,6 +276,141 @@ func TestCreateBundleIncludeDirtyUnbornHead(t *testing.T) {
 	if got := readFile(t, filepath.Join(ws, "a.txt")); got != "content\n" {
 		t.Errorf("a.txt = %q, want 'content'", got)
 	}
+}
+
+// TestCreateBundleProvenance asserts CreateBundle reports the real HEAD and the actually-bundled
+// commit distinctly across all five bundling shapes (§8.4 provenance). The two coincide only in
+// full-history/no-dirty; every other shape bundles a synthetic tip. Each SHA is checked against an
+// independent `git rev-parse` — HeadSHA vs the source repo, BundleSHA vs the ingested workspace
+// HEAD (the commit the guest actually operates on) — not merely "non-empty".
+func TestCreateBundleProvenance(t *testing.T) {
+	ctx := context.Background()
+
+	// ingestHead ingests a bundle into a fresh workspace and returns its recorded baseline (the
+	// workspace HEAD) plus the workspace path, so the bundled commit can be verified independently
+	// of what CreateBundle reported.
+	ingestHead := func(t *testing.T, bundle string) (string, string) {
+		t.Helper()
+		ws := filepath.Join(t.TempDir(), "ws")
+		baseline, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity)
+		if err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		return baseline, ws
+	}
+
+	t.Run("full-history/no-dirty: BundleSHA == HeadSHA", func(t *testing.T) {
+		src := newRepo(t, map[string]string{"a.txt": "1\n"})
+		wantHead := git(t, src, "rev-parse", "HEAD")
+		bundle := filepath.Join(t.TempDir(), "repo.bundle")
+		br, err := patch.CreateBundle(ctx, src, bundle, 0, false)
+		if err != nil {
+			t.Fatalf("CreateBundle: %v", err)
+		}
+		if br.HeadSHA != wantHead {
+			t.Errorf("HeadSHA = %q, want source HEAD %q", br.HeadSHA, wantHead)
+		}
+		if br.BundleSHA != wantHead {
+			t.Errorf("BundleSHA = %q, want == HeadSHA %q for full history/no dirty", br.BundleSHA, wantHead)
+		}
+		if baseline, _ := ingestHead(t, bundle); baseline != br.BundleSHA {
+			t.Errorf("ingested HEAD %q != reported BundleSHA %q", baseline, br.BundleSHA)
+		}
+	})
+
+	t.Run("snapshot/no-dirty: synthetic BundleSHA != HeadSHA", func(t *testing.T) {
+		src := newRepo(t, map[string]string{"a.txt": "1\n"})
+		wantHead := git(t, src, "rev-parse", "HEAD")
+		bundle := filepath.Join(t.TempDir(), "repo.bundle")
+		br, err := patch.CreateBundle(ctx, src, bundle, 1, false)
+		if err != nil {
+			t.Fatalf("CreateBundle: %v", err)
+		}
+		if br.HeadSHA != wantHead {
+			t.Errorf("HeadSHA = %q, want %q", br.HeadSHA, wantHead)
+		}
+		if br.BundleSHA == "" || br.BundleSHA == br.HeadSHA {
+			t.Errorf("BundleSHA = %q, want a non-empty synthetic SHA != HeadSHA", br.BundleSHA)
+		}
+		baseline, ws := ingestHead(t, bundle)
+		if baseline != br.BundleSHA {
+			t.Errorf("ingested HEAD %q != BundleSHA %q", baseline, br.BundleSHA)
+		}
+		if n := git(t, ws, "rev-list", "--count", "HEAD"); n != "1" {
+			t.Errorf("snapshot HEAD should be parentless (1 commit), got count %s", n)
+		}
+	})
+
+	t.Run("snapshot/dirty: parentless synthetic BundleSHA != HeadSHA", func(t *testing.T) {
+		src := newRepo(t, map[string]string{"a.txt": "1\n"})
+		writeFile(t, filepath.Join(src, "a.txt"), "dirty\n")
+		wantHead := git(t, src, "rev-parse", "HEAD")
+		bundle := filepath.Join(t.TempDir(), "repo.bundle")
+		br, err := patch.CreateBundle(ctx, src, bundle, 1, true)
+		if err != nil {
+			t.Fatalf("CreateBundle: %v", err)
+		}
+		if br.HeadSHA != wantHead {
+			t.Errorf("HeadSHA = %q, want %q", br.HeadSHA, wantHead)
+		}
+		if br.BundleSHA == "" || br.BundleSHA == br.HeadSHA {
+			t.Errorf("BundleSHA = %q, want synthetic dirty SHA != HeadSHA", br.BundleSHA)
+		}
+		baseline, ws := ingestHead(t, bundle)
+		if baseline != br.BundleSHA {
+			t.Errorf("ingested HEAD %q != BundleSHA %q", baseline, br.BundleSHA)
+		}
+		if n := git(t, ws, "rev-list", "--count", "HEAD"); n != "1" {
+			t.Errorf("snapshot/dirty HEAD should be parentless, got count %s", n)
+		}
+	})
+
+	t.Run("full-history/dirty: BundleSHA parented on HeadSHA, still !=", func(t *testing.T) {
+		src := newRepo(t, map[string]string{"a.txt": "1\n"})
+		writeFile(t, filepath.Join(src, "a.txt"), "dirty\n")
+		wantHead := git(t, src, "rev-parse", "HEAD")
+		bundle := filepath.Join(t.TempDir(), "repo.bundle")
+		br, err := patch.CreateBundle(ctx, src, bundle, 0, true)
+		if err != nil {
+			t.Fatalf("CreateBundle: %v", err)
+		}
+		if br.HeadSHA != wantHead {
+			t.Errorf("HeadSHA = %q, want %q", br.HeadSHA, wantHead)
+		}
+		if br.BundleSHA == "" || br.BundleSHA == br.HeadSHA {
+			t.Errorf("BundleSHA = %q, want dirty commit != HeadSHA", br.BundleSHA)
+		}
+		baseline, ws := ingestHead(t, bundle)
+		if baseline != br.BundleSHA {
+			t.Errorf("ingested HEAD %q != BundleSHA %q", baseline, br.BundleSHA)
+		}
+		// In full-history mode the dirty commit is parented on the real HEAD.
+		if parent := git(t, ws, "rev-parse", "HEAD^"); parent != br.HeadSHA {
+			t.Errorf("BundleSHA parent = %q, want HeadSHA %q", parent, br.HeadSHA)
+		}
+	})
+
+	t.Run("unborn-HEAD/dirty: empty HeadSHA, BundleSHA set", func(t *testing.T) {
+		dir := t.TempDir()
+		git(t, dir, "init", "--quiet", "-b", "main")
+		git(t, dir, "config", "user.name", "tester")
+		git(t, dir, "config", "user.email", "tester@example.com")
+		writeFile(t, filepath.Join(dir, "a.txt"), "content\n")
+		bundle := filepath.Join(t.TempDir(), "repo.bundle")
+		br, err := patch.CreateBundle(ctx, dir, bundle, 1, true)
+		if err != nil {
+			t.Fatalf("CreateBundle: %v", err)
+		}
+		if br.HeadSHA != "" {
+			t.Errorf("HeadSHA = %q, want empty for unborn HEAD", br.HeadSHA)
+		}
+		if br.BundleSHA == "" {
+			t.Error("BundleSHA empty, want the captured root commit")
+		}
+		if baseline, _ := ingestHead(t, bundle); baseline != br.BundleSHA {
+			t.Errorf("ingested HEAD %q != BundleSHA %q", baseline, br.BundleSHA)
+		}
+	})
 }
 
 // TestRoundTripMultiCommitMerge is the regression for the shallow-bundle bug: a repo whose HEAD is
@@ -290,7 +425,7 @@ func TestRoundTripMultiCommitMerge(t *testing.T) {
 	for _, depth := range []int{1, 0} {
 		t.Run(fmt.Sprintf("depth=%d", depth), func(t *testing.T) {
 			bundle := filepath.Join(t.TempDir(), "repo.bundle")
-			if err := patch.CreateBundle(ctx, src, bundle, depth, false); err != nil {
+			if _, err := patch.CreateBundle(ctx, src, bundle, depth, false); err != nil {
 				t.Fatalf("CreateBundle: %v", err)
 			}
 			ws := filepath.Join(t.TempDir(), "ws")
@@ -340,7 +475,7 @@ func TestCreateBundleMultiCommitIncludeDirty(t *testing.T) {
 	writeFile(t, filepath.Join(src, "base.txt"), "base dirty\n") // uncommitted edit on a merge HEAD
 
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, true); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, true); err != nil {
 		t.Fatalf("CreateBundle includeDirty: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "ws")
@@ -365,7 +500,7 @@ func TestDiffConfigInjectionInert(t *testing.T) {
 	ctx := context.Background()
 	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "ws")
@@ -427,7 +562,7 @@ func TestDiffBaselineTamperInert(t *testing.T) {
 	ctx := context.Background()
 	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
 	bundle := filepath.Join(t.TempDir(), "repo.bundle")
-	if err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
 		t.Fatalf("CreateBundle: %v", err)
 	}
 	ws := filepath.Join(t.TempDir(), "ws")

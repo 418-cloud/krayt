@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/opencontainers/go-digest"
 	"google.golang.org/grpc"
 
 	"github.com/418-cloud/krayt/internal/guest"
@@ -95,6 +97,26 @@ func TestReportAndMeta(t *testing.T) {
 		t.Errorf("safety findings should mention the CI workflow; got %v", m.Safety)
 	}
 
+	// provenance — the default snapshot bundle (depth 1, no dirty): head_sha is the real source
+	// HEAD, bundle_sha is a *different* synthetic snapshot commit, and both are checked against
+	// independently-run git, not just "present" (§8.4 Done-when).
+	wantHead := gitOut(t, src, "rev-parse", "HEAD")
+	if m.Provenance == nil {
+		t.Fatal("meta.json missing provenance")
+	}
+	if m.Provenance.HeadSHA != wantHead {
+		t.Errorf("provenance.head_sha = %q, want source HEAD %q", m.Provenance.HeadSHA, wantHead)
+	}
+	if m.Provenance.BundleSHA == "" || m.Provenance.BundleSHA == wantHead {
+		t.Errorf("provenance.bundle_sha = %q, want a synthetic snapshot SHA != head_sha", m.Provenance.BundleSHA)
+	}
+	if m.Provenance.BundleDepth != 1 || m.Provenance.IncludeDirty {
+		t.Errorf("provenance depth/dirty = %d/%v, want 1/false", m.Provenance.BundleDepth, m.Provenance.IncludeDirty)
+	}
+	if _, err := digest.Parse(m.Provenance.BundleDigest); err != nil {
+		t.Errorf("provenance.bundle_digest = %q is not a valid digest: %v", m.Provenance.BundleDigest, err)
+	}
+
 	// report.md — fixed sections.
 	rep := readFile(t, filepath.Join(runDir, "report.md"))
 	for _, want := range []string{
@@ -102,6 +124,10 @@ func TestReportAndMeta(t *testing.T) {
 		"- Image: img@sha256:abc",
 		"Result: success",
 		"## Changes",
+		"## Provenance",
+		"- Commit: " + wantHead + "  (bundle: " + m.Provenance.BundleSHA + ", depth: 1, dirty: no)",
+		"- Bundle digest: " + m.Provenance.BundleDigest,
+		"consistency check, not a signature",
 		"## Safety",
 		".github/workflows/ci.yml",
 		"## Notes",
@@ -111,6 +137,30 @@ func TestReportAndMeta(t *testing.T) {
 			t.Errorf("report.md missing %q; got:\n%s", want, rep)
 		}
 	}
+
+	// The metadata digest in report.md is a re-hash of the exact meta.json bytes on disk: read them
+	// back, hash independently, and confirm the string the report printed matches (§8.4 drift check).
+	metaBytes, err := os.ReadFile(filepath.Join(runDir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMetaDigest := digest.FromBytes(metaBytes)
+	if !strings.Contains(rep, "Metadata digest (consistency check, not a signature): "+wantMetaDigest.String()) {
+		t.Errorf("report.md metadata digest does not match an independent hash of meta.json (%s); got:\n%s", wantMetaDigest, rep)
+	}
+}
+
+// gitOut runs git in dir and returns trimmed stdout, for asserting provenance SHAs against an
+// independent invocation.
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // TestReportPrefersAgentNotes checks that an agent-written /output/report.md (collected into

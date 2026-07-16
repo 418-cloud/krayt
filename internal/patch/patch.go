@@ -54,19 +54,23 @@ var DefaultIdentity = Identity{Name: "krayt", Email: "krayt@418.cloud"}
 // When includeDirty is set, uncommitted changes are folded into the tip's tree without mutating the
 // user's repo: the working tree is captured via a temporary index, writing objects into our own
 // clone (not the source), leaving the user's index/worktree/refs untouched.
-func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, includeDirty bool) error {
+//
+// BundleResult reports both the real HEAD and the commit actually bundled, so a run can record its
+// provenance (§8.4): the two coincide only in the full-history/no-dirty case; every other shape
+// bundles a synthetic tip, so the caller must not conflate them.
+func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, includeDirty bool) (BundleResult, error) {
 	absRepo, err := filepath.Abs(repoPath)
 	if err != nil {
-		return fmt.Errorf("patch: resolve repo path: %w", err)
+		return BundleResult{}, fmt.Errorf("patch: resolve repo path: %w", err)
 	}
 	hasCommits := gitOK(ctx, absRepo, "rev-parse", "--verify", "HEAD")
 	if !hasCommits && !includeDirty {
-		return fmt.Errorf("patch: repo %s has no commits to bundle (unborn HEAD)", absRepo)
+		return BundleResult{}, fmt.Errorf("patch: repo %s has no commits to bundle (unborn HEAD)", absRepo)
 	}
 
 	tmp, err := os.MkdirTemp("", "krayt-bundle-src-")
 	if err != nil {
-		return fmt.Errorf("patch: temp dir: %w", err)
+		return BundleResult{}, fmt.Errorf("patch: temp dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tmp) }()
 	src := filepath.Join(tmp, "src")
@@ -82,18 +86,30 @@ func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, in
 		}
 		cloneArgs = append(cloneArgs, "file://"+absRepo, src)
 		if _, err := runGit(ctx, "", cloneArgs...); err != nil {
-			return fmt.Errorf("patch: clone source: %w", err)
+			return BundleResult{}, fmt.Errorf("patch: clone source: %w", err)
 		}
 		if branch, err = currentBranch(ctx, src); err != nil {
-			return err
+			return BundleResult{}, err
 		}
 	} else {
 		// Unborn HEAD + includeDirty: nothing to clone, so start a fresh empty repo we own
 		// and capture the working tree as a root commit.
 		if _, err := runGit(ctx, "", "init", "--quiet", "-b", "main", src); err != nil {
-			return fmt.Errorf("patch: init empty bundle repo: %w", err)
+			return BundleResult{}, fmt.Errorf("patch: init empty bundle repo: %w", err)
 		}
 		branch = "main"
+	}
+
+	// The real, permanent HEAD (empty for an unborn-HEAD repo). A depth-1 clone still records the
+	// tip's true SHA, so this is the checkoutable commit the run was based on regardless of shape.
+	// Resolved once here so every switch branch reports it, even the ones whose bundled tip differs.
+	var headSHA string
+	if hasCommits {
+		h, err := runGit(ctx, src, "rev-parse", "HEAD")
+		if err != nil {
+			return BundleResult{}, fmt.Errorf("patch: resolve HEAD: %w", err)
+		}
+		headSHA = strings.TrimSpace(h)
 	}
 
 	gitDir := filepath.Join(src, ".git")
@@ -105,27 +121,23 @@ func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, in
 	case includeDirty:
 		tree, err := captureWorkTree(ctx, src, absRepo, hasCommits, filepath.Join(tmp, "idx"))
 		if err != nil {
-			return err
+			return BundleResult{}, err
 		}
 		var parents []string
 		if hasCommits && !snapshot { // full history keeps the real parent; a snapshot is rootless
-			head, err := runGit(ctx, src, "rev-parse", "HEAD")
-			if err != nil {
-				return fmt.Errorf("patch: resolve clone HEAD: %w", err)
-			}
-			parents = []string{strings.TrimSpace(head)}
+			parents = []string{headSHA}
 		}
 		if tip, err = commitTree(ctx, gitDir, tree, "krayt: include uncommitted changes", parents...); err != nil {
-			return err
+			return BundleResult{}, err
 		}
 	case snapshot:
 		// Snapshot committed HEAD's tree as a parentless root commit (hasCommits holds here).
 		tree, err := runGit(ctx, src, "rev-parse", "HEAD^{tree}")
 		if err != nil {
-			return fmt.Errorf("patch: resolve HEAD tree: %w", err)
+			return BundleResult{}, fmt.Errorf("patch: resolve HEAD tree: %w", err)
 		}
 		if tip, err = commitTree(ctx, gitDir, strings.TrimSpace(tree), "krayt: workspace snapshot"); err != nil {
-			return err
+			return BundleResult{}, err
 		}
 	default:
 		// Full history, no dirty: the real HEAD is already self-contained; bundle it as-is.
@@ -134,15 +146,32 @@ func CreateBundle(ctx context.Context, repoPath, outBundle string, depth int, in
 	if tip != "" {
 		// HEAD is a symbolic ref to the branch, so moving the branch moves what HEAD resolves to.
 		if _, err := runGit(ctx, src, "update-ref", "refs/heads/"+branch, tip); err != nil {
-			return fmt.Errorf("patch: point branch at bundle tip: %w", err)
+			return BundleResult{}, fmt.Errorf("patch: point branch at bundle tip: %w", err)
 		}
 	}
 
 	// Name a ref (the branch) plus HEAD so `git clone` of the bundle has something to check out (§6.7).
 	if _, err := runGit(ctx, src, "bundle", "create", outBundle, "HEAD", branch); err != nil {
-		return fmt.Errorf("patch: create bundle: %w", err)
+		return BundleResult{}, fmt.Errorf("patch: create bundle: %w", err)
 	}
-	return nil
+	// The bundled tip is the synthetic snapshot/dirty commit when one was built; only the full
+	// history/no-dirty case leaves tip empty, and there the real HEAD is exactly what was bundled.
+	bundleSHA := tip
+	if bundleSHA == "" {
+		bundleSHA = headSHA
+	}
+	return BundleResult{HeadSHA: headSHA, BundleSHA: bundleSHA}, nil
+}
+
+// BundleResult reports the two distinct commits a CreateBundle call is defined by (§8.4 provenance):
+//   - HeadSHA is the real `git rev-parse HEAD` at bundle time ("" for an unborn HEAD) — permanent
+//     and checkoutable, answering "what named commit was this run based on".
+//   - BundleSHA is the commit actually imported as the guest's krayt-baseline and diffed against for
+//     changes.patch. It equals HeadSHA only in the full-history/no-dirty case; every other shape
+//     bundles a synthetic commit not reachable from any of the user's branches.
+type BundleResult struct {
+	HeadSHA   string // "" if unborn HEAD
+	BundleSHA string // always set on success — the tip actually bundled
 }
 
 // captureWorkTree writes a tree of the source working tree (committed state + uncommitted,
