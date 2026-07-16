@@ -61,7 +61,12 @@ func writeReport(runDir string, rec RunRecord, agentNotes string, metaDigest dig
 		b.WriteString("\n## Provenance\n")
 		fmt.Fprintf(&b, "- Commit: %s  (bundle: %s, depth: %d, dirty: %s)\n", p.HeadSHA, p.BundleSHA, p.BundleDepth, dirty)
 		fmt.Fprintf(&b, "- Bundle digest: %s\n", p.BundleDigest)
-		fmt.Fprintf(&b, "- Metadata digest (consistency check, not a signature): %s\n", metaDigest)
+		// Only surface the meta.json digest when we actually have one: writeRecord's error is
+		// ignored at the call site (best-effort finalize), so a failed record write leaves
+		// metaDigest empty — printing a blank digest here would read as a real, empty hash.
+		if metaDigest != "" {
+			fmt.Fprintf(&b, "- Metadata digest (consistency check, not a signature): %s\n", metaDigest)
+		}
 	}
 
 	if len(rec.Safety) > 0 {

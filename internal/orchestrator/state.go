@@ -81,10 +81,10 @@ type PatchMeta struct {
 // that determine whether that equality is expected, so a reader can tell a fidelity gap from a bug.
 // BundleDigest is a digest of the actual bundle bytes streamed to the guest.
 type ProvenanceMeta struct {
-	HeadSHA      string `json:"head_sha,omitempty"`
+	HeadSHA      string `json:"head_sha"`
 	BundleSHA    string `json:"bundle_sha"`
 	BundleDepth  int    `json:"bundle_depth"`
-	IncludeDirty bool   `json:"include_dirty,omitempty"`
+	IncludeDirty bool   `json:"include_dirty"`
 	BundleDigest string `json:"bundle_digest"`
 }
 
