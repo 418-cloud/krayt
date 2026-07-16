@@ -1,0 +1,79 @@
+name: vmimage-graduate
+
+# Always-manual graduation of a boot-tested RC to a clean, pinnable vmimage-v* tag. This is the
+# ONLY thing allowed to produce a non "-rc." vmimage-v* tag (vmimage-rc.yml only ever produces
+# -rc.N tags, unconditionally, regardless of which branch/event triggered it). See RELEASING.md
+# ("Releasing a new VM image") for the full RC -> graduate flow.
+#
+# Tags rc_tag's exact commit -- NOT main's current tip -- so the artifact image.yml publishes for
+# the new clean tag is built from the exact source a human already boot-tested. Since the Nix
+# build is meant to be reproducible, the resulting digest should match the already-tested RC's
+# digest; see RELEASING.md if it ever doesn't.
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "Exact RC tag being graduated, e.g. vmimage-v0.5.1-rc.3 (must already exist and have been boot-tested on real hardware)"
+        required: true
+        type: string
+      version:
+        description: "Clean version to publish as, e.g. 0.5.1 or 0.6.0 (no 'v' prefix, no '-rc')"
+        required: true
+        type: string
+
+permissions:
+  contents: write # push the graduated tag
+  actions: write # dispatch image.yml's publish job (tag pushes via GITHUB_TOKEN don't trigger it)
+
+jobs:
+  graduate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # need rc_tag's history to resolve its commit
+
+      - name: Validate inputs
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RC_TAG" =~ ^vmimage-v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            echo "::error::rc_tag '$RC_TAG' doesn't look like a vmimage-vX.Y.Z-rc.N tag"
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version '$VERSION' must be a plain X.Y.Z (no leading 'v', no '-rc')"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$RC_TAG" >/dev/null; then
+            echo "::error::rc_tag '$RC_TAG' does not exist in this repo"
+            exit 1
+          fi
+
+      - name: Tag the RC's exact commit as the clean release
+        id: tag
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-list -n 1 "refs/tags/$RC_TAG")"
+          clean_tag="vmimage-v${VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$clean_tag" "$sha"
+          git push origin "$clean_tag"
+
+          echo "tag=$clean_tag" >> "$GITHUB_OUTPUT"
+          echo "::notice title=vmimage-graduate::Tagged ${clean_tag} at ${sha} (graduated from ${RC_TAG}). Triggering image.yml to publish it; once its digest is verified, pin it in internal/vmimage/pinned.go as a fix: commit."
+
+      - name: Trigger image.yml publish for the graduated tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run image.yml --ref "$TAG" -f publish=true -f tag="$TAG"

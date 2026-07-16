@@ -31,6 +31,30 @@ only tracks what's still open.
 
 ---
 
+## [tooling/CI] vmimage RC/graduate workflows — real GitHub Actions run needed
+
+Added `hack/next-vmimage-tag.sh`, `.github/workflows/vmimage-rc.yml`, and
+`.github/workflows/vmimage-graduate.yml` (see `RELEASING.md` for the full flow). The
+tag-computation logic itself is verified locally (fabricated tag lists for rc→rc+1,
+stable→next-patch-rc.1, and no-prior-tag, plus a real push round-trip against a scratch bare
+repo) — but three things need a real run against GitHub Actions to confirm, not just reason
+about:
+
+1. **A real PR push actually triggers `vmimage-rc.yml` and publishes a working RC tag.** Open a
+   PR touching one of the watched paths (`images/**`, `internal/guest/**`, `cmd/krayt-agent/**`,
+   `cmd/krayt-proxy/**`, `cmd/krayt-ask/**`) and confirm the workflow runs, computes the expected
+   tag, and pushes it — then that `image.yml`'s existing tag trigger picks it up and publishes.
+2. **A real `vmimage-graduate.yml` dispatch actually re-tags the right commit and `image.yml`
+   publishes it correctly.** Run it with a real `rc_tag` + `version` and confirm the new clean tag
+   points at the RC's exact commit (not `main`'s tip) and that the published digest matches the
+   already-tested RC's digest (the reproducibility expectation noted in `RELEASING.md`).
+3. **Whether concurrent PRs touching these paths behave as expected under the
+   `vmimage-rc-tag` concurrency group** — plausible to reason about (global group, no
+   `cancel-in-progress`, so overlapping runs queue rather than race), but not proven without
+   actually triggering two overlapping runs.
+
+Not fabricating any of these — logging here per the handoff protocol instead.
+
 ## [tooling] Build + first-run the new `edit-probe` image — ✅ DONE
 
 Published multi-arch to `ghcr.io/418-cloud/krayt-probe:edit-probe` via `probe-images.yml`. The
