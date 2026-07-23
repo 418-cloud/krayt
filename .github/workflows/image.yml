@@ -55,11 +55,11 @@ jobs:
           - { runner: ubuntu-24.04, arch: amd64, system: x86_64-linux }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # determinate-nix-action pins the installed Nix version (nix-installer-action
       # always grabs the newest Nix even when the action is pinned).
-      - uses: DeterminateSystems/determinate-nix-action@c70cb8ae92d68c66953db28a26a63db1665bc837 # v3.21.5
+      - uses: DeterminateSystems/determinate-nix-action@2a0be2498974c2b6327e19780488744384637d88 # v3.21.7
 
       - name: Build VM image (${{ matrix.system }})
         run: nix build ./images#vmImage --print-build-logs
@@ -85,8 +85,8 @@ jobs:
       contents: read
       packages: write # push to GHCR
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: DeterminateSystems/determinate-nix-action@c70cb8ae92d68c66953db28a26a63db1665bc837 # v3.21.5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/determinate-nix-action@2a0be2498974c2b6327e19780488744384637d88 # v3.21.7
 
       - name: Build VM image (${{ matrix.system }})
         run: nix build ./images#vmImage --print-build-logs
