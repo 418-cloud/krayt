@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.1](https://github.com/418-cloud/krayt/compare/v0.6.0...v0.6.1) (2026-08-08)
+
+
+### Dependencies
+
+* update gomod non-major dependencies ([#84](https://github.com/418-cloud/krayt/issues/84)) ([0585b70](https://github.com/418-cloud/krayt/commit/0585b70a7c3537d1654f1b78f4ab092d62c14c4f))
+* update module google.golang.org/grpc to v1.82.1 [security] ([#82](https://github.com/418-cloud/krayt/issues/82)) ([6d95b00](https://github.com/418-cloud/krayt/commit/6d95b005be2def7f6a85d0d7f87ee600b57df23a))
+* update pinned VM image reference and digest to v0.3.1 ([#86](https://github.com/418-cloud/krayt/issues/86)) ([208826d](https://github.com/418-cloud/krayt/commit/208826d70f8a2bb3cdf4c66e7f1f0b6293abae87))
+
 ## [0.6.0](https://github.com/418-cloud/krayt/compare/v0.5.2...v0.6.0) (2026-07-16)
 
 
