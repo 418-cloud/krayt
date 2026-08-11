@@ -7,9 +7,8 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
-**Open:** nothing. The last open item — the `krayt upgrade` real-network download+swap smoke
-test — is now confirmed on real darwin hardware with unrestricted internet. See the `[tooling]`
-entry at the bottom.
+**Open:** one item — the real CI compression ratio/timing and a real post-decompress boot for the
+rootfs-compression change. See the `[tooling/CI]` entry at the bottom.
 
 Everything else is shipped: all three integration-test-runner handoffs are confirmed — two on real
 hardware, and `integration-linux` is now green in CI. The `gh` CLI + `GH_TOKEN` +
@@ -149,3 +148,28 @@ covering everything the earlier sandbox pass couldn't:
 No gaps remain: this closes out every item the original entry listed as unverifiable (tarball
 download, checksum verification, extraction, atomic swap, the post-swap confirmation subprocess,
 and the `--yes`-free interactive prompt).
+
+## [tooling/CI] Real compression ratio, CI time, and post-decompress boot for `rootfs.img` zstd compression — OPEN
+
+- **Needed:** a real `vmimage` publish run (`.github/workflows/image.yml`'s `publish` job, both
+  arches) with the new `zstd -19 -T0` staging step, plus a real `krayt image pull` against the
+  published artifact and a real boot on hardware.
+- **Why the agent can't:** building the real ~2 GiB rootfs needs a Linux builder (native
+  `ubuntu-24.04`/`ubuntu-24.04-arm` GitHub Actions runners); confirming the decompressed image
+  boots needs real vfkit (Apple Silicon Mac) or firecracker (Linux/KVM) hardware — same category
+  as every other vmimage CI/boot change in this repo (see the entries above).
+- **Exact steps/commands:** push a `vmimage-v*` tag (or `workflow_dispatch` with `publish: true`)
+  to trigger `image.yml`'s `publish` job; read the `ls -la result/rootfs.img
+  $stage/rootfs.img.zst` line from the "Push OCI artifact + record digest" step's log for both
+  arches; time the step itself (start/end timestamps in the Actions run) to see what `-19 -T0`
+  actually costs. Then `krayt image pull` (or `krayt run`) against the newly published digest on
+  real hardware and confirm the VM boots.
+- **Verify success by:** recording here — uncompressed vs. `.zst` size and the ratio for both
+  arm64 and amd64, the wall-clock time the compression step added, and a real boot succeeding
+  (`Hello` round-trip) after a pull that went through the decompression path. If the ratio is
+  disappointing, decision 5 in `docs/ai-tasks/compress-vmimage-rootfs.md` (no `--long`) is the
+  first thing to revisit — a `-15`/`-12` level drop is the documented cheap fallback if the CI
+  time cost turns out too high instead.
+- **Blocking:** no — the offline-verifiable parts (unit tests, build, cross-compile, lint,
+  `go.mod` cleanup) are all done and merged independently of this; this is a follow-up
+  confirmation only.

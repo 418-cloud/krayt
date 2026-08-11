@@ -1389,10 +1389,12 @@ Linux/NixOS images **on a Mac requires a Linux builder**. Resolution:
 - **Build:** CI on an **arm64 Linux runner** builds the kernel + rootfs natively for
   `aarch64-linux` (no emulation) and emits a versioned, content-addressed artifact.
 - **Distribute:** the artifact is packaged as a standard **OCI artifact** and pushed to
-  an OCI registry. The OCI **digest is the content address** — `krayt` pins its
-  version → digest and **verifies the digest** on `krayt image pull` (and `doctor`)
-  before first use. The registry is interchangeable (ghcr.io is the convenient default,
-  but any OCI-compliant registry works — **no hard dependency on ghcr.io**).
+  an OCI registry (the `rootfs.img` layer is zstd-compressed in transit, to shrink the
+  ~2 GiB cold-pull download — see below). The OCI **digest is the content address** —
+  `krayt` pins its version → digest and **verifies the digest** on `krayt image pull`
+  (and `doctor`) before first use. The registry is interchangeable (ghcr.io is the
+  convenient default, but any OCI-compliant registry works — **no hard dependency on
+  ghcr.io**).
 - **Run:** each run gets a **copy-on-write clone** of the verified base image so runs
   never share state.
 - **Update:** bump the flake input/lock → CI rebuilds → push new OCI artifact → bump the
@@ -1452,11 +1454,15 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - run: nix build .#vmImage      # -> ./result (kernel + rootfs)
       - run: |
+          zstd -19 -T0 -o rootfs.img.zst ./result/rootfs.img
           oras push <registry>/krayt-vmimage:${GITHUB_REF_NAME} \
             ./result/vmlinuz:application/vnd.krayt.kernel \
-            ./result/rootfs.img:application/vnd.krayt.rootfs
+            ./rootfs.img.zst:application/vnd.krayt.rootfs+zstd
       # capture the pushed digest -> record as the pinned image reference
 ```
+`rootfs.img` is the only layer compressed (`vmlinuz`/`initrd` are too small for it to be worth
+the complexity) — the client (`vmimage.Pull`) decompresses it back to plain raw bytes
+immediately after download, so nothing past `Pull` ever sees the compressed form.
 
 Consumer side: `krayt image pull` resolves its pinned digest, pulls the OCI artifact
 from whichever registry is configured, verifies the digest, and caches the base image
@@ -1488,7 +1494,10 @@ must produce and guarantee:
   egress proxy (§6.6). No editors, no shells beyond what systemd needs, no package manager.
 - **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — neither backend
   takes qcow2), built for **both** `aarch64-linux` and `x86_64-linux` from one flake and one
-  NixOS config, and published as a **single multi-arch OCI index** (§11.5). krayt pins the
+  NixOS config, and published as a **single multi-arch OCI index** (§11.5). `rootfs.img` is
+  compressed (`+zstd`) for the registry transfer only; `krayt image pull` decompresses it back
+  to the same raw format before anything touches it, so the raw-on-disk / CoW-clone contract
+  stated here is unchanged. krayt pins the
   *index* digest — one `PinnedRef`, one `PinnedDigest`, no architecture anywhere in the pin —
   and resolves it to the arch it can boot at pull time (`vmimage.selectPlatform`): arm64 for
   vfkit, amd64 for firecracker.
