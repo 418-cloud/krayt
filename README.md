@@ -39,6 +39,13 @@ a PE `Image`, Firecracker an uncompressed ELF `vmlinux`), and only the vfkit-for
 boot under Firecracker, so it's left unshipped rather than shipped broken. Verify a download
 against the release's `checksums.txt`.
 
+**Upgrading.** Once krayt is installed, `krayt upgrade` updates it in place: it finds the latest
+GitHub release (or a pinned one), downloads the right platform tarball, verifies it against that
+release's `checksums.txt` (the same check described above, automated), and atomically swaps it
+in — leaving a `.bak` of the previous binary next to it. `krayt upgrade --check` reports whether
+an upgrade is available without changing anything; `krayt upgrade --version vX.Y.Z` pins,
+downgrades, or reinstalls a specific release instead of latest.
+
 ---
 
 ## Prerequisites
