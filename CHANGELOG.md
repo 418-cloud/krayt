@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/418-cloud/krayt/compare/v0.6.1...v0.7.0) (2026-08-11)
+
+
+### Features
+
+* add krayt upgrade for in-place self-update from GitHub Releases ([#90](https://github.com/418-cloud/krayt/issues/90)) ([2226619](https://github.com/418-cloud/krayt/commit/22266196dc51275856f176e3244faa6a17bf3aa8))
+
 ## [0.6.1](https://github.com/418-cloud/krayt/compare/v0.6.0...v0.6.1) (2026-08-08)
 
 
