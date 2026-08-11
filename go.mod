@@ -6,6 +6,7 @@ require (
 	github.com/containerd/containerd/v2 v2.3.3
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/crc-org/vfkit v0.6.4
+	github.com/klauspost/compress v1.18.6
 	github.com/mdlayher/vsock v1.3.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/opencontainers/go-digest v1.0.0
@@ -44,7 +45,6 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/lufia/plan9stats v0.0.0-20240909124753-873cd0166683 // indirect
 	github.com/mdlayher/socket v0.6.0 // indirect
 	github.com/moby/locker v1.0.1 // indirect

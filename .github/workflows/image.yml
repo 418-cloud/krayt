@@ -130,11 +130,22 @@ jobs:
           ref="ghcr.io/${GITHUB_REPOSITORY_OWNER}/krayt-vmimage:${tag}-${{ matrix.arch }}"
           config="${RUNNER_TEMP}/oci-config-${{ matrix.arch }}.json"
           printf '{"architecture":"%s","os":"linux"}' "${{ matrix.arch }}" > "$config"
-          cd result
+
+          # result/ is a symlink into the read-only /nix/store (same reason --config can't live
+          # there either, see the comment above) — stage the push inputs in a writable dir instead
+          # of trying to write rootfs.img.zst next to rootfs.img.
+          command -v zstd >/dev/null || (sudo apt-get update && sudo apt-get install -y zstd)
+          stage="${RUNNER_TEMP}/oci-stage-${{ matrix.arch }}"
+          mkdir -p "$stage"
+          cp result/vmlinuz result/initrd "$stage/"
+          zstd -19 -T0 -o "$stage/rootfs.img.zst" result/rootfs.img
+          ls -la result/rootfs.img "$stage/rootfs.img.zst"   # sizes in the log, for the ratio check in Verify
+
+          cd "$stage"
           oras push --config "${config}:application/vnd.oci.image.config.v1+json" "$ref" \
             vmlinuz:application/vnd.krayt.kernel \
             initrd:application/vnd.krayt.initrd \
-            rootfs.img:application/vnd.krayt.rootfs
+            rootfs.img.zst:application/vnd.krayt.rootfs+zstd
           digest="$(oras manifest fetch "$ref" --descriptor | jq -r .digest)"
           echo "::notice title=krayt-vmimage (${{ matrix.arch }})::pushed $ref  digest=$digest"
 

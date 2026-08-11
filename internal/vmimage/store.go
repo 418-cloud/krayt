@@ -11,11 +11,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
@@ -37,12 +39,23 @@ const (
 	FileRootFS = "rootfs.img"
 )
 
+// FileRootFSZstd is the on-wire/on-disk name of rootfs.img when zstd-compressed for transport
+// (introduced to shrink the ~2 GiB cold-pull download). Pull decompresses it into FileRootFS
+// immediately, so nothing downstream of Pull (CoW cloning, doctor, image ls/rm/prune) ever sees
+// this name or cares that compression happened on the wire.
+const FileRootFSZstd = FileRootFS + ".zst"
+
 // OCI layer media types for the base-image artifact (§11.5).
 const (
 	MediaTypeKernel = "application/vnd.krayt.kernel"
 	MediaTypeInitrd = "application/vnd.krayt.initrd"
 	MediaTypeRootFS = "application/vnd.krayt.rootfs"
 )
+
+// MediaTypeRootFSZstd is rootfs.img's blob media type when zstd-compressed. Artifacts published
+// before this task used MediaTypeRootFS (uncompressed) and remain pullable — Pull checks for
+// FileRootFSZstd's presence after the copy and only decompresses when it's there.
+const MediaTypeRootFSZstd = MediaTypeRootFS + "+zstd"
 
 // Image is a pulled, verified base VM image on local disk.
 type Image struct {
@@ -132,6 +145,12 @@ func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.
 		Initrd: filepath.Join(destDir, FileInitrd),
 		RootFS: filepath.Join(destDir, FileRootFS),
 	}
+	if compressed := filepath.Join(destDir, FileRootFSZstd); fileExists(compressed) {
+		if err := decompressRootFS(compressed, img.RootFS); err != nil {
+			_ = os.RemoveAll(destDir)
+			return nil, fmt.Errorf("vmimage: decompress rootfs: %w", err)
+		}
+	}
 	if err := img.verifyFiles(); err != nil {
 		return nil, err
 	}
@@ -195,6 +214,54 @@ func (img *Image) verifyFiles() error {
 		if _, err := os.Stat(p); err != nil {
 			return fmt.Errorf("vmimage: missing artifact file %s: %w", filepath.Base(p), err)
 		}
+	}
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// decompressRootFS streams the zstd-compressed blob at src into dst as plain raw bytes, then
+// removes src — only the decompressed file is kept, so the cache never pays double disk for the
+// same content twice. Writes through a same-directory temp file + rename so an interrupted or
+// failed decompression (killed process, corrupt stream, disk full) can never leave a partial,
+// truncated dst mistaken for a good cached rootfs — mirrors Pull's own "no half-written cache
+// survives an error" guarantee (store.go:120-126).
+func decompressRootFS(src, dst string) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	dec, err := zstd.NewReader(f) // default options: window sizes from plain `zstd -19` (no
+	if err != nil {               // --long) are well inside the default max window, no
+		return fmt.Errorf("zstd reader: %w", err) // WithDecoderMaxWindow needed — see decision 5.
+	}
+	defer dec.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".rootfs-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := io.Copy(tmp, dec); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("decompress: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename into place: %w", err)
+	}
+	if err := os.Remove(src); err != nil {
+		return fmt.Errorf("remove compressed source %s: %w", src, err)
 	}
 	return nil
 }

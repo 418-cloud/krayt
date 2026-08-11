@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -54,6 +55,48 @@ func fakeArtifact(t *testing.T) (oras.ReadOnlyTarget, string, digest.Digest) {
 	return store, ref, manifest.Digest
 }
 
+// fakeArtifactCompressed is fakeArtifact's rootfs layer swapped for a zstd-compressed one, media
+// type MediaTypeRootFSZstd, titled FileRootFSZstd — proves Pull's decompression path end to end.
+func fakeArtifactCompressed(t *testing.T, plaintext []byte) (oras.ReadOnlyTarget, string, digest.Digest) {
+	t.Helper()
+	ctx := context.Background()
+	store := memory.New()
+
+	layer := func(mediaType, title string, data []byte) ocispec.Descriptor {
+		desc := content.NewDescriptorFromBytes(mediaType, data)
+		desc.Annotations = map[string]string{ocispec.AnnotationTitle: title}
+		if err := store.Push(ctx, desc, bytes.NewReader(data)); err != nil {
+			t.Fatalf("push %s: %v", title, err)
+		}
+		return desc
+	}
+
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatalf("new zstd writer: %v", err)
+	}
+	compressed := enc.EncodeAll(plaintext, nil)
+	if err := enc.Close(); err != nil {
+		t.Fatalf("close zstd writer: %v", err)
+	}
+
+	layers := []ocispec.Descriptor{
+		layer(vmimage.MediaTypeKernel, vmimage.FileKernel, []byte("KERNEL")),
+		layer(vmimage.MediaTypeInitrd, vmimage.FileInitrd, []byte("INITRD")),
+		layer(vmimage.MediaTypeRootFSZstd, vmimage.FileRootFSZstd, compressed),
+	}
+	manifest, err := oras.PackManifest(ctx, store, oras.PackManifestVersion1_1,
+		"application/vnd.krayt.vmimage", oras.PackManifestOptions{Layers: layers})
+	if err != nil {
+		t.Fatalf("pack manifest: %v", err)
+	}
+	const ref = "v0-zstd"
+	if err := store.Tag(ctx, manifest, ref); err != nil {
+		t.Fatalf("tag: %v", err)
+	}
+	return store, ref, manifest.Digest
+}
+
 func TestPullExtractsAndVerifies(t *testing.T) {
 	src, ref, want := fakeArtifact(t)
 	dest := t.TempDir()
@@ -91,6 +134,80 @@ func TestPullTouchesLastUsed(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, ".krayt-last-used")); err != nil {
 		t.Fatalf("Pull did not create the last-used sentinel: %v", err)
+	}
+}
+
+// TestPullTouchesLastUsedCompressed is TestPullTouchesLastUsed's counterpart for the compressed
+// artifact path — the decompression branch must not skip the last-used bookkeeping either.
+func TestPullTouchesLastUsedCompressed(t *testing.T) {
+	src, ref, want := fakeArtifactCompressed(t, []byte("ROOTFS"))
+	dest := t.TempDir()
+
+	if _, err := vmimage.Pull(context.Background(), src, ref, want, dest); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, ".krayt-last-used")); err != nil {
+		t.Fatalf("Pull did not create the last-used sentinel: %v", err)
+	}
+}
+
+// TestPullDecompressesRootFS proves Pull's decompression path end to end: a compressed rootfs
+// layer lands on disk as the plain decompressed file, and the intermediate .zst is not left
+// behind (decision: never double the on-disk cache footprint for the same content).
+func TestPullDecompressesRootFS(t *testing.T) {
+	plaintext := []byte("this is the raw rootfs.img content, byte for byte")
+	src, ref, want := fakeArtifactCompressed(t, plaintext)
+	dest := t.TempDir()
+
+	img, err := vmimage.Pull(context.Background(), src, ref, want, dest)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if got := readFile(t, img.RootFS); got != string(plaintext) {
+		t.Errorf("rootfs contents = %q, want %q", got, plaintext)
+	}
+	if _, err := os.Stat(filepath.Join(dest, vmimage.FileRootFSZstd)); !os.IsNotExist(err) {
+		t.Fatalf("compressed rootfs.img.zst should have been removed after decompression; stat err = %v", err)
+	}
+}
+
+// TestPullRejectsCorruptZstdStream proves a corrupt/invalid .zst blob fails Pull cleanly with no
+// leftover destDir, matching every other Pull failure mode (e.g. TestPullRejectsDigestMismatch).
+func TestPullRejectsCorruptZstdStream(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+
+	layer := func(mediaType, title string, data []byte) ocispec.Descriptor {
+		desc := content.NewDescriptorFromBytes(mediaType, data)
+		desc.Annotations = map[string]string{ocispec.AnnotationTitle: title}
+		if err := store.Push(ctx, desc, bytes.NewReader(data)); err != nil {
+			t.Fatalf("push %s: %v", title, err)
+		}
+		return desc
+	}
+
+	layers := []ocispec.Descriptor{
+		layer(vmimage.MediaTypeKernel, vmimage.FileKernel, []byte("KERNEL")),
+		layer(vmimage.MediaTypeInitrd, vmimage.FileInitrd, []byte("INITRD")),
+		layer(vmimage.MediaTypeRootFSZstd, vmimage.FileRootFSZstd, []byte("not zstd")),
+	}
+	manifest, err := oras.PackManifest(ctx, store, oras.PackManifestVersion1_1,
+		"application/vnd.krayt.vmimage", oras.PackManifestOptions{Layers: layers})
+	if err != nil {
+		t.Fatalf("pack manifest: %v", err)
+	}
+	const ref = "v0-corrupt"
+	if err := store.Tag(ctx, manifest, ref); err != nil {
+		t.Fatalf("tag: %v", err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "dest")
+	_, err = vmimage.Pull(context.Background(), store, ref, manifest.Digest, dest)
+	if err == nil {
+		t.Fatal("expected an error decompressing a corrupt zstd stream, got nil")
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("destDir %s should have been removed after a decompression failure; stat err = %v", dest, statErr)
 	}
 }
 
