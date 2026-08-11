@@ -211,6 +211,47 @@ func TestPullRejectsCorruptZstdStream(t *testing.T) {
 	}
 }
 
+// TestPullRejectsMissingArtifactFile proves that a verifyFiles failure (an artifact whose
+// manifest is missing one of the three expected files) cleans up destDir like every other
+// Pull failure mode, rather than leaving a rejected/incomplete extraction on disk.
+func TestPullRejectsMissingArtifactFile(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+
+	layer := func(mediaType, title string, data []byte) ocispec.Descriptor {
+		desc := content.NewDescriptorFromBytes(mediaType, data)
+		desc.Annotations = map[string]string{ocispec.AnnotationTitle: title}
+		if err := store.Push(ctx, desc, bytes.NewReader(data)); err != nil {
+			t.Fatalf("push %s: %v", title, err)
+		}
+		return desc
+	}
+
+	// Deliberately omit the initrd layer so verifyFiles fails after a successful copy.
+	layers := []ocispec.Descriptor{
+		layer(vmimage.MediaTypeKernel, vmimage.FileKernel, []byte("KERNEL")),
+		layer(vmimage.MediaTypeRootFS, vmimage.FileRootFS, []byte("ROOTFS")),
+	}
+	manifest, err := oras.PackManifest(ctx, store, oras.PackManifestVersion1_1,
+		"application/vnd.krayt.vmimage", oras.PackManifestOptions{Layers: layers})
+	if err != nil {
+		t.Fatalf("pack manifest: %v", err)
+	}
+	const ref = "v0-missing-initrd"
+	if err := store.Tag(ctx, manifest, ref); err != nil {
+		t.Fatalf("tag: %v", err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "dest")
+	_, err = vmimage.Pull(context.Background(), store, ref, manifest.Digest, dest)
+	if err == nil {
+		t.Fatal("expected a missing-artifact-file error, got nil")
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("destDir %s should have been removed after a verifyFiles failure; stat err = %v", dest, statErr)
+	}
+}
+
 func TestPullRejectsDigestMismatch(t *testing.T) {
 	src, ref, _ := fakeArtifact(t)
 	wrong := digest.FromString("not-the-image")

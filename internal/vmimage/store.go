@@ -10,6 +10,7 @@ package vmimage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -145,13 +146,28 @@ func Pull(ctx context.Context, src oras.ReadOnlyTarget, ref string, want digest.
 		Initrd: filepath.Join(destDir, FileInitrd),
 		RootFS: filepath.Join(destDir, FileRootFS),
 	}
-	if compressed := filepath.Join(destDir, FileRootFSZstd); fileExists(compressed) {
+	// Stat the compressed layer explicitly rather than through a bool-returning fileExists:
+	// a non-ENOENT error here (permission, I/O) is not "no compressed layer" and must not be
+	// silently treated as the plain pre-compression artifact — that would skip decompression,
+	// leave img.RootFS missing, and only surface as a confusing verifyFiles error below.
+	compressed := filepath.Join(destDir, FileRootFSZstd)
+	switch _, err := os.Stat(compressed); {
+	case err == nil:
 		if err := decompressRootFS(compressed, img.RootFS); err != nil {
 			_ = os.RemoveAll(destDir)
 			return nil, fmt.Errorf("vmimage: decompress rootfs: %w", err)
 		}
+	case errors.Is(err, os.ErrNotExist):
+		// Pre-compression artifact: FileRootFS was already extracted directly, nothing to do.
+	default:
+		_ = os.RemoveAll(destDir)
+		return nil, fmt.Errorf("vmimage: stat %s: %w", compressed, err)
 	}
 	if err := img.verifyFiles(); err != nil {
+		// Matches every other Pull failure mode (copy error, digest mismatch, decompress
+		// failure): a rejected/incomplete extraction must not survive as something a later
+		// look could mistake for good cached content.
+		_ = os.RemoveAll(destDir)
 		return nil, err
 	}
 	_ = imagecache.Touch(destDir) // best-effort last-used bookkeeping for `krayt image ls/prune`
@@ -216,11 +232,6 @@ func (img *Image) verifyFiles() error {
 		}
 	}
 	return nil
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }
 
 // decompressRootFS streams the zstd-compressed blob at src into dst as plain raw bytes, then
