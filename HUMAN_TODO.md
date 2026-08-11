@@ -7,10 +7,9 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
-**Open:** the `krayt upgrade` real-network download+swap smoke test needs a linux/amd64 or
-darwin machine with unrestricted internet — this cloud agent's sandbox proxy allowlists
-`api.github.com` but blocks the release CDN host, and its own platform (linux/arm64) is
-intentionally unsupported by `krayt upgrade` regardless. See the `[tooling]` entry at the bottom.
+**Open:** nothing. The last open item — the `krayt upgrade` real-network download+swap smoke
+test — is now confirmed on real darwin hardware with unrestricted internet. See the `[tooling]`
+entry at the bottom.
 
 Everything else is shipped: all three integration-test-runner handoffs are confirmed — two on real
 hardware, and `integration-linux` is now green in CI. The `gh` CLI + `GH_TOKEN` +
@@ -120,67 +119,33 @@ Confirmed it: fetched the **review** comments (not just issue comments), triaged
 actual code, fixed genuine issues, left false positives untouched with a stated reason, wrote the
 summary table + suggested commit message to `report.md`, and attempted **no** GitHub write.
 
-## [tooling] `krayt upgrade` real-network download+swap smoke test — ⏳ OPEN
+## [tooling] `krayt upgrade` real-network download+swap smoke test — ✅ DONE
 
-`krayt upgrade` (`internal/selfupdate` + `internal/cli/upgrade.go`) is implemented and fully
-unit-tested offline against `httptest` fixtures (`go test -race ./...` and `golangci-lint run`
-both pass repo-wide, including the linux/arm64 cross-compile).
+`krayt upgrade` (`internal/selfupdate` + `internal/cli/upgrade.go`) was fully unit-tested offline
+against `httptest` fixtures from day one; what remained was the real end-to-end path this file
+originally called out as unreachable from the cloud sandbox (no unallowlisted internet, and
+linux/arm64 has no published release asset regardless). Run for real on darwin hardware
+(`/Users/tjololo/.local/bin/krayt`, real `api.github.com` + release CDN, real installed binary),
+covering everything the earlier sandbox pass couldn't:
 
-What I verified for real against the live `418-cloud/krayt` GitHub repo from this sandbox (a
-locally built binary, `go build -o /tmp/krayt-upgrade-smoke/krayt ./cmd/krayt`, run against real
-`api.github.com`):
-- `krayt upgrade --check` — correctly reports `current: v0.6.1   target: v0.6.1   up to date`.
-- `krayt upgrade --check --version v0.6.0` — correctly reports `current version is newer
-  (downgrade)`.
-- `krayt upgrade` with no flags — correctly no-ops with `krayt is already at the latest version
-  (v0.6.1)` (the repo's latest release is v0.6.1, matching this build's `Version`).
-- `krayt upgrade --version v0.6.0 --yes` — correctly refuses with `krayt upgrade does not support
-  linux/arm64 — see README.md's "Prebuilt binaries" paragraph for supported platforms`, before any
-  tarball download, leaving no files behind. This is the **correct** behavior, not a bug: this
-  sandbox's own architecture is linux/arm64, which `krayt upgrade` intentionally never supports
-  (no such release asset is published — see README's "Prebuilt binaries" paragraph).
+- Interactive upgrade (no `--yes`): real TTY prompt `Upgrade? [y/N]`, answered `y` — download,
+  checksum verification, extraction, and atomic swap all happened for real (0.7.0 → 0.7.1).
+- Post-swap confirmation subprocess: immediately after the backup message, `krayt upgrade` itself
+  printed the new binary's `version` output (`krayt 0.7.1` + vm-image digest) — confirms
+  `exec.CommandContext(ctx, path, "version")` runs the freshly-swapped binary, not the old one.
+- Backup + restore path: `krayt.bak` was created on every swap with the documented restore
+  command printed (`cp .../krayt.bak .../krayt`).
+- Downgrade path (`--version v0.6.0`-style, run here as `--version v0.7.0` against a 0.7.1
+  install): correctly labeled `(downgrade)` in the prompt, and completed the same
+  download/verify/swap sequence in reverse.
+- `--check`: correctly reported `up to date` when current == target, and `upgrade available` when
+  current < target, in both directions.
+- `--yes`: skipped the interactive prompt and upgraded non-interactively as documented.
+- Round-tripped 0.7.1 → 0.7.0 → 0.7.1 across four separate invocations, with `krayt version`
+  after each swap matching the version just installed (including the correct pinned vm-image
+  digest changing between 0.7.0 and 0.7.1) — real, observable confirmation, not something
+  provable from the network-restricted sandbox this was originally logged from.
 
-What I could **not** verify for real, and did not fabricate:
-- The actual tarball download, checksum verification, extraction, and atomic binary swap
-  (`selfupdate.DownloadAndVerify` / `ExtractBinary` / `Apply`). I tried, with a throwaway
-  `//go:build manualsmoke` test hitting the real release CDN directly (bypassing the CLI's
-  platform gate) — it failed with a proxy `403` on the `CONNECT` tunnel to
-  `release-assets.githubusercontent.com` (confirmed independently with `curl -sSL`, and confirmed
-  this sandbox routes all HTTPS through `HTTPS_PROXY=http://127.0.0.1:3128`, which allowlists
-  `api.github.com` but not the CDN host GitHub's release asset redirect lands on). That scratch
-  test file was deleted — it was never meant to be committed, only to check reachability.
-  Independently, even with network access, this sandbox's own platform (linux/arm64) means it
-  could never legitimately install or execute a downloaded `krayt` binary anyway.
-- The post-swap `exec.CommandContext(ctx, path, "version")` confirmation subprocess.
-- The `--yes`-free interactive confirmation prompt against a real TTY.
-
-**Needed:** a linux/amd64 or darwin/{arm64,amd64} machine with normal (non-allowlisted) internet
-access.
-
-**Exact steps:**
-```sh
-# On a disposable/writable install location:
-curl -LO https://github.com/418-cloud/krayt/releases/download/v0.6.0/krayt_v0.6.0_<os>_<arch>.tar.gz
-curl -LO https://github.com/418-cloud/krayt/releases/download/v0.6.0/checksums.txt
-sha256sum -c checksums.txt --ignore-missing   # sanity-check the manual path still works
-tar xzf krayt_v0.6.0_<os>_<arch>.tar.gz -C /some/writable/dir
-cd /some/writable/dir && ./krayt version      # confirm it reports 0.6.0
-
-./krayt upgrade --check                       # expect: upgrade available, v0.6.0 -> latest
-./krayt upgrade                                # expect: prompt "krayt 0.6.0 -> <latest> (upgrade)"; accept "y"
-./krayt version                                # expect: reports the new (latest) version
-ls -la ./krayt.bak                             # expect: exists, and `./krayt.bak version` reports 0.6.0
-
-./krayt upgrade --version v0.6.0 --yes         # downgrade path
-./krayt version                                # expect: back to 0.6.0
-```
-
-**Verify success by:** each `krayt version` after a swap matches the version just installed, and
-`krayt.bak` after each swap matches the version installed *before* that swap — this is real,
-observable confirmation, not something provable from a network-restricted or wrong-arch sandbox.
-
-**Blocking:** no — the offline test suite (fully passing) already covers the mechanics
-(`DownloadAndVerify`, `ExtractBinary`, `Apply`, `CompareVersions`, `ParseChecksums`) against
-`httptest` fixtures byte-for-byte identical in shape to the real GitHub API/CDN responses; this
-entry only confirms the real end-to-end wiring, which is lower-risk than the parts already
-unit-tested.
+No gaps remain: this closes out every item the original entry listed as unverifiable (tarball
+download, checksum verification, extraction, atomic swap, the post-swap confirmation subprocess,
+and the `--yes`-free interactive prompt).
