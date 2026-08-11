@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +19,30 @@ import (
 
 	"github.com/418-cloud/krayt/internal/selfupdate"
 )
+
+// buildFixtureTarGz builds a single-file tar.gz named "krayt" containing content, mirroring
+// exactly what release-please.yml's `tar -C dist -czf ... krayt` produces — and what
+// selfupdate.ExtractBinary expects to gunzip+untar.
+func buildFixtureTarGz(t *testing.T, content []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	hdr := &tar.Header{Name: "krayt", Mode: 0o755, Size: int64(len(content))}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatalf("write tar header: %v", err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatalf("write tar content: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar writer: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+	return buf.Bytes()
+}
 
 // upgradeFixture describes the single GitHub release an upgradeFixtureServer serves, both from
 // its "latest" endpoint and from its "tags/<tag>" endpoint.
@@ -39,7 +65,8 @@ func newUpgradeFixtureServer(t *testing.T, rf upgradeFixture) *httptest.Server {
 	if err != nil {
 		name = fmt.Sprintf("krayt_%s_%s_%s.tar.gz", rf.tag, runtime.GOOS, runtime.GOARCH)
 	}
-	sum := sha256.Sum256(rf.content)
+	tarball := buildFixtureTarGz(t, rf.content)
+	sum := sha256.Sum256(tarball)
 	digest := hex.EncodeToString(sum[:])
 	if rf.badChecksum {
 		digest = strings.Repeat("0", 64)
@@ -70,7 +97,7 @@ func newUpgradeFixtureServer(t *testing.T, rf upgradeFixture) *httptest.Server {
 		_, _ = fmt.Fprintf(w, "%s  %s\n", digest, name)
 	})
 	mux.HandleFunc("/download/"+name, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(rf.content)
+		_, _ = w.Write(tarball)
 	})
 
 	srv = httptest.NewServer(mux)
