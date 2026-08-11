@@ -31,6 +31,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newRmCmd())
 	root.AddCommand(newPatchCmd())
 	root.AddCommand(newVersionCmd())
+	root.AddCommand(newUpgradeCmd())
 	root.AddCommand(newQuestionsCmd())
 	root.AddCommand(newAnswerCmd())
 	return root

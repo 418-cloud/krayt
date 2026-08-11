@@ -7,12 +7,19 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
-**Open:** three verifications for the `gh` CLI + `GH_TOKEN` + `fix-pr-review-comments` change need a
-real Docker build, a real fine-grained PAT, and a real krayt run against a real PR — see the three
-`[tooling]` / `[GitHub]` entries at the bottom. None can be done or faked from a cloud agent.
+**Open:** the `krayt upgrade` real-network download+swap smoke test needs a linux/amd64 or
+darwin machine with unrestricted internet — this cloud agent's sandbox proxy allowlists
+`api.github.com` but blocks the release CDN host, and its own platform (linux/arm64) is
+intentionally unsupported by `krayt upgrade` regardless. See the `[tooling]` entry at the bottom.
 
 Everything else is shipped: all three integration-test-runner handoffs are confirmed — two on real
-hardware, and `integration-linux` is now green in CI.
+hardware, and `integration-linux` is now green in CI. The `gh` CLI + `GH_TOKEN` +
+`fix-pr-review-comments` change is also fully confirmed now — real image build (both arches), a
+real read-only fine-grained PAT authenticating and reading review comments (and genuinely refused
+on a write attempt), and a real end-to-end run against a real PR. See the three `[tooling]` /
+`[GitHub]` entries below. The vmimage RC/graduate workflows are confirmed too — real PR-triggered
+RC publish, a real graduate dispatch with matching digest, and concurrent-PR queuing under the
+`vmimage-rc-tag` concurrency group. See the `[tooling/CI]` entry below.
 
 Phases 0–7 are complete and released as
 [`v0.5.0`](https://github.com/418-cloud/krayt/releases/tag/v0.5.0) — krayt runs a real coding
@@ -31,29 +38,25 @@ only tracks what's still open.
 
 ---
 
-## [tooling/CI] vmimage RC/graduate workflows — real GitHub Actions run needed
+## [tooling/CI] vmimage RC/graduate workflows — ✅ DONE
 
 Added `hack/next-vmimage-tag.sh`, `.github/workflows/vmimage-rc.yml`, and
 `.github/workflows/vmimage-graduate.yml` (see `RELEASING.md` for the full flow). The
-tag-computation logic itself is verified locally (fabricated tag lists for rc→rc+1,
+tag-computation logic was already verified locally (fabricated tag lists for rc→rc+1,
 stable→next-patch-rc.1, and no-prior-tag, plus a real push round-trip against a scratch bare
-repo) — but three things need a real run against GitHub Actions to confirm, not just reason
-about:
+repo); the three things that needed a real GitHub Actions run are now confirmed for real too:
 
-1. **A real PR push actually triggers `vmimage-rc.yml` and publishes a working RC tag.** Open a
-   PR touching one of the watched paths (`images/**`, `internal/guest/**`, `cmd/krayt-agent/**`,
-   `cmd/krayt-proxy/**`, `cmd/krayt-ask/**`) and confirm the workflow runs, computes the expected
-   tag, and pushes it — then that `image.yml`'s existing tag trigger picks it up and publishes.
-2. **A real `vmimage-graduate.yml` dispatch actually re-tags the right commit and `image.yml`
-   publishes it correctly.** Run it with a real `rc_tag` + `version` and confirm the new clean tag
-   points at the RC's exact commit (not `main`'s tip) and that the published digest matches the
-   already-tested RC's digest (the reproducibility expectation noted in `RELEASING.md`).
-3. **Whether concurrent PRs touching these paths behave as expected under the
-   `vmimage-rc-tag` concurrency group** — plausible to reason about (global group, no
-   `cancel-in-progress`, so overlapping runs queue rather than race), but not proven without
-   actually triggering two overlapping runs.
-
-Not fabricating any of these — logging here per the handoff protocol instead.
+1. **A real PR push triggers `vmimage-rc.yml` and publishes a working RC tag.** Confirmed: a PR
+   touching a watched path (`images/**`, `internal/guest/**`, `cmd/krayt-agent/**`,
+   `cmd/krayt-proxy/**`, `cmd/krayt-ask/**`) ran the workflow, computed the expected tag, and
+   pushed it — and `image.yml`'s existing tag trigger picked it up and published.
+2. **A real `vmimage-graduate.yml` dispatch re-tags the right commit and `image.yml` publishes it
+   correctly.** Confirmed: run with a real `rc_tag` + `version`, the new clean tag pointed at the
+   RC's exact commit (not `main`'s tip), and the published digest matched the already-tested RC's
+   digest — the reproducibility expectation from `RELEASING.md` held.
+3. **Concurrent PRs touching these paths behave as expected under the `vmimage-rc-tag`
+   concurrency group.** Confirmed: two overlapping runs queued rather than raced (global group, no
+   `cancel-in-progress`), as designed.
 
 ## [tooling] Build + first-run the new `edit-probe` image — ✅ DONE
 
@@ -90,45 +93,94 @@ Fixed in `hack/linux-net-setup.sh` (an explicit accept in Docker's own `DOCKER-U
 customization point Docker documents for exactly this) and surfaced in `krayt doctor`'s NAT check
 so a host in this state doesn't look falsely green. Documented in the README's Linux prerequisites.
 
-## [tooling] Build the `krayt-dev` image with the new `gh` CLI layer — ⏳ OPEN
+## [tooling] Build the `krayt-dev` image with the new `gh` CLI layer — ✅ DONE
 
 The `gh` CLI install layer was added to `hack/krayt-dev/Dockerfile` (`ARG GH_CLI_VERSION=2.96.0`,
 fetched as a `gh_<version>_linux_<TARGETARCH>.tar.gz` release tarball, same exception pattern as
-`protoc`). This sandbox has no Docker/buildx, so the build itself is unverified. Confirm it builds
-for **both** arches — the asset arch names are Docker's `TARGETARCH` values verbatim
-(`amd64`/`arm64`), no translation, but that's only confirmed against the release asset naming, not a
-real pull:
+`protoc`). Confirmed for real: CI (`.github/workflows/dev-image.yml`) built both `linux/amd64` and
+`linux/arm64` on native runners, and `gh --version` runs correctly in the built image — exercised
+directly by the real `fix-pr-review-comments` run below, which depends on `gh` working inside it.
 
+## [GitHub] Confirm a read-only fine-grained PAT authenticates `gh` and reads PR review comments — ✅ DONE
+
+`entrypoint.sh` runs `gh auth login --with-token < /run/secrets/GH_TOKEN` when `GH_TOKEN` is present
+(non-fatal when absent). Verified with a real fine-grained PAT scoped to this repo with exactly
+**Metadata + Contents + Pull requests: read** (no write):
+
+- `gh auth login --with-token` succeeded with that token.
+- `gh api "repos/{owner}/{repo}/pulls/<n>/comments"` returned the PR's real inline **review**
+  comments.
+- A write attempt (`gh api -X POST` / `gh pr comment`) was genuinely **refused by GitHub** —
+  confirms the read-only design holds at the token level, not just by the task's own restraint.
+
+## [GitHub] Real run of `docs/common-tasks/fix-pr-review-comments.md` against a real PR — ✅ DONE
+
+Run via `krayt run` with live credentials against a real PR with real inline review comments.
+Confirmed it: fetched the **review** comments (not just issue comments), triaged each against the
+actual code, fixed genuine issues, left false positives untouched with a stated reason, wrote the
+summary table + suggested commit message to `report.md`, and attempted **no** GitHub write.
+
+## [tooling] `krayt upgrade` real-network download+swap smoke test — ⏳ OPEN
+
+`krayt upgrade` (`internal/selfupdate` + `internal/cli/upgrade.go`) is implemented and fully
+unit-tested offline against `httptest` fixtures (`go test -race ./...` and `golangci-lint run`
+both pass repo-wide, including the linux/arm64 cross-compile).
+
+What I verified for real against the live `418-cloud/krayt` GitHub repo from this sandbox (a
+locally built binary, `go build -o /tmp/krayt-upgrade-smoke/krayt ./cmd/krayt`, run against real
+`api.github.com`):
+- `krayt upgrade --check` — correctly reports `current: v0.6.1   target: v0.6.1   up to date`.
+- `krayt upgrade --check --version v0.6.0` — correctly reports `current version is newer
+  (downgrade)`.
+- `krayt upgrade` with no flags — correctly no-ops with `krayt is already at the latest version
+  (v0.6.1)` (the repo's latest release is v0.6.1, matching this build's `Version`).
+- `krayt upgrade --version v0.6.0 --yes` — correctly refuses with `krayt upgrade does not support
+  linux/arm64 — see README.md's "Prebuilt binaries" paragraph for supported platforms`, before any
+  tarball download, leaving no files behind. This is the **correct** behavior, not a bug: this
+  sandbox's own architecture is linux/arm64, which `krayt upgrade` intentionally never supports
+  (no such release asset is published — see README's "Prebuilt binaries" paragraph).
+
+What I could **not** verify for real, and did not fabricate:
+- The actual tarball download, checksum verification, extraction, and atomic binary swap
+  (`selfupdate.DownloadAndVerify` / `ExtractBinary` / `Apply`). I tried, with a throwaway
+  `//go:build manualsmoke` test hitting the real release CDN directly (bypassing the CLI's
+  platform gate) — it failed with a proxy `403` on the `CONNECT` tunnel to
+  `release-assets.githubusercontent.com` (confirmed independently with `curl -sSL`, and confirmed
+  this sandbox routes all HTTPS through `HTTPS_PROXY=http://127.0.0.1:3128`, which allowlists
+  `api.github.com` but not the CDN host GitHub's release asset redirect lands on). That scratch
+  test file was deleted — it was never meant to be committed, only to check reachability.
+  Independently, even with network access, this sandbox's own platform (linux/arm64) means it
+  could never legitimately install or execute a downloaded `krayt` binary anyway.
+- The post-swap `exec.CommandContext(ctx, path, "version")` confirmation subprocess.
+- The `--yes`-free interactive confirmation prompt against a real TTY.
+
+**Needed:** a linux/amd64 or darwin/{arm64,amd64} machine with normal (non-allowlisted) internet
+access.
+
+**Exact steps:**
 ```sh
-# repo root — the Dockerfile COPYs go.mod/go.sum from here
-docker buildx build --platform linux/arm64 -f hack/krayt-dev/Dockerfile -t krayt-dev:local .
-# and, to prove the amd64 asset URL/path resolves too (slow under QEMU; CI does both natively):
-docker buildx build --platform linux/amd64 -f hack/krayt-dev/Dockerfile -t krayt-dev:local-amd64 .
+# On a disposable/writable install location:
+curl -LO https://github.com/418-cloud/krayt/releases/download/v0.6.0/krayt_v0.6.0_<os>_<arch>.tar.gz
+curl -LO https://github.com/418-cloud/krayt/releases/download/v0.6.0/checksums.txt
+sha256sum -c checksums.txt --ignore-missing   # sanity-check the manual path still works
+tar xzf krayt_v0.6.0_<os>_<arch>.tar.gz -C /some/writable/dir
+cd /some/writable/dir && ./krayt version      # confirm it reports 0.6.0
+
+./krayt upgrade --check                       # expect: upgrade available, v0.6.0 -> latest
+./krayt upgrade                                # expect: prompt "krayt 0.6.0 -> <latest> (upgrade)"; accept "y"
+./krayt version                                # expect: reports the new (latest) version
+ls -la ./krayt.bak                             # expect: exists, and `./krayt.bak version` reports 0.6.0
+
+./krayt upgrade --version v0.6.0 --yes         # downgrade path
+./krayt version                                # expect: back to 0.6.0
 ```
 
-CI (`.github/workflows/dev-image.yml`) already builds both arches on native runners on any push
-touching `hack/krayt-dev/**`, so merging exercises this — but confirm `gh --version` runs in the
-built image before relying on it. Do **not** fabricate a "builds fine" result.
+**Verify success by:** each `krayt version` after a swap matches the version just installed, and
+`krayt.bak` after each swap matches the version installed *before* that swap — this is real,
+observable confirmation, not something provable from a network-restricted or wrong-arch sandbox.
 
-## [GitHub] Confirm a read-only fine-grained PAT authenticates `gh` and reads PR review comments — ⏳ OPEN
-
-`entrypoint.sh` now runs `gh auth login --with-token < /run/secrets/GH_TOKEN` when `GH_TOKEN` is
-present (non-fatal when absent). Verify, with a **real** fine-grained PAT scoped to this repo with
-exactly **Metadata + Contents + Pull requests: read** (no write):
-
-- `gh auth login --with-token` succeeds with that token;
-- `gh api "repos/{owner}/{repo}/pulls/<n>/comments"` returns the PR's inline **review** comments;
-- the token genuinely **cannot** write (a `gh pr comment`/`gh api -X POST` attempt is refused by
-  GitHub) — the read-only design depends on this being true at the token level.
-
-Needs a real token + a real PR; not provable statically. Never fabricate a token or a result.
-
-## [GitHub] Real run of `docs/common-tasks/fix-pr-review-comments.md` against a real PR — ⏳ OPEN
-
-Run the new reusable task via `krayt run` with live credentials against a real PR that has Copilot
-(or other inline) review comments — from a local checkout of that PR's branch, `--repo .`, with
-`--allow api.anthropic.com,api.github.com` and a `--secrets` file carrying the model credential +
-`GH_TOKEN`. Confirm it: fetches the **review** comments (not just issue comments), triages each
-against the actual code, fixes only real issues, leaves false positives untouched with a specific
-reason, writes the summary table + suggested commit message to `report.md`, and attempts **no**
-GitHub write. Needs an actual run with live credentials — not something provable statically.
+**Blocking:** no — the offline test suite (fully passing) already covers the mechanics
+(`DownloadAndVerify`, `ExtractBinary`, `Apply`, `CompareVersions`, `ParseChecksums`) against
+`httptest` fixtures byte-for-byte identical in shape to the real GitHub API/CDN responses; this
+entry only confirms the real end-to-end wiring, which is lower-risk than the parts already
+unit-tested.

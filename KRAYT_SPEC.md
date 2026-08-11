@@ -1571,10 +1571,16 @@ krayt image ls                                       # list cached base-VM + con
 krayt image rm    <digest> [--force]                 # remove one cached image by digest/prefix (--force for the pinned base)
 krayt image prune [--repo] [--older-than DUR] [--all] [--dry-run]   # bulk-reclaim cache disk under the retention policy
 krayt doctor                   # check host prereqs (vfkit installed+runnable on macOS; /dev/kvm on linux)
+krayt upgrade [--version vX.Y.Z] [--yes|-y] [--check]   # update krayt in place from a GitHub release
 ```
 
 `run` is headless/detached-capable; default streams logs to the terminal but the VM
 work is the same either way.
+
+`upgrade` re-verifies the downloaded binary against the target release's published
+`checksums.txt` before installing it — the same check as the manual install path (README's
+"Prebuilt binaries"), automated — and never touches any other command's behavior: it is the only
+command that ever talks to GitHub, and only on-demand when a user runs it.
 
 `--task` takes a path to the task prompt file, or `-` to read the prompt from stdin (e.g.
 `echo "…" | krayt run --task - …`), so a prompt can be supplied without a file on disk. Combined
