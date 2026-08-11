@@ -211,10 +211,10 @@ func DownloadAndVerify(ctx context.Context, client *http.Client, url, wantSHA256
 }
 
 // ExtractBinary gunzips + untars tarGzPath, which must contain exactly one regular-file entry
-// (the workflow that produces it always tars a single file named "krayt"), and writes that
-// entry's bytes to a new 0755 temp file in destDir. It fails closed — erroring rather than
-// guessing — if the archive has zero entries, more than one entry, or its one entry isn't a
-// regular file.
+// named "krayt" (the workflow that produces it always tars a single file named "krayt"), and
+// writes that entry's bytes to a new 0755 temp file in destDir. It fails closed — erroring
+// rather than guessing — if the archive has zero entries, more than one entry, its one entry
+// isn't a regular file, or that entry isn't named "krayt".
 func ExtractBinary(tarGzPath, destDir string) (string, error) {
 	f, err := os.Open(tarGzPath)
 	if err != nil {
@@ -255,6 +255,9 @@ func ExtractBinary(tarGzPath, destDir string) (string, error) {
 	}
 	if hdr.Typeflag != tar.TypeReg {
 		return "", fmt.Errorf("%s: entry %s is not a regular file", tarGzPath, hdr.Name)
+	}
+	if name := strings.TrimPrefix(hdr.Name, "./"); name != "krayt" {
+		return "", fmt.Errorf("%s: expected entry named %q, found %q", tarGzPath, "krayt", hdr.Name)
 	}
 
 	tmp, err := os.CreateTemp(destDir, ".krayt-upgrade-bin-*.tmp")

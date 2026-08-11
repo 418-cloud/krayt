@@ -317,6 +317,29 @@ func TestExtractBinary(t *testing.T) {
 			t.Fatal("ExtractBinary(two entries): want error, got nil")
 		}
 	})
+
+	t.Run("wrong name", func(t *testing.T) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		hdr := &tar.Header{Name: "not-krayt", Mode: 0o755, Size: int64(len(content))}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		if _, err := tw.Write(content); err != nil {
+			t.Fatalf("write content: %v", err)
+		}
+		_ = tw.Close()
+		_ = gz.Close()
+		srcDir := t.TempDir()
+		tarPath := filepath.Join(srcDir, "wrongname.tar.gz")
+		if err := os.WriteFile(tarPath, buf.Bytes(), 0o644); err != nil {
+			t.Fatalf("write wrong-name tarball: %v", err)
+		}
+		if _, err := ExtractBinary(tarPath, t.TempDir()); err == nil {
+			t.Fatal("ExtractBinary(wrong name): want error, got nil")
+		}
+	})
 }
 
 func TestCompareVersions(t *testing.T) {
