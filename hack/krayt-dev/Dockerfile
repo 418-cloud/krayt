@@ -6,7 +6,7 @@
 #
 # Debian bookworm (glibc, not Nix) so the official native `claude` binary runs; non-root
 # throughout, per the §8.2 container contract.
-FROM golang:1.26-bookworm@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651
+FROM golang:1.26-bookworm@sha256:6c5605ab3a9a9fb3c4eafe5b3d63cdbf3881caf113262b67862547b54a9db599
 
 # Tool versions, pinned so Renovate's custom regex manager (renovate.json) can bump them
 # independently of the base image tag. `make proto` (Nix) stays the source of truth for the
