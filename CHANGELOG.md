@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/418-cloud/krayt/compare/v0.7.0...v0.7.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* pin vmimage v0.3.2 ([#92](https://github.com/418-cloud/krayt/issues/92)) ([aea02bd](https://github.com/418-cloud/krayt/commit/aea02bd712b56a8703240930cf6b163f7a7d91fb))
+
 ## [0.7.0](https://github.com/418-cloud/krayt/compare/v0.6.1...v0.7.0) (2026-08-11)
 
 
