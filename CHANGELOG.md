@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/418-cloud/krayt/compare/v0.7.1...v0.8.0) (2026-08-12)
+
+
+### Features
+
+* zstd-compress rootfs.img for CI→registry→client transfer ([#96](https://github.com/418-cloud/krayt/issues/96)) ([85f7446](https://github.com/418-cloud/krayt/commit/85f74468c467881d6cb942d5e9cb970761cb2571))
+
+
+### Dependencies
+
+* update module github.com/klauspost/compress to v1.19.2 ([#98](https://github.com/418-cloud/krayt/issues/98)) ([7f7f6a8](https://github.com/418-cloud/krayt/commit/7f7f6a82632d7504d163132ddd6c9a5fee297cbc))
+* update pinned digest ([#99](https://github.com/418-cloud/krayt/issues/99)) ([3fcdbc7](https://github.com/418-cloud/krayt/commit/3fcdbc71d32954e2b1349933e9d60ace5caed849))
+
 ## [0.7.1](https://github.com/418-cloud/krayt/compare/v0.7.0...v0.7.1) (2026-08-11)
 
 
