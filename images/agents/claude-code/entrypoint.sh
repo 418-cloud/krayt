@@ -25,7 +25,7 @@ for key in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN; do
   fi
 done
 if [ -z "$cred" ]; then
-  echo "[claude-code] no credential in $SECRETS_DIR (expected ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)" >&2
+  echo "[claude-code] no credential in $SECRETS_DIR (expected ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_AUTH_TOKEN)" >&2
   # Diagnostics: the usual cause is a permissions mismatch — krayt wrote the secrets tmpfs
   # root-only while this container runs non-root, so it can't read them. Print who we are and
   # what (if anything) we can see.

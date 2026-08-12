@@ -42,9 +42,10 @@ Exactly **one** of these in your `--secrets` file (§6.14):
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Console API key | Scoped, independently revocable — the recommended default for untrusted code / concurrent runs. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | `claude setup-token` output | Subscription auth (Pro/Max/Team/Enterprise); suits low-concurrency, trusted runs. |
+| `ANTHROPIC_AUTH_TOKEN` | Custom/proxy auth token | For gateway or reverse-proxy setups that front the Anthropic API with their own token. |
 
-Setting both is refused by the `--agent claude-code` pre-flight before any VM boots — Claude
-Code's own precedence would otherwise silently prefer the API key and bypass the subscription.
+Setting more than one is refused by the `--agent claude-code` pre-flight before any VM boots —
+Claude Code's own precedence would otherwise silently prefer one and bypass the others.
 
 ## Required `--allow` hosts
 

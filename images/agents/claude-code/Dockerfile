@@ -24,9 +24,13 @@ WORKDIR /home/agent
 
 # CLI version pinned so a run is reproducible; bumped by Renovate's custom regex manager
 # (renovate.json). Official installer (native binary; the npm package is deprecated) — `-s
-# <version>` pins the exact release instead of tracking `latest`.
+# <version>` pins the exact release instead of tracking `latest`. Downloaded to a file and run
+# explicitly (rather than piped straight into bash) so a failed/truncated fetch is caught by
+# curl's own exit code instead of silently executing a partial script.
 ARG CLAUDE_CODE_VERSION=2.1.226
-RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}"
+RUN curl -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh \
+ && bash /tmp/claude-install.sh "${CLAUDE_CODE_VERSION}" \
+ && rm -f /tmp/claude-install.sh
 ENV PATH="/home/agent/.local/bin:${PATH}"
 
 # Keep egress tight for the krayt allowlist (§6.6): no autoupdater, telemetry, or error
