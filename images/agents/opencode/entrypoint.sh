@@ -68,13 +68,20 @@ fi
 # When questions are enabled the adapter sets KRAYT_ASK_SOCKET (§6.13); register the ask_human
 # MCP server so opencode can ask the human. opencode reads MCP servers from its config's top-level
 # `mcp` block (opencode.json — verified against packages/web/src/content/docs/mcp-servers.mdx
-# upstream), and config files are merged (not replaced) across sources, so a config pointed at by
-# OPENCODE_CONFIG only adds this one key rather than clobbering any project/global config.
-# `krayt-ask --mcp` bridges to that socket. krayt-ask itself is bind-mounted by the guest onto
-# /usr/local/bin/krayt-ask — never baked into the image. In fail mode the var is unset and no
-# config is written — the run stays autonomous.
+# upstream), and config files are merged (not replaced) across sources, so this file only adds
+# the ask-human key rather than clobbering any project/global config. But if the caller already
+# pointed OPENCODE_CONFIG at their own file (e.g. via `krayt run --env`), overwriting it here
+# would replace that source outright — krayt's own env-precedence rule is that a user-set value
+# always wins (see applyAdapter in internal/cli/run.go) — so only write ours when it's unset;
+# otherwise skip and say why, rather than silently dropping the caller's config or their
+# ask-human wiring. `krayt-ask --mcp` bridges to the socket. krayt-ask itself is bind-mounted by
+# the guest onto /usr/local/bin/krayt-ask — never baked into the image. In fail mode the var is
+# unset and no config is written — the run stays autonomous.
 if [ -n "${KRAYT_ASK_SOCKET:-}" ] && command -v krayt-ask >/dev/null 2>&1; then
-  cat > /tmp/krayt-opencode.json <<EOF
+  if [ -n "${OPENCODE_CONFIG:-}" ]; then
+    echo "[opencode] OPENCODE_CONFIG already set to '${OPENCODE_CONFIG}' by the caller — skipping ask_human MCP registration to avoid overwriting it" >&2
+  else
+    cat > /tmp/krayt-opencode.json <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -87,8 +94,9 @@ if [ -n "${KRAYT_ASK_SOCKET:-}" ] && command -v krayt-ask >/dev/null 2>&1; then
   }
 }
 EOF
-  export OPENCODE_CONFIG=/tmp/krayt-opencode.json
-  echo "[opencode] registered ask_human MCP server (questions enabled)"
+    export OPENCODE_CONFIG=/tmp/krayt-opencode.json
+    echo "[opencode] registered ask_human MCP server (questions enabled)"
+  fi
 fi
 
 echo "[opencode] running opencode run in $(pwd) (model: ${model})"
