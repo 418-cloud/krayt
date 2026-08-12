@@ -79,6 +79,14 @@
       "matchStrings": ["ARG CLAUDE_CODE_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "npm",
       "packageNameTemplate": "@anthropic-ai/claude-code"
+    },
+    {
+      "customType": "regex",
+      "description": "images/agents/gemini-cli/Dockerfile: Gemini CLI, installed via npm",
+      "managerFilePatterns": ["^images/agents/gemini-cli/Dockerfile$"],
+      "matchStrings": ["ARG GEMINI_CLI_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "@google/gemini-cli"
     }
   ],
   "packageRules": [
