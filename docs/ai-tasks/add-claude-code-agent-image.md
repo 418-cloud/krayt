@@ -4,10 +4,10 @@
 contract) and `CLAUDE.md` first. Write a short plan and PROCEED with writing code. IGNORE the
 instruction in CLAUDE.md to wait for an OK.**
 
-This is task 1 of 3 in the "official agent images" series (see also
-`add-gemini-cli-agent-image.md`, `add-opencode-agent-image.md`). **This task creates the shared
-scaffolding** (the `agent-images.yml` workflow and the README "Agent images" section) that the
-other two extend — it must land first.
+This is task 1 of 4 in the "official agent images" series (see also
+`add-gemini-cli-agent-image.md`, `add-opencode-agent-image.md`, `add-codex-agent-image.md`).
+**This task creates the shared scaffolding** (the `agent-images.yml` workflow and the README
+"Agent images" section) that the other three extend — it must land first.
 
 ## Background
 
