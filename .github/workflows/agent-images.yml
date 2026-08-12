@@ -1,0 +1,142 @@
+name: agent-images
+
+# Builds + publishes krayt's official, ready-to-run agent images (images/agents/*): pull one,
+# grab a task file and a credential, and `krayt run` works with zero image building — these are
+# the images behind the main README's "Agent images" quickstart. One shared matrix workflow for
+# all of them (currently just claude-code; gemini-cli and opencode each add an entry to both
+# matrices below plus their own images/agents/<name>/ dir — no other workflow changes needed).
+#
+# Each arch builds on its OWN native runner (no QEMU — matches dev-image.yml), pushed by digest;
+# a merge job then assembles a multi-arch manifest per image so both arches pull under the SAME
+# tags. These images are small (no from-source toolchains like krayt-dev), so every trigger builds
+# ALL matrix images — no per-image change detection. PRs build both arches to validate each
+# Dockerfile but never push; main/schedule/dispatch push. The weekly schedule rebuilds even with
+# no source changes, to pick up base-image + CLI updates Renovate hasn't opened a PR for yet.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "images/agents/**"
+      - ".github/workflows/agent-images.yml"
+  pull_request:
+    paths:
+      - "images/agents/**"
+      - ".github/workflows/agent-images.yml"
+  schedule:
+    - cron: "42 4 * * 1" # weekly, Monday 04:42 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: agent-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # One native runner per (image, arch) pair — no emulation. Each pushes its single-arch image
+    # BY DIGEST (no tag); the merge job names the tags.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Add two entries here (amd64 + arm64) per new agent image.
+          - { image: claude-code, platform: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
+          - { image: claude-code, platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write # only exercised on push (below)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Context is images/agents/<image> — that dir is self-contained (Dockerfile +
+      # entrypoint.sh), unlike krayt-dev which needs the whole repo.
+      - name: Build ${{ matrix.image }} ${{ matrix.platform }} (push by digest outside pull_request)
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: images/agents/${{ matrix.image }}
+          platforms: ${{ matrix.platform }}
+          # PR: build only, to validate the Dockerfile (cacheonly runs every step, exports nothing).
+          # push/schedule/dispatch: push by digest so the merge job gathers them under the tags.
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name=ghcr.io/{0}/krayt-agent-{1},push-by-digest=true,name-canonical=true,push=true', github.repository_owner, matrix.image) || 'type=cacheonly' }}
+          # Persist the layer cache across CI runs, scoped per image+arch so they don't evict
+          # each other's cache.
+          cache-from: type=gha,scope=agent-image-${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=agent-image-${{ matrix.image }}-${{ matrix.arch }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    # Assemble each image's per-arch digests into one manifest list published under its shared
+    # tags, so `:latest` / `:sha-<short>` / `:<cli-version>` each resolve to both amd64 and arm64.
+    # The version tag is grepped out of the image's own Dockerfile `ARG ..._VERSION=` line so the
+    # pin stays single-source — nothing in this workflow hardcodes a version number.
+    if: github.event_name != 'pull_request'
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          # Keep in sync with the `build` matrix's image list above.
+          - claude-code
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create + push manifest list under shared tags
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository_owner }}/krayt-agent-${{ matrix.image }}"
+          sha_tag="sha-${GITHUB_SHA::7}"
+          version="$(grep -m1 -oP '^ARG \w*VERSION=\K\S+' "${GITHUB_WORKSPACE}/images/agents/${{ matrix.image }}/Dockerfile")"
+          docker buildx imagetools create \
+            -t "${image}:latest" \
+            -t "${image}:${sha_tag}" \
+            -t "${image}:${version}" \
+            $(printf "${image}@sha256:%s " *)
+          docker buildx imagetools inspect "${image}:latest"

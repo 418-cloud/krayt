@@ -162,20 +162,27 @@ To actually boot a VM you also need a published base image (`krayt image pull`) 
 
 ## Running an agent
 
-With a booted base image (`krayt image pull`) and an agent container image, a run looks like:
+With a booted base image (`krayt image pull`), no image building is required — pull one of
+krayt's published, ready-to-run [agent images](#agent-images), grab a task file and a
+credential, and run:
 
 ```bash
 # the agent works on a copy of the repo, returns a patch you review
-krayt run --image <agent-image> --task ./task.md --repo . \
-  --secrets ./secrets.env --allow api.anthropic.com
+krayt run --image ghcr.io/418-cloud/krayt-agent-claude-code --agent claude-code \
+  --task ./task.md --repo . --secrets ./secrets.env --allow api.anthropic.com
 
 # or pipe the prompt in headlessly (--task -) instead of a file:
-echo "fix the flaky test in internal/foo" | krayt run --image <agent-image> --task - --repo .
+echo "fix the flaky test in internal/foo" | \
+  krayt run --image ghcr.io/418-cloud/krayt-agent-claude-code --agent claude-code --task - --repo .
 
 krayt ls                      # states: starting → running → (waiting) → done
 krayt patch <run-id>          # inspect the diff …
 krayt apply <run-id>          # … then apply it to your repo if you're satisfied
 ```
+
+`--image` also accepts your own container (see [Agent images](#agent-images) for the extension
+pattern, or `hack/claude-code/` for a from-scratch build-it-yourself example) — krayt knows
+nothing about which AI or tools are inside.
 
 - **Agent auth** rides the per-task secrets file (`--secrets`), lands on tmpfs at
   `/run/secrets`, and is redacted from logs. With `--agent claude-code` the adapter enforces
@@ -201,7 +208,21 @@ krayt apply <run-id>          # … then apply it to your repo if you're satisfi
   host cache is the only thing that grows.
 
 Reproducible, ready-to-run examples live under `hack/` — most notably `hack/claude-code/`
-(a real Claude Code agent) and `hack/krayt-ask-probe/` (the question channel).
+(a real Claude Code agent, build-it-yourself version of the published image below) and
+`hack/krayt-ask-probe/` (the question channel).
+
+### Agent images
+
+krayt publishes official, minimal, version-pinned container images with an agent already
+installed — no `docker build` required to try krayt. Each is `debian:bookworm-slim` (or the
+agent's required base) plus the non-root `agent` user, the CLI, and nothing else; extend one
+with `FROM` + `apt-get` for your own tools (see each image's README). Built by
+[`agent-images.yml`](./.github/workflows/agent-images.yml), tagged `:latest`, `:sha-<short>`,
+and `:<cli-version>`.
+
+| Image | `--agent` | Credential (exactly one) | Required `--allow` |
+|---|---|---|---|
+| [`ghcr.io/418-cloud/krayt-agent-claude-code`](./images/agents/claude-code/) | `claude-code` | `ANTHROPIC_API_KEY` xor `CLAUDE_CODE_OAUTH_TOKEN` | `api.anthropic.com` |
 
 ### Shell completion
 
@@ -265,7 +286,7 @@ each `integration_test.go` remain the authoritative manual fallback for running 
 | `HUMAN_TODO.md` | Handoff log the agent maintains for steps a human must do (created during development). |
 | `SECURITY.md` | Threat model pointer + how to privately report a vulnerability. |
 | `CONTRIBUTING.md` | How to get set up, code/commit conventions, and what a PR should include. |
-| `images/` | Nix flake for the micro-VM image (CI-built). |
+| `images/` | Nix flake for the micro-VM image; `images/agents/` holds the published, ready-to-run agent images (CI-built). |
 | `internal/` | The implementation (see §9 of the spec for package layout). |
 | `cmd/` | Binaries: `krayt` (CLI), `krayt-agent` (guest), `krayt-proxy` (egress), `krayt-ask` (question front-end + MCP server). |
 | `configs/` | Example `krayt.yaml` + default allowlist. |
