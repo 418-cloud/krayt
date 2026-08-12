@@ -1,5 +1,9 @@
 # claude-code — real-world agent image for the `claude-code` adapter
 
+> Want to just try krayt? Use the published, ready-to-run
+> [`ghcr.io/418-cloud/krayt-agent-claude-code`](../../images/agents/claude-code/) image instead —
+> no `docker build` needed. This directory stays as a from-scratch, build-it-yourself demo fixture.
+
 A real agent image that runs **Claude Code** headlessly inside a krayt micro-VM against a task,
 edits `/workspace`, and returns a reviewable `changes.patch`. It's the image behind the
 `HUMAN_TODO.md` entry **"[Phase 5] Agent adapter end-to-end with live credentials"** and exercises

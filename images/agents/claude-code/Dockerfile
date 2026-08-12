@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1 # renovate: ignore
+# krayt-agent-claude-code — the published, ready-to-run Claude Code onboarding image. Pulls,
+# `krayt run --agent claude-code`, no image building required. Mirrors hack/claude-code/ (an
+# integration/demo fixture that stays as-is) but pins the CLI version and ships under the shared
+# ghcr.io/418-cloud/krayt-agent-claude-code name (see images/agents/claude-code/README.md).
+#
+# Debian slim (glibc) so the official native `claude` binary runs; a dedicated non-root user
+# because Claude Code refuses to run as uid 0 (§8.2 container contract).
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+
+# git: Claude Code shells out to it for repo ops; curl + ca-certificates: install + HTTPS to the
+# model API; bash: the entrypoint. Nothing else — extend via `FROM` + `apt-get` (see README).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git bash \
+ && rm -rf /var/lib/apt/lists/*
+
+# Non-root agent user (uid 1000). Any non-root uid satisfies Claude Code (§6.14/§8.2).
+RUN useradd --create-home --uid 1000 --shell /bin/bash agent
+
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/krayt-agent-entrypoint
+
+USER agent
+WORKDIR /home/agent
+
+# CLI version pinned so a run is reproducible; bumped by Renovate's custom regex manager
+# (renovate.json). Official installer (native binary; the npm package is deprecated) — `-s
+# <version>` pins the exact release instead of tracking `latest`.
+ARG CLAUDE_CODE_VERSION=2.1.226
+RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}"
+ENV PATH="/home/agent/.local/bin:${PATH}"
+
+# Keep egress tight for the krayt allowlist (§6.6): no autoupdater, telemetry, or error
+# reporting, so the container's only steady-state destination is the model API.
+ENV DISABLE_AUTOUPDATER=1 \
+    DISABLE_TELEMETRY=1 \
+    DISABLE_ERROR_REPORTING=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+ENTRYPOINT ["krayt-agent-entrypoint"]

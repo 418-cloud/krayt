@@ -7,8 +7,13 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
-**Open:** nothing. The rootfs-compression handoff (ratio/timing + a real post-decompress boot) is
-now fully confirmed — see the `[tooling/CI]` entry at the bottom.
+**Open:** the new `krayt-agent-claude-code` published image needs a real CI run + a real live
+onboarding run — see the `[tooling]` entry at the bottom. Non-blocking (nothing downstream
+depends on it yet; the gemini-cli/opencode agent-image tasks build on the *code* landing here, not
+on this verification).
+
+The rootfs-compression handoff (ratio/timing + a real post-decompress boot) is
+now fully confirmed — see the `[tooling/CI]` entry below it.
 
 Everything else is shipped: all three integration-test-runner handoffs are confirmed — two on real
 hardware, and `integration-linux` is now green in CI. The `gh` CLI + `GH_TOKEN` +
@@ -192,3 +197,29 @@ which gathers the two per-arch manual pushes above):
 
 This closes out the item: offline unit tests, real CI ratio/timing, and a real pull+boot are all
 now confirmed. No gaps remain.
+
+## [tooling] Publish `krayt-agent-claude-code` — real workflow run + live onboarding run
+- Needed:
+  1. A real push to `main` (or `workflow_dispatch`) triggering `.github/workflows/agent-images.yml`,
+     confirming both the `linux/amd64` and `linux/arm64` builds succeed, the merge job assembles a
+     multi-arch manifest, and `ghcr.io/418-cloud/krayt-agent-claude-code` is pushed with `:latest`,
+     `:sha-<short>`, and `:2.1.226` (the pinned CLI version) — plus a check that the GHCR package is
+     publicly visible (matching the other published images, e.g. `krayt-dev`/`krayt-probe`).
+  2. A live onboarding run exactly as the main README's quickstart shows, with a real
+     `ANTHROPIC_API_KEY`, confirming a `changes.patch` and `/output/report.md` come back:
+     ```sh
+     krayt run --image ghcr.io/418-cloud/krayt-agent-claude-code --agent claude-code \
+       --task ./task.md --repo . --secrets ./secrets.env --allow api.anthropic.com
+     ```
+- Why the agent can't: no `docker build`/push access and no live Anthropic credential in this
+  environment; also can't confirm GHCR package visibility without a real push.
+- Exact steps/commands: push this change (or `gh workflow run agent-images.yml`) and watch the
+  run; then, on a Mac with `krayt` built and the base VM image pulled, create a scratch repo +
+  `task.md` + `secrets.env` (one `ANTHROPIC_API_KEY`) and run the quickstart command above.
+- Verify success by: `agent-images.yml` green with both arches in the manifest
+  (`docker buildx imagetools inspect ghcr.io/418-cloud/krayt-agent-claude-code:latest` shows
+  `linux/amd64,linux/arm64`); the GHCR package page loads without auth; `krayt ls` shows the run
+  reaching `done` with `EXIT 0`; `.krayt/runs/<id>/changes.patch` applies cleanly and
+  `report.md` contains Claude's summary.
+- Blocking: no — the gemini-cli/opencode agent-image tasks depend on this task's *code* (the
+  `agent-images.yml` scaffolding + README table) having landed, not on this verification.
