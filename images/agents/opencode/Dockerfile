@@ -38,7 +38,7 @@ RUN set -eu; \
       arm64) oc_arch=arm64 ;; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL -o /tmp/opencode.tar.gz \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o /tmp/opencode.tar.gz \
       "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${oc_arch}.tar.gz" \
  && tar -xzf /tmp/opencode.tar.gz -C /tmp \
  && install -m 0755 /tmp/opencode /usr/local/bin/opencode \
@@ -51,7 +51,7 @@ RUN set -eu; \
 # check — only the background refresh loop checks TTL, and that loop is disabled below via
 # OPENCODE_DISABLE_MODELS_FETCH), so a run never needs to reach models.opencode.ai.
 RUN mkdir -p /home/agent/.cache/opencode \
- && curl -fsSL -o /home/agent/.cache/opencode/models.json https://models.opencode.ai/api.json \
+ && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o /home/agent/.cache/opencode/models.json https://models.opencode.ai/api.json \
  && chown -R agent:agent /home/agent/.cache
 
 USER agent
