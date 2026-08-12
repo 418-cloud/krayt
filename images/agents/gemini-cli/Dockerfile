@@ -12,7 +12,7 @@
 # this build environment didn't have (see HUMAN_TODO.md). Renovate (pinDigests: true for the
 # dockerfile manager, renovate.json) will open the bootstrap pin PR on its next run — merge that
 # instead of hand-pinning.
-FROM node:24-bookworm-slim
+FROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
 
 # ca-certificates: HTTPS to the model API and npm registry; curl: install-time fetches; git:
 # Gemini CLI shells out to it for repo ops; bash: the entrypoint. Nothing else — extend via
