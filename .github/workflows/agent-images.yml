@@ -3,7 +3,7 @@ name: agent-images
 # Builds + publishes krayt's official, ready-to-run agent images (images/agents/*): pull one,
 # grab a task file and a credential, and `krayt run` works with zero image building — these are
 # the images behind the main README's "Agent images" quickstart. One shared matrix workflow for
-# all of them (currently claude-code and gemini-cli; opencode adds an entry to both matrices
+# all of them (currently just claude-code; gemini-cli, opencode, and codex each adds an entry to both matrices
 # below plus its own images/agents/<name>/ dir — no other workflow changes needed).
 #
 # Each arch builds on its OWN native runner (no QEMU — matches dev-image.yml), pushed by digest;

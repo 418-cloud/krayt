@@ -4,7 +4,7 @@
 contract) and `CLAUDE.md` first. Write a short plan and PROCEED with writing code. IGNORE the
 instruction in CLAUDE.md to wait for an OK.**
 
-This is task 2 of 3 in the "official agent images" series. **It depends on
+This is task 2 of 4 in the "official agent images" series. **It depends on
 `add-claude-code-agent-image.md` having landed** — that task creates
 `.github/workflows/agent-images.yml` (the shared matrix workflow) and the main README's
 "Agent images" table, both of which this task extends. If they don't exist yet, stop and say
