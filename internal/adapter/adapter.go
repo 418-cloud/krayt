@@ -39,8 +39,8 @@ type Adapter interface {
 	Prepare(Input) (Plan, error)
 }
 
-// Get resolves an adapter by name (none | claude-code | gemini-cli). An unknown name errors so
-// a typo fails fast instead of silently running the bare image entrypoint.
+// Get resolves an adapter by name (none | claude-code | gemini-cli | opencode). An unknown name
+// errors so a typo fails fast instead of silently running the bare image entrypoint.
 func Get(name string) (Adapter, error) {
 	switch name {
 	case "", "none":
@@ -49,15 +49,17 @@ func Get(name string) (Adapter, error) {
 		return claudeCode{}, nil
 	case "gemini-cli":
 		return geminiCLI{}, nil
+	case "opencode":
+		return openCode{}, nil
 	default:
-		return nil, fmt.Errorf("unknown agent adapter %q (want none, claude-code, or gemini-cli)", name)
+		return nil, fmt.Errorf("unknown agent adapter %q (want none, claude-code, gemini-cli, or opencode)", name)
 	}
 }
 
 // Names lists every valid adapter name (the config/flag values Get accepts), for shell
 // completion. Keep in sync with Get's switch — small enough that duplication here is the
 // simplest way to keep both colocated and reviewable together.
-func Names() []string { return []string{"none", "claude-code", "gemini-cli"} }
+func Names() []string { return []string{"none", "claude-code", "gemini-cli", "opencode"} }
 
 // askEnv is the shared krayt-ask wiring: when the run pauses for questions, tell the in-image
 // krayt-ask binary which socket to reach (§6.13). Universal across adapters — krayt-ask is the

@@ -68,7 +68,7 @@ type runFlags struct {
 	questionTimeout   time.Duration // per-question wait limit
 	onQuestionTimeout string        // sentinel | abort
 
-	agent string // none | claude-code | gemini-cli (§6.14, §8.1)
+	agent string // none | claude-code | gemini-cli | opencode (§6.14, §8.1)
 
 	// container is resolved from krayt.yaml's `container:` block (§8.1); there are no CLI flags
 	// for it in v1 (config-file only), so it stays the secure zero value when no config is present.
@@ -112,7 +112,7 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.StringVar(&f.onQuestion, "on-question", "fail", "agent question mode: fail (autonomous) | wait (pause for input)")
 	fl.DurationVar(&f.questionTimeout, "question-timeout", 10*time.Minute, "per-question wait timeout")
 	fl.StringVar(&f.onQuestionTimeout, "on-question-timeout", "sentinel", "on question timeout: sentinel | abort")
-	fl.StringVar(&f.agent, "agent", "none", "agent adapter: none | claude-code | gemini-cli")
+	fl.StringVar(&f.agent, "agent", "none", "agent adapter: none | claude-code | gemini-cli | opencode")
 
 	// Dynamic shell completion for run's flag values (§13). Enum flags complete their fixed value
 	// sets, sourced from the same constants Parse*/Get validate against so completion can't drift;

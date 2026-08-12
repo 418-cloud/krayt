@@ -224,6 +224,7 @@ README). Built by [`agent-images.yml`](./.github/workflows/agent-images.yml), ta
 |---|---|---|---|
 | [`ghcr.io/418-cloud/krayt-agent-claude-code`](./images/agents/claude-code/) | `claude-code` | `ANTHROPIC_API_KEY` xor `CLAUDE_CODE_OAUTH_TOKEN` | `api.anthropic.com` |
 | [`ghcr.io/418-cloud/krayt-agent-gemini-cli`](./images/agents/gemini-cli/) | `gemini-cli` | `GEMINI_API_KEY` xor `GOOGLE_API_KEY` | `generativelanguage.googleapis.com` (`GEMINI_API_KEY`) or `aiplatform.googleapis.com` (`GOOGLE_API_KEY`, Vertex AI) |
+| [`ghcr.io/418-cloud/krayt-agent-opencode`](./images/agents/opencode/) | `opencode` | `ANTHROPIC_API_KEY` xor `OPENAI_API_KEY` xor `OPENROUTER_API_KEY` | `api.anthropic.com`, `api.openai.com`, or `openrouter.ai` (matching the credential) |
 
 ### Shell completion
 

@@ -3,8 +3,8 @@ name: agent-images
 # Builds + publishes krayt's official, ready-to-run agent images (images/agents/*): pull one,
 # grab a task file and a credential, and `krayt run` works with zero image building — these are
 # the images behind the main README's "Agent images" quickstart. One shared matrix workflow for
-# all of them (currently just claude-code; gemini-cli, opencode, and codex each adds an entry to both matrices
-# below plus its own images/agents/<name>/ dir — no other workflow changes needed).
+# all of them (currently claude-code, gemini-cli, and opencode; codex adds an entry to both
+# matrices below plus its own images/agents/<name>/ dir — no other workflow changes needed).
 #
 # Each arch builds on its OWN native runner (no QEMU — matches dev-image.yml), pushed by digest;
 # a merge job then assembles a multi-arch manifest per image so both arches pull under the SAME
@@ -46,6 +46,8 @@ jobs:
           - { image: claude-code, platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
           - { image: gemini-cli, platform: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
           - { image: gemini-cli, platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
+          - { image: opencode, platform: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
+          - { image: opencode, platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -108,6 +110,7 @@ jobs:
           # Keep in sync with the `build` matrix's image list above.
           - claude-code
           - gemini-cli
+          - opencode
     runs-on: ubuntu-24.04
     permissions:
       contents: read

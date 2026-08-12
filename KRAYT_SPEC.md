@@ -1021,7 +1021,7 @@ questions:                      # agent → human questions (§6.13)
 # optional orchestration adapter (otherwise the image entrypoint runs).
 # The adapter also wires the ask_human MCP server / krayt-ask CLI when mode: wait (§6.13).
 agent:
-  adapter: none                 # none | claude-code | gemini-cli
+  adapter: none                 # none | claude-code | gemini-cli | opencode
 
 # optional container hardening overrides (§6.10, §10). The defaults are the secure ones —
 # all capabilities dropped, containerd's seccomp profile applied, writable rootfs — so an
@@ -1210,7 +1210,7 @@ krayt/
 │   │   ├── proxy/           # egress allowlist proxy + firewall
 │   │   ├── ask/             # in-VM question bridge + ask_human MCP server (§6.13)
 │   │   └── runner/          # containerd Go client (single container per VM)
-│   ├── adapter/             # optional per-agent adapters (claude-code, gemini-cli); MCP/CLI wiring (§6.13)
+│   ├── adapter/             # optional per-agent adapters (claude-code, gemini-cli, opencode); MCP/CLI wiring (§6.13)
 │   ├── task/                # config schema + parsing
 │   ├── patch/               # git bundle create/verify/clone/diff (+ optional reverse bundle); non-mutating dirty capture; host-side apply helpers (§6.7)
 │   ├── imagestore/          # host pull + OCI export + digest-keyed cache (§6.11)
@@ -1708,7 +1708,7 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 ### Phase 5 — Polish & optional orchestration
 - [x] Emit `report.md` + `meta.json` per the §8.4 schemas (exit code, timings, patch stats, questions; agent notes if the image writes `/output/report.md`). *(Host-side, fakeProvider-proven: `RunRecord` is the full §8.4 schema; `report.go` renders the fixed-section report and folds the agent's `/output/report.md` into Notes; patch diffstat via `patch.Stat` (`git apply --numstat`). `TestReportAndMeta` + `TestReportPrefersAgentNotes`. **Confirmed on Apple Silicon** — run_afbb910f wrote a full §8.4 `meta.json` (`questions[]` with `answered_by`/`waited_secs`, patch diffstat, timings) and a rendered `report.md`.)*
 - [x] `krayt-ask` CLI front-end (§6.13): a small in-container binary any agent can shell out to (`krayt-ask [--choices a,b] "question"`), bridging to the Phase-4 question channel over the mounted unix socket; prints the answer on stdout (exit 0) or a no-answer sentinel (exit 2) so the agent falls back. *(`cmd/krayt-ask`, reusing `ask.OverSocket`; `TestRunSentinelWhenUnreachable`/`TestRunUsage`, round-trip `TestRunRoundTrip` skips under the sandbox's blocked `bind(2)` — HUMAN-verified on hardware. Built into the image via `flake.nix` and bind-mounted onto the container PATH at `/usr/local/bin/krayt-ask` (guest `RunConfig.AskBinary` + runner mount; `TestAskBinaryIn`). Exercising it on hardware — the last Done-when clause — awaits the base image rebuild (`hack/krayt-ask-probe`, HUMAN).)*
-- [x] Optional agent adapters (`internal/adapter`: `none`/`claude-code`/`gemini-cli`) — host-side pre-flight (`--agent` flag + `agent.adapter`) that validates auth and wires `krayt-ask` (`KRAYT_ASK_SOCKET`) when `--on-question=wait`. *(In-container credential export + agent launch run in the image entrypoint (§8.2) and need live keys — HUMAN. MCP-server registration is Phase 6.)*
+- [x] Optional agent adapters (`internal/adapter`: `none`/`claude-code`/`gemini-cli`/`opencode`) — host-side pre-flight (`--agent` flag + `agent.adapter`) that validates auth and wires `krayt-ask` (`KRAYT_ASK_SOCKET`) when `--on-question=wait`. *(In-container credential export + agent launch run in the image entrypoint (§8.2) and need live keys — HUMAN. MCP-server registration is Phase 6.)*
 - [x] Claude Code adapter maps the provided credential to the correct env var (`ANTHROPIC_API_KEY` vs `CLAUDE_CODE_OAUTH_TOKEN`) and enforces exactly-one auth, failing fast if both are set (§6.14). *(`claude-code` adapter, exactly-one over the recognized keys; wired into `krayt run` before any VM boot. `TestClaudeCodeExactlyOne` + `TestApplyAdapterAuthGate`/`TestApplyAdapterWiresAsk`.)*
 - [x] **Detached supervisor — "park and walk away" (§6.2):** `krayt run --detach` re-execs a session-detached (`setsid`) per-run supervisor (no central daemon) that owns the VM to completion; the launcher returns immediately. Cross-process max-concurrency via a file-lock semaphore (`AcquireSlot` over `.krayt/slots/`, `--max-concurrency`). Reuses the Phase-4 on-disk state + management commands unchanged; localized to the run entrypoint. *(`TestAcquireSlotLimits`/`TestAcquireSlotCrossProcess` (real subprocesses) + `TestSpawnDetached`; existing `TestMaxConcurrency` now backed by the file lock. End-to-end "close the terminal, answer after" **verified on Apple Silicon** via `hack/ask-probe`: `--detach` returned with the supervisor pid, `krayt ls` showed `starting`→`waiting`, and `krayt answer` from a separate shell resolved it to `done` — see HUMAN_TODO.)*
 - [x] Patch safety lint (flag hooks/suspicious changes). *(`patch.Lint` flags changes that execute outside the workspace edit — git hooks, CI config, shell startup files, direnv, newly-executable files — surfaced in `meta.json` `safety`, report.md's Safety section, and a `krayt run` warning. `TestLint`.)*

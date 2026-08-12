@@ -264,7 +264,7 @@ func TestCompleteFixedFlags(t *testing.T) {
 		{"net", []string{"allowlist", "full", "none"}},
 		{"on-question", []string{"fail", "wait"}},
 		{"on-question-timeout", []string{"sentinel", "abort"}},
-		{"agent", []string{"none", "claude-code", "gemini-cli"}},
+		{"agent", []string{"none", "claude-code", "gemini-cli", "opencode"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.flag, func(t *testing.T) {
