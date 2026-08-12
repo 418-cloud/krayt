@@ -7,8 +7,8 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
-**Open:** one item — the real CI compression ratio/timing and a real post-decompress boot for the
-rootfs-compression change. See the `[tooling/CI]` entry at the bottom.
+**Open:** nothing. The rootfs-compression handoff (ratio/timing + a real post-decompress boot) is
+now fully confirmed — see the `[tooling/CI]` entry at the bottom.
 
 Everything else is shipped: all three integration-test-runner handoffs are confirmed — two on real
 hardware, and `integration-linux` is now green in CI. The `gh` CLI + `GH_TOKEN` +
@@ -149,27 +149,46 @@ No gaps remain: this closes out every item the original entry listed as unverifi
 download, checksum verification, extraction, atomic swap, the post-swap confirmation subprocess,
 and the `--yes`-free interactive prompt).
 
-## [tooling/CI] Real compression ratio, CI time, and post-decompress boot for `rootfs.img` zstd compression — OPEN
+## [tooling/CI] Real compression ratio, CI time, and post-decompress boot for `rootfs.img` zstd compression — ✅ DONE
 
-- **Needed:** a real `vmimage` publish run (`.github/workflows/image.yml`'s `publish` job, both
-  arches) with the new `zstd -19 -T0` staging step, plus a real `krayt image pull` against the
-  published artifact and a real boot on hardware.
-- **Why the agent can't:** building the real ~2 GiB rootfs needs a Linux builder (native
-  `ubuntu-24.04`/`ubuntu-24.04-arm` GitHub Actions runners); confirming the decompressed image
-  boots needs real vfkit (Apple Silicon Mac) or firecracker (Linux/KVM) hardware — same category
-  as every other vmimage CI/boot change in this repo (see the entries above).
-- **Exact steps/commands:** push a `vmimage-v*` tag (or `workflow_dispatch` with `publish: true`)
-  to trigger `image.yml`'s `publish` job; read the `ls -la result/rootfs.img
-  $stage/rootfs.img.zst` line from the "Push OCI artifact + record digest" step's log for both
-  arches; time the step itself (start/end timestamps in the Actions run) to see what `-19 -T0`
-  actually costs. Then `krayt image pull` (or `krayt run`) against the newly published digest on
-  real hardware and confirm the VM boots.
-- **Verify success by:** recording here — uncompressed vs. `.zst` size and the ratio for both
-  arm64 and amd64, the wall-clock time the compression step added, and a real boot succeeding
-  (`Hello` round-trip) after a pull that went through the decompression path. If the ratio is
-  disappointing, decision 5 in `docs/ai-tasks/compress-vmimage-rootfs.md` (no `--long`) is the
-  first thing to revisit — a `-15`/`-12` level drop is the documented cheap fallback if the CI
-  time cost turns out too high instead.
-- **Blocking:** no — the offline-verifiable parts (unit tests, build, cross-compile, lint,
-  `go.mod` cleanup) are all done and merged independently of this; this is a follow-up
-  confirmation only.
+Ran for real via `workflow_dispatch` (`publish: true`, no tag) on commit `85f7446`, published as
+`ghcr.io/418-cloud/krayt-vmimage:manual-85f74468c467-{arm64,amd64}`. Both arches pushed the new
+`rootfs.img.zst` layer under `application/vnd.krayt.rootfs+zstd`, with `vmlinuz`/`initrd`
+unchanged (`Exists`, reused from a prior push) — confirms the media-type/layer-shape half of the
+change end-to-end against a real registry.
+
+**Measured ratio and step time**, from the "Push OCI artifact + record digest" step's log
+(`ls -la result/rootfs.img $stage/rootfs.img.zst` line + the step's own wall-clock duration):
+
+| arch  | uncompressed  | `.zst`        | ratio  | zstd-reported | step wall time |
+|-------|---------------|---------------|--------|----------------|----------------|
+| arm64 | 2,317,037,568 B (2.16 GiB) | 464,153,046 B (443 MiB) | 4.99:1 | 20.03% | 2m 27s |
+| amd64 | 2,178,670,592 B (2.03 GiB) | 483,812,248 B (461 MiB) | 4.50:1 | 22.21% | 4m 29s |
+
+Ratio is well within the range that makes the `-19 -T0` choice (decision 3/5 in
+`docs/ai-tasks/compress-vmimage-rootfs.md`) look justified — no need to revisit the `--long`/level
+tradeoff based on this. Step time (compression + the `.zst` blob's registry upload, since the
+other layers were already `Exists`) is a few minutes per arch, run in parallel across the matrix —
+acceptable for a `publish` job that only runs on a tag push/dispatch, not on every PR.
+
+**Boot confirmation**, on an Apple-Silicon Mac (vfkit), against the real published multi-arch
+index (`internal/vmimage/pinned.go` updated to
+`ghcr.io/418-cloud/krayt-vmimage@sha256:f831c8f1dff2f8c06a52e688fd62303048351fbb121694b16fadbcfd7ccb2501`,
+which gathers the two per-arch manual pushes above):
+
+- `krayt doctor` correctly reported the pinned digest **not cached** beforehand (proves it wasn't
+  silently reusing an old plain-`rootfs.img` cache entry).
+- `krayt image pull` verified the digest and produced a plain, decompressed
+  `rootfs.img`/`vmlinuz`/`initrd` under `~/Library/Caches/krayt/vmimage/<digest>/` — confirms
+  `vmimage.Pull`'s zstd-decompress-then-verify path works against a real registry artifact, not
+  just the offline fixture.
+- `krayt run` (with `--skip-resource-check`, unrelated to this change — just local free-memory
+  headroom) booted the pulled image under vfkit for a real task: `echo "Write Hello to a
+  greetings.txt file" | krayt run --task -` completed exit 0, `greetings.txt` containing `Hello`
+  came back in `changes.patch`, and `report.md`'s provenance section shows the run's own commit
+  (`85f74468c467`) matching the compression change itself. A corrupted/truncated decompression
+  would have failed to boot or produced garbage here, not a silent success — this is the real
+  round-trip the offline tests couldn't reach.
+
+This closes out the item: offline unit tests, real CI ratio/timing, and a real pull+boot are all
+now confirmed. No gaps remain.
