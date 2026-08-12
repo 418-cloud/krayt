@@ -49,12 +49,14 @@ func TestClaudeCodeExactlyOne(t *testing.T) {
 // TestAskWiring checks that the krayt-ask front-end is wired (KRAYT_ASK_SOCKET) only when the
 // run pauses for questions, across every adapter (§6.13).
 func TestAskWiring(t *testing.T) {
-	for _, name := range []string{"none", "claude-code", "gemini-cli"} {
+	for _, name := range []string{"none", "claude-code", "gemini-cli", "opencode"} {
 		ad, err := adapter.Get(name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// A valid single credential so claude-code/gemini pass the auth gate.
+		// A valid single credential so claude-code/gemini/opencode pass the auth gate.
+		// ANTHROPIC_API_KEY alone satisfies opencode too (it's one of its recognized keys), so
+		// this doesn't need a fourth key.
 		keys := []string{"ANTHROPIC_API_KEY", "GEMINI_API_KEY"}
 
 		waiting, err := ad.Prepare(adapter.Input{SecretKeys: keys, QuestionsWait: true, AskSocket: askSocket})
@@ -90,6 +92,45 @@ func TestGeminiAndNone(t *testing.T) {
 	// none imposes no auth rule — even with no secrets it prepares cleanly.
 	if p, err := n.Prepare(adapter.Input{}); err != nil || p.Credential != "" {
 		t.Errorf("none: plan=%+v err=%v", p, err)
+	}
+}
+
+// TestOpenCodeExactlyOne is the §6.14 proof for the opencode adapter: it accepts exactly one of
+// its three recognized credentials, and fails fast when none or several are set.
+func TestOpenCodeExactlyOne(t *testing.T) {
+	ad, err := adapter.Get("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name     string
+		keys     []string
+		wantErr  string // substring; "" = success
+		wantCred string
+	}{
+		{"anthropic only", []string{"ANTHROPIC_API_KEY", "GH_TOKEN"}, "", "ANTHROPIC_API_KEY"},
+		{"openai only", []string{"OPENAI_API_KEY"}, "", "OPENAI_API_KEY"},
+		{"openrouter only", []string{"OPENROUTER_API_KEY"}, "", "OPENROUTER_API_KEY"},
+		{"two set", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}, "exactly one", ""},
+		{"all three set", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"}, "exactly one", ""},
+		{"none set", []string{"GH_TOKEN"}, "no auth credential", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plan, err := ad.Prepare(adapter.Input{SecretKeys: c.keys})
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if plan.Credential != c.wantCred {
+					t.Errorf("credential = %q, want %q", plan.Credential, c.wantCred)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("error = %v, want substring %q", err, c.wantErr)
+			}
+		})
 	}
 }
 

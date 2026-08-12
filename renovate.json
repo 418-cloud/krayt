@@ -87,6 +87,15 @@
       "matchStrings": ["ARG GEMINI_CLI_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "npm",
       "packageNameTemplate": "@google/gemini-cli"
+    },
+    {
+      "customType": "regex",
+      "description": "images/agents/opencode/Dockerfile: opencode, fetched as a release tarball (self-contained binary, no Dockerfile-manager datasource)",
+      "managerFilePatterns": ["^images/agents/opencode/Dockerfile$"],
+      "matchStrings": ["ARG OPENCODE_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "anomalyco/opencode",
+      "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ],
   "packageRules": [
