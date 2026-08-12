@@ -215,14 +215,15 @@ Reproducible, ready-to-run examples live under `hack/` — most notably `hack/cl
 
 krayt publishes official, minimal, version-pinned container images with an agent already
 installed — no `docker build` required to try krayt. Each is `debian:bookworm-slim` (or the
-agent's required base) plus the non-root `agent` user, the CLI, and nothing else; extend one
-with `FROM` + `apt-get` for your own tools (see each image's README). Built by
-[`agent-images.yml`](./.github/workflows/agent-images.yml), tagged `:latest`, `:sha-<short>`,
-and `:<cli-version>`.
+agent's required base, e.g. `node:24-bookworm-slim` for gemini-cli) plus a non-root user, the
+CLI, and nothing else; extend one with `FROM` + `apt-get` for your own tools (see each image's
+README). Built by [`agent-images.yml`](./.github/workflows/agent-images.yml), tagged `:latest`,
+`:sha-<short>`, and `:<cli-version>`.
 
 | Image | `--agent` | Credential (exactly one) | Required `--allow` |
 |---|---|---|---|
 | [`ghcr.io/418-cloud/krayt-agent-claude-code`](./images/agents/claude-code/) | `claude-code` | `ANTHROPIC_API_KEY` xor `CLAUDE_CODE_OAUTH_TOKEN` | `api.anthropic.com` |
+| [`ghcr.io/418-cloud/krayt-agent-gemini-cli`](./images/agents/gemini-cli/) | `gemini-cli` | `GEMINI_API_KEY` xor `GOOGLE_API_KEY` | `generativelanguage.googleapis.com` (`GEMINI_API_KEY`) or `aiplatform.googleapis.com` (`GOOGLE_API_KEY`, Vertex AI) |
 
 ### Shell completion
 
