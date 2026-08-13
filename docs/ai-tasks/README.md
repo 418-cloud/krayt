@@ -26,6 +26,20 @@ can act on it. Name them descriptively in kebab-case after the outcome (e.g.
 | [`add-opencode-agent-image.md`](./add-opencode-agent-image.md) | Publish `ghcr.io/418-cloud/krayt-agent-opencode` **and** add the missing host-side `opencode` adapter (exactly-one of ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY, §6.14) + completion + spec updates. Depends on the claude-code agent-image task. | ⬜ Not started |
 | [`add-codex-agent-image.md`](./add-codex-agent-image.md) | Publish `ghcr.io/418-cloud/krayt-agent-codex` (debian slim + the pinned static musl `codex` release binary, `codex exec` headless, TOML `[mcp_servers]` ask-human wiring) **and** add the missing host-side `codex` adapter (exactly-one of OPENAI_API_KEY / CODEX_API_KEY, §6.14) + completion + spec updates. Depends on the claude-code agent-image task; shares the adapter ripple with the opencode task. | ⬜ Not started |
 
+## Host-side egress proxy (three-step arc)
+
+Moving the egress proxy out of the VM and turning it into a credential-injecting MITM. **Strictly
+ordered — each step depends on the previous one landing *and* passing its hardware re-verification.**
+The split is deliberate: step 1 is an unambiguous security win that must be independently revertable
+from step 2, which is a trust-model trade (secrets leave the VM, but the adversarially-exposed parser
+leaves the blast-radius boundary). All three amend spec statements they contradict, per `CLAUDE.md`.
+
+| Task | What it does | Status |
+|---|---|---|
+| [`move-egress-proxy-to-host.md`](./move-egress-proxy-to-host.md) | **Step 1.** Move the allowlist proxy from the guest to the host, as a *pure CONNECT tunnel* in its own process (`krayt __egress-proxy`, listener passed on fd 3), reached over a new guest→host vsock channel (`EgressPort`, `VM.ListenEgress`); the guest keeps only a parse-nothing `krayt-vsock-forward` pipe. Deletes the `meta skuid "proxyd"` lock and its cross-module dependency on the §6.10 container hardening — the guest chain becomes `policy drop` + `oif "lo" accept` and nothing else. vsock over a gateway-bound TCP proxy because vfkit/vmnet gives concurrent VMs a *shared* segment. Hard-blocks every private/loopback range in all modes (deleting the `full` carve-out, which means something much worse once the dialer is on the host) and adds a host-redacted `proxy.log` artifact. | ⬜ Not started |
+| [`add-tls-mitm-credential-injection.md`](./add-tls-mitm-credential-injection.md) | **Step 2.** Terminate TLS at the host proxy (ephemeral in-memory per-run ECDSA CA, bounded SNI leaf cache, `http/1.1`-only ALPN, `FlushInterval: -1`, per-host passthrough list) and inject auth headers host-side, so HTTP-shaped credentials never enter the VM at all — injected keys are withheld from `SecretsBundle` and reach the proxy child on stdin, never argv or env. Opt-in via `network.mitm`, default off, allowed in every mode (`full` + `mitm` intercepts everything not in `passthrough`). Removes credential *theft*, not credential *use*; documents that honestly. | ⬜ Not started |
+| [`inject-claude-oauth-token-at-proxy.md`](./inject-claude-oauth-token-at-proxy.md) | **Step 3.** Credential *shape translation*: the container is always configured API-key-shaped with a placeholder and cannot tell which credential is really in use, while the proxy speaks OAuth upstream. Because API keys never refresh, this removes the refresh flow from the container entirely rather than intercepting it. Accepts a maintenance dependency on Anthropic's wire format, confined to one dated, golden-tested table in `internal/adapter/anthropic_wire.go` — `internal/proxy` stays vendor-free. One `[HUMAN]` probe decides between the primary design and a pre-specified response-rewriting fallback; the agent chooses nothing. | ⬜ Not started |
+
 ## Security-review remediation (from the pre-release secure code review)
 
 Ordered by severity. The two Criticals should land before any public release. Tasks that need a real
