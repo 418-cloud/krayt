@@ -25,7 +25,7 @@ on:
       - "images/**"
       - "internal/guest/**"
       - "cmd/krayt-agent/**"
-      - "cmd/krayt-proxy/**"
+      - "cmd/krayt-vsock-forward/**"
       - "cmd/krayt-ask/**"
   push:
     branches: [main]
@@ -33,7 +33,7 @@ on:
       - "images/**"
       - "internal/guest/**"
       - "cmd/krayt-agent/**"
-      - "cmd/krayt-proxy/**"
+      - "cmd/krayt-vsock-forward/**"
       - "cmd/krayt-ask/**"
 
 # Global, not per-ref like image.yml's own group: computing "the next tag" is a read-then-write

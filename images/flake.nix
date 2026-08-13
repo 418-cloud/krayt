@@ -45,7 +45,7 @@
             pname = "krayt-agent";
             version = "0.0.0-dev";
             src = ../.; # repo root (go.mod, internal/, cmd/)
-            subPackages = [ "cmd/krayt-agent" "cmd/krayt-proxy" "cmd/krayt-ask" ];
+            subPackages = [ "cmd/krayt-agent" "cmd/krayt-vsock-forward" "cmd/krayt-ask" ];
             vendorHash = "sha256-zpb6RQWKQAt+b/EW/mhw+vNm6CnBz6mu6vlVQH+RKOg=";
             env.CGO_ENABLED = "0";
           };
@@ -117,14 +117,19 @@
 
                 networking.nftables.enable = true; # per-task rules applied by the agent at run start
 
-                # ---- egress proxy identity (§6.6) ----
-                # The proxy runs as this dedicated, non-root uid; the nftables lock permits
-                # egress only for `skuid "proxyd"`, so the container (a different uid) cannot
-                # bypass it. The name must exist for both the credential switch and the rule.
+                # ---- egress forwarder identity (§6.6) ----
+                # krayt-vsock-forward (the guest-side TCP<->vsock pipe to the host-side L7
+                # allowlist proxy, since move-egress-proxy-to-host.md) runs as this dedicated,
+                # non-root uid. This is NO LONGER load-bearing for the nftables lock — that lock
+                # is loopback-only now and does not key on any uid (firewall_linux.go) — but it
+                # is kept deliberately as defense in depth: the one guest process that touches
+                # container-controlled bytes should not run as the guest-agent's own root
+                # identity. Do not delete this as vestigial; it is a documented, intentional
+                # residual control, not a leftover from the old skuid-keyed design.
                 users.users.proxyd = {
                   isSystemUser = true;
                   group = "proxyd";
-                  description = "krayt egress allowlist proxy";
+                  description = "krayt guest-side egress forwarder (defense in depth, not the L3 lock)";
                 };
                 users.groups.proxyd = { };
 
@@ -167,7 +172,7 @@
                   requires = [ "containerd.service" ];
                   # On PATH for the agent: git for the §6.7 bundle ingest/diff; nftables (`nft`)
                   # for the §6.6 egress lock; and the guest-agent package itself so the agent can
-                  # exec `krayt-proxy` (built into the same derivation).
+                  # exec `krayt-vsock-forward` (built into the same derivation).
                   path = [ pkgs.gitMinimal pkgs.nftables guest-agent ];
                   # Route the agent's working files (image tar, repo bundle, /workspace clone)
                   # onto the scratch disk rather than tmpfs/RAM (§6.10).

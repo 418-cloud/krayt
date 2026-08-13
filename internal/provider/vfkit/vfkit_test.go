@@ -5,6 +5,7 @@ package vfkit
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -66,8 +67,9 @@ func TestBuildConfigDevices(t *testing.T) {
 	clone := "/run/run_x/rootfs.img"
 	scratch := "/run/run_x/scratch.img"
 	ctrlSock := "/run/run_x/control.sock"
+	egressSock := "/run/run_x/egress.sock"
 
-	cfg, err := buildConfig(spec, clone, scratch, ctrlSock)
+	cfg, err := buildConfig(spec, clone, scratch, ctrlSock, egressSock)
 	if err != nil {
 		t.Fatalf("buildConfig: %v", err)
 	}
@@ -89,6 +91,14 @@ func TestBuildConfigDevices(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Errorf("cmdline missing %q\n  got: %s", want, line)
 		}
+	}
+	// The egress vsock device needs its own exact-tuple assertion: checking only that
+	// egressSock appears somewhere in the line would still pass if the device used the wrong
+	// port or listen=false (host→guest instead of guest→host), either of which breaks the
+	// channel silently.
+	wantEgress := fmt.Sprintf("virtio-vsock,port=%d,socketURL=%s,listen", provider.EgressPort, egressSock)
+	if !strings.Contains(line, wantEgress) {
+		t.Errorf("cmdline missing egress vsock device %q\n  got: %s", wantEgress, line)
 	}
 	// The base image must never be passed directly to vfkit.
 	if strings.Contains(line, spec.RootFS) {

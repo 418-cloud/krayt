@@ -175,11 +175,19 @@ func List(stateDir string) ([]RunRecord, error) {
 func LogPath(runDir string) string { return filepath.Join(runDir, "logs", "agent.log") }
 
 // ConsoleLogPath is the persisted guest serial-console log path for a run dir — the
-// guest-agent's own stdout/stderr (and anything it execs, e.g. proxyd), as opposed to
-// LogPath's container-only stdout/stderr. Populated best-effort by Run before it tears the VM
-// down (provider.VM.LogPaths); may not exist if the provider had nothing to offer (e.g. the
-// fake provider, or a VM that never got far enough to boot).
+// guest-agent's own stdout/stderr (and anything it execs, e.g. the proxyd-uid
+// krayt-vsock-forward), as opposed to LogPath's container-only stdout/stderr. Populated
+// best-effort by Run before it tears the VM down (provider.VM.LogPaths); may not exist if the
+// provider had nothing to offer (e.g. the fake provider, or a VM that never got far enough to
+// boot).
 func ConsoleLogPath(runDir string) string { return filepath.Join(runDir, "logs", "console.log") }
+
+// ProxyLogPath is the persisted HOST-side egress-proxy child log path for a run dir (§6.6, §9
+// of move-egress-proxy-to-host.md): the redacted stdout/stderr of `krayt __egress-proxy`
+// (allow/deny verdicts, dial errors — never bodies). Distinct from ConsoleLogPath, which is
+// still guest-side diagnostics; this is the first artifact whose content originates entirely
+// on the host.
+func ProxyLogPath(runDir string) string { return filepath.Join(runDir, "proxy.log") }
 
 // FollowLog tails runDir/logs/agent.log, writing new bytes to w as they appear, until the
 // run reaches a terminal state (log then drained) or ctx is canceled. Because it reads the

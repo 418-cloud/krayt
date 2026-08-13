@@ -1,11 +1,20 @@
-// Package proxy is the in-guest egress allowlist proxy of §6.6: a small HTTP/HTTPS CONNECT
-// forward proxy that checks each request's host against the per-task policy. It is the L7
-// half of the egress control; the L3 nftables lock (firewall_linux.go) makes it
-// unbypassable by dropping all egress except loopback and the proxy's own uid.
+// Package proxy is krayt's egress allowlist proxy (§6.6): a small HTTP/HTTPS CONNECT forward
+// proxy that checks each request's host against the per-task policy. Since the
+// move-egress-proxy-to-host task it runs as its own process on the HOST — `krayt
+// __egress-proxy` (internal/cli) execs the binary named here and hands it a fd-3 listener —
+// not inside the guest VM. The guest's only egress-side component is
+// cmd/krayt-vsock-forward, a dumb TCP<->vsock pipe that parses nothing; this package is the
+// entire L7 decision engine.
 //
-// The proxy logic here is OS-agnostic and unit-tested directly. The implementation is
-// deliberately behind the Factory seam so it can be swapped for elazarl/goproxy or any
-// other backend without touching the guest wiring (the user chose hand-rolled for v1).
+// The package is deliberately OS-agnostic and build-tag-free even though it now runs
+// host-side only: it must still cross-compile for linux/arm64 (it is a dependency of nothing
+// in the guest, but the module as a whole is), and keeping it free of host-specific imports
+// keeps the swap seam below honest.
+//
+// The logic here is unit-tested directly. The implementation is deliberately behind the
+// Factory seam so it can be swapped for elazarl/goproxy, or a memory-safe reimplementation in
+// another language honoring the same flags/fd-3/log contract (§6.6), without touching the
+// process that execs it — see KRAYT_EGRESS_PROXY_BIN in internal/orchestrator.
 package proxy
 
 import (
@@ -44,7 +53,8 @@ type Factory func(Policy) http.Handler
 const dialTimeout = 30 * time.Second
 
 // Serve runs a forward proxy built by factory (HandRolled if nil) on lis until ctx is
-// canceled. It is what cmd/krayt-proxy runs as the dedicated proxyd uid (§6.6).
+// canceled. It is what the `krayt __egress-proxy` hidden subcommand runs on its fd-3
+// listener (§6.6, internal/cli).
 func Serve(ctx context.Context, lis net.Listener, p Policy, factory Factory) error {
 	if factory == nil {
 		factory = HandRolled
@@ -60,31 +70,28 @@ func Serve(ctx context.Context, lis net.Listener, p Policy, factory Factory) err
 	return nil
 }
 
-// DefaultDNSServer is where the proxy resolves names. Resolution is done by the proxy
-// itself (dialed as proxyd), not the system stub resolver — the stub runs as a different
-// uid and its upstream queries are dropped by the nftables egress lock, so a stub-based
-// lookup fails under `allowlist`/`none` (§6.6).
-const DefaultDNSServer = "1.1.1.1:53"
-
 // HandRolled is the default allowlist forward proxy: it tunnels CONNECT (HTTPS) and
 // forwards plain HTTP, allowing a request only if its host passes the policy (§6.6). It
-// resolves via DefaultDNSServer.
+// resolves through the host's system resolver (respecting the user's VPN/split-horizon/
+// corporate DNS), same as any ordinary process on the machine it runs on.
 func HandRolled(p Policy) http.Handler {
-	return HandRolledDNS(p, DefaultDNSServer)
+	return HandRolledDNS(p, "")
 }
 
-// HandRolledDNS is HandRolled with an explicit DNS server (the krayt-proxy --dns flag).
+// HandRolledDNS is HandRolled with an explicit DNS server override (the `--dns` flag on
+// `krayt __egress-proxy`). An empty dnsServer means "use the system resolver" — that is the
+// default; DNS no longer resolves in the VM's network context, but in the host's (§6.6).
 func HandRolledDNS(p Policy, dnsServer string) http.Handler {
-	// Control fires once per resolved address the dialer tries, just before connect, with
-	// the resolved ip:port — so the post-resolution SSRF guard (checkDialAddr, §6.6) covers
-	// every A/AAAA answer and every Happy-Eyeballs attempt, closing the DNS-rebinding window
-	// (the resolved IP is checked, not the name). This one dialer backs both the CONNECT
-	// tunnel dial and the HTTP transport dial, so both paths are guarded.
+	// Control fires once per resolved address the dialer tries, just before connect, so the
+	// post-resolution SSRF guard (checkDialAddr, §6.6) covers every A/AAAA answer and every
+	// Happy-Eyeballs attempt, closing the DNS-rebinding window (the resolved IP is checked,
+	// not the name). This one dialer backs both the CONNECT tunnel dial and the HTTP
+	// transport dial, so both paths are guarded.
 	d := &net.Dialer{
 		Timeout:  dialTimeout,
 		Resolver: resolverVia(dnsServer),
 		Control: func(_, address string, _ syscall.RawConn) error {
-			return checkDialAddr(p.Mode, address)
+			return checkDialAddr(address)
 		},
 	}
 	tr := &http.Transport{
@@ -98,7 +105,7 @@ func HandRolledDNS(p Policy, dnsServer string) http.Handler {
 	return newHandler(p, tr, d.DialContext)
 }
 
-// dialFunc dials an upstream address (resolving as proxyd, §6.6).
+// dialFunc dials an upstream address.
 type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // newHandler builds the proxy with an injectable transport + dialer (tests pass fakes so no
@@ -113,9 +120,15 @@ func newHandler(p Policy, rt http.RoundTripper, dial dialFunc) *handler {
 	return &handler{mode: p.Mode, allow: allow, transport: rt, dial: dial}
 }
 
-// resolverVia forces DNS through dnsServer, dialed by the proxy (proxyd) so the query is
-// permitted by the nftables lock rather than routed through a stub resolver on another uid.
+// resolverVia returns a *net.Resolver that dials dnsServer for every lookup, or nil (the
+// system resolver) when dnsServer is empty — the default since this package moved host-side
+// (§6.6): there is no longer a nftables uid lock to route DNS around, so the ordinary system
+// resolver is both simpler and more correct (it respects the user's VPN/split-horizon/
+// corporate DNS, which a hardcoded server would not).
 func resolverVia(dnsServer string) *net.Resolver {
+	if dnsServer == "" {
+		return nil
+	}
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -130,7 +143,7 @@ func resolverVia(dnsServer string) *net.Resolver {
 var errBlockedAddr = errors.New("krayt: dial target resolves to a blocked address")
 
 // cgnat is the RFC 6598 shared-address (carrier-grade NAT) range, which netip's IsPrivate
-// does not cover; it is treated like a private range (blocked unless mode == full).
+// does not cover; it is treated like a private range (always blocked, §6.6).
 var cgnat = netip.MustParsePrefix("100.64.0.0/10")
 
 // metadataIP is the cloud instance-metadata address, always refused (also caught by the
@@ -138,23 +151,31 @@ var cgnat = netip.MustParsePrefix("100.64.0.0/10")
 var metadataIP = netip.MustParseAddr("169.254.169.254")
 
 // blockedAddrMsg is the operator-facing 403 body for a target checkDialAddr refused (§6.6) —
-// worded generically since the block covers loopback/link-local/multicast/unspecified/metadata
-// and (mode-dependent) private/CGNAT ranges, and can fire for a request host that was already an
-// IP literal (no resolution involved).
+// worded generically since the block covers loopback/link-local/multicast/unspecified/
+// metadata/private/CGNAT ranges, and can fire for a request host that was already an IP
+// literal (no resolution involved).
 func blockedAddrMsg(host string) string {
 	return "krayt: egress to " + host + " targets a blocked address range"
 }
 
 // checkDialAddr is the post-resolution SSRF guard (§6.6). It runs on the *resolved* ip:port
-// of every upstream dial and refuses:
-//   - always, in every mode: loopback, link-local (uni/multicast), the cloud metadata IP,
-//     the unspecified address, and multicast;
-//   - unless mode == full: RFC 1918 / RFC 4193 (ULA) private ranges and the RFC 6598 CGNAT
-//     range.
+// of every upstream dial and refuses, in EVERY mode including full — no exceptions: loopback,
+// link-local (uni/multicast), the cloud metadata IP, the unspecified address, multicast, and
+// RFC 1918 / RFC 4193 (ULA) private ranges plus the RFC 6598 CGNAT range.
+//
+// This is unconditional (no mode carve-out) because the proxy now runs on the HOST: with the
+// dialer inside a VM, "allow mode=full to reach RFC1918" meant "the VM's own NAT segment is
+// reachable"; with the dialer on the host, the identical carve-out would mean "the sandbox can
+// reach the user's real LAN and loopback services from a trusted host process" — a materially
+// worse trade, so it is refused unconditionally instead of widened (§6.6, move-egress-proxy-
+// to-host.md §2). A local Ollama/LM Studio on 127.0.0.1 or a LAN package mirror is therefore
+// unreachable from the sandbox in every mode; that is a deliberate, documented casualty, not
+// an oversight — a purpose-built named-forward-target mechanism is the follow-up, not a range
+// unblock.
 //
 // It is fail-closed: an unparseable address is refused. It does not consult the host-string
 // allowlist — that check already ran in the handler; this guard is strictly additional.
-func checkDialAddr(mode, address string) error {
+func checkDialAddr(address string) error {
 	host := address
 	if h, _, err := net.SplitHostPort(address); err == nil {
 		host = h
@@ -169,8 +190,9 @@ func checkDialAddr(mode, address string) error {
 		ip.IsMulticast(), ip.IsUnspecified(), ip == metadataIP:
 		return fmt.Errorf("%w: %s (loopback/link-local/metadata)", errBlockedAddr, ip)
 	}
-	if mode != ModeFull && (ip.IsPrivate() || cgnat.Contains(ip)) {
-		return fmt.Errorf("%w: %s (private range, allowed only in full mode)", errBlockedAddr, ip)
+	if ip.IsPrivate() || cgnat.Contains(ip) {
+		return fmt.Errorf("%w: %s (private/LAN range, blocked in every mode — host/LAN "+
+			"services are not a supported egress target, §6.6)", errBlockedAddr, ip)
 	}
 	return nil
 }
@@ -219,8 +241,9 @@ func (h *handler) connect(w http.ResponseWriter, r *http.Request) {
 		// hack/netprobe, uses) discards the response body on a non-2xx CONNECT reply — the
 		// caller only ever sees the status text ("Bad Gateway"), never this message. Log it
 		// server-side so the real reason (DNS failure, connection refused, timeout, …) is
-		// visible in the guest-agent log this process's stdout/stderr feeds (§6.6).
-		log.Printf("krayt-proxy: CONNECT %s: upstream dial failed: %v", r.Host, err)
+		// visible in proxy.log (§6.6, §9 of move-egress-proxy-to-host.md), the only place a
+		// denial reason survives.
+		log.Printf("krayt-egress-proxy: CONNECT %s: upstream dial failed: %v", r.Host, err)
 		http.Error(w, "krayt: upstream dial failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -254,7 +277,7 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
 			return
 		}
-		log.Printf("krayt-proxy: %s %s: upstream request failed: %v", r.Method, requestHost(r), err)
+		log.Printf("krayt-egress-proxy: %s %s: upstream request failed: %v", r.Method, requestHost(r), err)
 		http.Error(w, "krayt: upstream request failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
