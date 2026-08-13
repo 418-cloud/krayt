@@ -43,11 +43,10 @@ func (f *forwarder) serve() error {
 			f.wg.Wait()
 			return nil // the only expected error is the listener being closed by close()
 		}
-		if !f.track(conn) { // shutting down
+		if !f.beginHandler(conn) { // shutting down
 			_ = conn.Close()
 			continue
 		}
-		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
 			defer f.untrack(conn)
@@ -89,6 +88,24 @@ func (f *forwarder) track(c net.Conn) bool {
 		return false
 	}
 	f.conns[c] = struct{}{}
+	return true
+}
+
+// beginHandler is track plus the handler goroutine's wg.Add(1), done atomically under the same
+// lock. Doing the Add here — rather than after track() returns, as a separate statement — closes
+// a WaitGroup race: if it happened later, close() could acquire the lock, see closed==true (or
+// even just run its own wg.Wait()) in the window between track() returning true and the Add
+// happening, observing a zero counter and returning before this connection's handler goroutine
+// is even launched. Adding under the same critical section that registers the connection means
+// close() can never observe the connection as tracked without the Add having already happened.
+func (f *forwarder) beginHandler(c net.Conn) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return false
+	}
+	f.conns[c] = struct{}{}
+	f.wg.Add(1)
 	return true
 }
 

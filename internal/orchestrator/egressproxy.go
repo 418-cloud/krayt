@@ -121,10 +121,7 @@ func (p *egressProxy) stop() {
 // a query string. Same fail-closed rule as writeConsoleLog: if the secret values can't be
 // loaded to redact against, the file is dropped rather than risked in the clear.
 func (p *egressProxy) writeLog() {
-	b := p.out.Bytes()
-	if len(b) > maxProxyLog {
-		b = b[len(b)-maxProxyLog:] // keep the tail: closest to whatever the run ended on
-	}
+	b := p.out.Bytes() // already capped to maxProxyLog by syncBuffer.Write
 	if p.secretsPath != "" {
 		values, err := secrets.Load(p.secretsPath)
 		if err != nil {
@@ -162,6 +159,11 @@ func takeListenerFD(lis net.Listener) (*os.File, error) {
 // syncBuffer is a concurrency-safe io.Writer sink for the egress proxy child's combined
 // stdout/stderr. exec.Cmd already serializes writes when Stdout and Stderr are the same
 // value, but a mutex here makes that safe by construction rather than by relying on it.
+//
+// It retains only the last maxProxyLog bytes AS WRITES ARRIVE, not just when writeLog later
+// reads it back — an upstream that generates unbounded failure output over a long run must not
+// be able to grow this buffer (and this process's memory) without bound just because the
+// on-disk artifact is capped.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -170,7 +172,11 @@ type syncBuffer struct {
 func (w *syncBuffer) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.buf.Write(p)
+	n, err := w.buf.Write(p)
+	if extra := w.buf.Len() - maxProxyLog; extra > 0 {
+		w.buf.Next(extra) // drop the oldest bytes, keeping the tail
+	}
+	return n, err
 }
 
 func (w *syncBuffer) Bytes() []byte {

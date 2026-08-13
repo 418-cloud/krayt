@@ -223,12 +223,16 @@ loopback. Two behavior notes worth knowing:
 - **DNS resolves in your host's network context**, not the VM's — it uses your system resolver
   by default, so VPN/split-horizon/corporate DNS behaves the way it would for any other process
   on your machine.
-- **Loopback, link-local, and private/LAN ranges (RFC 1918, CGNAT, ULA) are refused in every
-  mode, including `full`.** A local Ollama/LM Studio on `127.0.0.1:11434` or a LAN package
-  mirror is **not reachable** from inside the sandbox — this is deliberate: the proxy now runs
-  on your host, so a range unblock would mean giving sandboxed code a path to your real LAN and
-  loopback services, not just the VM's own NAT segment. There is no per-task opt-in for this; a
-  purpose-built named-forward-target mechanism is a possible future addition.
+- **Loopback, link-local, and private/LAN ranges (RFC 1918, CGNAT, ULA) are refused on every
+  proxy-mediated dial, in every policy mode, including `full`.** A local Ollama/LM Studio on
+  `127.0.0.1:11434` or a LAN package mirror is **not reachable through the proxy** — this is
+  deliberate: the proxy now runs on your host, so a range unblock would mean giving sandboxed
+  code a path to your real LAN and loopback services, not just the VM's own NAT segment. There is
+  no per-task opt-in for this; a purpose-built named-forward-target mechanism is a possible
+  future addition. **Note:** `--net full` also opens the guest's NIC directly (it deletes the
+  in-guest firewall table), so software that ignores `HTTP_PROXY` — or opens a raw socket — is
+  **not** subject to this guard at all in `full` mode and can reach routable private/LAN
+  addresses directly; only the proxy path is hard-blocked.
 
 ### Agent images
 

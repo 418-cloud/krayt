@@ -538,29 +538,36 @@ is the simplest correct choice. Enforcement layers:
   agent's **auth/refresh** endpoints must be allowlisted alongside the inference endpoint
   (§6.14); an OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key, so
   it can need a wider list.
-- **Resolved-IP guard (SSRF / DNS-rebinding) — now a HARD block in every mode, no carve-out.**
-  The host-string allowlist is not enough on its own: an allowlisted name (or, in `full`, any
-  name) could resolve to an internal address. After the proxy resolves an upstream name, it
-  checks the **resolved IP** — on *every* A/AAAA answer and every connection attempt, via the
-  dialer's `Control` hook, covering both the CONNECT tunnel dial and the plain-HTTP transport
-  dial — and refuses, **unconditionally, in every mode including `full`**: loopback
-  (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), the cloud **metadata** IP
-  `169.254.169.254`, the unspecified address (`0.0.0.0`, `::`), multicast, and (since this task)
-  **private / ULA ranges** — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, the
-  `100.64.0.0/10` CGNAT range, and `fc00::/7` — **with no `mode: full` exception anymore**.
+- **Resolved-IP guard (SSRF / DNS-rebinding) — now a HARD block on every proxy-mediated dial, no
+  carve-out.** The host-string allowlist is not enough on its own: an allowlisted name (or, in
+  `full`, any name) could resolve to an internal address. After the proxy resolves an upstream
+  name, it checks the **resolved IP** — on *every* A/AAAA answer and every connection attempt,
+  via the dialer's `Control` hook, covering both the CONNECT tunnel dial and the plain-HTTP
+  transport dial — and refuses, **unconditionally, in every policy mode including `full`**:
+  loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), the cloud
+  **metadata** IP `169.254.169.254`, the unspecified address (`0.0.0.0`, `::`), multicast, and
+  (since this task) **private / ULA ranges** — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+  the `100.64.0.0/10` CGNAT range, and `fc00::/7` — **with no `mode: full` exception anymore**.
   Public addresses are allowed (still subject to the host allowlist above). The check is
-  **fail-closed**: an address that cannot be parsed is refused. A refusal returns a `403`.
+  **fail-closed**: an address that cannot be parsed is refused. A refusal returns a `403`. **This
+  guard is proxy-side, so it only covers traffic that is actually proxy-mediated** — see the
+  `full`-mode caveat immediately below.
 
   **Why the carve-out was deleted rather than kept.** The old `mode: full` exception existed
   because the dialer lived *inside* the VM: letting it reach `192.168.0.0/16` meant "the VM's
   own NAT segment is reachable" — a contained, low-stakes trade. With the dialer now on the
   **host**, the identical carve-out would mean "the sandbox can reach the user's real LAN and
   loopback services from a trusted host process" — a materially worse trade, so it is refused
-  outright rather than widened. **This is a deliberate, documented casualty:** reaching a
-  service on the host or LAN from the sandbox — a local Ollama/LM Studio on
-  `127.0.0.1:11434`, a LAN package mirror — is now **impossible in every mode**. That use case,
-  if wanted, needs a purpose-built mechanism (an explicitly named forward target), not a range
-  unblock; it is recorded as a possible follow-up (§15), not built here.
+  outright rather than widened. **This is a deliberate, documented casualty for proxy-mediated
+  traffic:** a well-behaved agent that honors `HTTP_PROXY` — a local Ollama/LM Studio on
+  `127.0.0.1:11434`, a LAN package mirror — cannot reach it through the proxy, in any policy
+  mode. That use case, if wanted, needs a purpose-built mechanism (an explicitly named forward
+  target), not a range unblock; it is recorded as a possible follow-up (§15), not built here.
+  **It is not a hard guarantee in `mode: full`**, though: `full` also deletes the guest's
+  nftables table outright (above), so software that ignores `HTTP_PROXY` — or opens a raw socket
+  — bypasses the proxy (and this guard) entirely and can reach any routable private/LAN address
+  directly over the NIC, identically to before this task. Only the proxy path gained the
+  unconditional block; `full`'s raw-NIC escape hatch is unchanged and was never proxy-mediated.
 
   Because the *resolved* IP is what's checked (not the requested name), this also mitigates
   **DNS-rebinding** to internal addresses.

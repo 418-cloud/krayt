@@ -49,11 +49,13 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 )
@@ -111,13 +113,26 @@ func main() {
 	fmt.Printf("netprobe: ok — raw connect to %s blocked (%v)\n", rawTarget, err)
 
 	// 4. An allowlisted-but-private target must still be blocked, by the resolved-IP SSRF guard
-	//    rather than the L7 host check (§6.6 §2, Phase 8 regression check).
-	if err := getViaProxy(privateTarget); err == nil {
-		fmt.Fprintf(os.Stderr, "netprobe: FAIL — allowlisted-but-private target %s WAS reachable via the "+
-			"proxy; the hard SSRF block on private/LAN ranges has regressed (§6.6 §2)\n", privateTarget)
+	//    rather than the L7 host check (§6.6 §2, Phase 8 regression check). This must be a
+	//    status-aware CONNECT, not getViaProxy: getViaProxy treats ANY error — including a
+	//    timeout or connection failure while dialing the deliberately unroutable private
+	//    target — as "blocked", so a regressed guard that lets the dial through but then hangs
+	//    or fails to route would still report success here. Only an explicit 403 from the proxy
+	//    proves the SSRF guard actually fired.
+	status, err := connectStatus(proxy, net.JoinHostPort(privateTarget, "443"))
+	switch {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "netprobe: FAIL — CONNECT to allowlisted-but-private target %s errored "+
+			"instead of returning a clean 403 (guard status can't be confirmed, so a regression can't be "+
+			"ruled out): %v\n", privateTarget, err)
+		os.Exit(24)
+	case status != http.StatusForbidden:
+		fmt.Fprintf(os.Stderr, "netprobe: FAIL — CONNECT to allowlisted-but-private target %s returned "+
+			"HTTP %d, want 403; the hard SSRF block on private/LAN ranges has regressed (§6.6 §2)\n",
+			privateTarget, status)
 		os.Exit(24)
 	}
-	fmt.Printf("netprobe: ok — allowlisted-but-private target %s blocked by the SSRF guard\n", privateTarget)
+	fmt.Printf("netprobe: ok — allowlisted-but-private target %s blocked by the SSRF guard (403)\n", privateTarget)
 
 	fmt.Println("netprobe: PASS — allowlisted reachable, non-allowlisted blocked, raw socket blocked, allowlisted-but-private target blocked")
 }
@@ -142,6 +157,34 @@ func getViaProxy(host string) error {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
 	fmt.Printf("netprobe:   %s -> HTTP %d\n", host, resp.StatusCode)
 	return nil
+}
+
+// connectStatus sends a raw HTTP CONNECT for target through the proxy and returns the status
+// code the proxy itself replied with, distinguishing a deliberate 403 (the SSRF guard fired)
+// from a timeout, dial error, or 502 (upstream dial failure) — outcomes getViaProxy's net/http
+// client path collapses into an indistinguishable error.
+func connectStatus(proxyURL, target string) (int, error) {
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return 0, fmt.Errorf("parse proxy URL: %w", err)
+	}
+	conn, err := net.DialTimeout("tcp", u.Host, 8*time.Second)
+	if err != nil {
+		return 0, fmt.Errorf("dial proxy: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return 0, err
+	}
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+		return 0, fmt.Errorf("write CONNECT: %w", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		return 0, fmt.Errorf("read CONNECT response: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode, nil
 }
 
 func envOr(key, fallback string) string {

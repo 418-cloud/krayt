@@ -10,6 +10,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -96,6 +97,13 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		rec.DurationSecs = durationSecs(rec.StartedAt, rec.EndedAt)
 		switch {
 		case err != nil:
+			// If the run failed because ctx was canceled by the egress-death watch below
+			// (rather than by the caller or the wall-clock timeout), surface that specific
+			// reason instead of whatever generic "context canceled" the failing step reported.
+			if cause := context.Cause(ctx); cause != nil &&
+				!errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
+				err = cause
+			}
 			rec.State, rec.Error = StateFailed, err.Error()
 		case res != nil && res.TimedOut:
 			rec.State, rec.ExitCode, rec.TimedOut = StateTimedOut, res.ExitCode, true
@@ -153,6 +161,21 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return nil, err
 	}
 	defer egress.stop()
+
+	// spawnEgressProxy only catches a child that dies within its startup window; nothing past
+	// that point watches egress.waited until teardown, so a delayed init failure or a crash
+	// during the run would otherwise leave the VM running with its only egress path dead,
+	// contrary to spawnEgressProxy's fail-fast contract. Cancel the run the moment that happens,
+	// so every ctx-aware step below fails instead of silently continuing.
+	ctx, cancelOnEgressDeath := context.WithCancelCause(ctx)
+	defer cancelOnEgressDeath(nil)
+	go func() {
+		select {
+		case <-egress.waited:
+			cancelOnEgressDeath(fmt.Errorf("orchestrator: egress proxy exited mid-run; see %s", ProxyLogPath(runDir)))
+		case <-ctx.Done():
+		}
+	}()
 
 	if err := vm.Start(ctx); err != nil {
 		return nil, fmt.Errorf("orchestrator: start VM: %w", err)
