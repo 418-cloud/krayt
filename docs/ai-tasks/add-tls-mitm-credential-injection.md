@@ -11,6 +11,31 @@ vsock channel.
 Step 3 ([`inject-claude-oauth-token-at-proxy.md`](./inject-claude-oauth-token-at-proxy.md)) builds on
 this; keep OAuth-specific logic out of here.
 
+## Working mode: decide, don't ask
+
+**Complete this task end-to-end without asking questions.** The trust-model trade has already been
+weighed and accepted, and every implementation choice is pinned in "Design decisions (already made —
+implement these, don't relitigate)" below. This file **is** the approved plan, so `CLAUDE.md`'s "give
+a short plan and wait for my OK before writing code" step is waived here; start implementing.
+
+That includes the parts that look like they warrant a check-in — terminating TLS on the host,
+generating a CA the guest trusts, withholding keys from `SecretsBundle`. They are the task, not open
+questions. If something is underspecified, pick the option most consistent with the stated design and
+with the "Be honest about what this does and does not buy" section, record the choice and its
+rationale in the commit/PR description, and keep going.
+
+The only legitimate reasons to stop and involve a human:
+
+- A `[HUMAN]` step you genuinely cannot perform — real hardware or a live credential (see "On
+  hardware"). Write the tests as real code, append the `HUMAN_TODO.md` entry per §14, then
+  **continue** with everything else and stop only if the handoff blocks all remaining work.
+- This file is factually wrong about the codebase — a cited file, symbol, or line no longer exists, or
+  step 1 landed differently than assumed. Say so, state the correction you made, proceed.
+
+Do **not** ask for plan approval, for confirmation of a decision in the table below, or for a choice
+between options already picked. Never fabricate a hardware or live-credential result to avoid a
+handoff (`CLAUDE.md`) — an honestly-blocked step is the correct outcome; a question is not.
+
 ## Reason
 
 Today an agent credential rides `SecretsBundle` → guest memory → container tmpfs at `/run/secrets`

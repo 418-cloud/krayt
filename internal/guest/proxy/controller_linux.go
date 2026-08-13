@@ -1,5 +1,12 @@
 //go:build linux
 
+// Package proxy is the GUEST side of krayt's egress control (§6.6). Since
+// move-egress-proxy-to-host.md it is no longer the L7 enforcement point — that is
+// internal/proxy now, running as a separate process on the HOST (`krayt __egress-proxy`,
+// internal/cli). What remains here is: the simplified L3 nftables lock (firewall_linux.go,
+// loopback-only, keyed on no uid) and the Controller that starts krayt-vsock-forward — a dumb
+// TCP<->vsock pipe with no policy of its own — as the dedicated `proxyd` uid and wires its
+// listen address into the container's HTTP_PROXY/HTTPS_PROXY env (controller_linux.go).
 package proxy
 
 import (
@@ -10,37 +17,45 @@ import (
 	"os/exec"
 	"os/user"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/418-cloud/krayt/internal/guest"
+	"github.com/418-cloud/krayt/internal/provider"
 )
 
 const (
 	defaultProxyUser = "proxyd"
 	defaultListen    = "127.0.0.1:3128"
-	defaultBinary    = "krayt-proxy"
+	defaultBinary    = "krayt-vsock-forward"
 )
 
-// Controller is the linux guest.Network (§6.6): at run start it launches the allowlist
-// proxy as the dedicated proxyd uid and installs the nftables lock, returning the
-// HTTP(S)_PROXY env for the container. The proxy is tied to the run context, so it exits
+// Controller is the linux guest.Network (§6.6): at run start it launches the guest-side
+// egress forwarder as the dedicated proxyd uid and installs the nftables lock, returning the
+// HTTP(S)_PROXY env for the container. The forwarder is tied to the run context, so it exits
 // when the run ends.
+//
+// Since move-egress-proxy-to-host.md this no longer starts the L7 allowlist proxy — that runs
+// on the HOST now, as `krayt __egress-proxy` (internal/proxy, internal/orchestrator), reached
+// over the guest→host vsock channel (provider.EgressPort). What this controller starts is
+// krayt-vsock-forward, a dumb TCP<->vsock pipe (cmd/krayt-vsock-forward) that parses nothing
+// and enforces nothing — the container's HTTP_PROXY points at it purely so its traffic stays
+// on loopback, which is what the simplified nftables lock (firewall_linux.go) keys on.
 type Controller struct {
-	Binary string // krayt-proxy path or name (default: resolved on PATH)
-	User   string // proxy uid name (default: proxyd)
-	Listen string // proxy listen address (default: 127.0.0.1:3128)
+	Binary    string // krayt-vsock-forward path or name (default: resolved on PATH)
+	User      string // forwarder uid name (default: proxyd)
+	Listen    string // forwarder listen address (default: 127.0.0.1:3128)
+	VsockPort uint32 // host egress vsock port the forwarder dials (default: provider.EgressPort)
 }
 
 // NewController returns a Controller with the production defaults.
 func NewController() *Controller {
-	return &Controller{Binary: defaultBinary, User: defaultProxyUser, Listen: defaultListen}
+	return &Controller{Binary: defaultBinary, User: defaultProxyUser, Listen: defaultListen, VsockPort: provider.EgressPort}
 }
 
 // Apply implements guest.Network.
 func (c *Controller) Apply(ctx context.Context, policy guest.NetworkPolicy) (map[string]string, error) {
-	binary, username, listen := c.Binary, c.User, c.Listen
+	binary, username, listen, vsockPort := c.Binary, c.User, c.Listen, c.VsockPort
 	if binary == "" {
 		binary = defaultBinary
 	}
@@ -50,32 +65,37 @@ func (c *Controller) Apply(ctx context.Context, policy guest.NetworkPolicy) (map
 	if listen == "" {
 		listen = defaultListen
 	}
+	if vsockPort == 0 {
+		vsockPort = provider.EgressPort
+	}
 
 	uid, gid, err := lookupUser(username)
 	if err != nil {
 		return nil, err
 	}
 
-	// Run the proxy as proxyd so the nftables `skuid "proxyd"` rule (and only that rule)
-	// permits its egress; the container, running as a different uid, cannot bypass it.
+	// Run the forwarder as proxyd. The nftables lock no longer keys on this uid (it only
+	// needs loopback to be open, §7) — this is now defense in depth only: the one guest
+	// process that touches container-controlled bytes still runs as a dedicated non-root
+	// uid rather than as the guest-agent's own root identity. Keep it; a future reader
+	// should not delete this as vestigial (see also images/flake.nix's proxyd user).
 	cmd := exec.CommandContext(ctx, binary,
 		"--listen", listen,
-		"--mode", policy.Mode,
-		"--allow", strings.Join(policy.Allow, ","),
+		"--vsock-port", strconv.FormatUint(uint64(vsockPort), 10),
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid}}
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr // surface proxy logs into the agent journal
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr // surface forwarder logs into the agent journal
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("proxy: start krayt-proxy as %s: %w", username, err)
+		return nil, fmt.Errorf("proxy: start krayt-vsock-forward as %s: %w", username, err)
 	}
 
-	// Reap the proxy so that when CommandContext kills it at run end (or via stopProxy on the
-	// error paths below) it is not left as a zombie. Harmless in the one-run-per-VM model
-	// today, but it prevents a per-run zombie/goroutine leak once a warm-VM pool reuses a
+	// Reap the forwarder so that when CommandContext kills it at run end (or via stopForwarder
+	// on the error paths below) it is not left as a zombie. Harmless in the one-run-per-VM
+	// model today, but it prevents a per-run zombie/goroutine leak once a warm-VM pool reuses a
 	// long-lived guest-agent across runs (§15).
 	waited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(waited) }()
-	stopProxy := func() {
+	stopForwarder := func() {
 		_ = cmd.Process.Kill()
 		select {
 		case <-waited:
@@ -84,11 +104,11 @@ func (c *Controller) Apply(ctx context.Context, policy guest.NetworkPolicy) (map
 	}
 
 	if err := ApplyFirewall(ctx, policy.Mode); err != nil {
-		stopProxy()
+		stopForwarder()
 		return nil, err
 	}
 	if err := waitListening(ctx, listen, 5*time.Second); err != nil {
-		stopProxy()
+		stopForwarder()
 		return nil, fmt.Errorf("proxy: %w", err)
 	}
 
@@ -115,7 +135,7 @@ func lookupUser(name string) (uint32, uint32, error) {
 	return uint32(uid), uint32(gid), nil
 }
 
-// waitListening blocks until the proxy accepts a connection on addr or the timeout passes.
+// waitListening blocks until the forwarder accepts a connection on addr or the timeout passes.
 func waitListening(ctx context.Context, addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -130,7 +150,7 @@ func waitListening(ctx context.Context, addr string, timeout time.Duration) erro
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("proxy did not start listening on %s within %s", addr, timeout)
+	return fmt.Errorf("forwarder did not start listening on %s within %s", addr, timeout)
 }
 
 var _ guest.Network = (*Controller)(nil)

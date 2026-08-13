@@ -108,8 +108,9 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 	}
 	ctrlSock := filepath.Join(sockDir, "control.sock")
 	restSock := filepath.Join(sockDir, "rest.sock")
+	egressSock := filepath.Join(sockDir, "egress.sock")
 
-	vmConfig, err := buildConfig(spec, clone, scratch, ctrlSock)
+	vmConfig, err := buildConfig(spec, clone, scratch, ctrlSock, egressSock)
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +135,7 @@ func (p *Provider) Create(_ context.Context, spec provider.VMSpec) (provider.VM,
 		clone:      clone,
 		ctrlSock:   ctrlSock,
 		restSock:   restSock,
+		egressSock: egressSock,
 		consoleLog: consoleLog,
 		config:     vmConfig,
 		rest:       newRESTClient(restSock),
@@ -212,11 +214,17 @@ func ensureSockRoot(root string) error {
 }
 
 // buildConfig assembles the vfkit VirtualMachine: Linux bootloader (kernel+initrd+
-// cmdline), the CoW rootfs and the scratch disk as virtio-blk disks, a NAT NIC, and a
-// host→guest vsock device bridged to ctrlSock on the host (§6.3, §6.6, §6.12). The rootfs
-// is added first so it enumerates as /dev/vda (the cmdline's root=) and the scratch disk
-// as /dev/vdb (mounted by the guest at /var/lib/containerd, §6.10).
-func buildConfig(spec provider.VMSpec, rootfs, scratch, ctrlSock string) (*config.VirtualMachine, error) {
+// cmdline), the CoW rootfs and the scratch disk as virtio-blk disks, a NAT NIC, a
+// host→guest vsock device bridged to ctrlSock on the host, and a guest→host vsock device
+// bridged to egressSock (§6.3, §6.6, §6.12). The rootfs is added first so it enumerates as
+// /dev/vda (the cmdline's root=) and the scratch disk as /dev/vdb (mounted by the guest at
+// /var/lib/containerd, §6.10).
+//
+// vfkit fixes its device list at Create time (it cannot be changed after the VM config is
+// built), so the egress device is added unconditionally here even though ListenEgress does
+// not bind egressSock until later, right before Start — vfkit only dials it once the guest
+// actually connects, which cannot happen before boot.
+func buildConfig(spec provider.VMSpec, rootfs, scratch, ctrlSock, egressSock string) (*config.VirtualMachine, error) {
 	bootloader := config.NewLinuxBootloader(spec.Kernel, spec.Cmdline, spec.Initrd)
 	vmConfig := config.NewVirtualMachine(uint(spec.CPUs), spec.MemoryMiB, bootloader)
 
@@ -238,7 +246,15 @@ func buildConfig(spec provider.VMSpec, rootfs, scratch, ctrlSock string) (*confi
 	if err != nil {
 		return nil, fmt.Errorf("vfkit: virtio-vsock: %w", err)
 	}
-	if err := vmConfig.AddDevices(blk, scratchBlk, nic, vsockDev); err != nil {
+	// listen=true: connections are guest→host — vfkit's pkg/vf/vsock.go listenVsock "proxies
+	// connections from a vsock port to a host unix socket", i.e. vfkit is the CLIENT dialing
+	// egressSock each time the guest connects out on EgressPort; we are the one who binds and
+	// listens on it (ListenEgress, called by the orchestrator before Start).
+	egressDev, err := config.VirtioVsockNew(uint(provider.EgressPort), egressSock, true)
+	if err != nil {
+		return nil, fmt.Errorf("vfkit: virtio-vsock (egress): %w", err)
+	}
+	if err := vmConfig.AddDevices(blk, scratchBlk, nic, vsockDev, egressDev); err != nil {
 		return nil, fmt.Errorf("vfkit: add devices: %w", err)
 	}
 	return vmConfig, nil
@@ -266,6 +282,7 @@ type vm struct {
 	clone      string
 	ctrlSock   string
 	restSock   string
+	egressSock string
 	consoleLog string
 	config     *config.VirtualMachine
 	rest       *restClient
@@ -315,6 +332,19 @@ func (v *vm) Start(_ context.Context) error {
 func (v *vm) DialControl(ctx context.Context, _ uint32) (net.Conn, error) {
 	var d net.Dialer
 	return d.DialContext(ctx, "unix", v.ctrlSock)
+}
+
+// ListenEgress implements provider.VM (§6.6, §6.12): it binds egressSock, the host end of the
+// second (listen=true) vsock device buildConfig added. vfkit is the CLIENT of this socket — it
+// dials in each time the guest connects out on EgressPort — so the listener must exist before
+// Start, which is why the orchestrator calls this between Create and Start. port is ignored:
+// the guest port is fixed in the VM config, same as DialControl/ControlPort.
+func (v *vm) ListenEgress(_ context.Context, _ uint32) (net.Listener, error) {
+	ln, err := net.Listen("unix", v.egressSock)
+	if err != nil {
+		return nil, fmt.Errorf("vfkit: listen egress socket: %w", err)
+	}
+	return ln, nil
 }
 
 // ControlSocket returns the host-side control socket path, which the orchestrator records so

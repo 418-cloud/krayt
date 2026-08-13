@@ -66,8 +66,9 @@ func TestBuildConfigDevices(t *testing.T) {
 	clone := "/run/run_x/rootfs.img"
 	scratch := "/run/run_x/scratch.img"
 	ctrlSock := "/run/run_x/control.sock"
+	egressSock := "/run/run_x/egress.sock"
 
-	cfg, err := buildConfig(spec, clone, scratch, ctrlSock)
+	cfg, err := buildConfig(spec, clone, scratch, ctrlSock, egressSock)
 	if err != nil {
 		t.Fatalf("buildConfig: %v", err)
 	}
@@ -82,6 +83,7 @@ func TestBuildConfigDevices(t *testing.T) {
 		clone,          // virtio-blk uses the CoW clone, not the base image
 		scratch,        // second virtio-blk: the per-run scratch disk (/dev/vdb)
 		ctrlSock,       // vsock bridged to the host control socket
+		egressSock,     // vsock bridged to the host egress socket
 		"virtio-vsock", // control channel device
 		"virtio-net",   // NAT NIC
 		"port=1024",    // fixed control port (provider.ControlPort)

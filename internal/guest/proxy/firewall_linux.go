@@ -7,43 +7,39 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/418-cloud/krayt/internal/guest"
 )
 
-// egressRuleset is the §6.6 nftables lock: default-deny egress in the inet family (so IPv4 and
-// IPv6 are both covered), permitting only loopback, the proxy's own uid (proxyd), and
-// established/related return traffic. The container's only path out is therefore via the proxy
-// (set through HTTP_PROXY/HTTPS_PROXY); direct sockets are dropped, closing the raw-socket bypass.
+// egressRuleset is the §6.6 L3 lock, in the inet family (so IPv4 and IPv6 are both covered):
+// default-deny egress, permitting only loopback. Since the move-egress-proxy-to-host task the
+// L7 proxy runs on the HOST, reached over vsock — the container's only path out is
+// 127.0.0.1:3128 (krayt-vsock-forward, a dumb pipe with no policy of its own) via
+// HTTP_PROXY/HTTPS_PROXY, so "permit loopback, drop everything else" is the entire guest-side
+// lock. There is no uid to key on anymore: krayt-vsock-forward parses nothing and enforces
+// nothing, so its identity is not load-bearing for this rule (it still runs as the
+// non-root `proxyd` uid for defense in depth — see controller_linux.go — but the firewall
+// does not depend on that).
 //
-// SAFETY INVARIANT — the `skuid "proxyd"` accept is unbypassable ONLY BECAUSE the container cannot
-// become proxyd. That is not guaranteed by this rule; it is guaranteed by the container OCI spec
-// (§6.10, harden-container-oci-spec.md), which drops CAP_SETUID/CAP_SETGID and forbids running as
-// root (enforced, not convention — see withEnforceNonRoot in internal/guest/runner). Without that,
-// a container process could learn proxyd's numeric uid from /proc/net/tcp (the :3128 listener's
-// owner is visible in the shared netns) or brute-force the small system-uid range, setuid() to it,
-// and send egress that matches this accept — bypassing the L7 allowlist entirely (finding #1).
-// If you ever loosen the container caps or allow root, this lock silently reopens.
-//
-// SINGLE-NETNS ASSUMPTION — this rule is correct only while the container shares the VM's network
-// namespace (§6.6, oci.WithHostNamespace in the runner), so its sockets traverse this `output` hook.
-// If a future change gives the container its own netns, the `output` hook will no longer see the
-// container's traffic and a `forward` chain (plus the same uid/veth reasoning) would be required.
-//
-// The proxyd user must exist in the image (added by the flake) so `skuid "proxyd"` resolves.
+// SINGLE-NETNS ASSUMPTION — this rule is correct only while the container shares the VM's
+// network namespace (§6.6, oci.WithHostNamespace in the runner), so its sockets traverse this
+// `output` hook. If a future change gives the container its own netns, the `output` hook will
+// no longer see the container's traffic and a `forward` chain (plus veth-based addressing)
+// would be required.
 const egressRuleset = `table inet krayt_egress {
   chain output {
     type filter hook output priority 0; policy drop;
     oif "lo" accept
-    meta skuid "proxyd" accept
-    ct state established,related accept
   }
 }`
 
 // ApplyFirewall installs the egress lock for the policy mode via `nft` (§6.6). For `full`
 // (explicit opt-in) it removes any lock so all egress is allowed; for `allowlist`/`none` it
-// installs the default-deny ruleset so only the proxy can leave the VM. The proxy then
-// enforces the per-host allowlist (or denies everything for `none`) at L7.
+// installs the default-deny ruleset so only loopback (i.e. the forwarder at 127.0.0.1:3128)
+// may leave the guest. The host-side proxy then enforces the per-host allowlist (or denies
+// everything for `none`) at L7, on the far side of the vsock channel.
 func ApplyFirewall(ctx context.Context, mode string) error {
-	if mode == ModeFull {
+	if mode == guest.NetFull {
 		// Best-effort removal; absent table is not an error worth failing the run over.
 		_ = nft(ctx, "delete table inet krayt_egress")
 		return nil
