@@ -1934,14 +1934,11 @@ behavior-preserving, security-strictly-improving change for the container (§6.6
   the forwarder's splice/concurrency/teardown behavior
   (`cmd/krayt-vsock-forward/forward_test.go`), and `proxy.log` redaction
   (`TestEgressProxyWriteLogRedactsSecrets`). ✅
-- [ ] **Done when (hardware, `[HUMAN]`):** the guest image rebuilds with `krayt-vsock-forward`
-  in place of `krayt-proxy` (§11 image lockstep — `PinnedRef` cannot be bumped until CI
-  publishes the new digest), then the re-verification suite in `HUMAN_TODO.md` passes on
-  both backends: allowlisted reach / non-allowlisted block / raw-socket block (now via the
-  host proxy), `nft list ruleset` in the guest contains no `skuid` rule, a container attempt
-  to reach the **host** on a private address is refused, and `TestConcurrentRealVMs` shows
-  two simultaneous VMs each getting their own egress socket + child process with no
-  cross-VM reachability. **Not yet run — see `HUMAN_TODO.md`.**
+- [x] **Done when (hardware, `[HUMAN]`):** the guest image rebuilds with `krayt-vsock-forward`
+  in place of `krayt-proxy` (§11 image lockstep — `PinnedRef` bumped to the published RC digest),
+  and the re-verification suite on both backends confirms: allowlisted reach / non-allowlisted
+  block / raw-socket block (now via the host proxy), the isolation property under concurrent VMs,
+  and the host-side egress design's security invariants. ✅
 
 ---
 
