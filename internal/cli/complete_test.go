@@ -348,3 +348,27 @@ func countOccurrences(ss []string, target string) int {
 	}
 	return n
 }
+
+// TestEgressProxyCmdHidden asserts `krayt __egress-proxy` (the host-side egress proxy child
+// process, move-egress-proxy-to-host.md §4) never surfaces to a user: not in --help's
+// available-commands list, and not in shell completion for the root command's subcommands —
+// cobra excludes Hidden commands from both (IsAvailableCommand, completions.go), which is what
+// this test locks in rather than reimplements.
+func TestEgressProxyCmdHidden(t *testing.T) {
+	root := NewRootCmd()
+	cmd, _, err := root.Find([]string{"__egress-proxy"})
+	if err != nil {
+		t.Fatalf("root.Find(__egress-proxy) = %v", err)
+	}
+	if !cmd.Hidden {
+		t.Error("__egress-proxy command must be Hidden")
+	}
+	if cmd.IsAvailableCommand() {
+		t.Error("__egress-proxy must not be an available (help/completion-visible) command")
+	}
+	for _, sub := range root.Commands() {
+		if sub.Name() == "__egress-proxy" && sub.IsAvailableCommand() {
+			t.Error("__egress-proxy appears as an available root subcommand")
+		}
+	}
+}

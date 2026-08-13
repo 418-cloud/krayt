@@ -61,18 +61,25 @@ var knownCapabilities = map[string]bool{
 }
 
 // deniedCapabilities are never grantable via the opt-in, even if named explicitly (§10). Each
-// either re-opens the egress-allowlist bypass this hardening closes — the setuid class lets a
-// process become proxyd's uid to satisfy the `skuid "proxyd"` nftables lock, and NET_ADMIN /
-// NET_RAW rewrite or bypass the firewall directly — or is a broad container-escape primitive
-// (SYS_ADMIN, SYS_PTRACE, DAC_READ_SEARCH, BPF, SETPCAP). A task that genuinely needs open
-// networking uses `network.mode: full` (a deliberate, separately-reviewed opt-in), not a cap.
+// either re-opens a direct-egress bypass — NET_ADMIN / NET_RAW can rewrite or route around the
+// guest's nftables lock (§6.6) and reach the network without ever touching the host-side proxy
+// — or is a broad container-escape primitive (SYS_ADMIN, SYS_PTRACE, DAC_READ_SEARCH, BPF,
+// SETPCAP). A task that genuinely needs open networking uses `network.mode: full` (a
+// deliberate, separately-reviewed opt-in), not a cap.
+//
+// The setuid class (SETUID/SETGID) is kept denied as ordinary least-privilege hygiene, but is
+// NOT load-bearing for egress the way it used to be: before `move-egress-proxy-to-host.md` the
+// guest's nftables lock keyed on `skuid "proxyd"`, so CAP_SETUID let a process assume that uid
+// and satisfy the accept directly (finding #1). The lock is loopback-only and keys on no uid at
+// all now (§6.6), so there is nothing left for a setuid() to unlock — but denying a capability
+// with no legitimate use in this container model costs nothing.
 var deniedCapabilities = map[string]string{
-	"CAP_SETUID":          "would let the process setuid() to proxyd and bypass the egress allowlist",
-	"CAP_SETGID":          "paired with setuid to reach proxyd's gid; re-opens the egress bypass",
+	"CAP_SETUID":          "least-privilege hygiene; no longer unlocks the egress lock (that no longer keys on any uid), kept denied on general principle",
+	"CAP_SETGID":          "least-privilege hygiene; paired with SETUID above",
 	"CAP_SETPCAP":         "can raise capabilities in the bounding set — a privilege-escalation primitive",
 	"CAP_SYS_ADMIN":       "near-root; a broad container-escape primitive",
-	"CAP_NET_ADMIN":       "can rewrite the nftables egress lock and defeat the allowlist",
-	"CAP_NET_RAW":         "raw sockets bypass the proxy and can spoof/observe traffic",
+	"CAP_NET_ADMIN":       "can rewrite the nftables egress lock and reach the network directly, around the host-side proxy",
+	"CAP_NET_RAW":         "raw sockets bypass the guest lock and can spoof/observe traffic",
 	"CAP_DAC_READ_SEARCH": "bypasses file-read permission checks (open_by_handle_at escape)",
 	"CAP_BPF":             "loads BPF programs — a kernel-attack and traffic-tampering surface",
 	"CAP_SYS_PTRACE":      "can attach to and manipulate other processes in the VM",

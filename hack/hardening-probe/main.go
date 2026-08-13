@@ -8,10 +8,14 @@
 //     (SECCOMP_MODE_FILTER)
 //   - the process uid is not 0 (root)
 //   - setuid() to proxyd's uid — read from /proc/net/tcp, visible because the container
-//     shares the VM's network namespace (§6.6) — fails with EPERM. This is the
+//     shares the VM's network namespace (§6.6) — fails with EPERM. This was originally the
 //     egress-allowlist-bypass regression (finding #1): without dropped CAP_SETUID/CAP_SETGID
 //     and enforced non-root, a container process could assume proxyd's uid and satisfy the
-//     nftables `skuid "proxyd"` rule directly, skipping the L7 allowlist entirely.
+//     nftables `skuid "proxyd"` rule directly, skipping the L7 allowlist entirely. Since
+//     `move-egress-proxy-to-host.md` (Phase 8) the guest's nftables lock no longer keys on any
+//     uid at all — proxyd now names krayt-vsock-forward, a parse-nothing pipe, not the L7 proxy
+//     — so this check is kept as a general non-root/capability regression guard, not because
+//     the egress lock's own correctness depends on it anymore.
 //
 // It speaks only the stdlib (no krayt imports) so a green run proves the OCI spec itself, not
 // any client code, and logs every check with a distinct non-zero exit code per failure so a
@@ -41,7 +45,7 @@ import (
 const (
 	statusPath = "/proc/self/status"
 	tcpPath    = "/proc/net/tcp"
-	proxyLocal = "0100007F:0C38" // 127.0.0.1:3128 (krayt-proxy's listen addr, /proc/net/tcp hex form)
+	proxyLocal = "0100007F:0C38" // 127.0.0.1:3128 (krayt-vsock-forward's listen addr, /proc/net/tcp hex form)
 	tcpListen  = "0A"            // TCP_LISTEN, per include/net/tcp_states.h
 )
 

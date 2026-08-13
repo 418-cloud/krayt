@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"google.golang.org/grpc"
@@ -43,6 +45,8 @@ type vm struct {
 	mu     sync.Mutex
 	lis    *bufconn.Listener
 	server *grpc.Server
+
+	egressDir string // set the first time ListenEgress is called; removed by Destroy
 }
 
 // Start brings up the in-process gRPC guest server on a bufconn listener.
@@ -92,9 +96,39 @@ func (v *vm) Stop(_ context.Context) error {
 	return nil
 }
 
-// Destroy tears the fake VM down. There is no CoW clone to remove, so it is just Stop.
+// ListenEgress implements provider.VM with a REAL unix-socket listener (not an in-memory
+// pipe): the fd-passing path in the orchestrator's `krayt __egress-proxy` spawn is genuinely
+// exercised by fakeProvider-backed tests this way, exactly as the vfkit/firecracker
+// providers behave (§6.6, move-egress-proxy-to-host.md §5). The per-VM directory is removed
+// by Destroy.
+func (v *vm) ListenEgress(_ context.Context, _ uint32) (net.Listener, error) {
+	dir, err := os.MkdirTemp("", "krayt-fake-egress-"+v.id+"-")
+	if err != nil {
+		return nil, fmt.Errorf("fake vm %s: create egress socket dir: %w", v.id, err)
+	}
+	ln, err := net.Listen("unix", filepath.Join(dir, "egress.sock"))
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("fake vm %s: listen egress socket: %w", v.id, err)
+	}
+	v.mu.Lock()
+	v.egressDir = dir
+	v.mu.Unlock()
+	return ln, nil
+}
+
+// Destroy tears the fake VM down. There is no CoW clone to remove, so it is just Stop plus
+// removing the egress socket dir ListenEgress may have created.
 func (v *vm) Destroy(ctx context.Context) error {
-	return v.Stop(ctx)
+	err := v.Stop(ctx)
+	v.mu.Lock()
+	dir := v.egressDir
+	v.egressDir = ""
+	v.mu.Unlock()
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+	return err
 }
 
 func (v *vm) ID() string { return v.id }

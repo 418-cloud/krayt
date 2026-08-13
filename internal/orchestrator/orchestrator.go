@@ -131,6 +131,29 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 			err = fmt.Errorf("orchestrator: destroy VM: %w", derr)
 		}
 	}()
+
+	// 1b. Open the guest→host egress channel and spawn the host-side allowlist proxy child
+	// BEFORE Start (§6, move-egress-proxy-to-host.md): the fd-3 listener must exist before the
+	// backend process launches, so a guest connection racing boot never finds it missing, and
+	// the container must never come up with its only egress path unspawned. Same wall-clock
+	// timeout handling as every other setup step below: a deadline that has already elapsed
+	// (or elapses mid-spawn) is a clean TimedOut result, not a raw exec/context error.
+	lis, err := vm.ListenEgress(ctx, provider.EgressPort)
+	if err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
+		return nil, fmt.Errorf("orchestrator: listen egress: %w", err)
+	}
+	egress, err := spawnEgressProxy(ctx, lis, spec.Network, runDir, spec.SecretsPath)
+	if err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
+		return nil, err
+	}
+	defer egress.stop()
+
 	if err := vm.Start(ctx); err != nil {
 		return nil, fmt.Errorf("orchestrator: start VM: %w", err)
 	}
