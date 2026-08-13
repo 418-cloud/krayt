@@ -387,7 +387,16 @@ Notes for implementers:
 - All secret material lives only in `SecretsBundle` → guest memory → container tmpfs;
   it is never written to the RunEvent stream or any artifact.
 
-### 6.6 Networking & egress proxy (`internal/guest/proxy`)
+### 6.6 Networking & egress proxy (`internal/proxy`, `internal/guest/proxy`, `internal/orchestrator`)
+> **Amended by `move-egress-proxy-to-host.md` (step 1 of a three-step arc, §14).** The L7
+> allowlist proxy moved from an in-guest process to a separate **host** process, reached over a
+> new guest→host vsock channel. This is a **behavior-preserving, security-strictly-improving**
+> move for the container: identical allowlist semantics, identical `HTTP_PROXY` contract — the
+> only user-visible changes are DNS now resolving in the host's network context (was: a
+> hardcoded `1.1.1.1`) and the SSRF guard's private-range carve-out being deleted outright (was:
+> permitted under `mode: full`). Everything below reflects the current (post-move) design;
+> superseded statements are not preserved inline — see git history for the pre-move text.
+
 The container runs in the **VM's own network namespace** (no CNI bridge) — there is one
 container per VM, so the VM boundary *is* the network boundary and host-networking-in-VM
 is the simplest correct choice. Enforcement layers:
@@ -417,92 +426,162 @@ is the simplest correct choice. Enforcement layers:
     (`hack/linux-net-setup.sh`: a `setcap cap_net_admin+ep` file capability on the krayt binary,
     so krayt does **not** run as root, plus the forwarding/masquerade rules) and checked by
     `krayt doctor`. The tap is handed to the invoking uid (`TUNSETOWNER`) so the *firecracker*
-    process itself needs no capabilities at all.
+    process itself needs no capabilities at all. This NIC still exists (`full` mode still needs
+    it — see below), but in `allowlist`/`none` the guest no longer strictly needs it; making it
+    conditional is a follow-up (§15), not done here.
   - **None of this weakens the guest's egress policy.** What a container may reach is still
-    decided inside the VM by the allowlist proxy + the nftables `skuid "proxyd"` lock below,
-    identically on both backends. The host setup only provides the wire.
-- **L7 allowlist:** a small **HTTP/HTTPS CONNECT forward proxy** (hand-rolled, or
-  `elazarl/goproxy`) runs in the guest as a dedicated uid (e.g. `proxyd`). It checks the
-  `CONNECT` host and plain-HTTP `Host` against the per-task allowlist.
-- **L3 enforcement (the real lock):** nftables makes the proxy *unbypassable* by dropping
-  all egress except loopback and the proxy's own uid:
+    decided by the allowlist proxy (now host-side, below) + the nftables loopback-only lock,
+    identically on both backends. The host network setup only provides the `full`-mode wire.
+- **The L7 allowlist proxy runs on the HOST, as a separate process (`internal/proxy`).** A
+  small **HTTP/HTTPS CONNECT forward proxy** (hand-rolled) checks the `CONNECT` host and
+  plain-HTTP `Host` against the per-task allowlist — exactly as before, just relocated.
+  Concretely: the run supervisor spawns `krayt __egress-proxy` (a hidden cobra subcommand,
+  `internal/cli`) via **self-exec** (`os.Executable()`, overridable with
+  `KRAYT_EGRESS_PROXY_BIN`) as its own OS process — it must not share an address space with the
+  process that (from step 2 of this task's arc onward) holds the user's real credentials,
+  writes their repo, and runs the run supervisor. The parent creates and binds the listener
+  socket and hands it to the child on **fd 3** (`cmd.ExtraFiles`), so the child needs no
+  filesystem access to the socket directory at all — a socket **path** is never passed. Policy
+  arrives as flags (`--mode`, `--allow`, `--dns`), matching the old in-guest contract shape.
+  A failure to spawn the child, or an early child exit, is a fail-fast run error: the VM never
+  boots with its only egress path already dead.
+- **The guest→host vsock channel (`EgressPort = 1025`, `internal/provider`).** This is the one
+  genuinely new primitive: every other vsock channel in krayt is host-initiated
+  (`DialControl`/`ControlPort = 1024`); this one is **guest-initiated**. `VM.ListenEgress(ctx,
+  port)` returns a listener accepting guest connections, called by the orchestrator after
+  `Create` and before `Start` (the socket must exist before the backend process launches, so a
+  guest connection racing boot never finds it missing):
+  - **vfkit:** a *second* virtio-vsock device, `VirtioVsockNew(EgressPort, egressSock, true)` —
+    `listen=true` means connections are guest→host, and (unintuitively) the **host** is the one
+    that binds and listens on `egressSock`; vfkit itself is the *client*, dialing in each time
+    the guest connects out. `ListenEgress` is a plain `net.Listen("unix", egressSock)`, called
+    before vfkit's subprocess starts. `egressSock` lives in the same short, `0700` per-VM socket
+    dir as `ctrlSock` (§6.12's socket-root hardening applies identically).
+  - **Firecracker:** no device to add and no `CONNECT <port>\n` handshake (that dance is
+    host→guest only, §6.12) — a guest connection to `(VMADDR_CID_HOST, port)` is bridged by
+    Firecracker to a host unix socket at `<uds_path>_<port>`, which Firecracker dials as a
+    *client*, symmetric with the vfkit case: the host must already be listening there.
+    `ListenEgress` is `net.Listen("unix", vsockSock+"_"+port)`.
+  - **fake provider:** a REAL unix-socket listener in a per-VM temp dir (not an in-memory
+    pipe), so orchestrator-level tests genuinely exercise the fd-passing path in §4 of the task,
+    not a mock of it.
+  - **Why vsock and not a gateway-bound TCP proxy.** The tempting shortcut — point
+    `HTTP_PROXY` at the VM's gateway IP and run the proxy there — is wrong. §6.6's tap+`/30`
+    isolation (above) exists precisely so two concurrent VMs share no L2 segment; vfkit/vmnet's
+    NAT gives no such isolation, so a gateway-bound proxy would be reachable by *every other
+    run's VM on the host*, and a `0.0.0.0` bind mistake would expose it to the LAN — a
+    materially worse blast radius once step 2 makes this process hold the user's real
+    credentials. vsock has neither problem: on vfkit each VM gets its own host unix socket, on
+    Firecracker its own `uds_path` — the channel is authenticated by construction and is not
+    routable. Concurrent-VM isolation over this channel is asserted on hardware by
+    `TestConcurrentRealVMs` (§14).
+- **The guest side is now a dumb pipe (`cmd/krayt-vsock-forward`, `internal/guest/proxy`).**
+  `krayt-vsock-forward --listen 127.0.0.1:3128 --vsock-port 1025` accepts TCP on `--listen`
+  (the container's `HTTP_PROXY` target) and, for each accepted connection, dials the host over
+  vsock and splices the two byte streams — **one vsock connection per accepted TCP connection**
+  (no multiplexing; `HTTP_PROXY` keep-alive means the container opens several concurrently). It
+  **parses nothing**: no HTTP, no TLS, no allowlist. That is the whole point — the
+  adversarially-exposed parser moved off the guest entirely, so nothing may follow it back onto
+  the guest side; if a future change makes this binary want to look at a byte, the design has
+  regressed. It still runs as the dedicated `proxyd` uid (`internal/guest/proxy/controller_linux.go`)
+  as defense in depth — a non-root uid for the one guest process touching container-controlled
+  bytes is free — but this is **no longer load-bearing for the L3 lock** (below); do not delete
+  it as vestigial.
+- **L3 enforcement, simplified to loopback-only.** With the L7 proxy off the guest entirely, the
+  guest needs no DNS (the host proxy resolves), no registry egress (§6.11 pre-loads images over
+  vsock), and no bundle egress (§6.7 rides vsock) — so in `allowlist`/`none` there is nothing for
+  the container to legitimately reach except the forwarder on loopback:
 
   ```
-  table inet egress {
+  table inet krayt_egress {
     chain output {
       type filter hook output priority 0; policy drop;
       oif "lo" accept
-      meta skuid "proxyd" accept          # only the proxy may leave the box
-      ct state established,related accept
     }
   }
   ```
-  The lock is in the **`inet` family**, so it covers IPv4 and IPv6 alike. Because the
-  container's only path out is via the proxy (set through `HTTP_PROXY`/`HTTPS_PROXY`), its
-  direct sockets are dropped — closing the raw-socket bypass a pure proxy-env approach would
-  leave open.
+  The lock is in the **`inet` family** (IPv4 + IPv6 alike). **No rule keys on a uid anymore** —
+  the `meta skuid "proxyd"` accept and its `ct state established,related` companion are both
+  gone, because there is no longer an external flow for the guest to legitimately originate at
+  all. This **deletes the cross-module invariant** the old design depended on (§10): previously
+  the lock's correctness lived partly outside `firewall_linux.go`, in the container's dropped
+  `CAP_SETUID`/`CAP_SETGID` and enforced non-root (§6.10) — a future OCI-spec regression there
+  could silently reopen the egress bypass (finding #1). Moving the proxy off-box **deletes that
+  invariant rather than defending it**: the guest chain no longer keys on identity at all, so
+  there is nothing for a capability regression to unlock. `full` mode is **unchanged** — it
+  still deletes the table outright, so raw egress over the NIC still works as an explicit
+  escape hatch; unifying `full` onto the proxy path is a legitimate follow-up (§15), not done
+  here.
 
-  **The lock depends on the container being unable to assume the `proxyd` uid.** The
-  `skuid "proxyd"` accept is unbypassable *only because* the container OCI spec drops
-  `CAP_SETUID`/`CAP_SETGID` and enforces non-root (§6.10) — otherwise a container process
-  could read `proxyd`'s numeric uid from `/proc/net/tcp` (the listener's owner is visible in
-  the shared netns) or brute-force the small system-uid range, `setuid()` to it, and egress
-  under the accept, bypassing the L7 allowlist (finding #1, closed by the hardened spec).
-  The uid rule is the load-bearing L3 control; the dropped caps + non-root are what make it hold.
-
-  **Single-netns assumption.** This `output`-hook rule is correct only while the container
-  shares the **VM's** network namespace (`oci.WithHostNamespace`, one container per VM) — the
-  VM boundary is the network boundary, so the container's sockets traverse this hook. A future
-  change that gives the container its own netns would move its traffic out of `output`'s view
-  and require a `forward` chain instead.
-- **Container env:** launched with `HTTP_PROXY` / `HTTPS_PROXY` pointing at the proxy and
-  `NO_PROXY=localhost,127.0.0.1` (the lowercase `http_proxy` / `https_proxy` / `no_proxy`
-  forms are set too, for tools that only read those).
-- **DNS:** the proxy resolves names itself, dialing a fixed resolver (`1.1.1.1:53` by
-  default; overridable via `krayt-proxy --dns`) **as `proxyd`**, so the lookup is permitted by
-  the L3 lock. The container does no DNS of its own — its direct egress, port 53 included, is
-  dropped. A system stub resolver (e.g. `systemd-resolved`) is deliberately bypassed: it runs
-  as a different uid and its upstream query would be dropped by the `skuid "proxyd"` rule.
+  **Single-netns assumption** (unchanged). This `output`-hook rule is correct only while the
+  container shares the **VM's** network namespace (`oci.WithHostNamespace`, one container per
+  VM) — the VM boundary is the network boundary, so the container's sockets traverse this hook.
+  A future change that gives the container its own netns would move its traffic out of
+  `output`'s view and require a `forward` chain instead.
+- **Container env:** launched with `HTTP_PROXY` / `HTTPS_PROXY` pointing at the forwarder
+  (`http://127.0.0.1:3128`) and `NO_PROXY=localhost,127.0.0.1` (the lowercase
+  `http_proxy` / `https_proxy` / `no_proxy` forms are set too, for tools that only read those)
+  — byte-for-byte the same contract the container saw before this task; only what is on the
+  other end of `127.0.0.1:3128` changed.
+- **DNS resolves in the HOST's network context now, not the VM's.** The host-side proxy
+  resolves through the **host's system resolver** by default — respecting the user's
+  VPN/split-horizon/corporate DNS, which a hardcoded server cannot. `--dns` (a child-process
+  flag, no `network.dns` user-facing config surface yet) still overrides it, mirroring the old
+  `krayt-proxy --dns` contract shape. This is a documented, intended behavior change: DNS used
+  to resolve as the VM would see it; now it resolves as the host does.
 - **Policy modes:** `allowlist` (default) — the proxy permits only the hosts the task lists
   (`--allow` / `network.allow`); with none listed it is **deny-all**, so a task that needs the
   AI endpoints (`api.anthropic.com`, `generativelanguage.googleapis.com`) or a package
   registry must allow them explicitly — krayt does **not** auto-seed them. `full` — nftables
-  policy switched to accept (explicit opt-in); `none` — proxy denies everything (usable
-  because image acquisition is off the VM net path, §6.11). The agent's **auth/refresh**
-  endpoints must be allowlisted alongside the inference endpoint (§6.14); an
-  OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key, so it can need
-  a wider list.
-- **Resolved-IP guard (SSRF / DNS-rebinding).** The host-string allowlist is not enough on its
-  own: an allowlisted name (or, in `full`, any name) could resolve to an internal address, and the
-  VM's NAT reaches the host network. So after the proxy resolves an upstream name, it checks the
-  **resolved IP** — on *every* A/AAAA answer and every connection attempt, via the dialer's
-  `Control` hook, covering both the CONNECT tunnel dial and the plain-HTTP transport dial:
-  - **Always refused, in every mode** (including `full`): loopback (`127.0.0.0/8`, `::1`),
-    link-local (`169.254.0.0/16`, `fe80::/10`), the cloud **metadata** IP `169.254.169.254`, the
-    unspecified address (`0.0.0.0`, `::`), and multicast.
-  - **Refused unless `mode: full`:** private / ULA ranges — `10.0.0.0/8`, `172.16.0.0/12`,
-    `192.168.0.0/16`, the `100.64.0.0/10` CGNAT range, and `fc00::/7`.
-  - Public addresses are allowed (still subject to the host allowlist above). The check is
-    **fail-closed**: an address that cannot be parsed is refused. A refusal returns a `403`.
+  policy switched to accept (explicit opt-in, guest-side, unchanged by this task); `none` —
+  proxy denies everything (usable because image acquisition is off the VM net path, §6.11). The
+  agent's **auth/refresh** endpoints must be allowlisted alongside the inference endpoint
+  (§6.14); an OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key, so
+  it can need a wider list.
+- **Resolved-IP guard (SSRF / DNS-rebinding) — now a HARD block in every mode, no carve-out.**
+  The host-string allowlist is not enough on its own: an allowlisted name (or, in `full`, any
+  name) could resolve to an internal address. After the proxy resolves an upstream name, it
+  checks the **resolved IP** — on *every* A/AAAA answer and every connection attempt, via the
+  dialer's `Control` hook, covering both the CONNECT tunnel dial and the plain-HTTP transport
+  dial — and refuses, **unconditionally, in every mode including `full`**: loopback
+  (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), the cloud **metadata** IP
+  `169.254.169.254`, the unspecified address (`0.0.0.0`, `::`), multicast, and (since this task)
+  **private / ULA ranges** — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, the
+  `100.64.0.0/10` CGNAT range, and `fc00::/7` — **with no `mode: full` exception anymore**.
+  Public addresses are allowed (still subject to the host allowlist above). The check is
+  **fail-closed**: an address that cannot be parsed is refused. A refusal returns a `403`.
+
+  **Why the carve-out was deleted rather than kept.** The old `mode: full` exception existed
+  because the dialer lived *inside* the VM: letting it reach `192.168.0.0/16` meant "the VM's
+  own NAT segment is reachable" — a contained, low-stakes trade. With the dialer now on the
+  **host**, the identical carve-out would mean "the sandbox can reach the user's real LAN and
+  loopback services from a trusted host process" — a materially worse trade, so it is refused
+  outright rather than widened. **This is a deliberate, documented casualty:** reaching a
+  service on the host or LAN from the sandbox — a local Ollama/LM Studio on
+  `127.0.0.1:11434`, a LAN package mirror — is now **impossible in every mode**. That use case,
+  if wanted, needs a purpose-built mechanism (an explicitly named forward target), not a range
+  unblock; it is recorded as a possible follow-up (§15), not built here.
 
   Because the *resolved* IP is what's checked (not the requested name), this also mitigates
-  **DNS-rebinding** to internal addresses. Note that `full` mode still exposes the **host LAN**
-  (the private ranges) by design — link-local/loopback/metadata stay blocked even there.
-- **Isolated as a swappable, memory-safety-critical component.** The proxy is a **standalone
-  in-guest process** (`krayt-proxy`, run as its own `proxyd` uid) — a separate binary, not
-  linked into the guest-agent — sitting behind a stable contract on both ends: the guest-agent
-  selects it through the `Factory` seam (`internal/guest/proxy`) and drives it purely by
-  process interface (fixed flags in — `--listen` / `--mode` / `--allow` / `--dns`; the proxy
-  env out; the nftables `skuid` lock around it). Nothing else in krayt depends on *how* it is
-  implemented. Because it is also the component most directly exposed to **untrusted,
-  adversarial network input**, that isolation makes it the natural candidate for a future
-  **memory-safe reimplementation** (e.g. Rust/Zig): drop in a binary that honors the same
-  flags + env + uid contract and neither the agnostic core nor the guest-agent changes.
-- **Single-layer, in-guest only.** The L7 proxy and the L3 nftables lock above are the *entire*
-  egress enforcement — there is no host/hypervisor-level firewall backstopping them (§10). Both
-  depend on the container-hardening controls in §6.10 (dropped `CAP_SETUID`/`CAP_SETGID`, enforced
-  non-root) to stay unbypassable from inside the guest; if those controls ever regress, nothing
-  outside the guest stops the resulting egress.
+  **DNS-rebinding** to internal addresses.
+- **Isolated as a swappable, memory-safety-critical component — more so now that it is
+  off-VM.** The proxy is a **standalone host process** (`krayt __egress-proxy`, spawned by
+  self-exec or `KRAYT_EGRESS_PROXY_BIN`) sitting behind a stable contract: fixed flags in
+  (`--mode` / `--allow` / `--dns`), a listener on fd 3, logs on stdout/stderr
+  (`internal/orchestrator` redirects them into `proxy.log`, §9). Nothing else in krayt depends
+  on *how* it is implemented — `internal/proxy`'s `Factory` seam (unchanged since before this
+  task) still lets the allowlist handler itself be swapped (e.g. for `elazarl/goproxy`) without
+  touching the process wiring. Because it is the component most directly exposed to
+  **untrusted, adversarial network input**, and now sits *outside* the VM boundary rather than
+  inside a disposable one, a memory-safe reimplementation (e.g. Rust/Zig) matters *more* here
+  than it did in-guest — drop in a binary honoring the same flags/fd-3/log contract via
+  `KRAYT_EGRESS_PROXY_BIN`, and neither the orchestrator nor the guest changes.
+- **`proxy.log` — a new, host-redacted run artifact (§9).** `net/http`'s CONNECT-proxy client
+  discards the response body on a non-2xx CONNECT, so the *only* place a denial's real reason
+  (DNS failure, connection refused, blocked-address guard, …) appears is the proxy's own
+  server-side log. The run supervisor captures the child's stdout/stderr and, on teardown,
+  redacts it against the task's secrets (the first HOST-side redaction path in krayt — §6.8) and
+  writes it to `.krayt/runs/<id>/proxy.log`.
 
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
@@ -658,9 +737,12 @@ can tell whether that equality is expected.
 - **Never** written to the VM's persistent disk image.
 - Destroyed with the VM.
 
-**Redaction scope (all in the guest, so no secret value crosses the vsock un-redacted).** The
-guest builds one `Redactor` per run from the secret values (§6.5) and applies it to everything
-the agent controls that the host will keep:
+**Redaction scope.** Until `move-egress-proxy-to-host.md` this was "all in the guest, so no
+secret value crosses the vsock un-redacted" — that guest-side claim is still true for every
+artifact below, but it is no longer the *whole* story: `proxy.log` (§6.6, §9) is the **first
+host-side** redaction path, because the egress proxy that produces it now runs on the host, not
+in the guest. The guest builds one `Redactor` per run from the secret values (§6.5) and applies
+it to everything the agent controls that the host will keep:
 - **Live container logs** — each stdout/stderr line is redacted before it is streamed as a
   `RunEvent`. This is line/chunk-oriented, so a value split across two chunks is a known,
   accepted miss (see §10 residuals); it only affects live logs.
@@ -675,6 +757,15 @@ the agent controls that the host will keep:
   (never the values, §8.4); the host raises a Safety warning per key in `report.md`/`meta.json`
   so the human reviews before applying. Whole-buffer scan, so unlike live logs there is no
   split-chunk gap here.
+- **`proxy.log` — HOST-side, built from a `Redactor` constructed the same way (§6.5's secret
+  values, loaded host-side from the same secrets file), applied once, whole-buffer, when the
+  run supervisor persists the egress proxy child's captured stdout/stderr (§6.6, §9).** This
+  exists because, for plain-HTTP forwards, the proxy sees full request URLs, which can carry a
+  token in a query string — the same class of risk `changes.patch`'s scan-not-redact already
+  documents, just on a different artifact and (since the source is a log, not a git diff)
+  redactable in place like the other logs above, not merely scanned. Fail-closed like
+  `writeConsoleLog`: if the secret values can't be loaded to redact against, the file is
+  dropped rather than risked in the clear.
 
 Agent model-provider credentials (e.g. Claude Code's `ANTHROPIC_API_KEY` or
 `CLAUDE_CODE_OAUTH_TOKEN`) ride this same mechanism — see agent authentication (§6.14) for
@@ -716,12 +807,15 @@ via containerd's **native Go client** over its local gRPC socket.
     `container.capabilities` (§8.1); the setuid class (`CAP_SETUID`/`SETGID`/`SETPCAP`),
     the network-admin class (`CAP_NET_ADMIN`/`NET_RAW`), and broad escape primitives
     (`CAP_SYS_ADMIN`/`SYS_PTRACE`/`DAC_READ_SEARCH`/`BPF`) are **never** grantable — they
-    would re-open the egress bypass or the VM. Dropping `CAP_SETUID`/`SETGID` is what makes
-    the `skuid "proxyd"` egress lock (§6.6) unbypassable: the container cannot become
-    proxyd's uid to slip past the allowlist.
+    would re-open the VM escape surface. Dropping `CAP_SETUID`/`SETGID` is no longer what
+    the egress lock's correctness depends on — since `move-egress-proxy-to-host.md` the
+    guest's nftables chain is loopback-only and keys on no uid at all (§6.6) — but keeping
+    the caps dropped remains real defense-in-depth against everything else this OCI spec
+    guards against.
   - **Enforced non-root, fail-closed.** An image that would run as uid 0 (explicit `USER root`
     or an unset `USER`) **fails the run** with a clear error — krayt never silently forces a
-    uid. Non-root is load-bearing for egress and secret confinement (§8.2), not a convention.
+    uid. Non-root is load-bearing for secret confinement (§8.2); it is no longer load-bearing
+    for egress the way it was before `move-egress-proxy-to-host.md` (§6.6, §10).
   - **Containerd's default seccomp profile** is applied by default; a task opts out with
     `container.seccomp: unconfined` (§8.1).
   - **`NoNewPrivileges=true`** (containerd default) is kept.
@@ -824,7 +918,44 @@ symmetric across the two backends, so the `Provider` hides the difference behind
   exists it must be a real directory owned by the current uid with mode exactly `0700`, or
   krayt **fails closed** with a clear error rather than placing control sockets under a
   directory another local user controls. krayt never chmod/chowns a directory it does not
-  own. The per-VM socket dir inside it is an atomic `0700` `MkdirTemp`.
+  own. The per-VM socket dir inside it is an atomic `0700` `MkdirTemp`. The egress socket
+  below lives in this same per-VM dir and inherits the same hardening.
+
+- **The guest→host direction (`EgressPort = 1025`, added by `move-egress-proxy-to-host.md`).**
+  Every channel above is **host-initiated** — the host dials, the guest listens. `EgressPort`
+  is the opposite: the **guest** initiates, over `VM.ListenEgress(ctx, port) (net.Listener,
+  error)`, called by the orchestrator after `Create` and before `Start` (§6.6). Both backends
+  turn out to support this the same shape as the host→guest direction, just mirrored — the
+  host binds and listens, and the backend's own process is the *client* dialing in once the
+  guest connects out:
+  - **vfkit:** a *second* `virtio-vsock` device with `listen=true` —
+    `config.VirtioVsockNew(EgressPort, egressSock, true)`. Per vfkit's `pkg/config/virtio.go`,
+    `Listen=true` means *"vsock connections will have to be done from guest to host"*; per
+    `pkg/vf/vsock.go`'s `listenVsock`, vfkit "proxies connections from a vsock port to a host
+    unix socket" — i.e. vfkit is the client of `egressSock`, not its server. Because vfkit
+    fixes its device list at `Create` time, this device is added unconditionally there, even
+    though the socket itself is not bound until `ListenEgress` runs (right before `Start`).
+    vfkit's multiple-`--device virtio-vsock` support is per-port, not per-device: "there will
+    only be a single virtio-vsock device added to the VM regardless of the number of
+    occurrences" — the two `VirtioVsockNew` calls (control port 1024, egress port 1025) map
+    onto one underlying vsock device with two port forwards, not two devices.
+  - **Firecracker:** no device to add, and — unlike `DialControl` — **no `CONNECT <port>\n`
+    handshake**; that dance is host→guest only. A guest connection to `(VMADDR_CID_HOST,
+    port)` is bridged by Firecracker to a host unix socket at `<uds_path>_<port>`, which
+    Firecracker dials as a client the moment the guest connects, symmetric with the vfkit case
+    above. `ListenEgress` is a bare `net.Listen("unix", vsockSock+"_"+port)` — no bridge type
+    is needed the way `DialControl`'s host→guest direction needed one, because there is no
+    handshake to hide from callers.
+  - **fake provider:** returns a REAL unix-socket listener in a per-VM temp dir (not an
+    in-memory `bufconn` pipe like `DialControl`'s loopback), specifically so
+    orchestrator-level tests can fd-pass it to a real spawned `krayt __egress-proxy` child and
+    exercise the whole path for real (§6.6).
+  - Closing the returned listener stops accepting; the VM itself is unaffected. The listener's
+    underlying socket **file** is not explicitly unlinked by the process that closes it —
+    `(*net.UnixListener).SetUnlinkOnClose(false)` is set first, so a guest connection racing the
+    handoff to the spawned proxy child never finds the path gone — cleanup happens once, when
+    the provider tears down the VM's per-run socket dir (`Destroy`), not via any listener
+    `Close` in between.
 
 ### 6.13 Agent → human questions (`ask_human`)
 An **optional, asynchronous** way for the agent to pause and ask the human a question, get
@@ -1101,9 +1232,11 @@ Every run produces a self-contained directory the human reviews from:
 ├── report.md         # human-readable summary (see below)
 ├── meta.json         # machine-readable run record (schema below)
 ├── secret-scan.json  # optional: present only if a secret value appears in changes.patch (§6.8)
+├── proxy.log         # host-side egress proxy child's redacted stdout/stderr (§6.6, §6.8)
 ├── questions/        # one <qid>.json per agent question + its answer (§6.13), if any
 └── logs/
     ├── agent.log     # container stdout/stderr (merged, timestamped)
+    ├── console.log   # guest-agent's own stdout/stderr, incl. krayt-vsock-forward (§6.6)
     └── events.jsonl  # one JSON object per RunEvent (optional, for tooling)
 ```
 
@@ -1207,15 +1340,17 @@ krayt/
 │   ├── protocol/            # vsock control protocol (shared host+guest)
 │   ├── guest/               # guest-agent (compiled to linux)
 │   │   ├── agent.go         # init/control server
-│   │   ├── proxy/           # egress allowlist proxy + firewall
+│   │   ├── proxy/           # simplified L3 lock (loopback-only) + the guest forwarder's Controller (§6.6)
 │   │   ├── ask/             # in-VM question bridge + ask_human MCP server (§6.13)
 │   │   └── runner/          # containerd Go client (single container per VM)
+│   ├── proxy/               # host-side L7 egress allowlist proxy (`krayt __egress-proxy`, §6.6)
 │   ├── adapter/             # optional per-agent adapters (claude-code, gemini-cli, opencode); MCP/CLI wiring (§6.13)
 │   ├── task/                # config schema + parsing
 │   ├── patch/               # git bundle create/verify/clone/diff (+ optional reverse bundle); non-mutating dirty capture; host-side apply helpers (§6.7)
 │   ├── imagestore/          # host pull + OCI export + digest-keyed cache (§6.11)
 │   └── secrets/             # secrets loading + redaction
 ├── cmd/krayt-ask/main.go    # tiny in-container CLI front-end for ask_human (§6.13)
+├── cmd/krayt-vsock-forward/ # guest-side parse-nothing TCP<->vsock pipe to the host proxy (§6.6)
 ├── images/                  # Nix-based VM image definition (kernel + rootfs)
 │   ├── flake.nix            # declarative base image; pins kernel, runtime, guest-agent
 │   ├── flake.lock           # pinned inputs (the update surface)
@@ -1293,20 +1428,26 @@ exposed.
 | Host kernel | Not shared — full VM boundary |
 | Host filesystem | No live mount; input via git bundle, output via reviewed patch |
 | Repo ingest | git bundle cloned in-guest — source `.git/hooks` are never executed or imported, and the guest commits under a throwaway krayt bot identity. The workspace `.git` is left container-writable (so the agent can commit) but is **never trusted by the root guest-agent's git**: patch generation runs against a root-only `patchgit` snapshot with `core.fsmonitor`/`core.hooksPath` force-cleared and `--no-textconv`, so container-written `.git/config`/hooks/attributes cannot execute as root (§6.7, finding #2) |
-| Network egress | Default-deny + allowlist proxy; per-task opt-in to widen. The L3 lock keys egress on proxyd's uid, which the container **cannot** reach because `CAP_SETUID`/`SETGID` are dropped and it runs non-root — so the allowlist is unbypassable (§6.6, §6.10) |
+| Network egress | Default-deny + allowlist proxy, per-task opt-in to widen — **enforced host-side** since `move-egress-proxy-to-host.md`. The L7 allowlist proxy is a separate HOST process reached over a guest-initiated vsock channel; the guest's L3 lock is loopback-only and keys on **no uid at all**, so there is no container-hardening dependency left for it to bypass (§6.6) |
 | Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
 | Secrets | tmpfs only, never on disk, destroyed with VM; **redacted in the guest** from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted** (redacting hunks would break `git apply`); a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
 | Persistence | CoW disk destroyed on teardown; fresh VM per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
 
 **Residual considerations to document:**
-- Proxy-bypass via raw sockets is caught by the default-deny `skuid "proxyd"` L3 lock (§6.6). The
-  real historical gap was not the raw socket itself but **uid assumption**: the container kept
-  `CAP_SETUID`, so it could `setuid()` to proxyd (uid learned from `/proc/net/tcp` in the shared
-  netns) and satisfy the `skuid` accept — bypassing the allowlist entirely. That is now closed by
-  the hardened OCI spec dropping `CAP_SETUID`/`SETGID` and enforcing non-root (§6.10); the `skuid`
-  rule is unbypassable only while that holds. Regression-guarded by the `egressRuleset`-shape unit
-  test and, on hardware, by the `setuid(proxyd)=EPERM` + allowlist-enforcement integration tests.
+- Proxy-bypass via raw sockets is caught by the default-deny, loopback-only L3 lock (§6.6). The
+  original historical gap (finding #1) was **uid assumption**: with the L7 proxy in-guest and
+  the L3 lock keyed on `skuid "proxyd"`, a container that kept `CAP_SETUID` could `setuid()` to
+  proxyd (uid learned from `/proc/net/tcp` in the shared netns) and satisfy the `skuid` accept —
+  bypassing the allowlist entirely. That was closed once (hardened OCI spec dropping
+  `CAP_SETUID`/`SETGID` and enforcing non-root, §6.10) and is now closed a second, independent
+  way by `move-egress-proxy-to-host.md`: the guest chain no longer has a `skuid` rule *at all* —
+  egress-worthy content the container could send is either loopback (permitted, reaches only the
+  parse-nothing forwarder) or dropped, full stop, with no identity for a capability regression to
+  exploit. Regression-guarded by the `egressRuleset`-shape unit test (now also asserting `skuid`
+  is *absent*) and, on hardware, by the `setuid(proxyd)=EPERM` + allowlist-enforcement
+  integration tests — the `EPERM` assertion is kept as a still-useful non-root regression check,
+  it just no longer doubles as the egress-bypass's load-bearing proof.
 - Container-runtime / guest-kernel bugs — blast radius minimized by the least-privilege OCI
   spec (dropped caps, seccomp, no-new-privs, non-root) inside the already-isolated VM (§6.10).
 - Malicious patch content (e.g. `.git/hooks`, build scripts) applied on the **host** — the
@@ -1316,14 +1457,28 @@ exposed.
   `changes.patch` could still add files like `.git/hooks/*` or build scripts that run on the
   **host** after apply; reviewing the diff before `git apply` is the control, and a
   `--strip-hooks` / lint pass on patches is a possible future addition.
-- **Egress control is single-layer (in-guest).** The host applies no network filtering — the
-  allowlist is enforced entirely by the in-VM L7 proxy + L3 nftables lock (§6.6). A *future*
-  regression that let a container assume the proxyd uid, or a guest-root escape that flushed
-  nftables, would defeat the allowlist with no backstop; nothing outside the guest would catch it.
-  The container-hardening controls (dropped `CAP_SETUID`/`CAP_SETGID`, enforced non-root, seccomp,
-  isolated `patchgit` patch generation — §6.10, §6.7) are therefore the primary mitigations, not one
-  layer among several defense-in-depth controls. Host-side NAT/firewall filtering on macOS/vfkit is
-  impractical for v1; a host backstop is a possible future follow-up task.
+- **Egress enforcement is host-side now — a different trade, not a strictly safer one.**
+  `move-egress-proxy-to-host.md` moved the L7 allowlist proxy out of the VM entirely; this
+  supersedes the old "single-layer, in-guest only" residual (the allowlist was previously
+  enforced *entirely inside* the VM, with the host applying no filtering at all — that is no
+  longer true). The honest statement of the new trade: a **guest-root escape can no longer
+  defeat the allowlist** by flushing guest nftables or assuming a guest uid, because the L7
+  decision does not live in the guest anymore — but a **compromise of the proxy process itself
+  is now a HOST compromise**, not an escape from a disposable VM that was about to be destroyed
+  anyway. This is why the proxy is a **separate process** (self-exec, not linked into the run
+  supervisor) that **parses nothing it does not have to** — the guest's own forwarder
+  (`krayt-vsock-forward`) is a byte-for-byte pipe with zero parsing surface, so the entire
+  adversarial-input attack surface concentrates in one host process running the hand-rolled (or
+  swapped-in, `KRAYT_EGRESS_PROXY_BIN`) `internal/proxy` package, rather than being spread across
+  a guest process *and* a uid-keyed firewall rule whose correctness depended on container
+  capabilities. The vsock channel this process is reached over additionally gives **concurrent-VM
+  isolation by construction**: each VM gets its own host unix socket (vfkit) or `uds_path`
+  (Firecracker), so one run's egress channel is not reachable from another run's VM — unlike a
+  gateway-bound TCP proxy would be on vfkit/vmnet's shared-segment NAT (§6.6); asserted on
+  hardware by `TestConcurrentRealVMs`. The container-hardening controls (dropped
+  `CAP_SETUID`/`CAP_SETGID`, enforced non-root, seccomp, isolated `patchgit` patch generation —
+  §6.10, §6.7) remain real defense-in-depth for everything else in this table, but are no longer
+  what the egress allowlist's correctness depends on.
 - Secret redaction coverage — the guest redacts every artifact it can safely rewrite (live
   logs, `report.md`, `ask_human` prompt/choices, §6.8). Two known, accepted gaps: (1) live-log
   redaction is chunk-oriented, so a secret value split across two log chunks is not caught — it
@@ -1490,8 +1645,10 @@ must produce and guarantee:
   nftables, the static guest-agent binary, CA certificates, busybox-equivalent coreutils, and
   the pieces the run pipeline shells out to: **`gitMinimal`** for the §6.7 bundle
   ingest/diff, **`e2fsprogs` + `util-linux`** to format + mount the per-run scratch disk
-  (§6.10), and the **`krayt-proxy`** binary run as the dedicated **`proxyd`** user for the
-  egress proxy (§6.6). No editors, no shells beyond what systemd needs, no package manager.
+  (§6.10), and — since `move-egress-proxy-to-host.md` replaced the in-guest L7 proxy with a
+  host process — the **`krayt-vsock-forward`** binary (a dumb TCP<->vsock pipe, not a proxy)
+  run as the dedicated **`proxyd`** user, kept as defense in depth though no longer load-bearing
+  for the L3 lock (§6.6). No editors, no shells beyond what systemd needs, no package manager.
 - **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — neither backend
   takes qcow2), built for **both** `aarch64-linux` and `x86_64-linux` from one flake and one
   NixOS config, and published as a **single multi-arch OCI index** (§11.5). `rootfs.img` is
@@ -1728,6 +1885,57 @@ Both items need a `.proto`/image change, so they share one guest image rebuild a
 - [x] **Done when:** the Phase 2 end-to-end test passes unmodified on a Linux host via the firecracker provider. ✅ **Verified on real hardware** (GCP VM, nested virt, Intel VT-x): `TestEndToEndRealVM` — the Phase 2 test, body and assertions byte-identical, with only the provider construction swapped — boots the x86_64 image under Firecracker v1.16.1, streams in the image + repo bundle, runs the agent container, and returns a `changes.patch` that `patch.Apply` lands cleanly on a fresh clone (exit 0). Also green: `TestBootHello` (`Hello` round-trips over the vsock handshake), `TestGuestNetwork`, and `TestConcurrentRealVMs` (3 simultaneous VMs, unique taps/CIDs, patches provably not crossed, every tap reaped on teardown).
 - [x] **The Phase 3 security suite also re-verified on Linux** (not required by the "Done when", but the claim worth having before anyone runs untrusted code on this backend): `TestEgressEnforcement`, `TestContainerHardening`, `TestRootImageFailsClosed`, `TestGuestGitConfigInjectionInert`, `TestSecretConfinementInArtifacts` — all green against firecracker. The two that matter: a non-allowlisted host is refused by the proxy **and** a raw socket that ignores the proxy is dropped by nftables (`1.1.1.1:443` → timeout), while `setuid(proxyd)` fails `EPERM` — so the finding-#1 egress bypass is closed on this backend too. This required writing `hack/netprobe`, which the spec assumed existed but which had never been committed.
 
+### Phase 8 — Host-side egress proxy, step 1 (`move-egress-proxy-to-host.md`) ⏳
+Step 1 of the three-step host-side-proxy arc (`docs/ai-tasks/README.md`). Moves the L7
+allowlist proxy off the guest entirely, behind a new guest-initiated vsock channel — a
+behavior-preserving, security-strictly-improving change for the container (§6.6).
+
+> **Supersedes the Phase 3 "Done when" egress evidence.** `TestEgressEnforcement`,
+> `TestContainerHardening`'s `setuid(proxyd)` clause, and `TestConcurrentRealVMs`'s isolation
+> claim were all proven against the **in-guest** proxy design. That design no longer exists —
+> the evidence is not wrong, it is **obsolete**, and must be re-collected against the new
+> host-side design before this phase's own "Done when" is considered met on hardware. See
+> `HUMAN_TODO.md`.
+
+- [x] `internal/proxy` — the L7 allowlist handler + resolved-IP SSRF guard, moved out of
+  `internal/guest/proxy` (git history preserved via `git mv`), OS-agnostic and
+  build-tag-free. `checkDialAddr` no longer takes a `mode` parameter: every private/special
+  address range is refused in **every** mode, including `full` — the `mode: full` carve-out
+  that used to permit RFC1918/CGNAT/ULA is deleted outright, not widened, because the dialer
+  now runs on the host rather than inside a VM (§6.6 §2). The `Factory` and `newHandler`
+  test seams are unchanged.
+- [x] `internal/guest/proxy` keeps only the simplified, loopback-only, uid-free nftables lock
+  (`firewall_linux.go`) and the `Controller` that starts the new guest-side forwarder
+  (`controller_linux.go`) as the `proxyd` uid — defense in depth, no longer load-bearing.
+- [x] `cmd/krayt-vsock-forward` (new, `//go:build linux`) replaces `cmd/krayt-proxy` (deleted):
+  a parse-nothing TCP<->vsock pipe, one vsock connection per accepted TCP connection.
+- [x] Provider seam: `provider.EgressPort = 1025` + `VM.ListenEgress`, implemented on vfkit (a
+  second `listen=true` virtio-vsock device), Firecracker (`<uds_path>_<port>`, no handshake —
+  guest→host needs none), and the fake provider (a real unix-socket listener, not an
+  in-memory pipe, so orchestrator tests genuinely exercise fd-passing).
+- [x] `krayt __egress-proxy` — a hidden cobra subcommand, self-exec'd by the run supervisor
+  (`KRAYT_EGRESS_PROXY_BIN` swap seam), receiving its listener on fd 3 (never a socket path).
+  Verified excluded from shell completion (`TestEgressProxyCmdHidden`,
+  `internal/cli/complete_test.go`).
+- [x] Orchestrator wiring: `ListenEgress` + spawn, between `Create` and `Start`; teardown
+  alongside the VM; `proxy.log` written host-redacted from the child's captured
+  stdout/stderr — the first host-side redaction path in krayt (§6.8).
+- [x] **Done when (offline):** `go build ./...` + `GOOS=linux GOARCH=arm64 go build ./...` +
+  `go test -race ./...` + `golangci-lint run` all green, including a real (not mocked)
+  `krayt __egress-proxy` child process spawned over the fake provider's fd-3 listener
+  (`TestSpawnEgressProxyRealChildProcess`), its teardown (`TestSpawnEgressProxyTeardown`),
+  the forwarder's splice/concurrency/teardown behavior
+  (`cmd/krayt-vsock-forward/forward_test.go`), and `proxy.log` redaction
+  (`TestEgressProxyWriteLogRedactsSecrets`). ✅
+- [ ] **Done when (hardware, `[HUMAN]`):** the guest image rebuilds with `krayt-vsock-forward`
+  in place of `krayt-proxy` (§11 image lockstep — `PinnedRef` cannot be bumped until CI
+  publishes the new digest), then the re-verification suite in `HUMAN_TODO.md` passes on
+  both backends: allowlisted reach / non-allowlisted block / raw-socket block (now via the
+  host proxy), `nft list ruleset` in the guest contains no `skuid` rule, a container attempt
+  to reach the **host** on a private address is refused, and `TestConcurrentRealVMs` shows
+  two simultaneous VMs each getting their own egress socket + child process with no
+  cross-VM reachability. **Not yet run — see `HUMAN_TODO.md`.**
+
 ---
 
 ## 15. Open Questions / Future Work
@@ -1748,6 +1956,26 @@ Both items need a `.proto`/image change, so they share one guest image rebuild a
 - **Mid-run human input** — *resolved:* async `ask_human` question channel (§6.13), not a
   terminal. Full interactive/attached pairing remains intentionally out of scope.
 - **Artifact signing / provenance** — optionally sign run outputs for auditability.
+- **Removing the guest NIC entirely in `allowlist`/`none`** — since `move-egress-proxy-to-host.md`,
+  the VM no longer needs one in those modes (no DNS, no registry egress, no bundle egress), which
+  would additionally let Linux drop `setcap cap_net_admin+ep` (`hack/linux-net-setup.sh`) and the
+  tap+masquerade setup from `krayt doctor`. Not done: Firecracker's `allocSlot` currently bundles
+  tap + `/30` + CID into one allocation, and `full` mode still needs the NIC, so making it
+  conditional is its own task.
+- **Unifying `full` mode onto the host proxy path** — today `full` still opens the guest NIC
+  directly (nftables table deleted outright) rather than routing through the host proxy at HTTP
+  granularity. Doing so would change `full`'s meaning from "any protocol, unfiltered" to "HTTP(S)
+  only, unfiltered by host string" — a real semantic change deserving its own task, not folded into
+  `move-egress-proxy-to-host.md`.
+- **A named-forward-target mechanism for host/LAN services** — `move-egress-proxy-to-host.md`
+  hard-blocks loopback/private/LAN ranges from the egress proxy in every mode (§6.6 §2), so a
+  local Ollama/LM Studio on `127.0.0.1:11434` or a LAN package mirror is no longer reachable from
+  the sandbox at all. If wanted, that needs a purpose-built, explicitly-named forward target (not
+  a blanket range unblock, which would let the sandbox reach the user's entire LAN).
+- **Host-side proxy steps 2 and 3** (`add-tls-mitm-credential-injection.md`,
+  `inject-claude-oauth-token-at-proxy.md`) — TLS MITM + host-side credential injection, then
+  OAuth-token support specifically for Claude Code. Both strictly depend on step 1
+  (`move-egress-proxy-to-host.md`) landing and passing its hardware re-verification first.
 
 ---
 

@@ -14,6 +14,33 @@ model) first.** This is step 1 of a three-step arc:
 unambiguous security *win* that can land and be verified on hardware on its own, while step 2 is a
 trust-model *trade* that must be independently revertable.
 
+## Working mode: decide, don't ask
+
+**Complete this task end-to-end without asking questions.** Every decision it depends on — vsock over
+a gateway TCP proxy, separate process via hidden self-exec, fd-3 listener passing, the hard SSRF
+block, the spec statements to reverse — is already made and written down below. This file **is** the
+approved plan, so `CLAUDE.md`'s "give a short plan and wait for my OK before writing code" step is
+waived here; start implementing.
+
+Where this file and `KRAYT_SPEC.md` disagree, this file wins and amending the spec is part of the
+deliverable (see the section directly below) — do not ask whether to amend. If something is
+underspecified, pick the option most consistent with the stated design, record the choice and its
+rationale in the commit/PR description, and keep going.
+
+The only legitimate reasons to stop and involve a human:
+
+- A `[HUMAN]` step you genuinely cannot perform — real Apple-Silicon hardware, a Linux/KVM box, the
+  `PinnedRef` digest that does not exist until CI publishes it (§11). Do everything around it, append
+  the `HUMAN_TODO.md` entry per §14, then **continue** if other work remains and stop only if it
+  blocks everything left.
+- This file is factually wrong about the codebase — a cited file, symbol, or line no longer exists, or
+  the behavior described differs. Say so, state the correction you made, proceed on the corrected
+  understanding.
+
+Do **not** ask for plan approval, for confirmation of a decision already settled here, or for a choice
+between options this file has already picked. Never fabricate a hardware result to avoid a handoff
+(`CLAUDE.md`) — an honestly-blocked step is the correct outcome; a question is not.
+
 ## ⚠️ This contradicts the spec — amend it, don't just code around it
 
 Per `CLAUDE.md` ("the spec is the source of truth… flag the conflict instead of guessing"), this task

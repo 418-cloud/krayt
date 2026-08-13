@@ -139,20 +139,32 @@ func TestEndToEndRealVM(t *testing.T) {
 	}
 }
 
-// TestEgressEnforcement is the real-VM proof of the Phase 3 "Done when" egress clauses: with
-// an allowlist policy, the container reaches an allowlisted host through the proxy but is
-// blocked from a non-allowlisted host AND from a raw (non-proxied) socket — the nftables L3
+// TestEgressEnforcement is the real-VM proof of the Phase 3 "Done when" egress clauses, now
+// exercised against the `move-egress-proxy-to-host.md` (Phase 8) design: the L7 allowlist
+// decision is made by a HOST process reached over vsock, not an in-guest proxy — but the
+// probe's observable contract is unchanged, since the whole point of that task was to be
+// behavior-preserving for the container. With an allowlist policy, the container reaches an
+// allowlisted host through the (now host-side) proxy but is blocked from a non-allowlisted
+// host AND from a raw (non-proxied) socket — the guest's simplified, loopback-only nftables
 // lock. This needs real virtualization + nftables + network, so it is gated and run on a
 // Mac/CI (§14). KRAYT_NETPROBE_IMAGE must be a linux/arm64 image whose entrypoint probes
 // egress and exits 0 only when: HTTPS to KRAYT_ALLOW_HOST via HTTPS_PROXY succeeds, HTTPS to
-// a non-allowlisted host fails, and a raw TCP connect (ignoring HTTP(S)_PROXY) to a
-// non-allowlisted host:443 fails. See HUMAN_TODO.md for the probe-image contract.
+// a non-allowlisted host fails, a raw TCP connect (ignoring HTTP(S)_PROXY) to a
+// non-allowlisted host:443 fails, AND (added for Phase 8) a CONNECT through the proxy to a
+// private-range target is refused with 403 — proving the §6.6 §2 hard SSRF block holds on a
+// real, spawned host process, not just in TestCheckDialAddr. See HUMAN_TODO.md for the
+// probe-image contract.
 //
 // Together with TestContainerHardening's setuid(proxyd)=EPERM assertion, this is the on-hardware
-// egress-allowlist-bypass regression for finding #1 (fix-egress-allowlist-bypass.md): the direct
-// non-allowlisted connect being dropped proves the L3 `skuid "proxyd"` lock holds, and the EPERM
-// proves the container cannot assume proxyd's uid to satisfy it. The cheap offline counterpart is
-// TestEgressRulesetShape in internal/guest/proxy.
+// egress-allowlist-bypass regression for finding #1 (fix-egress-allowlist-bypass.md). Before
+// Phase 8 the non-allowlisted connect being dropped proved the L3 `skuid "proxyd"` lock held,
+// and the EPERM proved the container couldn't assume proxyd's uid to satisfy it — the lock's
+// correctness depended on both together. Since Phase 8 the guest lock is loopback-only and
+// keys on no uid at all, so there is nothing left for a capability regression to unlock; the
+// EPERM assertion is kept as a still-useful non-root regression check, not because the egress
+// lock depends on it anymore. The cheap offline counterpart is TestEgressRulesetShape in
+// internal/guest/proxy, which also now asserts `skuid` is absent from the ruleset. **Not yet
+// re-run against the Phase 8 design on real hardware — see HUMAN_TODO.md.**
 func TestEgressEnforcement(t *testing.T) {
 	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
 	image := os.Getenv("KRAYT_NETPROBE_IMAGE")
@@ -178,11 +190,17 @@ func TestEgressEnforcement(t *testing.T) {
 		t.Fatalf("imagestore.Acquire: %v", err)
 	}
 
+	// privateTarget mirrors hack/netprobe's KRAYT_PRIVATE_TARGET default: it must be ALLOWLISTED
+	// here (so the probe's check 4 is proven blocked by the resolved-IP SSRF guard specifically,
+	// not merely by the ordinary L7 host check) yet still refused — the Phase 8 regression check
+	// for §6.6 §2's hard private-range block (move-egress-proxy-to-host.md).
+	const privateTarget = "192.168.255.1"
+
 	runDir := filepath.Join(t.TempDir(), "run")
 	spec := task.RunSpec{
 		ID: "run_egress", ImageRef: image, RepoPath: src, BundleDepth: 1,
 		TaskPrompt: []byte("probe egress"),
-		Network:    task.NetworkPolicy{Mode: task.NetworkAllowlist, Allow: []string{allowHost}},
+		Network:    task.NetworkPolicy{Mode: task.NetworkAllowlist, Allow: []string{allowHost, privateTarget}},
 		Resources:  task.Resources{CPUs: 2, MemoryMiB: 2048, Timeout: 4 * time.Minute},
 	}
 	deps := orchestrator.Deps{
@@ -197,26 +215,31 @@ func TestEgressEnforcement(t *testing.T) {
 		logConsoleOnFailure(t, runDir)
 		t.Fatalf("orchestrator.Run: %v", err)
 	}
-	// The probe image encodes the expected allow/deny/raw-socket behavior and exits 0 only
-	// when the enforcement is correct.
+	// The probe image encodes the expected allow/deny/raw-socket/private-target behavior and
+	// exits 0 only when the enforcement is correct.
 	if res.ExitCode != 0 {
 		logConsoleOnFailure(t, runDir)
-		t.Fatalf("egress probe failed (exit %d): allowlisted reach, non-allowlisted block, or "+
-			"raw-socket block did not behave as expected — see the guest console log above", res.ExitCode)
+		t.Fatalf("egress probe failed (exit %d): allowlisted reach, non-allowlisted block, "+
+			"raw-socket block, or allowlisted-but-private-target block did not behave as expected "+
+			"— see the guest console log above", res.ExitCode)
 	}
 }
 
 // TestContainerHardening is the real-VM proof of the least-privilege OCI spec (§6.10, §10,
 // findings #1/#3): the default container drops all capabilities, runs a non-root uid, has the
-// seccomp filter engaged, keeps no-new-privs, and cannot setuid to proxyd (the egress bypass).
-// It needs real virtualization + containerd + nftables, so it is gated and run on a Mac/CI (§14).
-// KRAYT_HARDENING_IMAGE must be a linux/arm64, NON-ROOT (e.g. USER 1000) image whose entrypoint
-// asserts and exits 0 ONLY when all of the following hold (see HUMAN_TODO.md for the contract):
+// seccomp filter engaged, keeps no-new-privs, and cannot setuid to proxyd. That last check
+// predates Phase 8 (`move-egress-proxy-to-host.md`) as the egress-bypass regression; it is kept
+// as a general non-root/capability regression check, but the egress lock's own correctness no
+// longer depends on it — see TestEgressEnforcement's doc comment. It needs real virtualization
+// + containerd + nftables, so it is gated and run on a Mac/CI (§14). KRAYT_HARDENING_IMAGE must
+// be a linux/arm64, NON-ROOT (e.g. USER 1000) image whose entrypoint asserts and exits 0 ONLY
+// when all of the following hold (see HUMAN_TODO.md for the contract):
 //   - /proc/self/status: CapEff == 0000000000000000, CapAmb == 0000000000000000, NoNewPrivs == 1,
 //     Seccomp == 2 (SECCOMP_MODE_FILTER)
 //   - `id -u` != 0
 //   - setuid(<proxyd uid, read from /proc/net or brute-forced over the system-uid range>) fails
-//     with EPERM (the egress-allowlist-bypass regression, shared with fix-egress-allowlist-bypass)
+//     with EPERM (a non-root/capability regression check; no longer the egress lock's own proof
+//     since Phase 8, see above)
 func TestContainerHardening(t *testing.T) {
 	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
 	image := os.Getenv("KRAYT_HARDENING_IMAGE")

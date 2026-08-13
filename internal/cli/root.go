@@ -34,5 +34,6 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newUpgradeCmd())
 	root.AddCommand(newQuestionsCmd())
 	root.AddCommand(newAnswerCmd())
+	root.AddCommand(newEgressProxyCmd())
 	return root
 }

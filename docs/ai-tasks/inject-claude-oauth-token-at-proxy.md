@@ -7,6 +7,32 @@ container contract, §10) first.**
 2), which depends on [`move-egress-proxy-to-host.md`](./move-egress-proxy-to-host.md) (step 1). Do not
 start until step 2 has landed with its hardware verification green.**
 
+## Working mode: decide, don't ask
+
+**Complete this task end-to-end without asking questions.** The design is settled, including the
+branch: the P1–P5 probe *observations* decide between the primary and fallback designs, and both are
+fully specified below. The agent chooses nothing and asks nothing — it reads the probe results and
+implements the matching branch. This file **is** the approved plan, so `CLAUDE.md`'s "give a short
+plan and wait for my OK before writing code" step is waived here; start implementing.
+
+The extra maintenance cost — krayt tracking Anthropic's wire format — is already accepted; "Making the
+treadmill cheap" is the agreed response to it. Do not re-raise it as a question. If something is
+underspecified, pick the option most consistent with the stated design, record the choice and its
+rationale in the commit/PR description, and keep going.
+
+The only legitimate reasons to stop and involve a human:
+
+- The P1–P5 probes, which need a real credential of each shape and so are a genuine `[HUMAN]` step.
+  Write the probe procedure and recording template, append the `HUMAN_TODO.md` entry per §14, do every
+  piece of work that does not depend on the outcome, and stop only when the remaining work genuinely
+  hinges on the observations. That is a handoff with a filled-in template, **not** a question.
+- This file is factually wrong about the codebase — a cited file, symbol, or line no longer exists, or
+  step 2 landed differently than assumed. Say so, state the correction you made, proceed.
+
+Do **not** ask for plan approval, for confirmation of a settled decision, or which branch to take.
+Never fabricate a probe result, header name, or hardware result to avoid a handoff (`CLAUDE.md`) — an
+honestly-blocked step is the correct outcome; a question is not.
+
 ## The rule this task implements
 
 > **When `mitm` is on, the container never receives a real credential, and never learns what kind of

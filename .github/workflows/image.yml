@@ -18,7 +18,7 @@ on:
       - "go.sum"
       - "internal/**"
       - "cmd/krayt-agent/**"
-      - "cmd/krayt-proxy/**"
+      - "cmd/krayt-vsock-forward/**"
       - "cmd/krayt-ask/**"
       - ".github/workflows/image.yml"
   push:
