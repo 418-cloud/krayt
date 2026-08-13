@@ -11,7 +11,7 @@
 # Built command binaries (from `go build ./cmd/...` or `make krayt`)
 /krayt
 /krayt-agent
-/krayt-proxy
+/krayt-vsock-forward
 /krayt-ask
 /bin/
 

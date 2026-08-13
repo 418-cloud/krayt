@@ -2,16 +2,19 @@ package orchestrator_test
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/418-cloud/krayt/internal/orchestrator"
+	"github.com/418-cloud/krayt/internal/proxy"
 )
 
 // Env vars that turn a re-exec of this test binary into a slot-acquiring helper process, so the
@@ -22,9 +25,24 @@ const (
 	slotHelperHold = "KRAYT_TEST_SLOT_HOLD_MS"
 )
 
-// TestMain doubles as the slot helper: when slotHelperDir is set it acquires one slot (max=1),
-// records the held interval to its tag file, holds, releases, and exits — never running the
-// suite. Otherwise it runs the tests normally.
+// egressHelperFlag flags a re-exec of this test binary as the egress-proxy child instead of
+// the slot helper or the test suite — see the TestMain doc below.
+const egressHelperFlag = "KRAYT_TEST_EGRESS_HELPER"
+
+// TestMain triples as: (1) the slot-acquiring helper process used by
+// TestAcquireSlotCrossProcess, (2) the egress-proxy child process EVERY orchestrator.Run call
+// in this package's tests spawns for real (§4/§6 of move-egress-proxy-to-host.md — there is no
+// fake/no-op path in production, so there should not be one in tests either), or (3) the test
+// suite itself.
+//
+// For (2): rather than hand every orchestrator.Run call site a purpose-built stub binary, this
+// test binary points orchestrator.EgressProxyBinEnv at itself before running the suite. Any
+// child spawned that way inherits egressHelperFlag=1 through the default (nil Cmd.Env, i.e.
+// full-environment-inherit) exec.Cmd behavior — since this process sets it on itself with
+// os.Setenv before m.Run(), every subprocess m.Run() goes on to spawn sees it too, and reruns
+// this same TestMain, which recognizes the flag and behaves as the child (adopt fd 3, run the
+// real proxy.Serve loop) instead of recursing into the suite. This exercises the genuine
+// fd-passing + allowlist-enforcement path end to end in every orchestrator test, not a mock.
 func TestMain(m *testing.M) {
 	if dir := os.Getenv(slotHelperDir); dir != "" {
 		hold, _ := strconv.Atoi(os.Getenv(slotHelperHold))
@@ -39,7 +57,42 @@ func TestMain(m *testing.M) {
 		rel()
 		os.Exit(0)
 	}
+	if os.Getenv(egressHelperFlag) == "1" {
+		os.Exit(runEgressHelper())
+	}
+	if self, err := os.Executable(); err == nil {
+		_ = os.Setenv(orchestrator.EgressProxyBinEnv, self)
+		_ = os.Setenv(egressHelperFlag, "1")
+	}
 	os.Exit(m.Run())
+}
+
+// runEgressHelper is this test binary re-exec'd as a `krayt __egress-proxy` stand-in: it
+// behaves exactly like the real hidden subcommand (internal/cli/egressproxy.go) — adopt fd 3,
+// serve proxy.Serve — but lives here so every orchestrator-package test that calls
+// orchestrator.Run gets a REAL child process without repeating this wiring per test.
+func runEgressHelper() int {
+	fs := flag.NewFlagSet("egress-helper", flag.ContinueOnError)
+	mode := fs.String("mode", proxy.ModeAllowlist, "")
+	allowCSV := fs.String("allow", "", "")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "egress-helper: parse flags:", err)
+		return 1
+	}
+	lis, err := proxy.ListenerFromFD(3)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "egress-helper:", err)
+		return 1
+	}
+	var allow []string
+	if *allowCSV != "" {
+		allow = strings.Split(*allowCSV, ",")
+	}
+	if err := proxy.Serve(context.Background(), lis, proxy.Policy{Mode: *mode, Allow: allow}, nil); err != nil {
+		fmt.Fprintln(os.Stderr, "egress-helper:", err)
+		return 1
+	}
+	return 0
 }
 
 // TestAcquireSlotLimits proves the file-lock semaphore caps concurrency at max and actually

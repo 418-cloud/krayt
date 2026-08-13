@@ -452,6 +452,23 @@ func (v *vm) DialControl(ctx context.Context, port uint32) (net.Conn, error) {
 	return dialVsock(ctx, v.vsockSock, port)
 }
 
+// ListenEgress implements provider.VM (§6.6, §6.12). Guest→host is the direction Firecracker
+// vsock supports natively with NO handshake (the "CONNECT <port>\n" dance in vsock.go is
+// host→guest only): per the Firecracker vsock docs, a guest connecting out to
+// (VMADDR_CID_HOST, port) is bridged by firecracker to a host unix socket at
+// "<uds_path>_<port>", which firecracker dials as a CLIENT — so, exactly like the vfkit
+// listen=true device, the host must already be listening there before any guest connection can
+// land. No bridge type is needed here (contrast DialControl/ControlSocket above): there is no
+// handshake to hide from callers, so the raw listener is the whole implementation.
+func (v *vm) ListenEgress(_ context.Context, port uint32) (net.Listener, error) {
+	path := v.vsockSock + "_" + strconv.FormatUint(uint64(port), 10)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("firecracker: listen egress socket: %w", err)
+	}
+	return ln, nil
+}
+
 // ControlSocket returns the host-side control socket path, which the orchestrator records so
 // a later `krayt answer`/`stop` can dial this run's guest directly (§6.2, §6.13). This is the
 // bridge socket, not firecracker's raw vsock socket, so the caller gets a plain gRPC

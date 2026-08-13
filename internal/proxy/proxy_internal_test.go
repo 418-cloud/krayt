@@ -38,14 +38,17 @@ func TestAllowed(t *testing.T) {
 	}
 }
 
-// TestCheckDialAddr exercises the post-resolution SSRF guard (§6.6) directly: the pure
-// range/mode decision, with no network. This is the heart of the resolved-IP guard.
+// TestCheckDialAddr exercises the post-resolution SSRF guard (§6.6) directly: the pure range
+// decision, with no network and no mode parameter — since the proxy moved host-side, every
+// private/special range is blocked in every mode with no carve-out (move-egress-proxy-to-
+// host.md §2). This is the heart of the resolved-IP guard.
 func TestCheckDialAddr(t *testing.T) {
 	// addr joins an IP with a port, bracketing IPv6 correctly (":443" concatenation would
 	// mangle "::1" into a different, valid address).
 	addr := func(ip string) string { return net.JoinHostPort(ip, "443") }
-	// Always blocked, in every mode (loopback/link-local/metadata/unspecified/multicast).
-	alwaysBlocked := []string{
+	// Blocked everywhere: loopback/link-local/metadata/unspecified/multicast plus, since the
+	// proxy is host-side now, every private/ULA/CGNAT range too — no mode carve-out survives.
+	blocked := []string{
 		"169.254.169.254", // cloud metadata
 		"127.0.0.1",       // IPv4 loopback
 		"::1",             // IPv6 loopback
@@ -54,45 +57,32 @@ func TestCheckDialAddr(t *testing.T) {
 		"0.0.0.0",         // unspecified
 		"::",              // unspecified v6
 		"224.0.0.1",       // multicast
+		"10.1.2.3",        // RFC 1918
+		"192.168.1.1",     // RFC 1918
+		"172.16.0.1",      // RFC 1918
+		"100.64.0.1",      // RFC 6598 CGNAT
+		"fc00::1",         // RFC 4193 ULA
 	}
-	for _, mode := range []string{ModeAllowlist, ModeFull, ModeNone} {
-		for _, ip := range alwaysBlocked {
-			if err := checkDialAddr(mode, addr(ip)); err == nil {
-				t.Errorf("checkDialAddr(%q, %q) = nil, want blocked", mode, ip)
-			} else if !errors.Is(err, errBlockedAddr) {
-				t.Errorf("checkDialAddr(%q, %q) err = %v, want errBlockedAddr", mode, ip, err)
-			}
-		}
-	}
-
-	// Private/ULA/CGNAT: blocked in allowlist/none, allowed in full.
-	privateRanges := []string{"10.1.2.3", "192.168.1.1", "172.16.0.1", "100.64.0.1", "fc00::1"}
-	for _, ip := range privateRanges {
-		if err := checkDialAddr(ModeAllowlist, addr(ip)); !errors.Is(err, errBlockedAddr) {
-			t.Errorf("checkDialAddr(allowlist, %q) = %v, want blocked", ip, err)
-		}
-		if err := checkDialAddr(ModeNone, addr(ip)); !errors.Is(err, errBlockedAddr) {
-			t.Errorf("checkDialAddr(none, %q) = %v, want blocked", ip, err)
-		}
-		if err := checkDialAddr(ModeFull, addr(ip)); err != nil {
-			t.Errorf("checkDialAddr(full, %q) = %v, want allowed", ip, err)
+	for _, ip := range blocked {
+		if err := checkDialAddr(addr(ip)); err == nil {
+			t.Errorf("checkDialAddr(%q) = nil, want blocked", ip)
+		} else if !errors.Is(err, errBlockedAddr) {
+			t.Errorf("checkDialAddr(%q) err = %v, want errBlockedAddr", ip, err)
 		}
 	}
 
-	// Public addresses: allowed in every mode (still gated by the host allowlist elsewhere).
+	// Public addresses: allowed (still gated by the host allowlist elsewhere).
 	public := []string{"1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"}
-	for _, mode := range []string{ModeAllowlist, ModeFull, ModeNone} {
-		for _, ip := range public {
-			if err := checkDialAddr(mode, addr(ip)); err != nil {
-				t.Errorf("checkDialAddr(%q, %q) = %v, want allowed", mode, ip, err)
-			}
+	for _, ip := range public {
+		if err := checkDialAddr(addr(ip)); err != nil {
+			t.Errorf("checkDialAddr(%q) = %v, want allowed", ip, err)
 		}
 	}
 
 	// Fail closed: an address that cannot be parsed is refused.
 	for _, bad := range []string{"not-an-ip:443", "garbage", ""} {
-		if err := checkDialAddr(ModeFull, bad); !errors.Is(err, errBlockedAddr) {
-			t.Errorf("checkDialAddr(full, %q) = %v, want blocked (fail-closed)", bad, err)
+		if err := checkDialAddr(bad); !errors.Is(err, errBlockedAddr) {
+			t.Errorf("checkDialAddr(%q) = %v, want blocked (fail-closed)", bad, err)
 		}
 	}
 }
@@ -105,7 +95,7 @@ func (b *blockingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	if b.reached != nil {
 		*b.reached = true
 	}
-	return nil, &net.OpError{Op: "dial", Err: checkDialAddr(ModeAllowlist, "169.254.169.254:80")}
+	return nil, &net.OpError{Op: "dial", Err: checkDialAddr("169.254.169.254:80")}
 }
 
 // TestGuardBlocksResolvedIP asserts that when an allowlisted name resolves to a blocked IP,
@@ -131,7 +121,7 @@ func TestGuardBlocksResolvedIP(t *testing.T) {
 		dialed := false
 		dial := func(_ context.Context, _, _ string) (net.Conn, error) {
 			dialed = true // Control would refuse before a real connect; simulate that here.
-			return nil, &net.OpError{Op: "dial", Err: checkDialAddr(ModeAllowlist, "127.0.0.1:443")}
+			return nil, &net.OpError{Op: "dial", Err: checkDialAddr("127.0.0.1:443")}
 		}
 		h := newHandler(pol, http.DefaultTransport, dial)
 		req := httptest.NewRequest(http.MethodConnect, "//rebind.example.com:443", nil)

@@ -166,8 +166,10 @@ func buildSpecOpts(cfg guest.RunConfig, image oci.Image) []oci.SpecOpts {
 
 // securitySpecOpts is the least-privilege half of the spec (§10): it depends only on the task
 // policy in cfg, not on the image, so it applies cleanly to a seeded *specs.Spec in tests.
-//   - withEnforceNonRoot fails the run if the image would run as uid 0 (§8.2) — the enforcement
-//     that, together with dropped CAP_SETUID/SETGID, makes the skuid-based egress lock unbypassable.
+//   - withEnforceNonRoot fails the run if the image would run as uid 0 (§8.2). Together with
+//     dropped CAP_SETUID/SETGID this is no longer what makes the egress lock unbypassable —
+//     since move-egress-proxy-to-host.md the guest's nftables chain is loopback-only and keys on
+//     no uid at all (§6.6) — but non-root remains load-bearing for secret confinement (§8.2).
 //   - WithCapabilities(cfg.AddCapabilities) drops ALL capabilities when the opt-in list is empty
 //     (Bounding/Effective/Permitted/Inheritable), or grants exactly the validated opt-in set.
 //   - withClearAmbient zeroes the ambient set belt-and-suspenders, regardless of the image config.

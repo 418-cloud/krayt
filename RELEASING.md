@@ -34,7 +34,7 @@ commit type:
 
 - `feat:` → minor, `fix:` → patch, `feat!:`/`BREAKING CHANGE:` → major. `chore:`/`docs:`/`ci:`
   don't bump the version.
-- **Guest / image-only changes** — `internal/guest/**`, `cmd/krayt-agent`, `cmd/krayt-proxy`,
+- **Guest / image-only changes** — `internal/guest/**`, `cmd/krayt-agent`, `cmd/krayt-vsock-forward`,
   `cmd/krayt-ask`, `images/**` — ship in the VM image, not the `krayt` binary, so commit them as
   **`chore:`**. (Renovate already types Nix-flake, GitHub-Actions, and Dockerfile updates as
   `chore:`, so image-dependency churn doesn't cut CLI releases.)
@@ -47,7 +47,7 @@ The image isn't a release-please package (see below) — it has its own small **
 tagging flow, purpose-built so a candidate can be boot-tested *before* it becomes pin-eligible:
 
 1. **Land a change** under any of the watched paths: `images/**`, `internal/guest/**`,
-   `cmd/krayt-agent/**`, `cmd/krayt-proxy/**`, `cmd/krayt-ask/**`.
+   `cmd/krayt-agent/**`, `cmd/krayt-vsock-forward/**`, `cmd/krayt-ask/**`.
 2. **An RC auto-publishes.** Pushing that change — either to a PR branch or to `main` — triggers
    `vmimage-rc.yml`, which runs `hack/next-vmimage-tag.sh` and pushes the next
    `vmimage-vX.Y.Z-rc.N` tag (rc → rc+1 off the same series, or stable/no-prior-tag → the next

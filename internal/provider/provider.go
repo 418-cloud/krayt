@@ -57,7 +57,30 @@ type VM interface {
 	// before calling Destroy, not after. Either path may be empty if the VM never got far
 	// enough to produce one.
 	LogPaths() (providerLog, consoleLog string)
+
+	// ListenEgress returns a listener accepting guest-initiated connections on the fixed
+	// egress vsock port (§6.6, §6.12): the guest's krayt-vsock-forward dials out to it for
+	// every TCP connection the container makes, and the host's `krayt __egress-proxy` child
+	// accepts from it. This is the ONE new primitive move-egress-proxy-to-host.md adds — every
+	// other vsock channel in krayt is host-initiated (DialControl).
+	//
+	// The provider absorbs the backend asymmetry: on vfkit it is the unix socket a second
+	// virtio-vsock device (listen=true) connects to; on Firecracker it is the unix socket at
+	// <uds_path>_<port>, which is how a Firecracker vsock device exposes the guest→host
+	// direction (no CONNECT handshake — that is host→guest only, see DialControl). On both,
+	// the host is the one that binds and listens; the backend's own process (vfkit/
+	// firecracker) is a client of it, connecting out only once the guest dials.
+	//
+	// Must be called after Create and before Start — the socket must exist before the backend
+	// process launches so a guest connection racing the boot never finds it missing. Closing
+	// the returned listener stops accepting; the VM itself is unaffected.
+	ListenEgress(ctx context.Context, port uint32) (net.Listener, error)
 }
 
 // ControlPort is the fixed guest vsock port the guest-agent listens on (§6.12).
 const ControlPort uint32 = 1024
+
+// EgressPort is the fixed vsock port the guest's krayt-vsock-forward dials on the host for
+// every container-initiated connection (§6.6, §6.12). Guest→host, the opposite direction of
+// ControlPort — see VM.ListenEgress.
+const EgressPort uint32 = 1025

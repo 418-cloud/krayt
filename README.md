@@ -79,7 +79,8 @@ Common to both platforms:
   The script grants krayt `CAP_NET_ADMIN` as a **file capability** (so krayt does *not* run as
   root), enables IP forwarding, and installs krayt's NAT/forward rules as `krayt-nat.service` so
   they survive a reboot. It does not loosen the guest's egress policy — what a container may
-  reach is still enforced inside the VM.
+  reach is still enforced by the host-side egress proxy (see "Egress control" below); this NIC
+  only matters for `--net full` and the vsock control channel.
 - **If Docker is also installed:** it sets the netfilter `FORWARD` chain's default policy to
   `DROP` at `dockerd` startup — a separate rule set from krayt's own, evaluated independently, so
   krayt's NAT rules above being correctly in place does not save you: guest egress gets silently
@@ -211,6 +212,24 @@ Reproducible, ready-to-run examples live under `hack/` — most notably `hack/cl
 (a real Claude Code agent, build-it-yourself version of the published image below) and
 `hack/krayt-ask-probe/` (the question channel).
 
+### Egress control
+
+`--net allowlist` (default) — only hosts in `--allow`/`network.allow` are reachable; `--net full`
+opens the guest's NIC directly (explicit opt-in); `--net none` denies everything. The allowlist
+is enforced by a **host-side proxy process** (`krayt __egress-proxy`, spawned per run, reached
+over a dedicated vsock channel) — the container's own network access is otherwise dropped except
+loopback. Two behavior notes worth knowing:
+
+- **DNS resolves in your host's network context**, not the VM's — it uses your system resolver
+  by default, so VPN/split-horizon/corporate DNS behaves the way it would for any other process
+  on your machine.
+- **Loopback, link-local, and private/LAN ranges (RFC 1918, CGNAT, ULA) are refused in every
+  mode, including `full`.** A local Ollama/LM Studio on `127.0.0.1:11434` or a LAN package
+  mirror is **not reachable** from inside the sandbox — this is deliberate: the proxy now runs
+  on your host, so a range unblock would mean giving sandboxed code a path to your real LAN and
+  loopback services, not just the VM's own NAT segment. There is no per-task opt-in for this; a
+  purpose-built named-forward-target mechanism is a possible future addition.
+
 ### Agent images
 
 krayt publishes official, minimal, version-pinned container images with an agent already
@@ -290,7 +309,7 @@ each `integration_test.go` remain the authoritative manual fallback for running 
 | `CONTRIBUTING.md` | How to get set up, code/commit conventions, and what a PR should include. |
 | `images/` | Nix flake for the micro-VM image; `images/agents/` holds the published, ready-to-run agent images (CI-built). |
 | `internal/` | The implementation (see §9 of the spec for package layout). |
-| `cmd/` | Binaries: `krayt` (CLI), `krayt-agent` (guest), `krayt-proxy` (egress), `krayt-ask` (question front-end + MCP server). |
+| `cmd/` | Binaries: `krayt` (CLI, incl. the hidden `krayt __egress-proxy` host-side allowlist proxy), `krayt-agent` (guest), `krayt-vsock-forward` (guest-side parse-nothing pipe to the host proxy), `krayt-ask` (question front-end + MCP server). |
 | `configs/` | Example `krayt.yaml` + default allowlist. |
 | `hack/` | Reproducible demo/probe images used to verify features on hardware (`claude-code` agent, `ask-probe`, `krayt-ask-probe`). |
 
@@ -326,8 +345,8 @@ See `CLAUDE.md` for the full working agreement.
 
 ## Status
 
-Built phase by phase per `KRAYT_SPEC.md` §14. **All eight phases (0–7) are complete and verified
-on real hardware on both backends**, released as
+Built phase by phase per `KRAYT_SPEC.md` §14. **Phases 0–7 are complete and verified on real
+hardware on both backends**, released as
 [`v0.5.0`](https://github.com/418-cloud/krayt/releases/tag/v0.5.0) — krayt runs a real coding
 agent (Claude Code) in an isolated micro-VM over an untrusted repo and hands back a reviewable
 patch, with egress control, secrets, concurrency, park-and-walk-away, and an agent↔human question
@@ -344,6 +363,7 @@ channel, on **both** macOS/vfkit and Linux/firecracker behind the same `Provider
 | 5 — Polish & orchestration | `report.md`/`meta.json`, patch lint, agent adapters + auth, `krayt-ask`, detached "park & walk away" | ✅ hardware |
 | 6 — `ask_human` MCP + precise resume | in-VM MCP server, `waiting`→`running` on answer | ✅ hardware |
 | 7 — Linux backend (parity) | `firecracker` provider behind the same interface | ✅ hardware |
+| 8 — Host-side egress proxy, step 1 | L7 allowlist proxy moved off the guest to a separate host process over a new guest-initiated vsock channel (`move-egress-proxy-to-host.md`) | ✅ offline / ⏳ hardware re-verification, see `HUMAN_TODO.md` |
 
 The showcase: a real agent, blocked mid-task on a decision only a human could make, paused,
 asked over MCP, got the answer, and continued with it — all inside the VM with a live

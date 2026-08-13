@@ -7,6 +7,13 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
+**Open:** `move-egress-proxy-to-host.md` (Phase 8, §14) needs a guest image rebuild (it changes
+`cmd/krayt-vsock-forward` + `internal/guest/proxy`), a `PinnedRef` bump to the new digest once CI
+publishes it, and the Phase-3 egress hardware suite re-run against the new host-side design —
+see the `[hardware]` entry below. **Blocking**: nothing else in the repo currently depends on it,
+but no run with a real host-side egress proxy can boot until the image is rebuilt and re-pinned,
+so the feature is offline-complete only until this lands.
+
 **Open:** the `krayt-agent-claude-code`, `krayt-agent-gemini-cli`, and (new)
 `krayt-agent-opencode` published images each need a real CI run + a real live onboarding run —
 see the `[tooling]` entries below. The gemini-cli image also needs its `node:24-bookworm-slim`
@@ -43,6 +50,57 @@ pruned now that it's shipped — the record of *how* lives in `git log`/PR histo
 only tracks what's still open.
 
 ---
+
+## [hardware] `move-egress-proxy-to-host.md` — image rebuild, `PinnedRef` bump, and Phase-3 egress suite re-verification
+
+- **Needed:** (1) push these changes so the RC image-build workflow publishes a new guest image
+  digest (the guest side changed: `cmd/krayt-vsock-forward` replaces `cmd/krayt-proxy`,
+  `internal/guest/proxy` is simplified); (2) read that digest from the workflow run and bump
+  `internal/vmimage/pinned.go`'s `PinnedRef`; (3) re-run the hardware egress suite against the
+  new host-side proxy design on **both** backends (Apple Silicon/vfkit and Linux/KVM/firecracker).
+- **Why the agent can't:** `PinnedRef` is a single hardcoded digest that does not exist until CI
+  builds and publishes the new image (§11, §14) — it cannot be guessed or fabricated. The actual
+  boot + egress-enforcement tests need real virtualization (vz on Apple Silicon, KVM on Linux),
+  neither of which this sandbox has.
+- **Exact steps/commands:**
+  1. Push this branch/PR — `.github/workflows/vmimage-rc.yml` is path-triggered on
+     `images/**`, `internal/guest/**`, `cmd/krayt-agent/**`, `cmd/krayt-vsock-forward/**`,
+     `cmd/krayt-ask/**`, all of which this task touches, so it fires automatically (see
+     `RELEASING.md`).
+  2. Read the published RC tag/digest from the workflow run (or `oras manifest fetch` the tag it
+     prints) and set `internal/vmimage/pinned.go`'s `PinnedRef` to it.
+  3. `go test -tags integration ./internal/orchestrator/... -run TestEgressEnforcement` and
+     `-run TestContainerHardening` on a Mac with vfkit installed (`KRAYT_KERNEL`/`KRAYT_INITRD`/
+     `KRAYT_ROOTFS`/`KRAYT_NETPROBE_IMAGE`/`KRAYT_ALLOW_HOST`/`KRAYT_HARDENING_IMAGE` per each
+     test's header comment) and on a Linux/KVM box for the firecracker backend — same tests, same
+     env vars, `hack/run-integration-tests.sh` auto-detects which backend to use.
+  4. `-run TestConcurrentRealVMs` on both backends (needs `KRAYT_IMAGE`, a real agent image) —
+     asserts two simultaneous VMs each get their own egress socket + child process with no
+     cross-VM reachability, the concurrency property this task's vsock design is supposed to buy
+     over a gateway-bound TCP proxy.
+  5. **New checks this task adds that the existing probes don't cover yet** — write these as real
+     test/probe code before running them, don't skip straight to manual verification:
+     - `nft list ruleset` inside the guest, over a debug shell or an extended probe image,
+       contains **no `skuid` rule** (the existing `hardening-probe` only checks that
+       `setuid(proxyd)` itself fails `EPERM`, which is still worth keeping as a non-root
+       regression check, but no longer proves the egress lock's correctness — the ruleset shape
+       does. `TestEgressRulesetShape` (`internal/guest/proxy/firewall_internal_test.go`) is the
+       offline counterpart; this hardware check confirms the *installed* ruleset on a live guest
+       matches it, not just the constant.
+     - A container attempt to reach the **host** itself on a private address (e.g. the vfkit/
+       firecracker host's own LAN IP) is refused by the SSRF guard — extend `hack/netprobe` with
+       a fourth check (a new exit code) that CONNECTs through the proxy to a private-range target
+       and asserts it gets a 403, proving the §2 hard-block change actually holds on hardware, not
+       just in `TestCheckDialAddr`.
+- **Verify success by:** all of the above tests/probes passing (`--- PASS`) on both backends,
+  with the new image's digest recorded in `PinnedRef`. Update `KRAYT_SPEC.md` §14's Phase 8 "Done
+  when (hardware)" checkbox from `[ ]` to `[x]` and this section's status line once confirmed —
+  do not mark it done without a real boot + real test run.
+- **Blocking:** no (nothing else in the repo currently depends on this landing), but the run
+  supervisor cannot boot a VM with a working egress path against the *old* pinned image (guest
+  side is now `krayt-vsock-forward`, not `krayt-proxy`) — so this is the one step standing between
+  "offline-complete" and "actually usable" for this task specifically. See the top-of-file Status
+  note.
 
 ## [tooling/CI] vmimage RC/graduate workflows — ✅ DONE
 
