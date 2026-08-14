@@ -16,7 +16,8 @@ self-contained release binary, not an npm package or native installer). Nothing 
 
 The entrypoint (`entrypoint.sh`, baked in as `/usr/local/bin/krayt-agent-entrypoint`) exports the
 credential from `/run/secrets` into the environment, registers the `ask_human` MCP server when
-`KRAYT_ASK_SOCKET` is set (§6.13), then runs:
+`KRAYT_ASK_SOCKET` is set (§6.13), trusts krayt's ephemeral MITM CA when `KRAYT_CA_CERT` is set
+(`network.mitm: true`, §6.6.1 — a no-op otherwise), then runs:
 
 ```sh
 opencode run --model "$model" --auto "$(cat /task/prompt.md)" | tee /output/report.md

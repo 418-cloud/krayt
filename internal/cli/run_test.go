@@ -190,6 +190,69 @@ func TestRunRunResourcePreflightRejectsOversizedRequest(t *testing.T) {
 	}
 }
 
+// TestRunRunNetworkInjectPreflightRejectsMissingSecretKey checks that a network.inject rule
+// naming a secrets-file key that doesn't exist fails fast at pre-flight — before any VM/image
+// work — rather than producing a run that fails opaquely once the agent tries to authenticate
+// (add-tls-mitm-credential-injection.md §1).
+func TestRunRunNetworkInjectPreflightRejectsMissingSecretKey(t *testing.T) {
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "task.md")
+	if err := os.WriteFile(taskFile, []byte("do the thing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "krayt.yaml")
+	cfg := "image: img:1\n" +
+		"network:\n  mode: allowlist\n  allow: [api.anthropic.com]\n  mitm: true\n" +
+		"  inject:\n    - host: api.anthropic.com\n      set:\n        x-api-key: TYPO_KEY\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var f runFlags
+	cmd := newTestRunCmd(&f)
+	if err := cmd.ParseFlags([]string{"--task", taskFile, "--repo", dir, "--config", cfgPath}); err != nil {
+		t.Fatal(err)
+	}
+	err := runRun(cmd, &f)
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("runRun err = %v, want a network.inject pre-flight error naming the missing secrets key", err)
+	}
+}
+
+// TestRunRunNetworkInjectPreflightPassesWithRealSecretKey is the companion positive case: when
+// the referenced key really is in the secrets file, pre-flight validation does not itself
+// reject the run (it may still fail later for unrelated reasons — no provider on this host,
+// same as TestRunRunResourcePreflightBypassedBySkipFlag — that's fine and untested here).
+func TestRunRunNetworkInjectPreflightPassesWithRealSecretKey(t *testing.T) {
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "task.md")
+	if err := os.WriteFile(taskFile, []byte("do the thing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secretsPath := filepath.Join(dir, "secrets.env")
+	if err := os.WriteFile(secretsPath, []byte("ANTHROPIC_API_KEY=sk-test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "krayt.yaml")
+	cfg := "image: img:1\n" +
+		"secrets: " + secretsPath + "\n" +
+		"network:\n  mode: allowlist\n  allow: [api.anthropic.com]\n  mitm: true\n" +
+		"  inject:\n    - host: api.anthropic.com\n      set:\n        x-api-key: ANTHROPIC_API_KEY\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var f runFlags
+	cmd := newTestRunCmd(&f)
+	if err := cmd.ParseFlags([]string{"--task", taskFile, "--repo", dir, "--config", cfgPath, "--skip-resource-check"}); err != nil {
+		t.Fatal(err)
+	}
+	err := runRun(cmd, &f)
+	if err != nil && strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("runRun err = %v, want the network.inject pre-flight to pass for a real secret key", err)
+	}
+}
+
 // TestRunRunResourcePreflightBypassedBySkipFlag checks that --skip-resource-check bypasses the
 // preflight entirely, on every platform: the same oversized request must never fail with the
 // resource-preflight error once the flag is set (it may still fail later for other reasons, e.g.

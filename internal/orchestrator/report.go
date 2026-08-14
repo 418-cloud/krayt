@@ -167,15 +167,22 @@ func hms(secs int) string {
 }
 
 // networkLine renders the egress policy for the report, e.g. "allowlist (api.anthropic.com)".
+// When MITM injected credentials host-side (§2, add-tls-mitm-credential-injection.md), it names
+// which keys — the user-visible payoff: the human can see the container ran credential-free.
 func networkLine(n NetworkMeta) string {
 	mode := n.Mode
 	if mode == "" {
 		mode = "allowlist"
 	}
-	if len(n.Allow) == 0 {
-		return mode
+	if len(n.Allow) > 0 {
+		mode = fmt.Sprintf("%s (%s)", mode, strings.Join(n.Allow, ", "))
 	}
-	return fmt.Sprintf("%s (%s)", mode, strings.Join(n.Allow, ", "))
+	if len(n.InjectedKeys) > 0 {
+		mode += fmt.Sprintf("; mitm: injected host-side, container ran without %s", strings.Join(n.InjectedKeys, ", "))
+	} else if n.MITM {
+		mode += "; mitm: on"
+	}
+	return mode
 }
 
 // durationSecs returns the whole seconds between two RFC3339 stamps, or 0 if either is missing

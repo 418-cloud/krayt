@@ -135,7 +135,41 @@ func ParseNetworkMode(s string) (NetworkMode, error) {
 
 // NetworkPolicy is the host-side network policy for a run; it mirrors the proto enum
 // in §6.5 and is translated to protocol.NetworkPolicy before being pushed to the guest.
+//
+// MITM/Passthrough/Inject are host-only (§6.6, add-tls-mitm-credential-injection.md): they
+// never ride the guest protocol — only the resulting CA certificate does (NetworkPolicy.ca_cert
+// in krayt.proto). The proxy child receives them over its stdin JSON config
+// (internal/orchestrator's spawnEgressProxy), never on argv or in env.
 type NetworkPolicy struct {
 	Mode  NetworkMode
 	Allow []string
+
+	MITM        bool         // opt-in TLS termination + header injection at the host proxy; default false
+	Passthrough []string     // hosts tunneled (never MITM'd) even when MITM is on; subset of Allow in allowlist mode
+	Inject      []InjectRule // per-host header injection rules; requires MITM
+}
+
+// InjectRule is one `network.inject[]` entry (§8.1): for requests to Host through the MITM
+// path, delete every header named in Strip, then set every header in Set (resolved secrets-file
+// key names, resolved host-side to real values) and SetLiteral (fixed, non-secret values).
+// Strip and Set are deliberately separate — the header the container sends is not necessarily
+// the header that goes upstream (step 3 removes one auth header and sets a different one).
+type InjectRule struct {
+	Host       string
+	Strip      []string          // header names to delete from the guest's request first
+	Set        map[string]string // header name -> secrets-file key name, resolved host-side
+	SetLiteral map[string]string // header name -> fixed literal value (never a secret)
+	Refresh    *RefreshRule      // optional host-side credential refresh (plumbing only; step 3 fills in execution)
+}
+
+// RefreshRule declaratively names an upstream credential-refresh endpoint for one InjectRule
+// (§4.6). The proxy is generic: it recognizes the shape and, on this task, provides only the
+// generic "one refresh, one retry" mechanism (internal/proxy's RefreshFunc seam) — it does not
+// know how to actually perform a refresh for any specific vendor. That knowledge (request
+// construction, response parsing) belongs in a per-agent adapter (§6.14), the first consumer
+// being inject-claude-oauth-token-at-proxy.md (step 3).
+type RefreshRule struct {
+	Host                string
+	PathPrefix          string
+	ResponseTokenFields []string
 }

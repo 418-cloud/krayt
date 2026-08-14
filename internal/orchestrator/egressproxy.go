@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -11,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/418-cloud/krayt/internal/proxy"
 	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
 )
@@ -50,41 +53,84 @@ type egressProxy struct {
 
 	runDir      string
 	secretsPath string
+
+	// caCertPEM is the child's ephemeral MITM CA public certificate (§5,
+	// add-tls-mitm-credential-injection.md), reported back over fd 4 — empty when
+	// network.mitm is false, or if nothing arrived within the startup window (an older
+	// KRAYT_EGRESS_PROXY_BIN replacement, or an unusually slow child). The caller pushes this
+	// into the guest's NetworkPolicy so the container's TLS stack can trust MITM'd connections.
+	caCertPEM []byte
 }
 
-// spawnEgressProxy starts the host-side egress allowlist proxy for one run (§4, §6): it
-// duplicates lis's fd for the child, execs it with that dup as fd 3, and captures its
-// stdout/stderr for later redaction into proxy.log (writeLog, §9). The caller must have
-// created lis via vm.ListenEgress, after Create and before vm.Start, and must call stop() on
-// the returned egressProxy as part of the run's teardown.
+// caHandshakeWait bounds how long spawnEgressProxy additionally waits, after confirming the
+// child didn't exit immediately, to receive its CA cert (or its explicit "no CA" signal — an
+// empty read then EOF) over fd 4. Cert generation + a single small write is sub-millisecond in
+// practice; this only needs to be generous enough to absorb scheduling noise under load.
+const caHandshakeWait = 2 * time.Second
+
+// spawnEgressProxy starts the host-side egress allowlist/MITM proxy for one run (§4, §6, and
+// §2/§4 of add-tls-mitm-credential-injection.md): it duplicates lis's fd for the child, execs it
+// with that dup as fd 3 and a CA-cert-report pipe as fd 4, writes the injection/passthrough
+// config (with any secrets-file key names already resolved to values) to the child's stdin and
+// closes it, and captures its stdout/stderr for later redaction into proxy.log (writeLog, §9).
+// The caller must have created lis via vm.ListenEgress, after Create and before vm.Start, and
+// must call stop() on the returned egressProxy as part of the run's teardown.
 //
 // A failure here — including the child exiting within egressProxyStartupWait of Start — is a
 // fail-fast run error: the run must never boot a VM whose only egress path is already dead.
-func spawnEgressProxy(ctx context.Context, lis net.Listener, np task.NetworkPolicy, runDir, secretsPath string) (*egressProxy, error) {
+func spawnEgressProxy(ctx context.Context, lis net.Listener, np task.NetworkPolicy, runID, runDir, secretsPath string) (*egressProxy, error) {
 	f, err := takeListenerFD(lis)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: egress proxy listener: %w", err)
 	}
 	defer func() { _ = f.Close() }() // the child inherits its own dup at Start; see takeListenerFD
 
+	caR, caW, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: egress proxy CA-cert pipe: %w", err)
+	}
+	defer func() { _ = caR.Close() }()
+
+	stdinPayload, err := buildEgressStdinConfig(np, secretsPath)
+	if err != nil {
+		_ = caW.Close()
+		return nil, err
+	}
+
 	args := []string{"--mode", string(np.Mode), "--allow", strings.Join(np.Allow, ",")}
+	if np.MITM {
+		args = append(args, "--mitm")
+	}
+	if runID != "" {
+		args = append(args, "--run-id", runID)
+	}
 	var cmd *exec.Cmd
 	if bin := os.Getenv(EgressProxyBinEnv); bin != "" {
 		cmd = exec.CommandContext(ctx, bin, args...)
 	} else {
 		self, err := os.Executable()
 		if err != nil {
+			_ = caW.Close()
 			return nil, fmt.Errorf("orchestrator: resolve krayt executable for egress proxy: %w", err)
 		}
 		cmd = exec.CommandContext(ctx, self, append([]string{"__egress-proxy"}, args...)...)
 	}
-	cmd.ExtraFiles = []*os.File{f}
+	cmd.ExtraFiles = []*os.File{f, caW}
+	cmd.Stdin = bytes.NewReader(stdinPayload)
 	out := &syncBuffer{}
 	cmd.Stdout, cmd.Stderr = out, out
 
 	if err := cmd.Start(); err != nil {
+		_ = caW.Close()
 		return nil, fmt.Errorf("orchestrator: start egress proxy: %w", err)
 	}
+	_ = caW.Close() // this process's own copy; the child owns its independent dup at fd 4 from here
+
+	caCh := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(caR)
+		caCh <- b
+	}()
 
 	waited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(waited) }()
@@ -96,7 +142,48 @@ func spawnEgressProxy(ctx context.Context, lis net.Listener, np task.NetworkPoli
 		return nil, fmt.Errorf("orchestrator: egress proxy exited immediately at startup; see %s", ProxyLogPath(runDir))
 	case <-time.After(egressProxyStartupWait):
 	}
+	select {
+	case ep.caCertPEM = <-caCh:
+	case <-time.After(caHandshakeWait):
+		// No CA signal within the window — proceed without one rather than fail the run: absence
+		// here just means the guest gets no ca_cert, i.e. mitm-off behavior on the guest side.
+	}
 	return ep, nil
+}
+
+// buildEgressStdinConfig builds the JSON document written to the egress proxy child's stdin
+// (§2b): the passthrough list plus every inject rule, with each rule's `set` resolved from a
+// secrets-file key NAME to its actual VALUE — the only place that resolution happens, so
+// internal/proxy never needs to know what a "secrets file" is. Pre-flight validation
+// (task.ValidateNetworkPolicy, run before any VM boots) already guarantees every referenced key
+// exists, so a lookup miss here would be a programming error, not a user-facing one.
+func buildEgressStdinConfig(np task.NetworkPolicy, secretsPath string) ([]byte, error) {
+	cfg := proxy.StdinConfig{Passthrough: np.Passthrough}
+	if len(np.Inject) > 0 {
+		values, err := secrets.Load(secretsPath)
+		if err != nil {
+			return nil, fmt.Errorf("orchestrator: load secrets for network.inject: %w", err)
+		}
+		for _, r := range np.Inject {
+			set := make(map[string]string, len(r.Set))
+			for header, key := range r.Set {
+				set[header] = values[key]
+			}
+			pr := proxy.InjectRule{Host: r.Host, Strip: r.Strip, Set: set, SetLiteral: r.SetLiteral}
+			if r.Refresh != nil {
+				pr.Refresh = &proxy.RefreshRule{
+					Host: r.Refresh.Host, PathPrefix: r.Refresh.PathPrefix,
+					ResponseTokenFields: r.Refresh.ResponseTokenFields,
+				}
+			}
+			cfg.Inject = append(cfg.Inject, pr)
+		}
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: marshal egress proxy stdin config: %w", err)
+	}
+	return b, nil
 }
 
 // stop kills the egress proxy child, waits (bounded) for it to exit, and persists its

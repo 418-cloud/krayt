@@ -234,6 +234,36 @@ loopback. Two behavior notes worth knowing:
   **not** subject to this guard at all in `full` mode and can reach routable private/LAN
   addresses directly; only the proxy path is hard-blocked.
 
+### Credential injection
+
+**Opt-in, off by default.** With `network.mitm: true`, the host egress proxy terminates TLS for
+the hosts you name in `network.inject[]` and attaches the credential itself — the container
+never sees it at all, closing the window where a compromised agent (or anything it touches)
+could read `/run/secrets` and walk off with a long-lived key. This is **not** a strict
+improvement over the default: it removes credential *theft*, not *use* (a compromised agent can
+still make authenticated requests for the run's duration), it only covers HTTP-shaped
+credentials, and it concentrates more trust in the host proxy process, which now holds your real
+credential in memory. Read `KRAYT_SPEC.md` §6.6.1/§10 before enabling it for anything sensitive.
+
+```yaml
+# krayt.yaml
+secrets: ./secrets.env          # still holds ANTHROPIC_API_KEY — the proxy loads it host-side;
+                                 # the container never receives this specific key at all
+network:
+  mode: allowlist
+  allow: [api.anthropic.com]
+  mitm: true                    # terminate TLS at the host proxy for the hosts named below
+  inject:
+    - host: api.anthropic.com
+      strip: [x-api-key, authorization]   # remove any value the container itself sent
+      set:
+        x-api-key: ANTHROPIC_API_KEY      # secrets-file key name, resolved host-side
+```
+
+Run it exactly like any other task — `krayt run --config krayt.yaml --task ./task.md`. `krayt
+ls`/`report.md` show which keys were injected (names only, never values) so you can confirm the
+container ran without them.
+
 ### Agent images
 
 krayt publishes official, minimal, version-pinned container images with an agent already

@@ -21,8 +21,11 @@ type Config struct {
 	BundleDepth  *int              `yaml:"bundle_depth"`
 	Env          map[string]string `yaml:"env"`
 	Network      struct {
-		Mode  string   `yaml:"mode"`
-		Allow []string `yaml:"allow"`
+		Mode        string             `yaml:"mode"`
+		Allow       []string           `yaml:"allow"`
+		MITM        bool               `yaml:"mitm"`        // opt-in TLS termination + header injection; default false
+		Passthrough []string           `yaml:"passthrough"` // hosts tunneled (never MITM'd) even when mitm is on
+		Inject      []ConfigInjectRule `yaml:"inject"`
 	} `yaml:"network"`
 	Resources struct {
 		CPUs    *int   `yaml:"cpus"`
@@ -43,6 +46,48 @@ type Config struct {
 		Seccomp        string   `yaml:"seccomp"`         // ""/"default" (default profile) | "unconfined"
 		ReadonlyRootfs *bool    `yaml:"readonly_rootfs"` // opt-in; pointer distinguishes unset from explicit false
 	} `yaml:"container"`
+}
+
+// ConfigInjectRule mirrors one `network.inject[]` entry (§8.1,
+// add-tls-mitm-credential-injection.md). Strip/Set are separate lists on purpose — the header
+// the container sends is not necessarily the header that goes upstream. Set values are
+// secrets-file key names, resolved host-side; SetLiteral values are fixed, non-secret strings —
+// kept syntactically distinct so a literal can never be mistaken for a resolved secret.
+type ConfigInjectRule struct {
+	Host       string            `yaml:"host"`
+	Strip      []string          `yaml:"strip"`
+	Set        map[string]string `yaml:"set"`
+	SetLiteral map[string]string `yaml:"set_literal"`
+	Refresh    *ConfigRefresh    `yaml:"refresh"`
+}
+
+// ConfigRefresh mirrors one `network.inject[].refresh` block — plumbing only; see
+// task.RefreshRule.
+type ConfigRefresh struct {
+	Host                string   `yaml:"host"`
+	PathPrefix          string   `yaml:"path_prefix"`
+	ResponseTokenFields []string `yaml:"response_token_fields"`
+}
+
+// InjectRulesFromConfig converts the parsed `network.inject` block into the domain type
+// (§8.1). Called from CLI config resolution, not from LoadConfig itself, so LoadConfig stays a
+// pure parse with no domain-type dependency.
+func InjectRulesFromConfig(crs []ConfigInjectRule) []InjectRule {
+	if len(crs) == 0 {
+		return nil
+	}
+	out := make([]InjectRule, 0, len(crs))
+	for _, cr := range crs {
+		r := InjectRule{Host: cr.Host, Strip: cr.Strip, Set: cr.Set, SetLiteral: cr.SetLiteral}
+		if cr.Refresh != nil {
+			r.Refresh = &RefreshRule{
+				Host: cr.Refresh.Host, PathPrefix: cr.Refresh.PathPrefix,
+				ResponseTokenFields: cr.Refresh.ResponseTokenFields,
+			}
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // LoadConfig reads and parses a krayt.yaml. Unknown keys are rejected so typos surface

@@ -207,7 +207,7 @@ func (s *Service) SetNetworkPolicy(_ context.Context, req *pb.NetworkPolicy) (*p
 		mode = NetAllowlist
 	}
 	s.mu.Lock()
-	s.netPolicy = NetworkPolicy{Mode: mode, Allow: req.GetAllow()}
+	s.netPolicy = NetworkPolicy{Mode: mode, Allow: req.GetAllow(), CACert: req.GetCaCert()}
 	s.mu.Unlock()
 	return &pb.Ack{Ok: true}, nil
 }

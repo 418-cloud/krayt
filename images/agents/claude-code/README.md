@@ -14,7 +14,8 @@ extend it (see below) rather than asking upstream to add tools.
 
 The entrypoint (`entrypoint.sh`, baked in as `/usr/local/bin/krayt-agent-entrypoint`) exports
 the credential from `/run/secrets` into the environment, registers the `ask_human` MCP server
-when `KRAYT_ASK_SOCKET` is set (§6.13), then runs:
+when `KRAYT_ASK_SOCKET` is set (§6.13), trusts krayt's ephemeral MITM CA when `KRAYT_CA_CERT` is
+set (`network.mitm: true`, §6.6.1 — a no-op otherwise), then runs:
 
 ```sh
 claude -p "$(cat /task/prompt.md)" --dangerously-skip-permissions | tee /output/report.md

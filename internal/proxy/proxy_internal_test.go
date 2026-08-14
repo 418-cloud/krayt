@@ -31,7 +31,7 @@ func TestAllowed(t *testing.T) {
 		{Policy{Mode: ""}, "api.anthropic.com", false}, // empty mode defaults to allowlist
 	}
 	for _, tc := range cases {
-		h := newHandler(tc.policy, nil, nil)
+		h := newHandler(tc.policy, nil, nil, nil, nil)
 		if got := h.allowed(tc.host); got != tc.want {
 			t.Errorf("mode=%q allow=%v host=%q: allowed=%v, want %v", tc.policy.Mode, tc.policy.Allow, tc.host, got, tc.want)
 		}
@@ -105,7 +105,7 @@ func TestGuardBlocksResolvedIP(t *testing.T) {
 
 	t.Run("forward returns 403", func(t *testing.T) {
 		var reached bool
-		h := newHandler(pol, &blockingTransport{reached: &reached}, nil)
+		h := newHandler(pol, &blockingTransport{reached: &reached}, nil, nil, nil)
 		req := httptest.NewRequest(http.MethodGet, "http://rebind.example.com/", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -123,7 +123,7 @@ func TestGuardBlocksResolvedIP(t *testing.T) {
 			dialed = true // Control would refuse before a real connect; simulate that here.
 			return nil, &net.OpError{Op: "dial", Err: checkDialAddr("127.0.0.1:443")}
 		}
-		h := newHandler(pol, http.DefaultTransport, dial)
+		h := newHandler(pol, http.DefaultTransport, dial, nil, nil)
 		req := httptest.NewRequest(http.MethodConnect, "//rebind.example.com:443", nil)
 		req.Host = "rebind.example.com:443"
 		rec := httptest.NewRecorder()
@@ -156,7 +156,7 @@ func (f *fakeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 func TestServeHTTPForwarding(t *testing.T) {
 	t.Run("allowlisted forwards", func(t *testing.T) {
 		var reached string
-		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, &fakeTransport{reached: &reached}, nil)
+		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, &fakeTransport{reached: &reached}, nil, nil, nil)
 		req := httptest.NewRequest(http.MethodGet, "http://api.anthropic.com/v1/messages", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -170,7 +170,7 @@ func TestServeHTTPForwarding(t *testing.T) {
 
 	t.Run("blocked never reaches upstream", func(t *testing.T) {
 		var reached string
-		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, &fakeTransport{reached: &reached}, nil)
+		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, &fakeTransport{reached: &reached}, nil, nil, nil)
 		req := httptest.NewRequest(http.MethodGet, "http://evil.example.com/", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -186,7 +186,7 @@ func TestServeHTTPForwarding(t *testing.T) {
 // TestConnectBlocked checks a CONNECT to a non-allowlisted host is refused before any dial
 // (the allow path's byte-tunnel is covered by the real-VM integration test).
 func TestConnectBlocked(t *testing.T) {
-	h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, http.DefaultTransport, nil)
+	h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, http.DefaultTransport, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodConnect, "//blocked.example.com:443", nil)
 	req.Host = "blocked.example.com:443"
 	rec := httptest.NewRecorder()

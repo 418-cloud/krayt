@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -29,6 +30,11 @@ const (
 	defaultListen    = "127.0.0.1:3128"
 	defaultBinary    = "krayt-vsock-forward"
 )
+
+// caCertPath is the contract path a compliant container entrypoint reads (§8.2,
+// add-tls-mitm-credential-injection.md §5): world-readable (0644) since it is public, and never
+// written when network.mitm is false, so a mitm-off run has no /run/krayt/ca.crt at all.
+const caCertPath = "/run/krayt/ca.crt"
 
 // Controller is the linux guest.Network (§6.6): at run start it launches the guest-side
 // egress forwarder as the dedicated proxyd uid and installs the nftables lock, returning the
@@ -113,10 +119,46 @@ func (c *Controller) Apply(ctx context.Context, policy guest.NetworkPolicy) (map
 	}
 
 	u := "http://" + listen
-	return map[string]string{
+	env := map[string]string{
 		"HTTP_PROXY": u, "HTTPS_PROXY": u, "http_proxy": u, "https_proxy": u,
 		"NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1",
-	}, nil
+	}
+	if err := applyCACert(policy.CACert, caCertPath, env); err != nil {
+		stopForwarder()
+		return nil, err
+	}
+	return env, nil
+}
+
+// applyCACert writes the run's ephemeral MITM CA public cert to path (caCertPath in production;
+// overridable here so tests don't need real root-owned /run access) and adds the KRAYT_CA_CERT
+// contract var plus best-effort SSL_CERT_FILE/REQUESTS_CA_BUNDLE/NODE_EXTRA_CA_CERTS to env
+// (§8.2, §5 of add-tls-mitm-credential-injection.md). A no-op when caCert is empty
+// (network.mitm: false) — env gains no new keys, so a mitm-off run's container environment is
+// byte-identical to before this task.
+//
+// SSL_CERT_FILE/REQUESTS_CA_BUNDLE here point at the krayt CA ALONE, not a distro bundle — that
+// would break verification for anything on the passthrough list. This is the guest's
+// best-effort default; the container entrypoint (§8.2, distro-specific, not the guest's job)
+// overrides both to point at a concatenated (distro bundle + krayt CA) file instead.
+// NODE_EXTRA_CA_CERTS is genuinely additive, so it can point at the krayt CA directly with no
+// further work — required for all three current agent images, which are all node-based and do
+// not read the system trust store at all.
+func applyCACert(caCert []byte, path string, env map[string]string) error {
+	if len(caCert) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("proxy: create %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, caCert, 0o644); err != nil {
+		return fmt.Errorf("proxy: write %s: %w", path, err)
+	}
+	env["KRAYT_CA_CERT"] = path
+	env["SSL_CERT_FILE"] = path
+	env["REQUESTS_CA_BUNDLE"] = path
+	env["NODE_EXTRA_CA_CERTS"] = path
+	return nil
 }
 
 func lookupUser(name string) (uint32, uint32, error) {

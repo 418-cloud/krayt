@@ -52,10 +52,15 @@ type RunRecord struct {
 	CtrlSocket   string          `json:"ctrl_socket,omitempty"` // guest control socket (for `krayt answer`, §6.13)
 }
 
-// NetworkMeta is the run's egress policy as recorded in meta.json (§8.4).
+// NetworkMeta is the run's egress policy as recorded in meta.json (§8.4). MITM/InjectedKeys are
+// the add-tls-mitm-credential-injection.md §2 user-visible payoff: InjectedKeys names (never
+// values) which secrets-file keys were attached host-side instead of shipping to the guest, so
+// the human reviewing the run can see the container ran credential-free for those.
 type NetworkMeta struct {
-	Mode  string   `json:"mode"`
-	Allow []string `json:"allow,omitempty"`
+	Mode         string   `json:"mode"`
+	Allow        []string `json:"allow,omitempty"`
+	MITM         bool     `json:"mitm,omitempty"`
+	InjectedKeys []string `json:"injected_keys,omitempty"`
 }
 
 // ResourceMeta is the run's resource budget as recorded in meta.json (§8.4).

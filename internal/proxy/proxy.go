@@ -18,7 +18,9 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,10 +40,74 @@ const (
 	ModeNone      = "none"      // deny everything
 )
 
-// Policy is the per-task egress policy the proxy enforces (§6.6).
+// Policy is the per-task egress policy the proxy enforces (§6.6,
+// add-tls-mitm-credential-injection.md). MITM/Passthrough/Inject are all host-only — they never
+// ride the guest protocol; only the resulting CA certificate does (§5).
 type Policy struct {
 	Mode  string
 	Allow []string
+
+	MITM        bool         // terminate TLS and allow header injection; default false (§1)
+	Passthrough []string     // hosts tunneled (never MITM'd) even when MITM is on
+	Inject      []InjectRule // per-host header injection rules; requires MITM
+}
+
+// InjectRule is one resolved network.inject[] rule (§1, §4.5): for a MITM'd request to Host,
+// delete every header named in Strip, then set every header in Set and SetLiteral. Set/SetLiteral
+// values here are already the real header values to attach — any secrets-file key name in the
+// user's config (task.InjectRule.Set) is resolved to its value host-side, before this type is
+// built, so this package never has any notion of a "secrets file".
+type InjectRule struct {
+	Host       string
+	Strip      []string
+	Set        map[string]string // header -> resolved value
+	SetLiteral map[string]string // header -> literal value
+	Refresh    *RefreshRule      // optional host-side credential refresh (plumbing only, §4.6)
+}
+
+// RefreshRule declaratively names an upstream credential-refresh endpoint for one InjectRule.
+// The proxy stays generic: it provides only the mechanism (RefreshFunc, one refresh + one retry
+// on a 401, §4.6) — constructing the actual refresh request and parsing its response is
+// vendor-specific and belongs in a per-agent adapter (§6.14); this task ships the plumbing only.
+type RefreshRule struct {
+	Host                string
+	PathPrefix          string
+	ResponseTokenFields []string
+}
+
+// RefreshFunc performs one InjectRule's host-side credential refresh exactly once and returns
+// the replacement header values to retry the request with. nil (the default built by
+// BuildHandler) means no refresh capability is wired: a 401 is then surfaced to the agent as-is.
+type RefreshFunc func(ctx context.Context, rule InjectRule) (map[string]string, error)
+
+// StdinConfig is the JSON document the run supervisor writes to the `krayt __egress-proxy`
+// child's stdin, once, then closes (§2b). Secret material — resolved header values for
+// network.inject[].set — rides here, never on argv or in env: flags land in the process table
+// and env is readable from /proc/<pid>/environ; stdin, read to EOF then closed, is neither.
+// Non-secret policy (--mode/--allow/--dns/--mitm) stays on flags, unchanged from before this
+// task; only config that can carry a secret value moved here.
+type StdinConfig struct {
+	Passthrough []string     `json:"passthrough"`
+	Inject      []InjectRule `json:"inject"`
+}
+
+// ReadStdinConfig reads and parses r (the child's stdin) to EOF. An empty stream (no bytes at
+// all — the parent always writes at least "{}", but a hand-invoked or older caller might not)
+// decodes as the zero value rather than an error, so this never blocks a run over an empty
+// config.
+func ReadStdinConfig(r io.Reader) (StdinConfig, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return StdinConfig{}, fmt.Errorf("proxy: read stdin config: %w", err)
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return StdinConfig{}, nil
+	}
+	var cfg StdinConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return StdinConfig{}, fmt.Errorf("proxy: parse stdin config: %w", err)
+	}
+	return cfg, nil
 }
 
 // Factory builds the forward-proxy handler for a policy. This is the swap seam: HandRolled
@@ -59,7 +125,14 @@ func Serve(ctx context.Context, lis net.Listener, p Policy, factory Factory) err
 	if factory == nil {
 		factory = HandRolled
 	}
-	srv := &http.Server{Handler: factory(p), ReadHeaderTimeout: 10 * time.Second}
+	return ServeHandler(ctx, lis, factory(p))
+}
+
+// ServeHandler runs h as a forward-proxy handler on lis until ctx is canceled — the same server
+// loop Serve uses, exposed directly for a caller that built its handler via BuildHandler (the
+// `krayt __egress-proxy` child, so it can retain the *CA reference for the fd-4 handoff, §2b/§5).
+func ServeHandler(ctx context.Context, lis net.Listener, h http.Handler) error {
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
@@ -82,11 +155,41 @@ func HandRolled(p Policy) http.Handler {
 // `krayt __egress-proxy`). An empty dnsServer means "use the system resolver" — that is the
 // default; DNS no longer resolves in the VM's network context, but in the host's (§6.6).
 func HandRolledDNS(p Policy, dnsServer string) http.Handler {
+	h, _, err := buildHandler(p, dnsServer, "", nil)
+	if err != nil {
+		// newCA only fails on a crypto/rand read error — effectively never in practice.
+		// HandRolledDNS's signature (unchanged since before this task) has no error return, so
+		// degrade to a handler that always fails closed rather than panic or silently run
+		// without MITM.
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "krayt: mitm CA initialization failed: "+err.Error(), http.StatusInternalServerError)
+		})
+	}
+	return h
+}
+
+// BuildHandler is HandRolledDNS's superset: it also returns the run's ephemeral MITM CA (nil
+// when p.MITM is false), for a caller that needs the CA's public cert — the `krayt
+// __egress-proxy` child, to hand it back to the parent over fd 4 (§2b, §5). runID (may be
+// empty) is folded into the CA's CN for operator legibility only.
+func BuildHandler(p Policy, dnsServer, runID string) (http.Handler, *CA, error) {
+	return buildHandler(p, dnsServer, runID, nil)
+}
+
+// BuildHandlerWithRefresh is BuildHandler plus a RefreshFunc seam (§4.6) for a caller — a future
+// per-agent adapter, step 3 — that can actually perform a rule's host-side credential refresh.
+// nil behaves exactly like BuildHandler (no refresh capability; a 401 is surfaced as-is).
+func BuildHandlerWithRefresh(p Policy, dnsServer, runID string, refresh RefreshFunc) (http.Handler, *CA, error) {
+	return buildHandler(p, dnsServer, runID, refresh)
+}
+
+func buildHandler(p Policy, dnsServer, runID string, refresh RefreshFunc) (*handler, *CA, error) {
 	// Control fires once per resolved address the dialer tries, just before connect, so the
 	// post-resolution SSRF guard (checkDialAddr, §6.6) covers every A/AAAA answer and every
 	// Happy-Eyeballs attempt, closing the DNS-rebinding window (the resolved IP is checked,
-	// not the name). This one dialer backs both the CONNECT tunnel dial and the HTTP
-	// transport dial, so both paths are guarded.
+	// not the name). This one dialer backs the CONNECT tunnel dial, the plain-HTTP transport
+	// dial, AND (add-tls-mitm-credential-injection.md §4) the MITM reverse proxy's upstream
+	// dial, so all three paths are guarded identically.
 	d := &net.Dialer{
 		Timeout:  dialTimeout,
 		Resolver: resolverVia(dnsServer),
@@ -102,22 +205,45 @@ func HandRolledDNS(p Policy, dnsServer string) http.Handler {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
-	return newHandler(p, tr, d.DialContext)
+	var ca *CA
+	if p.MITM {
+		var err error
+		ca, err = newCA(runID)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return newHandler(p, tr, d.DialContext, ca, refresh), ca, nil
 }
 
 // dialFunc dials an upstream address.
 type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // newHandler builds the proxy with an injectable transport + dialer (tests pass fakes so no
-// real network is needed).
-func newHandler(p Policy, rt http.RoundTripper, dial dialFunc) *handler {
+// real network is needed) and an optional CA (nil disables the MITM path entirely, §4).
+func newHandler(p Policy, rt http.RoundTripper, dial dialFunc, ca *CA, refresh RefreshFunc) *handler {
 	allow := make(map[string]bool, len(p.Allow))
 	for _, a := range p.Allow {
 		if a = strings.ToLower(strings.TrimSpace(a)); a != "" {
 			allow[a] = true
 		}
 	}
-	return &handler{mode: p.Mode, allow: allow, transport: rt, dial: dial}
+	passthrough := make(map[string]bool, len(p.Passthrough))
+	for _, h := range p.Passthrough {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			passthrough[h] = true
+		}
+	}
+	inject := make(map[string]InjectRule, len(p.Inject))
+	for _, r := range p.Inject {
+		if h := strings.ToLower(strings.TrimSpace(r.Host)); h != "" {
+			inject[h] = r
+		}
+	}
+	return &handler{
+		mode: p.Mode, allow: allow, transport: rt, dial: dial,
+		mitm: p.MITM, passthrough: passthrough, inject: inject, ca: ca, refresh: refresh,
+	}
 }
 
 // resolverVia returns a *net.Resolver that dials dnsServer for every lookup, or nil (the
@@ -202,6 +328,15 @@ type handler struct {
 	allow     map[string]bool
 	transport http.RoundTripper
 	dial      dialFunc
+
+	// MITM state (add-tls-mitm-credential-injection.md). mitm==false or ca==nil means the
+	// CONNECT path never leaves the plain tunnel below, unconditionally — mitm:false runs are
+	// byte-identical to before this task.
+	mitm        bool
+	passthrough map[string]bool       // hosts tunneled (never MITM'd) even when mitm is on
+	inject      map[string]InjectRule // by lowercased host
+	ca          *CA
+	refresh     RefreshFunc
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +347,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodConnect {
 		h.connect(w, r)
+		return
+	}
+	// Injection targets HTTPS only (§1, §4.5): the MITM path is the only place a credential is
+	// attached, and a plain-HTTP request never goes through it. Refuse outright for a host with
+	// an injection rule rather than silently forwarding it unauthenticated or attaching a
+	// credential to a cleartext request.
+	if _, ok := h.inject[strings.ToLower(host)]; ok {
+		http.Error(w, "krayt: "+host+" requires HTTPS (credential injection configured); plain HTTP is refused", http.StatusBadRequest)
 		return
 	}
 	h.forward(w, r)
@@ -229,8 +372,23 @@ func (h *handler) allowed(host string) bool {
 	}
 }
 
-// connect tunnels an HTTPS CONNECT to the (already allowed) target, copying bytes both ways.
+// connect dispatches an (already allowed) CONNECT to the MITM path or the plain tunnel (§4.2).
+// A passthrough host, or MITM being off entirely, always gets the tunnel — pinned clients and
+// non-HTTP-over-TLS (git+ssh on 443) survive only because this fallback exists, so it must stay
+// reachable no matter what the MITM path does.
 func (h *handler) connect(w http.ResponseWriter, r *http.Request) {
+	if !h.mitm || h.ca == nil || h.passthrough[strings.ToLower(requestHost(r))] {
+		h.tunnel(w, r)
+		return
+	}
+	h.connectMITM(w, r)
+}
+
+// tunnel is the original CONNECT behavior, preserved verbatim (§4.2): dial the (already
+// allowed) target and splice bytes both ways with no inspection. This is the fallback when
+// anything about MITM is inapplicable or misbehaves, so it must never be modified to depend on
+// MITM state.
+func (h *handler) tunnel(w http.ResponseWriter, r *http.Request) {
 	upstream, err := h.dial(r.Context(), "tcp", r.Host)
 	if err != nil {
 		if errors.Is(err, errBlockedAddr) {
