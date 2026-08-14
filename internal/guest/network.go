@@ -15,6 +15,12 @@ const (
 type NetworkPolicy struct {
 	Mode  string
 	Allow []string
+
+	// CACert is the run's ephemeral MITM CA's PUBLIC certificate, PEM-encoded (§5,
+	// add-tls-mitm-credential-injection.md) — empty when network.mitm is false. The private key
+	// never leaves the host proxy child; this is only what the container needs to trust the
+	// connections that proxy terminates.
+	CACert []byte
 }
 
 // Network configures per-task egress (§6.6): it starts krayt-vsock-forward (a dumb TCP<->vsock

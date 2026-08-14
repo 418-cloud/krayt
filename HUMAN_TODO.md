@@ -14,6 +14,19 @@ see the `[hardware]` entry below. **Blocking**: nothing else in the repo current
 but no run with a real host-side egress proxy can boot until the image is rebuilt and re-pinned,
 so the feature is offline-complete only until this lands.
 
+**Open:** `add-tls-mitm-credential-injection.md` (Phase 9, §14) is offline-complete — CA/leaf
+generation, the MITM CONNECT path, header injection, secrets partitioning, the stdin/fd-4 child
+contract, and hostile-input handling are all real code, exercised by `go test -race ./...`. It
+needs the same class of hardware verification as Phase 8 (real Mac/vfkit + real Linux/KVM,
+**plus a live Anthropic credential** this one), and additionally depends on Phase 8's own
+hardware verification landing first — this task's guest-side pieces (`/run/krayt/ca.crt`, the
+`KRAYT_CA_CERT` env vars, the three reference entrypoints) ride the SAME image rebuild Phase 8 is
+already waiting on, so there is no separate image to build; the two can be verified together in
+one hardware session once a Mac/Linux-KVM box is available. See the `[hardware]` entry below.
+**Blocking**: no — nothing else in the repo depends on `network.mitm` landing; it is a purely
+opt-in feature and every other run is byte-identical whether or not this verification has
+happened.
+
 **Open:** the `krayt-agent-claude-code`, `krayt-agent-gemini-cli`, and (new)
 `krayt-agent-opencode` published images each need a real CI run + a real live onboarding run —
 see the `[tooling]` entries below. The gemini-cli image also needs its `node:24-bookworm-slim`
@@ -101,6 +114,55 @@ only tracks what's still open.
   side is now `krayt-vsock-forward`, not `krayt-proxy`) — so this is the one step standing between
   "offline-complete" and "actually usable" for this task specifically. See the top-of-file Status
   note.
+
+## [hardware] `add-tls-mitm-credential-injection.md` — real MITM run, `NODE_EXTRA_CA_CERTS` check, and Phase-3 re-verification
+
+- **Needed:** (1) the SAME guest image rebuild Phase 8 above is already waiting on (this task's
+  guest-side pieces — `/run/krayt/ca.crt`, `KRAYT_CA_CERT` + trust-store env vars — ride it too,
+  no separate rebuild needed) and the resulting `PinnedRef` bump; (2) a real `claude-code` image
+  run with `mitm: true` and `inject:` for `ANTHROPIC_API_KEY`, confirming the agent authenticates
+  successfully while `env` and `/run/secrets` inside the container hold **no** credential (assert
+  the absence with `env | grep -i anthropic` and `ls -la /run/secrets` — or their absence —
+  inside the container, not just that the run succeeded); (3) the same run with `mitm: false`,
+  confirming it is unchanged (regression); (4) `npm install` (or an equivalent TLS-heavy fetch)
+  through the MITM path in **each** of the three agent images — this exercises
+  `NODE_EXTRA_CA_CERTS` and is the most likely thing to break, since none of the three entrypoint
+  changes have ever run against a real `npm`/`pip`/`curl` through a real intercepted TLS
+  connection; (5) the full Phase 3 security suite re-run on both backends, with `TestEgressEnforcement`
+  and `TestSecretConfinementInArtifacts` in particular.
+- **Why the agent can't:** same reason as Phase 8 (no real Mac/vfkit or Linux/KVM in this
+  sandbox), **plus** this task specifically needs a live Anthropic API key to prove the
+  authenticate-without-a-credential-in-the-VM claim for real — a claim that cannot be honestly
+  demonstrated any other way (a fake/mocked "credential" proves nothing about whether the actual
+  injected header format Anthropic's API expects is correct).
+- **Exact steps/commands:**
+  1. Once Phase 8's image rebuild + `PinnedRef` bump has landed (this task rides the same image,
+     no separate rebuild), on a Mac with vfkit and/or a Linux/KVM box:
+     ```sh
+     krayt run --image ghcr.io/418-cloud/krayt-agent-claude-code --agent claude-code \
+       --task ./task.md --repo . --config ./krayt-mitm-test.yaml
+     ```
+     with `krayt-mitm-test.yaml` setting `secrets: ./secrets.env` (one real
+     `ANTHROPIC_API_KEY`), `network: {mode: allowlist, allow: [api.anthropic.com], mitm: true,
+     inject: [{host: api.anthropic.com, strip: [x-api-key, authorization], set: {x-api-key:
+     ANTHROPIC_API_KEY}}]}`.
+  2. While the run is in progress (or via a debug shell into the same image), confirm
+     `env | grep -i -E 'anthropic|api.key'` and `ls -la /run/secrets/` inside the container show
+     nothing — the absence is the proof, not the run's exit code.
+  3. Re-run with `mitm: false` (drop the `network.mitm`/`inject` keys) and confirm it completes
+     identically to before this task.
+  4. Repeat step 1's shape for `krayt-agent-gemini-cli` and `krayt-agent-opencode`, each doing a
+     real package-manager or HTTP fetch through the MITM'd host, to exercise
+     `NODE_EXTRA_CA_CERTS` on all three.
+  5. `hack/run-integration-tests.sh` (or the individual `TestEgressEnforcement`/
+     `TestSecretConfinementInArtifacts` runs) on both backends, unchanged from Phase 8's own
+     commands.
+- **Verify success by:** all of the above passing for real, with concrete evidence (command
+  output showing no credential in the container, `npm install` succeeding through the MITM path
+  in each image). Update `KRAYT_SPEC.md` §14's Phase 9 "Done when (hardware)" checkbox from `[ ]`
+  to `[x]` and this section's status line once confirmed — do not mark it done without a real run.
+- **Blocking:** no — `network.mitm` is opt-in and defaults to false; every run that doesn't set
+  it is unaffected regardless of whether this verification has happened.
 
 ## [tooling/CI] vmimage RC/graduate workflows — ✅ DONE
 

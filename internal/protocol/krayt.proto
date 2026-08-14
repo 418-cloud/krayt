@@ -45,8 +45,11 @@ message TaskSpec {
   bool readonly_rootfs = 5;              // opt-in read-only rootfs (default false)
 }
 message SecretsBundle { map<string, string> values = 1; }               // tmpfs at /run/secrets
+// ca_cert is the PEM-encoded PUBLIC certificate of this run's ephemeral MITM CA (§6.6,
+// add-tls-mitm-credential-injection.md) — empty when network.mitm is false. Never the private
+// key: the guest only needs to trust connections the host proxy terminates, not sign anything.
 message NetworkPolicy { enum Mode { ALLOWLIST = 0; FULL = 1; NONE = 2; }
-                        Mode mode = 1; repeated string allow = 2; }
+                        Mode mode = 1; repeated string allow = 2; bytes ca_cert = 3; }
 
 message StartRequest  { string image_ref = 1; uint32 timeout_secs = 2; }
 

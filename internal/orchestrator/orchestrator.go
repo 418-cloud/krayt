@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -85,8 +86,11 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// schema; the dynamic ones (timings, patch stats, questions, safety) are filled below.
 	rec := RunRecord{
 		ID: spec.ID, ImageRef: spec.ImageRef, RepoPath: spec.RepoPath,
-		TaskSummary:  summarizeTask(spec.TaskPrompt),
-		Network:      NetworkMeta{Mode: string(spec.Network.Mode), Allow: spec.Network.Allow},
+		TaskSummary: summarizeTask(spec.TaskPrompt),
+		Network: NetworkMeta{
+			Mode: string(spec.Network.Mode), Allow: spec.Network.Allow,
+			MITM: spec.Network.MITM, InjectedKeys: sortedKeys(spec.Network.InjectedSecretKeys()),
+		},
 		Resources:    ResourceMeta{CPUs: spec.Resources.CPUs, MemoryMiB: spec.Resources.MemoryMiB, DiskGiB: spec.Resources.DiskGiB, TimeoutSecs: int(spec.Resources.Timeout.Seconds())},
 		QuestionMode: string(spec.Questions.Mode),
 		State:        StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
@@ -153,7 +157,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		}
 		return nil, fmt.Errorf("orchestrator: listen egress: %w", err)
 	}
-	egress, err := spawnEgressProxy(ctx, lis, spec.Network, runDir, spec.SecretsPath)
+	egress, err := spawnEgressProxy(ctx, lis, spec.Network, spec.ID, runDir, spec.SecretsPath)
 	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
@@ -260,14 +264,14 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		}
 		return nil, fmt.Errorf("orchestrator: push task: %w", err)
 	}
-	knownSecretKeys, err := pushSecrets(ctx, client, spec.SecretsPath)
+	knownSecretKeys, err := pushSecrets(ctx, client, spec.SecretsPath, spec.Network.InjectedSecretKeys())
 	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
 		return nil, err
 	}
-	if err := setNetworkPolicy(ctx, client, spec.Network); err != nil {
+	if err := setNetworkPolicy(ctx, client, spec.Network, egress.caCertPEM); err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
@@ -328,6 +332,20 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// written by the deferred finalizer above.
 	_, _ = client.Agent.Shutdown(context.WithoutCancel(ctx), &pb.ShutdownRequest{})
 	return res, nil
+}
+
+// sortedKeys returns the keys of a set map in sorted order, for a deterministic meta.json
+// field (§8.4).
+func sortedKeys(set map[string]bool) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // pushImage runs the incremental image transfer: ask which blobs the guest lacks, then
@@ -405,7 +423,14 @@ func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSp
 // KEY NAMES (never values) the host loaded, so the caller can later cross-check anything the
 // guest reports about them (secretPatchKeys) against a set the host determined independently of
 // the guest/container.
-func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath string) ([]string, error) {
+//
+// injectedKeys — the secrets-file keys named in any network.inject[].set rule
+// (task.NetworkPolicy.InjectedSecretKeys) — are withheld from the bundle actually sent to the
+// guest (add-tls-mitm-credential-injection.md §2, the load-bearing change): those values are
+// attached host-side, at the MITM proxy, so the container never holds them at all. The returned
+// key list still includes them, since it names every secret the TASK has, independent of where
+// each is delivered.
+func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath string, injectedKeys map[string]bool) ([]string, error) {
 	if secretsPath == "" {
 		return nil, nil
 	}
@@ -413,7 +438,14 @@ func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := client.Agent.PushSecrets(ctx, &pb.SecretsBundle{Values: values}); err != nil {
+	bundle := make(map[string]string, len(values))
+	for k, v := range values {
+		if injectedKeys[k] {
+			continue
+		}
+		bundle[k] = v
+	}
+	if _, err := client.Agent.PushSecrets(ctx, &pb.SecretsBundle{Values: bundle}); err != nil {
 		return nil, fmt.Errorf("orchestrator: push secrets: %w", err)
 	}
 	keys := make([]string, 0, len(values))
@@ -460,7 +492,11 @@ func writeConsoleLog(consoleLogSrc, runDir, secretsPath string) {
 }
 
 // setNetworkPolicy translates the task's egress policy to the proto and sends it (§6.6).
-func setNetworkPolicy(ctx context.Context, client *controlclient.Client, np task.NetworkPolicy) error {
+// caCertPEM is the run's ephemeral MITM CA's public certificate (empty when network.mitm is
+// false, §5 of add-tls-mitm-credential-injection.md) — the guest writes it to
+// /run/krayt/ca.crt so the container can trust the connections the host proxy terminates; the
+// private key never leaves the proxy child, let alone this process.
+func setNetworkPolicy(ctx context.Context, client *controlclient.Client, np task.NetworkPolicy, caCertPEM []byte) error {
 	mode := pb.NetworkPolicy_ALLOWLIST
 	switch np.Mode {
 	case task.NetworkFull:
@@ -468,7 +504,7 @@ func setNetworkPolicy(ctx context.Context, client *controlclient.Client, np task
 	case task.NetworkNone:
 		mode = pb.NetworkPolicy_NONE
 	}
-	if _, err := client.Agent.SetNetworkPolicy(ctx, &pb.NetworkPolicy{Mode: mode, Allow: np.Allow}); err != nil {
+	if _, err := client.Agent.SetNetworkPolicy(ctx, &pb.NetworkPolicy{Mode: mode, Allow: np.Allow, CaCert: caCertPEM}); err != nil {
 		return fmt.Errorf("orchestrator: set network policy: %w", err)
 	}
 	return nil

@@ -574,21 +574,149 @@ is the simplest correct choice. Enforcement layers:
 - **Isolated as a swappable, memory-safety-critical component — more so now that it is
   off-VM.** The proxy is a **standalone host process** (`krayt __egress-proxy`, spawned by
   self-exec or `KRAYT_EGRESS_PROXY_BIN`) sitting behind a stable contract: fixed flags in
-  (`--mode` / `--allow` / `--dns`), a listener on fd 3, logs on stdout/stderr
-  (`internal/orchestrator` redirects them into `proxy.log`, §9). Nothing else in krayt depends
-  on *how* it is implemented — `internal/proxy`'s `Factory` seam (unchanged since before this
-  task) still lets the allowlist handler itself be swapped (e.g. for `elazarl/goproxy`) without
-  touching the process wiring. Because it is the component most directly exposed to
+  (`--mode` / `--allow` / `--dns` / `--mitm` / `--run-id`, §6.6.1), a listener on fd 3, a
+  JSON `StdinConfig` (passthrough + resolved inject rules — the only place secret material
+  reaches this process, §6.6.1) on stdin, the ephemeral MITM CA's public cert (or nothing)
+  written once to fd 4, logs on stdout/stderr (`internal/orchestrator` redirects them into
+  `proxy.log`, §9). Nothing else in krayt depends on *how* it is implemented —
+  `internal/proxy`'s `Factory`/`newHandler` seam (unchanged since before
+  `add-tls-mitm-credential-injection.md`; MITM is a mode of the existing handler, not a fork
+  of it) still lets the allowlist/MITM handler itself be swapped (e.g. for `elazarl/goproxy`)
+  without touching the process wiring. Because it is the component most directly exposed to
   **untrusted, adversarial network input**, and now sits *outside* the VM boundary rather than
   inside a disposable one, a memory-safe reimplementation (e.g. Rust/Zig) matters *more* here
-  than it did in-guest — drop in a binary honoring the same flags/fd-3/log contract via
-  `KRAYT_EGRESS_PROXY_BIN`, and neither the orchestrator nor the guest changes.
+  than it did in-guest — drop in a binary honoring the same flags/fd-3/stdin/fd-4/log contract
+  via `KRAYT_EGRESS_PROXY_BIN`, and neither the orchestrator nor the guest changes.
 - **`proxy.log` — a new, host-redacted run artifact (§9).** `net/http`'s CONNECT-proxy client
   discards the response body on a non-2xx CONNECT, so the *only* place a denial's real reason
   (DNS failure, connection refused, blocked-address guard, …) appears is the proxy's own
   server-side log. The run supervisor captures the child's stdout/stderr and, on teardown,
   redacts it against the task's secrets (the first HOST-side redaction path in krayt — §6.8) and
   writes it to `.krayt/runs/<id>/proxy.log`.
+
+#### 6.6.1 TLS MITM & credential injection (`internal/proxy`, `add-tls-mitm-credential-injection.md`)
+> **Amended by `add-tls-mitm-credential-injection.md` (step 2 of the three-step host-side-proxy
+> arc, §14; depends on `move-egress-proxy-to-host.md`, step 1, above).** Everything below is
+> **opt-in** (`network.mitm: false` by default, §8.1) — a user who does not set it observes
+> **zero behavior change** from step 1: same tunnel path, no CA in the guest's env map, byte-
+> identical `internal/proxy` behavior.
+
+**What it buys.** Today an agent credential rides `SecretsBundle` → guest memory → container
+tmpfs at `/run/secrets` (§6.8, §6.14): the agent process can read it, and so can anything that
+compromises it, and a stolen credential **outlives the run** — the one thing the ephemeral-VM
+model otherwise prevents. With `network.mitm: true` plus `network.inject[]` naming a host, the
+proxy terminates that host's TLS on the host and attaches the credential itself; the named
+secrets-file key is **withheld from `SecretsBundle` entirely** (§6.8) — the container never
+holds it, so there is nothing in the VM for a compromise to steal.
+
+**What it does *not* buy — be honest about this, it is the main way overselling it goes wrong:**
+- **It removes credential *theft*, not credential *use*.** The proxy cannot distinguish an
+  agent-initiated request from a legitimate one: a compromised agent still has unlimited
+  *authenticated* access to every allowlisted host for the run's duration. This converts
+  exfiltration into a confused deputy — a real improvement (a confused deputy dies with the VM;
+  a stolen key does not) but not "no risk".
+- **It only covers HTTP-shaped credentials.** An SSH key, a signing key, or anything a tool
+  computes over cannot move to the proxy; those still ride `SecretsBundle` unchanged.
+- **It moves the adversarial parser outside the blast-radius boundary a second time.** §6.6
+  already names the proxy "the component most directly exposed to untrusted, adversarial network
+  input" post step-1: a proxy compromise there bought unrestricted egress from a VM about to be
+  destroyed. After this task, it buys code execution in the one host process holding the user's
+  real credentials. Go's memory safety helps; request-smuggling and header-confusion bugs do not
+  care — the hostile-input rules below (and §10's residual) are the mitigation, not optional
+  garnish.
+
+**Design decisions:**
+- **`mitm` is allowed in every mode, `full` included.** In `mode: full` + `mitm`, every TLS
+  connection not in `passthrough` is intercepted — including hosts on no allowlist at all. That
+  is the point of `full`, but it makes leaf-cert generation unbounded (the guest, not the
+  operator, picks every SNI), so the SNI leaf cache **must** be capped (below) rather than
+  growing for the run's lifetime.
+- **Ephemeral per-run CA, in memory, never written to host disk.** A persistent krayt CA on the
+  user's disk that VMs trust would be a worse artifact than the one step 1 removed. `internal/proxy`
+  generates one ECDSA P-256 CA per proxy-process lifetime (one process per run) and discards it at
+  teardown; there is no exported API path that can return its private key (only `CACertPEM()`,
+  the public certificate).
+- **ECDSA P-256** for the CA and every leaf — per-connection RSA keygen is visibly slow. Leaves
+  are cached by SNI, bounded at 1024 entries with eviction on overflow (a performance cache, not
+  a security boundary, so eviction policy needn't be precise LRU).
+- **Secret material reaches the proxy child on stdin, never argv or env.** Flags land in the
+  process table; env is readable from `/proc/<pid>/environ`. The run supervisor writes one JSON
+  document — the passthrough list and every inject rule, with `set`'s secrets-file key names
+  already resolved to values — to the child's stdin at startup, then closes it.
+- **`http/1.1` only in ALPN.** A hijacked `CONNECT` does not get `net/http`'s automatic h2
+  upgrade; advertising `h2` and then serving 1.1 breaks clients. The *upstream* leg (the shared,
+  SSRF-guarded transport) keeps `ForceAttemptHTTP2` as before.
+- **`FlushInterval: -1`** on the `httputil.ReverseProxy` that serves the decrypted request:
+  `ReverseProxy` only auto-flushes `text/event-stream` by default, and streaming NDJSON/long-poll
+  would otherwise buffer and stutter the agent's token stream.
+- **Per-host `passthrough` (tunnel, no MITM) list.** Pinned TLS clients and non-HTTP-over-TLS
+  (git+ssh on 443) must survive; those hosts get the plain step-1 tunnel, byte-for-byte, by
+  definition — never intercepted, never injected into.
+- **Never log request or response bodies.** Every byte is now cleartext in a process that writes
+  logs; headers may be logged name-only, same rule as step 1's `proxy.log`.
+- **`net/http/httputil.ReverseProxy`, stdlib only.** No new dependency — `internal/proxy` was
+  already hand-rolled (the `elazarl/goproxy` option in §6.6 was never adopted), so this removes
+  no third-party framework either.
+
+**Config (`network.mitm` / `network.passthrough` / `network.inject[]`, §8.1).** `inject[].strip`
+and `.set` are separate lists on purpose: the header the container sends is not necessarily the
+header that goes upstream (`inject-claude-oauth-token-at-proxy.md`, step 3, removes one auth
+header and sets a different one). `set` values are secrets-file **key names**, resolved
+host-side; `set_literal` values are fixed, non-secret strings — kept syntactically distinct so a
+literal can never be mistaken for a resolved secret. Every rule is validated at `krayt run`
+pre-flight, before any VM or image work: `inject` requires `mitm: true`; a rule's host must not
+be in `passthrough`, and (in `mode: allowlist`) must be in `allow`; every `set` key must exist in
+the secrets file; header names must be valid HTTP tokens and not hop-by-hop; `passthrough ⊆
+allow` in `mode: allowlist`. Injection targets **HTTPS only** — a plain-HTTP request to a host
+with an inject rule is refused outright (400) rather than forwarded unauthenticated or given the
+credential in cleartext; the MITM path is structurally the only place injection can fire.
+
+**The MITM path (`internal/proxy`'s `handler.connect` → `connectMITM`).** After the existing
+allowlist check: a `passthrough` host, or MITM being off, gets the unmodified step-1 tunnel —
+that fallback must stay reachable no matter what MITM does, so it is never modified to depend on
+MITM state. Otherwise: hijack the client connection, write `200 Connection established`, wrap it
+in `tls.Server` with a leaf for the CONNECT authority (never a guest-supplied `Host` header — the
+allowlist already approved the CONNECT authority, not whatever the decrypted request claims), and
+serve HTTP/1.1 over it via `httputil.ReverseProxy`. The `Rewrite` hook sets the outbound URL from
+the CONNECT authority; `Transport` is the **same, already SSRF-guarded** transport the tunnel and
+plain-HTTP paths use, so `checkDialAddr`'s resolved-IP guard (§6.6) runs on every MITM upstream
+dial too — proxy-mediated traffic gets the identical guarantee regardless of path. Injection
+applies **after** `Rewrite`, in order: delete every header named in `strip`, then set every header
+in `set`/`set_literal` — stripping before setting is what makes a guest header unable to smuggle
+a second value past an injected one.
+
+**Treating guest input as hostile (§10).** The proxy now parses attacker-controlled HTTP inside
+attacker-controlled TLS, on the host, holding real credentials — non-negotiable rules: an inner
+request's `Host` that disagrees with the CONNECT authority is a smuggling signal, refused with
+400, never forwarded; the inner HTTP server bounds `MaxHeaderBytes` (1 MiB) and
+`ReadHeaderTimeout` on top of step 1's existing timeouts; a CONNECT authority that isn't a valid
+`host[:port]` is refused with 400; an injected value that resolves empty at request time (a
+config error the pre-flight check didn't catch, e.g. an empty secrets-file value) is a 500, never
+sent upstream unauthenticated; any MITM setup failure — leaf generation, TLS handshake — **fails
+the connection outright**, never silently degrades to the plain tunnel (a silent fallback would
+drop injection and send the agent out unauthenticated, a confusing failure far from its cause).
+
+**Optional per-rule `refresh` (plumbing only).** A rule may declare `refresh: {host, path_prefix,
+response_token_fields}` naming an upstream credential-refresh endpoint. `internal/proxy` ships
+only the generic mechanism — a `RefreshFunc` seam wired into the MITM upstream transport that,
+on a `401` for a rule with `refresh` configured **and** a `RefreshFunc` actually registered,
+performs exactly one refresh and retries the original request exactly once (buffering the
+request body up to 4 MiB to make the retry correct; a larger body skips the retry rather than
+buffer without bound). A second `401` is always surfaced as-is — never a loop. The proxy stays
+generic on purpose: it has no idea what Anthropic (or anyone) is. Constructing the actual refresh
+request and parsing its response is vendor-specific knowledge that belongs in a per-agent adapter
+(§6.14), not the core — `inject-claude-oauth-token-at-proxy.md` (step 3) is the first consumer of
+this seam; with no `RefreshFunc` registered (true for every run until step 3 lands) it is a
+zero-overhead no-op and a `401` behaves exactly as it would with no `refresh` block at all.
+
+**Delivering the CA to the container (§8.2).** The credential never enters the VM; the run's
+ephemeral CA's **public** certificate does, over the channel that already exists:
+`NetworkPolicy.ca_cert` (`internal/protocol/krayt.proto`, empty when `network.mitm` is false).
+The guest (`internal/guest/proxy/controller_linux.go`) writes it to `/run/krayt/ca.crt` (0644 —
+it is public) and sets `KRAYT_CA_CERT` plus best-effort `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
+`NODE_EXTRA_CA_CERTS` pointing at it; the **distro-specific** part — concatenating that with the
+container's own system bundle so `passthrough` hosts still verify — is the container entrypoint's
+job (§8.2), not the guest's.
 
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
@@ -777,6 +905,19 @@ it to everything the agent controls that the host will keep:
 Agent model-provider credentials (e.g. Claude Code's `ANTHROPIC_API_KEY` or
 `CLAUDE_CODE_OAUTH_TOKEN`) ride this same mechanism — see agent authentication (§6.14) for
 how a credential maps to the right env var and the exactly-one rule the adapter enforces.
+
+**Secrets partitioning (`network.mitm` + `network.inject`, §6.6.1).** When a secrets-file key is
+named in any `inject[].set` rule, it is **withheld from `SecretsBundle` entirely** — the load-
+bearing change of `add-tls-mitm-credential-injection.md`. The above bullet list ("read from a
+per-task secrets file... mounted on tmpfs... transferred over vsock") is no longer true for an
+injected key specifically: it is loaded host-side, attached to the matching request by the MITM
+proxy, and never crosses into `SecretsBundle`, guest memory, or `/run/secrets` at all — the
+container that would otherwise hold it runs credential-free for that key. It **remains** in the
+host `Redactor` set used for run logs, `report.md`, and `proxy.log` (above), since a value the
+proxy attaches can still appear in `proxy.log` the same way any other secret can. `meta.json`/
+`report.md` record **which keys were injected** (names only) so the human reviewing a run can see
+the container ran without them — the user-visible payoff of this whole mechanism. Everything else
+in this section is unchanged: a non-injected secret still rides `SecretsBundle` exactly as before.
 
 ### 6.9 Logging & streaming (`internal/orchestrator` + guest)
 - Container stdout/stderr → guest → vsock `Logs` stream → host.
@@ -1097,6 +1238,19 @@ where you want to spend your own seat → `CLAUDE_CODE_OAUTH_TOKEN`. The safe de
 API key — matches krayt's headline use case (an agent working over an untrusted codebase), so
 the docs and examples lead with it.
 
+**Injection as the preferred delivery for HTTP-shaped credentials (§6.6.1).** Everything above
+describes the credential riding `SecretsBundle` into the container, which is still the only
+option for anything that isn't a bare HTTP header (an `apiKeyHelper` script, an SSH/signing key,
+anything a tool computes over) and remains the default. For a credential that is *just* an HTTP
+header on requests to one host — `ANTHROPIC_API_KEY` on `api.anthropic.com` is the canonical
+case — `network.mitm: true` + `network.inject[]` (§6.6.1, §8.1) is the **preferred** delivery
+where the trust-model trade is acceptable: the key never enters the VM at all, closing the
+"Auth-credential blast radius" residual below for that credential specifically, at the cost of
+concentrating more trust in the host proxy process (§10). It composes with everything above:
+which credential shape to use is unaffected, and the adapter's exactly-one rule still applies to
+whatever ends up in the secrets file — injection only changes *where* the chosen credential is
+attached, not which one is chosen.
+
 ---
 
 ## 7. Run Lifecycle (Step by Step)
@@ -1139,6 +1293,17 @@ network:
     - api.anthropic.com
     - generativelanguage.googleapis.com
     - registry.npmjs.org
+  mitm: true                      # opt-in TLS termination + header injection at the host proxy;
+                                   # default false — a run that doesn't set this is byte-identical
+                                   # to one without the feature at all (§6.6.1)
+  passthrough: [github.com]       # tunnel these, never MITM (subset of allow in mode: allowlist)
+  inject:
+    - host: api.anthropic.com     # exact host match, same matcher as `allow`
+      strip: [x-api-key, authorization]   # remove these from the guest's request first
+      set:                                # then set these
+        x-api-key: ANTHROPIC_API_KEY      # header name -> secrets-file key, resolved host-side
+      # set_literal:                      # header name -> fixed, non-secret value (optional)
+      #   x-krayt-mitm: "1"
 
 secrets: ./secrets.env          # per-task secrets file (tmpfs in container)
 
@@ -1196,6 +1361,16 @@ trusted guest-agent runs *outside* the container), so read-only rootfs mainly bu
 persistence/tamper resistance that has almost no blast radius here. When enabled it is paired
 with writable ephemeral tmpfs for `/tmp` and `/run` only.
 
+**`network.mitm`/`passthrough`/`inject` validation (§6.6.1).** All fail-fast at `krayt run`
+pre-flight, before any VM or image work: `inject` requires `mitm: true`; every `inject[].host`
+must not be in `passthrough`, and (in `mode: allowlist`) must also be in `allow` — in `mode:
+full` there is no list to check a host against, so any host is accepted; every secrets-file key
+named in `inject[].set` must exist (a typo must not silently produce an unauthenticated run that
+fails opaquely 30s into the agent); `passthrough ⊆ allow` in `mode: allowlist`, free-form in
+`mode: full`; header names must be valid HTTP tokens and not hop-by-hop. `full` + `mitm`
+intercepts **every** TLS connection the agent makes except those listed in `passthrough` — that
+is the point of `full`, stated plainly here so it isn't a surprise.
+
 ### 8.2 Container contract (convention)
 Injected by the tool, regardless of adapter:
 - `/workspace` — the repo snapshot (agent's working dir).
@@ -1223,6 +1398,39 @@ An image that writes into its own rootfs — e.g. `$HOME` under `/home/agent` (n
 `~/.claude`, Go caches) — is **incompatible with `container.readonly_rootfs: true`** (§8.1);
 read-only rootfs is opt-in (default OFF) partly for this reason. When enabled, only `/tmp` and
 `/run` are writable (ephemeral tmpfs); a writable tmpfs is never mounted over a populated dir.
+
+**The `KRAYT_CA_CERT` contract (§6.6.1, only when `network.mitm: true`).** The guest writes the
+run's ephemeral MITM CA's **public** certificate to `/run/krayt/ca.crt` (0644 — it is public,
+never the private key), bind-mounts it read-only at that SAME path inside the container (so
+`KRAYT_CA_CERT` resolves on both sides of the mount namespace, not just the guest's own), and
+sets `KRAYT_CA_CERT=/run/krayt/ca.crt` plus best-effort `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
+`NODE_EXTRA_CA_CERTS` pointing at it. This is a **no-op when `network.mitm` is false** — no file,
+no mount, no env var, byte-identical to a run without the feature.
+
+**The `KRAYT_INJECTED_CREDENTIAL` contract (§6.14, only when the adapter's selected credential is
+named in `network.inject[].set`).** That credential is withheld from `SecretsBundle` entirely
+(§6.6.1) — no `/run/secrets/<key>` file ever arrives for it — so a compliant entrypoint that
+otherwise requires the file to exist before starting must instead check
+`KRAYT_INJECTED_CREDENTIAL` for the (non-secret) key **name** and, if it matches one of the
+credentials the agent recognizes, proceed with a placeholder value for it: the real value is
+attached to outgoing requests by the host proxy regardless of what the container sends, so the
+placeholder only needs to satisfy the agent's own "a credential is configured" check. Unset when
+injection isn't configured for the selected credential, which is the common case and adds no new
+behavior.
+A compliant entrypoint that wants MITM'd hosts to verify, **and** wants `passthrough` hosts (which
+see the real upstream, not krayt's CA) to keep verifying too, must:
+- Check `KRAYT_CA_CERT` is set and non-empty before doing anything distro-specific.
+- For Go/OpenSSL-based tools, `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` **replace** the system trust
+  store rather than appending to it — pointing them at `KRAYT_CA_CERT` alone would break
+  verification for every `passthrough` host. Concatenate the image's own distro CA bundle (e.g.
+  `/etc/ssl/certs/ca-certificates.crt` on the Debian-based reference images) with `$KRAYT_CA_CERT`
+  into one file and point both vars at **that** instead.
+- `NODE_EXTRA_CA_CERTS` is genuinely additive, so it can point at `$KRAYT_CA_CERT` directly with
+  no concatenation. **Node does not read the system trust store at all**, which is why this is
+  required, not optional, for every one of the three current reference agent images
+  (`claude-code`, `gemini-cli`, `opencode`) — all node-based.
+- Do all of this only when `KRAYT_CA_CERT` is set, so a `mitm: false` run's entrypoint behavior
+  is unchanged.
 
 Completion = container process exit. Exit code is surfaced in `meta.json`.
 
@@ -1438,6 +1646,7 @@ exposed.
 | Network egress | Default-deny + allowlist proxy, per-task opt-in to widen — **enforced host-side** since `move-egress-proxy-to-host.md`. The L7 allowlist proxy is a separate HOST process reached over a guest-initiated vsock channel; the guest's L3 lock is loopback-only and keys on **no uid at all**, so there is no container-hardening dependency left for it to bypass (§6.6) |
 | Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
 | Secrets | tmpfs only, never on disk, destroyed with VM; **redacted in the guest** from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted** (redacting hunks would break `git apply`); a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
+| TLS MITM / credential injection | **Opt-in, default off** (`network.mitm`, §6.6.1). An injected secrets-file key is **withheld from `SecretsBundle` entirely** — the container never holds it, closing "Auth-credential blast radius" (below) for that credential. Ephemeral per-run CA, in memory only, private key never exported. Trades a HOST-process compromise for a *stronger* claim than plain egress enforcement: the proxy process now also holds real user credentials, not just a policy decision (residual below) |
 | Persistence | CoW disk destroyed on teardown; fresh VM per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
 
@@ -1497,7 +1706,28 @@ exposed.
 - Auth-credential blast radius — a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) is tied to
   a personal/seat plan and is less granularly revocable than a scoped API key; exposing one
   to untrusted code risks that seat's consumption and rate budget. Prefer a scoped,
-  independently-revocable API key for untrusted runs (§6.14).
+  independently-revocable API key for untrusted runs (§6.14). **Fully closed for an *injected*
+  credential** (`network.mitm` + `network.inject`, §6.6.1) — it never enters the VM, so there is
+  nothing there for a compromise to steal; this residual is otherwise unchanged for any
+  credential still delivered via `SecretsBundle` (the default, and the only option for anything
+  that isn't a bare HTTP header).
+- **TLS MITM / credential injection — an honest trade, not a strict improvement** (§6.6.1,
+  `add-tls-mitm-credential-injection.md`). Opt-in and off by default, but when on:
+  - **It removes credential *theft*, not credential *use*.** The proxy cannot distinguish an
+    agent-initiated request from a legitimate one — a compromised agent still has unlimited
+    *authenticated* access to every allowlisted host for the run's duration. This converts
+    exfiltration into a confused deputy (dies with the VM, unlike a stolen key) but is not "no
+    risk".
+  - **It only covers HTTP-shaped credentials.** An SSH key, a signing key, or anything a tool
+    computes over cannot move to the proxy; those still ride `SecretsBundle` unchanged.
+  - **It moves the adversarial parser outside the blast-radius boundary a second time.** A proxy
+    compromise before this task bought unrestricted egress from a VM about to be destroyed; after
+    it, the same compromise buys code execution in the one host process holding the user's real
+    credentials. Go's memory safety helps; request-smuggling and header-confusion bugs do not
+    care — mitigated, not eliminated, by the hostile-input rules in §6.6.1 (inner-Host/authority
+    match, bounded headers, fail-closed on any MITM setup failure, never a silent tunnel
+    fallback) and by keeping the CA private key in memory only, behind an accessor that returns
+    only the public certificate.
 
 ---
 
@@ -1942,6 +2172,62 @@ behavior-preserving, security-strictly-improving change for the container (§6.6
   to reach the **host** on a private address is refused, and `TestConcurrentRealVMs` shows
   two simultaneous VMs each getting their own egress socket + child process with no
   cross-VM reachability. **Not yet run — see `HUMAN_TODO.md`.**
+
+### Phase 9 — TLS MITM & credential injection, step 2 (`add-tls-mitm-credential-injection.md`) ⏳
+Step 2 of the three-step host-side-proxy arc (`docs/ai-tasks/README.md`; depends on Phase 8,
+step 1). Opt-in TLS termination at the host proxy so an HTTP-shaped agent credential never
+enters the VM at all (§6.6.1, §6.8, §6.14).
+
+> **Started ahead of Phase 8's hardware re-verification.** Phase 8 is offline-complete but its
+> hardware "Done when" is still open (`HUMAN_TODO.md`) — this repo's own practice (every prior
+> phase's offline-complete-then-hardware-handoff pattern) is to keep building on offline-verified
+> work rather than block on a hardware slot with no ETA. Both phases' hardware verification is
+> tracked together in `HUMAN_TODO.md`; this phase's own hardware "Done when" is additionally
+> gated on Phase 8's landing for real.
+
+- [x] `task.NetworkPolicy` extended with `MITM`/`Passthrough`/`Inject` (+ `InjectRule`/
+  `RefreshRule`); `task.ValidateNetworkPolicy` enforces every §8.1 pre-flight rule
+  (`internal/task/network.go`, `TestValidateNetworkPolicyValid`/`Invalid`).
+- [x] `NetworkPolicy.ca_cert` added to `krayt.proto` and regenerated (`make proto-direct`) —
+  the only new field on the guest wire protocol; mitm/passthrough/inject stay entirely host-side.
+- [x] `internal/proxy`'s ephemeral per-run CA + bounded (1024-entry) SNI leaf cache, ECDSA
+  P-256, no exported private-key path (`mitm.go`, `TestCAChainsAndSNI`/`TestCALeafCacheEvicts`/
+  `TestCAPrivateKeyNotExported`).
+- [x] The MITM CONNECT path (`connect_mitm.go`): hijack → leaf for the CONNECT authority →
+  `httputil.ReverseProxy` over the SAME SSRF-guarded transport as the tunnel/forward paths,
+  `FlushInterval: -1`, strip-then-set injection, inner-Host/authority mismatch → 400, oversized
+  headers → rejected, any MITM setup failure fails closed (never a silent tunnel fallback). The
+  plain tunnel (`handler.tunnel`, renamed verbatim from the old `connect`) is untouched and stays
+  the fallback for `passthrough`/mitm-off. A `RefreshFunc` seam (401 → one refresh → one retry)
+  ships as plumbing only, nil until `inject-claude-oauth-token-at-proxy.md` (step 3) registers one.
+- [x] `krayt __egress-proxy` gains `--mitm`/`--run-id`, a `StdinConfig` read from stdin
+  (passthrough + resolved inject rules — the only channel secret material crosses into this
+  process), and reports its CA's public cert back to the parent once over fd 4, then closes it.
+  `internal/orchestrator`'s `spawnEgressProxy` builds and sends that stdin payload (resolving
+  each `set` secrets-file key to its value) and reads the fd-4 CA cert back with a bounded wait.
+- [x] Secrets partitioning (§6.8's load-bearing change): `pushSecrets` withholds every
+  `network.inject[].set`-referenced key from `SecretsBundle`, asserted on the captured proto
+  message (`TestSecretsBundleOmitsInjectedKeys`) — not on downstream container behavior.
+  `meta.json`/`report.md` record which keys were injected (names only).
+- [x] Guest: `NetworkPolicy.ca_cert` → `/run/krayt/ca.crt` (0644) + `KRAYT_CA_CERT`/
+  `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS` in the container env
+  (`controller_linux.go`'s `applyCACert`, `TestApplyCACertNoop`/`WritesFileAndEnv`); a no-op when
+  `network.mitm` is false. All three reference agent-image entrypoints concatenate their distro
+  CA bundle with `$KRAYT_CA_CERT` for `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` (§8.2) — required, not
+  optional, since all three are node-based and Node does not read the system trust store at all.
+- [x] **Done when (offline):** `go build ./...` + `GOOS=linux GOARCH=arm64 go build ./...` +
+  `go test -race ./...` + `golangci-lint run` all green, including the full offline test list
+  from `add-tls-mitm-credential-injection.md` (CA/leaf, child stdin/fd-4 secrecy, `mode: full` +
+  `mitm`, injection replace-not-append, passthrough via a real TLS-terminating upstream, the SSRF
+  guard on the MITM path, SSE + chunked-NDJSON streaming, secrets partitioning,
+  `mitm: false` byte-identical, hostile-input rejection, and every pre-flight validation rule). ✅
+- [ ] **Done when (hardware, `[HUMAN]`):** a real `claude-code` image run with `mitm: true` +
+  `inject:` for `ANTHROPIC_API_KEY` completes a task while `env`/`/run/secrets` inside the
+  container hold **no** credential (absence asserted, not just success); the same run with
+  `mitm: false` is unchanged; `npm install` (or an equivalent TLS-heavy fetch) succeeds through
+  the MITM path in each of the three agent images (the `NODE_EXTRA_CA_CERTS` check — the most
+  likely thing to break); the full Phase 3 security suite re-run on both backends. Blocked on
+  Phase 8's own hardware verification landing first — see `HUMAN_TODO.md`. **Not yet run.**
 
 ---
 

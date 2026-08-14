@@ -73,6 +73,13 @@ type runFlags struct {
 	// container is resolved from krayt.yaml's `container:` block (§8.1); there are no CLI flags
 	// for it in v1 (config-file only), so it stays the secure zero value when no config is present.
 	container task.ContainerPolicy
+
+	// mitm/passthrough/inject are resolved from krayt.yaml's `network:` block
+	// (add-tls-mitm-credential-injection.md §1); config-file only, no CLI flags, so they stay the
+	// secure zero value (mitm off) when no config is present.
+	mitm        bool
+	passthrough []string
+	inject      []task.InjectRule
 }
 
 func newRunCmd() *cobra.Command {
@@ -260,11 +267,14 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		RepoPath:     repoAbs,
 		SecretsPath:  secretsPath,
 		IncludeDirty: f.includeDirty,
-		Network:      task.NetworkPolicy{Mode: netMode, Allow: f.allow},
-		Env:          f.env,
-		BundleDepth:  f.bundleDepth,
-		TaskPrompt:   prompt,
-		Detach:       f.detach,
+		Network: task.NetworkPolicy{
+			Mode: netMode, Allow: f.allow,
+			MITM: f.mitm, Passthrough: f.passthrough, Inject: f.inject,
+		},
+		Env:         f.env,
+		BundleDepth: f.bundleDepth,
+		TaskPrompt:  prompt,
+		Detach:      f.detach,
 		Resources: task.Resources{
 			CPUs:      f.cpus,
 			MemoryMiB: f.memory,
@@ -273,6 +283,18 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		},
 		Questions: task.QuestionsPolicy{Mode: qMode, Timeout: f.questionTimeout, OnTimeout: qOnTimeout},
 		Container: f.container,
+	}
+
+	// network.mitm/passthrough/inject pre-flight (§1, add-tls-mitm-credential-injection.md):
+	// every rule is checked against the secrets file and the allow/passthrough lists before any
+	// VM or image work, so a typo fails fast instead of producing a run that fails opaquely once
+	// the agent actually tries to authenticate.
+	secretKeys, err := loadSecretKeySet(spec.SecretsPath)
+	if err != nil {
+		return err
+	}
+	if err := task.ValidateNetworkPolicy(spec.Network, secretKeys); err != nil {
+		return err
 	}
 
 	// Optional per-agent adapter (§6.14): validate auth (exactly-one, fail fast before any VM
@@ -355,6 +377,23 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	return err
 }
 
+// loadSecretKeySet reads the per-task secrets file (if any) and returns just its key NAMES as a
+// set, for network.inject validation (task.ValidateNetworkPolicy) — never the values.
+func loadSecretKeySet(secretsPath string) (map[string]bool, error) {
+	if secretsPath == "" {
+		return nil, nil
+	}
+	vals, err := secrets.Load(secretsPath)
+	if err != nil {
+		return nil, fmt.Errorf("read secrets: %w", err)
+	}
+	keys := make(map[string]bool, len(vals))
+	for k := range vals {
+		keys[k] = true
+	}
+	return keys, nil
+}
+
 // applyAdapter runs the optional per-agent adapter's host-side pre-flight (§6.14): it loads the
 // per-task secrets file and passes only the credential key names — never the values — to the
 // adapter, which enforces the agent's exactly-one auth rule; then it merges the adapter's
@@ -379,6 +418,7 @@ func applyAdapter(spec *task.RunSpec, name string) error {
 		SecretKeys:    secretKeys,
 		QuestionsWait: spec.Questions.Mode == task.QuestionWait,
 		AskSocket:     guest.ContainerAskSocket,
+		InjectedKeys:  spec.Network.InjectedSecretKeys(),
 	})
 	if err != nil {
 		return err
@@ -549,6 +589,11 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	if !changed("allow") && len(cfg.Network.Allow) > 0 {
 		f.allow = cfg.Network.Allow
 	}
+	// mitm/passthrough/inject are config-file only (no CLI flags, like container: above), so
+	// there is no flag-precedence check here — the file is the only source.
+	f.mitm = cfg.Network.MITM
+	f.passthrough = cfg.Network.Passthrough
+	f.inject = task.InjectRulesFromConfig(cfg.Network.Inject)
 	if !changed("include-dirty") && cfg.IncludeDirty != nil {
 		f.includeDirty = *cfg.IncludeDirty
 	}

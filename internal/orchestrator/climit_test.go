@@ -69,12 +69,15 @@ func TestMain(m *testing.M) {
 
 // runEgressHelper is this test binary re-exec'd as a `krayt __egress-proxy` stand-in: it
 // behaves exactly like the real hidden subcommand (internal/cli/egressproxy.go) — adopt fd 3,
-// serve proxy.Serve — but lives here so every orchestrator-package test that calls
-// orchestrator.Run gets a REAL child process without repeating this wiring per test.
+// read the stdin config, report the CA cert (if any) over fd 4, serve — but lives here so every
+// orchestrator-package test that calls orchestrator.Run gets a REAL child process without
+// repeating this wiring per test.
 func runEgressHelper() int {
 	fs := flag.NewFlagSet("egress-helper", flag.ContinueOnError)
 	mode := fs.String("mode", proxy.ModeAllowlist, "")
 	allowCSV := fs.String("allow", "", "")
+	mitm := fs.Bool("mitm", false, "")
+	runID := fs.String("run-id", "", "")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "egress-helper: parse flags:", err)
 		return 1
@@ -88,7 +91,24 @@ func runEgressHelper() int {
 	if *allowCSV != "" {
 		allow = strings.Split(*allowCSV, ",")
 	}
-	if err := proxy.Serve(context.Background(), lis, proxy.Policy{Mode: *mode, Allow: allow}, nil); err != nil {
+	stdinCfg, err := proxy.ReadStdinConfig(os.Stdin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "egress-helper:", err)
+		return 1
+	}
+	policy := proxy.Policy{Mode: *mode, Allow: allow, MITM: *mitm, Passthrough: stdinCfg.Passthrough, Inject: stdinCfg.Inject}
+	h, ca, err := proxy.BuildHandler(policy, "", *runID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "egress-helper:", err)
+		return 1
+	}
+	if caW := os.NewFile(4, "ca-cert"); caW != nil {
+		if ca != nil {
+			_, _ = caW.Write(ca.CACertPEM())
+		}
+		_ = caW.Close()
+	}
+	if err := proxy.ServeHandler(context.Background(), lis, h); err != nil {
 		fmt.Fprintln(os.Stderr, "egress-helper:", err)
 		return 1
 	}

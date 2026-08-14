@@ -25,6 +25,15 @@ for key in GEMINI_API_KEY GOOGLE_API_KEY; do
     break
   fi
 done
+# network.mitm + network.inject (§6.6.1, add-tls-mitm-credential-injection.md §2): this
+# credential is deliberately withheld from $SECRETS_DIR and attached to outgoing requests by the
+# host proxy instead. KRAYT_INJECTED_CREDENTIAL names it (never its value) so this loop can start
+# without a file that will never arrive; the placeholder below only satisfies Gemini CLI's "a
+# credential is configured" check — the real value never enters this container.
+if [ -z "$cred" ] && [ -n "${KRAYT_INJECTED_CREDENTIAL:-}" ]; then
+  cred="$KRAYT_INJECTED_CREDENTIAL"
+  export "$cred=krayt-injected-at-host-proxy"
+fi
 if [ -z "$cred" ]; then
   echo "[gemini-cli] no credential in $SECRETS_DIR (expected GEMINI_API_KEY or GOOGLE_API_KEY)" >&2
   # Diagnostics: the usual cause is a permissions mismatch — krayt wrote the secrets tmpfs
@@ -46,6 +55,23 @@ if [ "$cred" = "GOOGLE_API_KEY" ]; then
   export GOOGLE_GENAI_USE_VERTEXAI=true
 fi
 echo "[gemini-cli] authenticated via $cred"
+
+# Trust the run's ephemeral MITM CA, when network.mitm is enabled (§8.2,
+# add-tls-mitm-credential-injection.md §5). KRAYT_CA_CERT is set by the guest only in that case;
+# unset here means byte-identical behavior to before this feature. SSL_CERT_FILE/
+# REQUESTS_CA_BUNDLE REPLACE the system trust store for Go/OpenSSL-based tools rather than
+# appending to it, which would silently break verification for any `passthrough` host — so
+# concatenate the distro bundle with the krayt CA into one file and point both vars at THAT.
+# NODE_EXTRA_CA_CERTS is genuinely additive (and required, not optional: Node does not read the
+# system trust store at all), so it can point at the krayt CA alone.
+if [ -n "${KRAYT_CA_CERT:-}" ] && [ -f "${KRAYT_CA_CERT}" ]; then
+  bundle=/tmp/krayt-ca-bundle.pem
+  cat /etc/ssl/certs/ca-certificates.crt "$KRAYT_CA_CERT" > "$bundle"
+  export SSL_CERT_FILE="$bundle"
+  export REQUESTS_CA_BUNDLE="$bundle"
+  export NODE_EXTRA_CA_CERTS="$KRAYT_CA_CERT"
+  echo "[gemini-cli] trusting krayt's ephemeral MITM CA (network.mitm enabled)"
+fi
 
 if [ ! -f "$TASK_FILE" ]; then
   echo "[gemini-cli] task file $TASK_FILE not found" >&2

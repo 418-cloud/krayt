@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -65,7 +67,7 @@ func TestSpawnEgressProxyRealChildProcess(t *testing.T) {
 
 	runDir := t.TempDir()
 	np := task.NetworkPolicy{Mode: task.NetworkAllowlist, Allow: []string{allowedHost}}
-	ep, err := spawnEgressProxy(ctx, lis, np, runDir, "")
+	ep, err := spawnEgressProxy(ctx, lis, np, "run_egress_child", runDir, "")
 	if err != nil {
 		t.Fatalf("spawnEgressProxy: %v", err)
 	}
@@ -133,7 +135,7 @@ func TestSpawnEgressProxyTeardown(t *testing.T) {
 	}
 
 	runDir := t.TempDir()
-	ep, err := spawnEgressProxy(ctx, lis, task.NetworkPolicy{Mode: task.NetworkNone}, runDir, "")
+	ep, err := spawnEgressProxy(ctx, lis, task.NetworkPolicy{Mode: task.NetworkNone}, "run_egress_teardown", runDir, "")
 	if err != nil {
 		t.Fatalf("spawnEgressProxy: %v", err)
 	}
@@ -158,6 +160,79 @@ func TestSpawnEgressProxyTeardown(t *testing.T) {
 	// unlinked by an earlier Destroy — either way this must be a clean, single teardown.
 	if err := vm.Destroy(ctx); err != nil {
 		t.Errorf("vm.Destroy after egress proxy teardown: %v", err)
+	}
+}
+
+// TestSpawnEgressProxySecretNeverInArgvEnvOrOutput proves a secret value resolved for
+// network.inject[].set — delivered to the child on stdin (§2b of
+// add-tls-mitm-credential-injection.md) — never appears in the REAL child process's argv or
+// environ (read from /proc, not just the exec.Cmd we constructed) or its full captured
+// stdout/stderr, matching the "Child config" test requirement verbatim.
+func TestSpawnEgressProxySecretNeverInArgvEnvOrOutput(t *testing.T) {
+	if os.Getenv(EgressProxyBinEnv) == "" {
+		t.Skip("EgressProxyBinEnv not set — this package's TestMain (climit_test.go) sets it; run via `go test`")
+	}
+	const secret = "sk-ant-PLANTED-0123456789-do-not-leak"
+	secretsFile := filepath.Join(t.TempDir(), "secrets.env")
+	if err := os.WriteFile(secretsFile, []byte("ANTHROPIC_API_KEY="+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	p := fake.New()
+	vm, err := p.Create(ctx, provider.VMSpec{ID: "run_secret_argv"})
+	if err != nil {
+		t.Fatalf("fake provider Create: %v", err)
+	}
+	defer func() { _ = vm.Destroy(ctx) }()
+	lis, err := vm.ListenEgress(ctx, provider.EgressPort)
+	if err != nil {
+		t.Fatalf("ListenEgress: %v", err)
+	}
+
+	np := task.NetworkPolicy{
+		Mode: task.NetworkAllowlist, Allow: []string{"api.example.com"}, MITM: true,
+		Inject: []task.InjectRule{{
+			Host: "api.example.com", Strip: []string{"x-api-key"},
+			Set: map[string]string{"x-api-key": "ANTHROPIC_API_KEY"},
+		}},
+	}
+	runDir := t.TempDir()
+	ep, err := spawnEgressProxy(ctx, lis, np, "run_secret_argv", runDir, secretsFile)
+	if err != nil {
+		t.Fatalf("spawnEgressProxy: %v", err)
+	}
+	pid := ep.cmd.Process.Pid
+
+	// argv, as this process actually constructed it for exec — the real OS-level argv can only
+	// be a subset/rearrangement of this, so if it's clean here it's clean on the wire.
+	for _, a := range ep.cmd.Args {
+		if strings.Contains(a, secret) {
+			t.Errorf("secret leaked into argv: %v", ep.cmd.Args)
+		}
+	}
+	// env, as constructed — nil means full-inherit of THIS test process's own environment, which
+	// never carries the secret either (it only ever lives in the secrets file + stdin payload).
+	for _, e := range ep.cmd.Env {
+		if strings.Contains(e, secret) {
+			t.Errorf("secret leaked into env: %v", e)
+		}
+	}
+	// Stronger, real-process assertions on Linux: read the actual argv/environ of the live child
+	// from /proc, not just what this process intended to pass.
+	if runtime.GOOS == "linux" {
+		pidStr := strconv.Itoa(pid)
+		if b, err := os.ReadFile("/proc/" + pidStr + "/cmdline"); err == nil && strings.Contains(string(b), secret) {
+			t.Errorf("secret leaked into the real child's /proc cmdline")
+		}
+		if b, err := os.ReadFile("/proc/" + pidStr + "/environ"); err == nil && strings.Contains(string(b), secret) {
+			t.Errorf("secret leaked into the real child's /proc environ")
+		}
+	}
+
+	ep.stop()
+	if strings.Contains(string(ep.out.Bytes()), secret) {
+		t.Errorf("secret leaked into the child's full stdout/stderr output: %q", ep.out.Bytes())
 	}
 }
 
