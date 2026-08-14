@@ -87,6 +87,23 @@ func (h *handler) connectMITM(w http.ResponseWriter, r *http.Request) {
 			// a request to an unapproved host through an approved CONNECT tunnel.
 			pr.SetURL(&url.URL{Scheme: "https", Host: authority})
 			pr.Out.Host = authority
+			// Strip/set MUST run here, after ReverseProxy's own hop-by-hop header cleanup (which
+			// runs on pr.Out BEFORE Rewrite is called) — never earlier. Otherwise a guest-supplied
+			// `Connection: X-Api-Key` would make ReverseProxy delete the credential we just
+			// injected as a "hop-by-hop" header (RFC 7230 §6.1), forwarding the request upstream
+			// unauthenticated. Stripping before setting is what makes the guest unable to
+			// influence or smuggle a second credential (§4.5).
+			if hasRule {
+				for _, name := range rule.Strip {
+					pr.Out.Header.Del(name)
+				}
+				for name, val := range rule.Set {
+					pr.Out.Header.Set(name, val)
+				}
+				for name, val := range rule.SetLiteral {
+					pr.Out.Header.Set(name, val)
+				}
+			}
 		},
 		Transport: &refreshingTransport{
 			base: h.transport, refresh: h.refresh, rule: rule, hasRule: hasRule && rule.Refresh != nil,
@@ -113,9 +130,9 @@ func (h *handler) connectMITM(w http.ResponseWriter, r *http.Request) {
 }
 
 // injectingHandler wraps rp with the hostile-input guard (inner Host must agree with the
-// CONNECT authority, §6) and the injection step (§4.5): delete every header in rule.Strip, then
-// set every header in rule.Set/SetLiteral — stripping before setting is what makes the guest
-// unable to influence or smuggle a second credential.
+// CONNECT authority, §6) and a pre-flight check that every rule.Set value actually resolved
+// (§7) — the strip/set mutation itself happens later, inside rp's Rewrite, after ReverseProxy's
+// own hop-by-hop header cleanup (see the comment there for why the order matters).
 //
 // Every log.Printf in this function names a header/host by KEY or by the (already-approved)
 // CONNECT authority only — never a header VALUE or the guest-supplied Host string, which is
@@ -129,9 +146,6 @@ func injectingHandler(authority string, rule InjectRule, hasRule bool, rp http.H
 			return
 		}
 		if hasRule {
-			for _, name := range rule.Strip {
-				req.Header.Del(name)
-			}
 			for name, val := range rule.Set {
 				if val == "" {
 					// Pre-flight validation (task.ValidateNetworkPolicy) only confirms the
@@ -142,10 +156,6 @@ func injectingHandler(authority string, rule InjectRule, hasRule bool, rp http.H
 					http.Error(w, "krayt: injected credential unavailable", http.StatusInternalServerError)
 					return
 				}
-				req.Header.Set(name, val)
-			}
-			for name, val := range rule.SetLiteral {
-				req.Header.Set(name, val)
 			}
 		}
 		rp.ServeHTTP(w, req)

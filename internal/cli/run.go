@@ -418,6 +418,7 @@ func applyAdapter(spec *task.RunSpec, name string) error {
 		SecretKeys:    secretKeys,
 		QuestionsWait: spec.Questions.Mode == task.QuestionWait,
 		AskSocket:     guest.ContainerAskSocket,
+		InjectedKeys:  spec.Network.InjectedSecretKeys(),
 	})
 	if err != nil {
 		return err

@@ -167,6 +167,17 @@ func TestValidateNetworkPolicyInvalid(t *testing.T) {
 			keys: map[string]bool{"K": true},
 		},
 		{
+			name: "header in both set and set_literal, differing only by case",
+			np: NetworkPolicy{
+				Mode: NetworkAllowlist, Allow: []string{"api.anthropic.com"}, MITM: true,
+				Inject: []InjectRule{{
+					Host: "api.anthropic.com",
+					Set:  map[string]string{"X-Api-Key": "K"}, SetLiteral: map[string]string{"x-api-key": "1"},
+				}},
+			},
+			keys: map[string]bool{"K": true},
+		},
+		{
 			name: "incomplete refresh block",
 			np: NetworkPolicy{
 				Mode: NetworkAllowlist, Allow: []string{"api.anthropic.com"}, MITM: true,

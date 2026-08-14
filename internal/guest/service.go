@@ -293,11 +293,16 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	// (§6.6). The controller is linux-only; without it (tests) the container just inherits
 	// the task env.
 	runEnv := env
+	caCertPath := ""
 	if s.network != nil {
 		proxyEnv, err := s.network.Apply(ctx, netPolicy)
 		if err != nil {
 			return fmt.Errorf("guest: apply network policy: %w", err)
 		}
+		// KRAYT_CA_CERT (when set) already names exactly the guest-fs path the controller wrote
+		// the cert to (§5, add-tls-mitm-credential-injection.md) — reuse it rather than adding a
+		// second Network-interface return value for the same fact.
+		caCertPath = proxyEnv["KRAYT_CA_CERT"]
 		runEnv = mergeEnv(env, proxyEnv)
 	}
 
@@ -366,6 +371,7 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 		TaskPath:         filepath.Join(root, "task", "prompt.md"),
 		OutputDir:        outputDir,
 		SecretsDir:       secretsDir,
+		CACertPath:       caCertPath,
 		Env:              runEnv,
 		AskSocket:        askSocket,
 		AskBinary:        askBinaryPath(),

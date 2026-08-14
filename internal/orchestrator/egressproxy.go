@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -56,17 +58,25 @@ type egressProxy struct {
 
 	// caCertPEM is the child's ephemeral MITM CA public certificate (§5,
 	// add-tls-mitm-credential-injection.md), reported back over fd 4 — empty when
-	// network.mitm is false, or if nothing arrived within the startup window (an older
-	// KRAYT_EGRESS_PROXY_BIN replacement, or an unusually slow child). The caller pushes this
-	// into the guest's NetworkPolicy so the container's TLS stack can trust MITM'd connections.
+	// network.mitm is false (the only case that's valid; spawnEgressProxy fails the run outright
+	// if MITM is enabled and no valid cert arrives, since a MITM child without a trusted CA is
+	// not equivalent to mitm-off). The caller pushes this into the guest's NetworkPolicy so the
+	// container's TLS stack can trust MITM'd connections.
 	caCertPEM []byte
 }
 
 // caHandshakeWait bounds how long spawnEgressProxy additionally waits, after confirming the
-// child didn't exit immediately, to receive its CA cert (or its explicit "no CA" signal — an
-// empty read then EOF) over fd 4. Cert generation + a single small write is sub-millisecond in
-// practice; this only needs to be generous enough to absorb scheduling noise under load.
+// child didn't exit immediately, to receive its CA cert over fd 4, when network.mitm is enabled.
+// Cert generation + a single small write is sub-millisecond in practice; this only needs to be
+// generous enough to absorb scheduling noise under load.
 const caHandshakeWait = 2 * time.Second
+
+// maxCACertPEMBytes bounds the fd-4 read for the child's CA-cert report. An ECDSA P-256
+// self-signed cert PEM is a few hundred bytes; this is generous headroom, not a real limit. The
+// child is the process most directly exposed to adversarial network input (§6.6.1), so this read
+// is bounded and the result validated rather than trusted, the same "treat as hostile" posture
+// §6 of add-tls-mitm-credential-injection.md applies to guest input.
+const maxCACertPEMBytes = 8 << 10
 
 // spawnEgressProxy starts the host-side egress allowlist/MITM proxy for one run (§4, §6, and
 // §2/§4 of add-tls-mitm-credential-injection.md): it duplicates lis's fd for the child, execs it
@@ -100,9 +110,15 @@ func spawnEgressProxy(ctx context.Context, lis net.Listener, np task.NetworkPoli
 	args := []string{"--mode", string(np.Mode), "--allow", strings.Join(np.Allow, ",")}
 	if np.MITM {
 		args = append(args, "--mitm")
-	}
-	if runID != "" {
-		args = append(args, "--run-id", runID)
+		// --run-id only means anything to MITM mode (it's folded into the ephemeral CA's CN,
+		// §5) and is a NEW flag a KRAYT_EGRESS_PROXY_BIN replacement built against the
+		// pre-add-tls-mitm-credential-injection.md contract won't recognize. Passing it
+		// unconditionally would break that replacement's mitm:false invocation even though
+		// mitm:false promises zero behavior change (add-tls-mitm-credential-injection.md
+		// Constraints) — so it rides along only when --mitm does.
+		if runID != "" {
+			args = append(args, "--run-id", runID)
+		}
 	}
 	var cmd *exec.Cmd
 	if bin := os.Getenv(EgressProxyBinEnv); bin != "" {
@@ -128,7 +144,12 @@ func spawnEgressProxy(ctx context.Context, lis net.Listener, np task.NetworkPoli
 
 	caCh := make(chan []byte, 1)
 	go func() {
-		b, _ := io.ReadAll(caR)
+		// Bounded: a compromised or merely buggy child could otherwise stream fd 4 until the
+		// caller times out, forcing unbounded allocation in this process. The +1 lets a
+		// legitimate cert (well under the cap) read cleanly while still detecting oversized
+		// output (len(b) > maxCACertPEMBytes below) instead of silently truncating it into
+		// something that happens to parse.
+		b, _ := io.ReadAll(io.LimitReader(caR, maxCACertPEMBytes+1))
 		caCh <- b
 	}()
 
@@ -142,13 +163,41 @@ func spawnEgressProxy(ctx context.Context, lis net.Listener, np task.NetworkPoli
 		return nil, fmt.Errorf("orchestrator: egress proxy exited immediately at startup; see %s", ProxyLogPath(runDir))
 	case <-time.After(egressProxyStartupWait):
 	}
-	select {
-	case ep.caCertPEM = <-caCh:
-	case <-time.After(caHandshakeWait):
-		// No CA signal within the window — proceed without one rather than fail the run: absence
-		// here just means the guest gets no ca_cert, i.e. mitm-off behavior on the guest side.
+	if np.MITM {
+		// Unlike mitm:false (where no CA is the correct, unchanged behavior), a MITM child that
+		// never reports a valid CA is NOT equivalent to mitm-off: the child still terminates TLS
+		// and presents certificates the guest has no way to trust, while the injected
+		// credential has already been withheld from SecretsBundle (§2). Proceeding here would
+		// silently strand the run without its credential, so treat a missing/oversized/
+		// unparseable cert as the same class of fail-fast startup error as an immediate child
+		// exit above — the child is killed and its log persisted either way.
+		var b []byte
+		select {
+		case b = <-caCh:
+		case <-time.After(caHandshakeWait):
+			ep.stop()
+			return nil, fmt.Errorf("orchestrator: egress proxy did not report its MITM CA cert within %s; see %s",
+				caHandshakeWait, ProxyLogPath(runDir))
+		}
+		if len(b) > maxCACertPEMBytes || !isCACertPEM(b) {
+			ep.stop()
+			return nil, fmt.Errorf("orchestrator: egress proxy reported no usable MITM CA cert; see %s", ProxyLogPath(runDir))
+		}
+		ep.caCertPEM = b
 	}
 	return ep, nil
+}
+
+// isCACertPEM reports whether b is a single well-formed PEM-encoded X.509 certificate — the
+// shape CACertPEM() (internal/proxy) produces. Bounds what spawnEgressProxy will accept from the
+// fd-4 channel to an actual certificate, not just "some bytes within the size cap".
+func isCACertPEM(b []byte) bool {
+	block, _ := pem.Decode(b)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return false
+	}
+	_, err := x509.ParseCertificate(block.Bytes)
+	return err == nil
 }
 
 // buildEgressStdinConfig builds the JSON document written to the egress proxy child's stdin

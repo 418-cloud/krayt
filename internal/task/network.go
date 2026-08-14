@@ -97,6 +97,13 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 				return fmt.Errorf("network: inject[%d] (%s) strip: %w", i, host, err)
 			}
 		}
+		// Header names are case-insensitive (RFC 7230 §3.2), but Go map keys are not — "X-Api-Key"
+		// in set and "x-api-key" in set_literal would pass a case-sensitive check and then race
+		// each other for the canonical header at injection time (net/http.Header.Set canonicalizes
+		// both to the same key, and map iteration order is unspecified). setNames tracks every
+		// header seen so far, lower-cased, to catch that case-insensitively — across set and
+		// set_literal, and between two same-cased spellings within either map.
+		setNames := map[string]bool{}
 		for h, key := range rule.Set {
 			if err := validateHeaderName(h); err != nil {
 				return fmt.Errorf("network: inject[%d] (%s) set: %w", i, host, err)
@@ -105,14 +112,19 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 				return fmt.Errorf("network: inject[%d] (%s): set[%q] names secrets-file key %q, which does not exist",
 					i, host, h, key)
 			}
+			if setNames[lower(h)] {
+				return fmt.Errorf("network: inject[%d] (%s): set has more than one header named %q (case-insensitive)", i, host, h)
+			}
+			setNames[lower(h)] = true
 		}
 		for h := range rule.SetLiteral {
 			if err := validateHeaderName(h); err != nil {
 				return fmt.Errorf("network: inject[%d] (%s) set_literal: %w", i, host, err)
 			}
-			if _, dup := rule.Set[h]; dup {
-				return fmt.Errorf("network: inject[%d] (%s): header %q is in both set and set_literal", i, host, h)
+			if setNames[lower(h)] {
+				return fmt.Errorf("network: inject[%d] (%s): header %q collides case-insensitively with another header in set/set_literal", i, host, h)
 			}
+			setNames[lower(h)] = true
 		}
 
 		if rule.Refresh != nil {

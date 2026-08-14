@@ -18,5 +18,5 @@ func (openCode) Prepare(in Input) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	return Plan{Env: askEnv(in), Credential: cred}, nil
+	return Plan{Env: credentialEnv(in, cred), Credential: cred}, nil
 }

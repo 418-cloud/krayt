@@ -29,6 +29,7 @@ type RunConfig struct {
 	TaskPath         string            // -> /task/prompt.md
 	OutputDir        string            // -> /output
 	SecretsDir       string            // -> /run/secrets (tmpfs); empty when no secrets (§6.8)
+	CACertPath       string            // guest-fs path of the run's MITM CA public cert, bind-mounted read-only at the SAME path in the container so KRAYT_CA_CERT resolves there too (§8.2, add-tls-mitm-credential-injection.md §5); empty when network.mitm is false
 	Env              map[string]string // non-secret env (§6.5 TaskSpec.env)
 	AskSocket        string            // guest-side ask-bridge socket to bind-mount at /run/krayt/ask.sock (§6.13); empty if unavailable
 	AskBinary        string            // guest-side krayt-ask binary to bind-mount onto the container PATH (§6.13); empty if unavailable

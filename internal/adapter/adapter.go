@@ -20,9 +20,10 @@ import (
 // the values — of the per-task secrets, so the adapter can select/validate the auth credential
 // without touching secret material.
 type Input struct {
-	SecretKeys    []string // names of the per-task secrets
-	QuestionsWait bool     // --on-question=wait: wire the krayt-ask front-end (§6.13)
-	AskSocket     string   // container path to the ask-bridge socket (§6.13)
+	SecretKeys    []string        // names of the per-task secrets
+	QuestionsWait bool            // --on-question=wait: wire the krayt-ask front-end (§6.13)
+	AskSocket     string          // container path to the ask-bridge socket (§6.13)
+	InjectedKeys  map[string]bool // secrets-file keys withheld from SecretsBundle by network.inject (§6.6.1)
 }
 
 // Plan is an adapter's host-side contribution to a run: non-secret env additions for the
@@ -69,6 +70,24 @@ func askEnv(in Input) map[string]string {
 		return nil
 	}
 	return map[string]string{"KRAYT_ASK_SOCKET": in.AskSocket}
+}
+
+// credentialEnv is askEnv's env plus, when the adapter's selected credential is delivered by
+// host-side proxy injection rather than SecretsBundle (network.mitm + inject, §6.6.1),
+// KRAYT_INJECTED_CREDENTIAL naming it. The value never enters the VM either way; this only tells
+// the container entrypoint which recognized key to treat as satisfied without a /run/secrets
+// file that will never arrive, so it can export a placeholder for it and start — the real header
+// is attached to outgoing requests by the host proxy regardless of what the container sends.
+func credentialEnv(in Input, cred string) map[string]string {
+	env := askEnv(in)
+	if !in.InjectedKeys[cred] {
+		return env
+	}
+	if env == nil {
+		env = map[string]string{}
+	}
+	env["KRAYT_INJECTED_CREDENTIAL"] = cred
+	return env
 }
 
 // exactlyOne selects the single credential key present among the recognized set, erroring on

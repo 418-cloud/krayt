@@ -490,6 +490,37 @@ func TestMITMSmuggledDuplicateInjectedHeaderStripped(t *testing.T) {
 	}
 }
 
+// TestMITMConnectionHeaderCannotStripInjectedCredential proves a guest cannot use a
+// `Connection: X-Api-Key` header to make ReverseProxy's own hop-by-hop cleanup (RFC 7230 §6.1)
+// delete the credential injectingHandler/Rewrite just attached, which would otherwise forward
+// the request upstream unauthenticated.
+func TestMITMConnectionHeaderCannotStripInjectedCredential(t *testing.T) {
+	upstream := &echoTransport{}
+	rule := InjectRule{Host: "api.example.com", Strip: []string{"x-api-key"}, Set: map[string]string{"x-api-key": "resolved-secret-value"}}
+	h := newMITMHarness(t, Policy{Mode: ModeAllowlist, Allow: []string{"api.example.com"}, Inject: []InjectRule{rule}}, upstream, nil)
+	conn := rawMITMConn(t, h, "api.example.com:443", "api.example.com")
+
+	req := "GET / HTTP/1.1\r\nHost: api.example.com\r\nConnection: X-Api-Key\r\nX-Api-Key: evil\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write inner request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read inner response: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	upstreamReq := upstream.lastRequest()
+	if upstreamReq == nil {
+		t.Fatal("upstream never received a request")
+	}
+	if got := upstreamReq.Header.Get("X-Api-Key"); got != "resolved-secret-value" {
+		t.Errorf("upstream X-Api-Key = %q, want resolved-secret-value (a smuggled Connection header must not strip the injected credential)", got)
+	}
+}
+
 func TestMITMOversizedHeaderRejected(t *testing.T) {
 	upstream := &echoTransport{}
 	h := newMITMHarness(t, Policy{Mode: ModeAllowlist, Allow: []string{"api.example.com"}}, upstream, nil)

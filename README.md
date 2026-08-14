@@ -260,9 +260,9 @@ network:
         x-api-key: ANTHROPIC_API_KEY      # secrets-file key name, resolved host-side
 ```
 
-Run it exactly like any other task — `krayt run --config krayt.yaml --task ./task.md`. `krayt
-ls`/`report.md` show which keys were injected (names only, never values) so you can confirm the
-container ran without them.
+Run it exactly like any other task — `krayt run --config krayt.yaml --task ./task.md`. The run's
+`report.md`/`meta.json` show which keys were injected (names only, never values) so you can
+confirm the container ran without them.
 
 ### Agent images
 

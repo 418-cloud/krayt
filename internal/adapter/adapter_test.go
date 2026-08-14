@@ -134,6 +134,43 @@ func TestOpenCodeExactlyOne(t *testing.T) {
 	}
 }
 
+// TestCredentialInjectionSignal proves that when the adapter's selected credential is withheld
+// from SecretsBundle by network.inject (§6.6.1), Prepare wires KRAYT_INJECTED_CREDENTIAL naming
+// it — so the container entrypoint can start without the /run/secrets file that will never
+// arrive — and that it is absent when injection isn't configured for that key.
+func TestCredentialInjectionSignal(t *testing.T) {
+	ad, err := adapter.Get("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{"ANTHROPIC_API_KEY"}
+
+	injected, err := ad.Prepare(adapter.Input{SecretKeys: keys, InjectedKeys: map[string]bool{"ANTHROPIC_API_KEY": true}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if injected.Env["KRAYT_INJECTED_CREDENTIAL"] != "ANTHROPIC_API_KEY" {
+		t.Errorf("KRAYT_INJECTED_CREDENTIAL = %q, want ANTHROPIC_API_KEY; env = %v", injected.Env["KRAYT_INJECTED_CREDENTIAL"], injected.Env)
+	}
+
+	notInjected, err := ad.Prepare(adapter.Input{SecretKeys: keys})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, set := notInjected.Env["KRAYT_INJECTED_CREDENTIAL"]; set {
+		t.Errorf("KRAYT_INJECTED_CREDENTIAL should be unset without network.inject; env = %v", notInjected.Env)
+	}
+
+	// A different key injected (not the one actually selected) must not wire the signal.
+	other, err := ad.Prepare(adapter.Input{SecretKeys: keys, InjectedKeys: map[string]bool{"SOME_OTHER_KEY": true}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, set := other.Env["KRAYT_INJECTED_CREDENTIAL"]; set {
+		t.Errorf("KRAYT_INJECTED_CREDENTIAL should only name the SELECTED credential; env = %v", other.Env)
+	}
+}
+
 func TestGetUnknown(t *testing.T) {
 	if _, err := adapter.Get("clyde"); err == nil {
 		t.Error("unknown adapter should error")

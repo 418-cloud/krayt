@@ -1401,9 +1401,22 @@ read-only rootfs is opt-in (default OFF) partly for this reason. When enabled, o
 
 **The `KRAYT_CA_CERT` contract (§6.6.1, only when `network.mitm: true`).** The guest writes the
 run's ephemeral MITM CA's **public** certificate to `/run/krayt/ca.crt` (0644 — it is public,
-never the private key) and sets `KRAYT_CA_CERT=/run/krayt/ca.crt` plus best-effort
-`SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`NODE_EXTRA_CA_CERTS` pointing at it. This is a **no-op when
-`network.mitm` is false** — no file, no env var, byte-identical to a run without the feature.
+never the private key), bind-mounts it read-only at that SAME path inside the container (so
+`KRAYT_CA_CERT` resolves on both sides of the mount namespace, not just the guest's own), and
+sets `KRAYT_CA_CERT=/run/krayt/ca.crt` plus best-effort `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
+`NODE_EXTRA_CA_CERTS` pointing at it. This is a **no-op when `network.mitm` is false** — no file,
+no mount, no env var, byte-identical to a run without the feature.
+
+**The `KRAYT_INJECTED_CREDENTIAL` contract (§6.14, only when the adapter's selected credential is
+named in `network.inject[].set`).** That credential is withheld from `SecretsBundle` entirely
+(§6.6.1) — no `/run/secrets/<key>` file ever arrives for it — so a compliant entrypoint that
+otherwise requires the file to exist before starting must instead check
+`KRAYT_INJECTED_CREDENTIAL` for the (non-secret) key **name** and, if it matches one of the
+credentials the agent recognizes, proceed with a placeholder value for it: the real value is
+attached to outgoing requests by the host proxy regardless of what the container sends, so the
+placeholder only needs to satisfy the agent's own "a credential is configured" check. Unset when
+injection isn't configured for the selected credential, which is the common case and adds no new
+behavior.
 A compliant entrypoint that wants MITM'd hosts to verify, **and** wants `passthrough` hosts (which
 see the real upstream, not krayt's CA) to keep verifying too, must:
 - Check `KRAYT_CA_CERT` is set and non-empty before doing anything distro-specific.

@@ -283,6 +283,18 @@ func contractMounts(cfg guest.RunConfig) []specs.Mount {
 			Options: []string{"rbind", "ro"},
 		})
 	}
+	// The run's MITM CA public cert (§8.2, add-tls-mitm-credential-injection.md §5), bind-mounted
+	// read-only at the SAME guest-fs path inside the container — KRAYT_CA_CERT (set into Env by
+	// the network controller) names this exact path, so it must resolve on both sides of the
+	// mount namespace, not just the guest's own. Comes after the /run tmpfs mount above (like
+	// /run/secrets) so a read-only-rootfs run's tmpfs doesn't shadow it. Empty when
+	// network.mitm is false — a mitm-off run adds no mount here, unchanged from before this task.
+	if cfg.CACertPath != "" {
+		mounts = append(mounts, specs.Mount{
+			Destination: cfg.CACertPath, Type: "bind", Source: cfg.CACertPath,
+			Options: []string{"rbind", "ro"},
+		})
+	}
 	// The agent → human question bridge socket (§6.13); the front-ends (MCP server / krayt-ask)
 	// inside the container connect to it. Empty when the guest could not open it.
 	if cfg.AskSocket != "" {

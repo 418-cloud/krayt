@@ -154,6 +154,36 @@ func TestContractMountsReadonlyOrdering(t *testing.T) {
 	}
 }
 
+// TestContractMountsBindsCACert guards the §5 gap: KRAYT_CA_CERT must resolve inside the
+// container too, not just on the guest, so CACertPath must produce a matching bind mount — and,
+// under a read-only rootfs, come after the /run tmpfs or that tmpfs would shadow it (same
+// shadowing bug TestContractMountsReadonlyOrdering guards for /run/secrets).
+func TestContractMountsBindsCACert(t *testing.T) {
+	cfg := guest.RunConfig{
+		WorkspaceDir: "/w", TaskPath: "/t/prompt.md", OutputDir: "/o",
+		CACertPath: "/run/krayt/ca.crt", ReadonlyRootfs: true,
+	}
+	mounts := contractMounts(cfg)
+	runIdx, caIdx := -1, -1
+	for i, m := range mounts {
+		switch m.Destination {
+		case "/run":
+			runIdx = i
+		case "/run/krayt/ca.crt":
+			caIdx = i
+		}
+	}
+	if runIdx < 0 || caIdx < 0 {
+		t.Fatalf("missing mounts: run=%d ca=%d in %+v", runIdx, caIdx, mounts)
+	}
+	if runIdx > caIdx {
+		t.Errorf("/run tmpfs (idx %d) must come before the CA cert bind (idx %d) or it shadows the cert", runIdx, caIdx)
+	}
+	if got := contractMounts(guest.RunConfig{WorkspaceDir: "/w", TaskPath: "/t/prompt.md", OutputDir: "/o"}); hasDest(got, "/run/krayt/ca.crt") {
+		t.Error("CACertPath empty (network.mitm false) must not add a CA cert mount")
+	}
+}
+
 func hasDest(mounts []specs.Mount, dest string) bool {
 	for _, m := range mounts {
 		if m.Destination == dest {

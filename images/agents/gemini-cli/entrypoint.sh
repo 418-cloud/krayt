@@ -25,6 +25,15 @@ for key in GEMINI_API_KEY GOOGLE_API_KEY; do
     break
   fi
 done
+# network.mitm + network.inject (§6.6.1, add-tls-mitm-credential-injection.md §2): this
+# credential is deliberately withheld from $SECRETS_DIR and attached to outgoing requests by the
+# host proxy instead. KRAYT_INJECTED_CREDENTIAL names it (never its value) so this loop can start
+# without a file that will never arrive; the placeholder below only satisfies Gemini CLI's "a
+# credential is configured" check — the real value never enters this container.
+if [ -z "$cred" ] && [ -n "${KRAYT_INJECTED_CREDENTIAL:-}" ]; then
+  cred="$KRAYT_INJECTED_CREDENTIAL"
+  export "$cred=krayt-injected-at-host-proxy"
+fi
 if [ -z "$cred" ]; then
   echo "[gemini-cli] no credential in $SECRETS_DIR (expected GEMINI_API_KEY or GOOGLE_API_KEY)" >&2
   # Diagnostics: the usual cause is a permissions mismatch — krayt wrote the secrets tmpfs

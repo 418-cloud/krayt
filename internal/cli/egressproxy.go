@@ -32,7 +32,10 @@ const egressProxyCACertFD = 4
 //
 // This is also the stable interface KRAYT_EGRESS_PROXY_BIN swaps out (internal/orchestrator):
 // any replacement binary — e.g. a future memory-safe reimplementation, §6.6 — must honor the
-// same contract: --mode/--allow/--dns/--mitm flags in; a listener on fd 3; a JSON StdinConfig
+// same contract: --mode/--allow/--dns flags in, always; --mitm and --run-id in too, but ONLY
+// when MITM is enabled for the run (internal/orchestrator's spawnEgressProxy never sends
+// --run-id on a mitm:false invocation, so mitm:false stays byte-identical to the pre-MITM
+// contract); a listener on fd 3; a JSON StdinConfig
 // (passthrough + resolved inject rules — the ONLY place secret material reaches this process,
 // §2b) on stdin, read to EOF; the CA's public cert PEM (or nothing) written once to fd 4, then
 // closed; logs (timestamps, hostnames, allow/deny verdicts, dial errors — never bodies, never
