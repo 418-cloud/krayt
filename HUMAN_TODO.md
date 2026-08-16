@@ -7,12 +7,14 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
-**Open:** `move-egress-proxy-to-host.md` (Phase 8, §14) needs a guest image rebuild (it changes
-`cmd/krayt-vsock-forward` + `internal/guest/proxy`), a `PinnedRef` bump to the new digest once CI
-publishes it, and the Phase-3 egress hardware suite re-run against the new host-side design —
-see the `[hardware]` entry below. **Blocking**: nothing else in the repo currently depends on it,
-but no run with a real host-side egress proxy can boot until the image is rebuilt and re-pinned,
-so the feature is offline-complete only until this lands.
+**Open:** `move-egress-proxy-to-host.md` (Phase 8, §14) is most of the way through its hardware
+verification. Done for real on darwin/vfkit against image digest `9c3712d5…`: the egress suite
+(`TestEgressEnforcement`, `TestContainerHardening`, `TestConcurrentRealVMs`) and the new
+private-target SSRF check (`hack/netprobe` check 4 → 403). Still open: the Linux/firecracker
+re-run, and the second new check — `nft list ruleset` in the guest containing no `skuid` rule —
+which is now written (`verifyInstalledRuleset` + `assertGuestRuleset`) but needs **another** image
+rebuild + `PinnedRef` bump to run, since it is guest-side code. See the `[hardware]` entry below.
+**Blocking**: nothing else in the repo depends on it.
 
 **Open:** `add-tls-mitm-credential-injection.md` (Phase 9, §14) is offline-complete — CA/leaf
 generation, the MITM CONNECT path, header injection, secrets partitioning, the stdin/fd-4 child
@@ -66,11 +68,23 @@ only tracks what's still open.
 
 ## [hardware] `move-egress-proxy-to-host.md` — image rebuild, `PinnedRef` bump, and Phase-3 egress suite re-verification
 
-- **Needed:** (1) push these changes so the RC image-build workflow publishes a new guest image
-  digest (the guest side changed: `cmd/krayt-vsock-forward` replaces `cmd/krayt-proxy`,
-  `internal/guest/proxy` is simplified); (2) read that digest from the workflow run and bump
-  `internal/vmimage/pinned.go`'s `PinnedRef`; (3) re-run the hardware egress suite against the
-  new host-side proxy design on **both** backends (Apple Silicon/vfkit and Linux/KVM/firecracker).
+**Progress so far (real runs, not offline):** the first image rebuild + `PinnedRef` bump is done
+(`sha256:9c3712d5…`), and on darwin/vfkit the whole suite passed against it — `TestBootHello`,
+`TestEndToEndRealVM`, `TestEgressEnforcement`, `TestContainerHardening`, `TestRootImageFailsClosed`,
+`TestGuestGitConfigInjectionInert`, `TestSecretConfinementInArtifacts`, `TestConcurrentRealVMs`.
+That covers steps 1–2, step 4, and the netprobe half of step 5 (check 4 reported
+`allowlisted-but-private target 192.168.255.1 blocked by the SSRF guard (403)` for real). What is
+left is step 3's Linux half and step 5's ruleset check, both detailed below.
+
+- **Needed:** (1) ~~push these changes so the RC image-build workflow publishes a new guest image
+  digest~~ — done once already, but the `nft list ruleset` check added since is guest-side code,
+  so it needs a **second** RC image build + `PinnedRef` bump before it can run at all (until then
+  `assertGuestRuleset` fails with "no ruleset dump … stale VM image", by design — it refuses to
+  pass vacuously against an image that never performed the check); (2) read that digest from the
+  workflow run and bump `internal/vmimage/pinned.go`'s `PinnedRef`; (3) re-run the hardware egress
+  suite on **Linux/KVM/firecracker** (the vfkit half is done). Note `internal/vmimage/**` is now in
+  `ci.yml`'s integration path filter, so the `PinnedRef`-bump PR itself triggers `integration-linux`
+  — that CI job is the Linux half; it does not need a hand-run Linux box.
 - **Why the agent can't:** `PinnedRef` is a single hardcoded digest that does not exist until CI
   builds and publishes the new image (§11, §14) — it cannot be guessed or fabricated. The actual
   boot + egress-enforcement tests need real virtualization (vz on Apple Silicon, KVM on Linux),
@@ -82,38 +96,44 @@ only tracks what's still open.
      `RELEASING.md`).
   2. Read the published RC tag/digest from the workflow run (or `oras manifest fetch` the tag it
      prints) and set `internal/vmimage/pinned.go`'s `PinnedRef` to it.
-  3. `go test -tags integration ./internal/orchestrator/... -run TestEgressEnforcement` and
-     `-run TestContainerHardening` on a Mac with vfkit installed (`KRAYT_KERNEL`/`KRAYT_INITRD`/
-     `KRAYT_ROOTFS`/`KRAYT_NETPROBE_IMAGE`/`KRAYT_ALLOW_HOST`/`KRAYT_HARDENING_IMAGE` per each
-     test's header comment) and on a Linux/KVM box for the firecracker backend — same tests, same
-     env vars, `hack/run-integration-tests.sh` auto-detects which backend to use.
-  4. `-run TestConcurrentRealVMs` on both backends (needs `KRAYT_IMAGE`, a real agent image) —
-     asserts two simultaneous VMs each get their own egress socket + child process with no
-     cross-VM reachability, the concurrency property this task's vsock design is supposed to buy
-     over a gateway-bound TCP proxy.
-  5. **New checks this task adds that the existing probes don't cover yet** — write these as real
-     test/probe code before running them, don't skip straight to manual verification:
-     - `nft list ruleset` inside the guest, over a debug shell or an extended probe image,
-       contains **no `skuid` rule** (the existing `hardening-probe` only checks that
-       `setuid(proxyd)` itself fails `EPERM`, which is still worth keeping as a non-root
-       regression check, but no longer proves the egress lock's correctness — the ruleset shape
-       does. `TestEgressRulesetShape` (`internal/guest/proxy/firewall_internal_test.go`) is the
-       offline counterpart; this hardware check confirms the *installed* ruleset on a live guest
-       matches it, not just the constant.
-     - A container attempt to reach the **host** itself on a private address (e.g. the vfkit/
-       firecracker host's own LAN IP) is refused by the SSRF guard — extend `hack/netprobe` with
-       a fourth check (a new exit code) that CONNECTs through the proxy to a private-range target
-       and asserts it gets a 403, proving the §2 hard-block change actually holds on hardware, not
-       just in `TestCheckDialAddr`.
+  3. `hack/run-integration-tests.sh` on a Mac with vfkit installed — it builds, preflights, pulls
+     the newly pinned image and runs the whole suite (it auto-detects the backend, so the same
+     command is what a hand-run Linux/KVM box would use). Passed once already against
+     `9c3712d5…`; needs one more pass against the re-pinned image so `assertGuestRuleset` runs.
+  4. For the Linux/firecracker half, the `PinnedRef`-bump PR from step 2 triggers CI's
+     `integration-linux` job, which runs the same script under KVM — no hand-run box needed. Watch
+     that job rather than repeating step 3 by hand.
+  5. **New checks this task adds that the existing probes don't cover yet** — both are now
+     written as real code, so this step is "run them", not "invent them":
+     - **`nft list ruleset` in the guest contains no `skuid` rule** — written, never run.
+       Implemented guest-side rather than as a probe-image check: the container drops all
+       capabilities (§6.10), so `nft list ruleset` inside it fails on CAP_NET_ADMIN, and granting
+       that capability to read the ruleset would weaken the very hardening `hardening-probe`
+       exists to prove. Instead `ApplyFirewall` reads its own installed ruleset back
+       (`verifyInstalledRuleset`, `internal/guest/proxy/firewall_linux.go`), **fails the run
+       closed** if a `skuid` rule is present anywhere / the `krayt_egress` table is missing / its
+       chain does not `policy drop` / the loopback accept is gone, and dumps the live ruleset to
+       the serial console between `krayt: BEGIN egress ruleset` / `krayt: END egress ruleset`.
+       `assertGuestRuleset` in `TestEgressEnforcement` then reads that dump out of the run's
+       `console.log` and asserts on it, so the evidence is observable on hardware rather than
+       only inside the guest. `checkRuleset`'s logic is covered offline against fixture dumps in
+       the nft-printed form (`TestCheckRulesetAcceptsInstalledShape`/`Rejects`), and
+       `TestEgressRulesetShape` still guards the constant. The `hardening-probe`
+       `setuid(proxyd)`→EPERM check stays as a non-root/capability regression check.
+     - A container attempt to reach a private address through the proxy is refused by the SSRF
+       guard — **done**: `hack/netprobe` check 4 (exit 24) CONNECTs to an allowlisted-but-private
+       target and asserts a 403, and it passed on darwin/vfkit
+       (`ok — allowlisted-but-private target 192.168.255.1 blocked by the SSRF guard (403)`).
 - **Verify success by:** all of the above tests/probes passing (`--- PASS`) on both backends,
-  with the new image's digest recorded in `PinnedRef`. Update `KRAYT_SPEC.md` §14's Phase 8 "Done
-  when (hardware)" checkbox from `[ ]` to `[x]` and this section's status line once confirmed —
-  do not mark it done without a real boot + real test run.
-- **Blocking:** no (nothing else in the repo currently depends on this landing), but the run
-  supervisor cannot boot a VM with a working egress path against the *old* pinned image (guest
-  side is now `krayt-vsock-forward`, not `krayt-proxy`) — so this is the one step standing between
-  "offline-complete" and "actually usable" for this task specifically. See the top-of-file Status
-  note.
+  with the new image's digest recorded in `PinnedRef`, and `TestEgressEnforcement`'s `-test.v`
+  output carrying the `live guest nftables ruleset (no skuid rule)` dump — that logged dump is
+  the Phase 8 evidence, so a run without it in the output has not actually verified the ruleset.
+  Update `KRAYT_SPEC.md` §14's Phase 8 "Done when (hardware)" checkbox from `[ ]` to `[x]` and
+  this section's status line once confirmed — do not mark it done without a real boot + real
+  test run.
+- **Blocking:** no (nothing else in the repo currently depends on this landing), and the egress
+  path itself is now confirmed working on vfkit against the re-pinned image — what remains is
+  verification coverage (the Linux backend + the ruleset check), not a broken feature.
 
 ## [hardware] `add-tls-mitm-credential-injection.md` — real MITM run, `NODE_EXTRA_CA_CERTS` check, and Phase-3 re-verification
 

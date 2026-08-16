@@ -162,9 +162,12 @@ func TestEndToEndRealVM(t *testing.T) {
 // correctness depended on both together. Since Phase 8 the guest lock is loopback-only and
 // keys on no uid at all, so there is nothing left for a capability regression to unlock; the
 // EPERM assertion is kept as a still-useful non-root regression check, not because the egress
-// lock depends on it anymore. The cheap offline counterpart is TestEgressRulesetShape in
-// internal/guest/proxy, which also now asserts `skuid` is absent from the ruleset. **Not yet
-// re-run against the Phase 8 design on real hardware — see HUMAN_TODO.md.**
+// lock depends on it anymore. What proves the lock's own shape now is assertGuestRuleset below,
+// which reads the LIVE ruleset off the guest console — the on-hardware counterpart to the
+// offline TestEgressRulesetShape (internal/guest/proxy), which can only see the constant.
+//
+// Re-verified against the Phase 8 design on darwin/vfkit; the Linux/firecracker re-run and the
+// first run of the assertGuestRuleset check are still open — see HUMAN_TODO.md.
 func TestEgressEnforcement(t *testing.T) {
 	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
 	image := os.Getenv("KRAYT_NETPROBE_IMAGE")
@@ -223,6 +226,64 @@ func TestEgressEnforcement(t *testing.T) {
 			"raw-socket block, or allowlisted-but-private-target block did not behave as expected "+
 			"— see the guest console log above", res.ExitCode)
 	}
+	assertGuestRuleset(t, runDir)
+}
+
+// Ruleset dump markers, duplicated from internal/guest/proxy (rulesetBegin/rulesetEnd). They
+// cannot be imported: that package is //go:build linux and this test also runs on darwin, where
+// the guest half of the tree does not build. TestEgressRulesetShape's package holds the
+// authoritative copy — if these drift, assertGuestRuleset stops finding the dump and fails
+// loudly rather than passing vacuously (see its "no ruleset dump" branch).
+const (
+	guestRulesetBegin = "krayt: BEGIN egress ruleset"
+	guestRulesetEnd   = "krayt: END egress ruleset"
+)
+
+// assertGuestRuleset is the §14 Phase 8 hardware check: `nft list ruleset` on the LIVE guest
+// contains no `skuid` rule. The guest agent dumps its installed ruleset to the serial console
+// between the markers above (internal/guest/proxy.verifyInstalledRuleset), and this reads it
+// back out of the run's persisted console.log.
+//
+// It has to be done from here rather than from the probe container: the container drops all
+// capabilities (§6.10), so `nft list ruleset` inside it fails on CAP_NET_ADMIN — and granting
+// that capability to read the ruleset would weaken the very hardening TestContainerHardening
+// exists to prove. The guest agent already runs as root in the VM's own netns, so it is the one
+// place the live ruleset is legible without loosening anything.
+//
+// The guest-side check fails the run closed, so a bad ruleset normally surfaces as
+// orchestrator.Run erroring above. This assertion is what makes the evidence observable — it
+// proves the check ran against a real kernel ruleset on this hardware, rather than being
+// satisfied by a guest that silently skipped it.
+func assertGuestRuleset(t *testing.T, runDir string) {
+	t.Helper()
+	b, err := os.ReadFile(orchestrator.ConsoleLogPath(runDir))
+	if err != nil {
+		t.Fatalf("read guest console log: %v", err)
+	}
+	console := string(b)
+	i := strings.Index(console, guestRulesetBegin)
+	j := strings.Index(console, guestRulesetEnd)
+	if i < 0 || j < i {
+		t.Fatalf("no ruleset dump between %q and %q in the guest console log — the guest agent "+
+			"did not verify its installed ruleset (stale VM image predating §14 Phase 8's "+
+			"verifyInstalledRuleset, or the markers drifted)", guestRulesetBegin, guestRulesetEnd)
+	}
+	dump := console[i+len(guestRulesetBegin) : j]
+
+	// The Phase 8 assertion proper: the L7 proxy is host-side now, so nothing in the guest may
+	// gate egress on a process identity. A `skuid` accept here would mean the pre-Phase-8 lock
+	// came back and the container-hardening controls are silently load-bearing for egress again.
+	if strings.Contains(dump, "skuid") {
+		t.Errorf("live guest ruleset gates egress on a uid (`skuid`):\n%s", dump)
+	}
+	// Confirm the dump is the real lock and not an empty/unrelated ruleset that would make the
+	// skuid check pass for the wrong reason.
+	for _, want := range []string{"table inet krayt_egress", "policy drop"} {
+		if !strings.Contains(dump, want) {
+			t.Errorf("live guest ruleset missing %q — the default-deny egress lock is not installed:\n%s", want, dump)
+		}
+	}
+	t.Logf("live guest nftables ruleset (no skuid rule):\n%s", strings.TrimSpace(dump))
 }
 
 // TestContainerHardening is the real-VM proof of the least-privilege OCI spec (§6.10, §10,

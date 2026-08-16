@@ -76,6 +76,11 @@ jobs:
               - 'internal/provider/**'
               - 'internal/orchestrator/**'
               - 'internal/guest/**'
+              # A PinnedRef bump changes which VM image every one of these tests boots — the
+              # single highest-signal reason to run them, and the one path that used to slip
+              # through: a digest-only bump touches nothing else here, so the suite was skipped
+              # on exactly the PRs that swap the guest out from under it.
+              - 'internal/vmimage/**'
               - 'cmd/krayt-agent/**'
               - 'hack/*-probe/**'
               - 'hack/netprobe/**'

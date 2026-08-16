@@ -2171,7 +2171,12 @@ behavior-preserving, security-strictly-improving change for the container (§6.6
   host proxy), `nft list ruleset` in the guest contains no `skuid` rule, a container attempt
   to reach the **host** on a private address is refused, and `TestConcurrentRealVMs` shows
   two simultaneous VMs each getting their own egress socket + child process with no
-  cross-VM reachability. **Not yet run — see `HUMAN_TODO.md`.**
+  cross-VM reachability. **Partly run.** Done on darwin/vfkit against image `9c3712d5…`: the
+  allowlisted-reach / non-allowlisted-block / raw-socket-block trio, the private-address
+  refusal (`hack/netprobe` check 4 → 403), and `TestConcurrentRealVMs`. Still open: the
+  Linux/firecracker re-run, and the `skuid`-free ruleset check — written since
+  (`verifyInstalledRuleset` + `TestEgressEnforcement`'s `assertGuestRuleset`) but guest-side,
+  so it needs one more image rebuild + `PinnedRef` bump to run. See `HUMAN_TODO.md`.
 
 ### Phase 9 — TLS MITM & credential injection, step 2 (`add-tls-mitm-credential-injection.md`) ⏳
 Step 2 of the three-step host-side-proxy arc (`docs/ai-tasks/README.md`; depends on Phase 8,
