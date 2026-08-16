@@ -113,6 +113,16 @@ EOF
   echo "[gemini-cli] registered ask_human MCP server (questions enabled)"
 fi
 
+# Gemini CLI gates tool use on whether it considers the working folder "trusted". In a headless
+# run an untrusted folder silently downgrades --approval-mode yolo back to "default" and then
+# aborts outright, so without this the image cannot complete ANY task (observed as exit 55,
+# "not running in a trusted directory"). Trusting it here is correct rather than merely
+# convenient: that prompt exists to protect a developer's own machine from a repo they just
+# cloned, whereas krayt's whole model already assumes the repo is untrusted and puts the
+# isolation boundary at the VM (§10). Set as an env var rather than the equivalent --skip-trust
+# flag so an upstream flag rename can't turn this into an argument-parsing failure.
+export GEMINI_CLI_TRUST_WORKSPACE=true
+
 echo "[gemini-cli] running gemini -p in $(pwd) (model: ${GEMINI_MODEL:-default})"
 # Print/headless mode (-p forces it) with auto-approved edits — safe because the whole run is
 # already isolated in the krayt micro-VM, so the tool-confirmation prompts add nothing.

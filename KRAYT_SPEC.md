@@ -1696,12 +1696,23 @@ exposed.
   §6.10, §6.7) remain real defense-in-depth for everything else in this table, but are no longer
   what the egress allowlist's correctness depends on.
 - Secret redaction coverage — the guest redacts every artifact it can safely rewrite (live
-  logs, `report.md`, `ask_human` prompt/choices, §6.8). Two known, accepted gaps: (1) live-log
+  logs, `report.md`, `ask_human` prompt/choices, §6.8). Three known, accepted gaps: (1) live-log
   redaction is chunk-oriented, so a secret value split across two log chunks is not caught — it
   affects only the streamed logs, since `report.md` and the patch are scanned as whole buffers;
   (2) `changes.patch` is left byte-exact (redacting hunks would break `git apply`), so a secret
   an agent wrote into a tracked file *is* present there — this is surfaced, not hidden, via the
-  `secret-scan.json` marker and a per-key Safety warning for the human's pre-apply review (§8.4).
+  `secret-scan.json` marker and a per-key Safety warning for the human's pre-apply review (§8.4);
+  (3) **redaction matches the secret value verbatim, so an agent that transforms it before
+  emitting it is not caught** — masking the middle, chunking it across lines, or encoding it all
+  defeat an exact-match `Redactor`. This is not hypothetical: Phase 9's `mitm: false` regression
+  run (`run_117d6f75`) hit it with a *cooperative* agent, which masked the middle of the API key
+  on its own initiative before writing the report. No exact match existed, so the `Redactor`
+  never fired at all, and a 19-character key prefix persisted in `report.md` and the agent log.
+  This limit is inherent to output filtering: it defends against accidental verbatim disclosure,
+  not against a container that holds the secret and chooses how to emit it — an agent set on
+  exfiltration can always encode it through an allowlisted channel. The structural fix for a
+  credential is to never give it to the container: `network.mitm` + `network.inject` (§6.6.1),
+  whose companion run (`run_c654e575`) had no credential in the VM to leak in any form.
 - Resource exhaustion — bounded by per-VM CPU/mem/disk + wall-clock timeout.
 - Auth-credential blast radius — a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) is tied to
   a personal/seat plan and is less granularly revocable than a scoped API key; exposing one
@@ -2189,17 +2200,18 @@ behavior-preserving, security-strictly-improving change for the container (§6.6
     isolation ("isolation is checked by construction, not by inspection"). An assertion would
     need per-run allowlists in the netprobe; logged here rather than claimed as tested.
 
-### Phase 9 — TLS MITM & credential injection, step 2 (`add-tls-mitm-credential-injection.md`) ⏳
+### Phase 9 — TLS MITM & credential injection, step 2 (`add-tls-mitm-credential-injection.md`) ✅
 Step 2 of the three-step host-side-proxy arc (`docs/ai-tasks/README.md`; depends on Phase 8,
 step 1). Opt-in TLS termination at the host proxy so an HTTP-shaped agent credential never
 enters the VM at all (§6.6.1, §6.8, §6.14).
 
-> **Phase 8's hardware gate has cleared.** This phase was started ahead of it, following the
-> repo's offline-complete-then-hardware-handoff pattern rather than blocking on a hardware slot.
-> Phase 8 is now verified on both backends against image `4fe2b0b7…`, so the dependency is
-> discharged and this phase's own hardware "Done when" is unblocked — its guest-side pieces
-> (`/run/krayt/ca.crt`, the `KRAYT_CA_CERT` env vars) ride that same image. What it still needs
-> is its own verification: a live Anthropic credential and a real MITM run (`HUMAN_TODO.md`).
+> **Complete, offline and on hardware.** Phase 8's gate cleared first (both backends, image
+> `4fe2b0b7…`), then this phase was verified with live credentials across two providers: an
+> Anthropic run proving a credential can authenticate without ever entering the VM, its
+> `mitm: false` mirror proving nothing changes when you don't opt in, and a Gemini run proving
+> Node trusts the ephemeral CA — each with the negative control that makes its positive mean
+> something. One clause (the `opencode` image's `NODE_EXTRA_CA_CERTS` check) was re-homed to that
+> image's own handoff entry; see the "Done when (hardware)" note below.
 
 - [x] `task.NetworkPolicy` extended with `MITM`/`Passthrough`/`Inject` (+ `InjectRule`/
   `RefreshRule`); `task.ValidateNetworkPolicy` enforces every §8.1 pre-flight rule
@@ -2237,15 +2249,34 @@ enters the VM at all (§6.6.1, §6.8, §6.14).
   `mitm`, injection replace-not-append, passthrough via a real TLS-terminating upstream, the SSRF
   guard on the MITM path, SSE + chunked-NDJSON streaming, secrets partitioning,
   `mitm: false` byte-identical, hostile-input rejection, and every pre-flight validation rule). ✅
-- [ ] **Done when (hardware, `[HUMAN]`):** a real `claude-code` image run with `mitm: true` +
+- [x] **Done when (hardware, `[HUMAN]`):** a real `claude-code` image run with `mitm: true` +
   `inject:` for `ANTHROPIC_API_KEY` completes a task while `env`/`/run/secrets` inside the
   container hold **no** credential (absence asserted, not just success); the same run with
   `mitm: false` is unchanged; `npm install` (or an equivalent TLS-heavy fetch) succeeds through
   the MITM path in each of the three agent images (the `NODE_EXTRA_CA_CERTS` check — the most
-  likely thing to break); the full Phase 3 security suite re-run on both backends. No longer
-  blocked — Phase 8's hardware verification landed against image `4fe2b0b7…`, which carries this
-  phase's guest-side pieces too. **Not yet run** (needs a live Anthropic credential) — see
-  `HUMAN_TODO.md`.
+  likely thing to break); the full Phase 3 security suite re-run on both backends. **Mostly run.**
+  The central claim is verified on darwin/vfkit with a live credential (run `run_c654e575`): the
+  agent authenticated while `/run/secrets` did not exist in the container at all, the env held
+  only the entrypoint's placeholder, a `curl` sending no auth header got 200 with a real body,
+  and the presented leaf was issued by `krayt ephemeral MITM CA (run_c654e575)` — interception
+  and injection both shown directly. The `mitm: false` regression (`run_117d6f75`) mirrors it
+  exactly — credential present in `/run/secrets`, CA vars unset, and the same no-auth call
+  answered 401 `x-api-key header is required`, which pins the injected run's 200 to the injection
+  rather than to any ambient auth. The Phase 3 suite re-ran green on both backends against the
+  same image (`4fe2b0b7…`). The `NODE_EXTRA_CA_CERTS` exercise is done for `krayt-agent-gemini-cli`
+  (`run_e19488dd`): a real `npm install` through the MITM proxy succeeded with `strict-ssl` on,
+  the same install with only `NODE_EXTRA_CA_CERTS` removed failed `SELF_SIGNED_CERT_IN_CHAIN`
+  (the negative control that makes the positive mean something), and the registry's presented
+  issuer was `krayt ephemeral MITM CA (run_e19488dd)`. `krayt-agent-claude-code` ships no
+  `node`/`npm` at all, so it satisfies the "equivalent TLS-heavy fetch" reading of this clause
+  (curl through the MITM path, done).
+  - **Scope decision, not an oversight:** the third image, `krayt-agent-opencode`, has not had
+    this check — it is not published yet. Rather than hold this phase open on an image build that
+    involves none of this phase's code, the requirement was **moved into that image's own
+    `[tooling]` entry in `HUMAN_TODO.md`** (with the full method: cache-cleared install, the
+    `SELF_SIGNED_CERT_IN_CHAIN` negative control, and the issuer check). It is recorded there as
+    required rather than optional, because Node reads no system trust store — broken CA plumbing
+    in that entrypoint would fail every TLS call it makes under `network.mitm`.
 
 ---
 
