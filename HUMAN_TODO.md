@@ -114,6 +114,10 @@ left is step 3's Linux half and step 5's ruleset check, both detailed below.
        closed** if a `skuid` rule is present anywhere / the `krayt_egress` table is missing / its
        chain does not `policy drop` / the loopback accept is gone, and dumps the live ruleset to
        the serial console between `krayt: BEGIN egress ruleset` / `krayt: END egress ruleset`.
+       That dump is written to `/dev/console` explicitly, not logged: `krayt-agent` is a systemd
+       unit with no `StandardOutput` override (`images/flake.nix`), so its stdout/stderr go to
+       the journal and die with the VM — nothing logged there reaches the host's `console.log`.
+       A first attempt used `log.Printf` and failed on hardware for exactly that reason.
        `assertGuestRuleset` in `TestEgressEnforcement` then reads that dump out of the run's
        `console.log` and asserts on it, so the evidence is observable on hardware rather than
        only inside the guest. `checkRuleset`'s logic is covered offline against fixture dumps in

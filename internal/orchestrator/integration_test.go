@@ -47,10 +47,12 @@ import (
 	"github.com/418-cloud/krayt/internal/task"
 )
 
-// logConsoleOnFailure prints the guest's serial console log — the guest-agent's own
-// stdout/stderr and anything it execs (proxyd included) — which is not part of
-// logs/agent.log (that file is the container's stdout/stderr only, streamed over the control
-// protocol). orchestrator.Run copies it out of the VM's directory before Destroy removes it,
+// logConsoleOnFailure prints the guest's serial console log: kernel and systemd output, plus
+// whatever the guest writes to /dev/console explicitly (the egress-ruleset evidence, §14 Phase
+// 8). It does NOT contain the guest-agent's own stdout/stderr — krayt-agent is a systemd unit
+// with no StandardOutput override (images/flake.nix), so its log goes to the journal and dies
+// with the VM. Nor is it logs/agent.log, which is the container's stdout/stderr only, streamed
+// over the control protocol. orchestrator.Run copies it out of the VM's directory before Destroy removes it,
 // but t.TempDir() still deletes the whole run dir when this test function returns, so a
 // failure that needs it must log it now, in the same -test.v output the failure itself
 // appears in, or it is gone before any human or CI log viewer could ever read it.
@@ -264,9 +266,17 @@ func assertGuestRuleset(t *testing.T, runDir string) {
 	i := strings.Index(console, guestRulesetBegin)
 	j := strings.Index(console, guestRulesetEnd)
 	if i < 0 || j < i {
+		// Dump the console before failing. "The marker is missing" has several very different
+		// causes — a stale image, a guest that could not open /dev/console, a boot that never
+		// reached ApplyFirewall — and they are indistinguishable without seeing what the console
+		// DOES contain. Without this the failure costs a second hardware run to diagnose.
+		logConsoleOnFailure(t, runDir)
 		t.Fatalf("no ruleset dump between %q and %q in the guest console log — the guest agent "+
-			"did not verify its installed ruleset (stale VM image predating §14 Phase 8's "+
-			"verifyInstalledRuleset, or the markers drifted)", guestRulesetBegin, guestRulesetEnd)
+			"did not verify its installed ruleset. Either the VM image predates §14 Phase 8's "+
+			"verifyInstalledRuleset, or it ran but could not publish the evidence to "+
+			"/dev/console. Check the console log above: if it has systemd unit messages but no "+
+			"krayt ruleset lines, the image is stale; note the agent's own log goes to the "+
+			"journal, not here, so its absence is expected", guestRulesetBegin, guestRulesetEnd)
 	}
 	dump := console[i+len(guestRulesetBegin) : j]
 

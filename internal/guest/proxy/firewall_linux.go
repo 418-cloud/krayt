@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -78,15 +79,44 @@ const (
 var loopbackAcceptRE = regexp.MustCompile(`oif (?:"lo"|1) accept`)
 
 // verifyInstalledRuleset dumps the guest's live nftables ruleset to the serial console and then
-// asserts the §6.6 lock is really in it. The dump is printed BEFORE the check so a failure
+// asserts the §6.6 lock is really in it. The dump is emitted BEFORE the check so a failure
 // arrives with the evidence that explains it instead of just an error string.
 func verifyInstalledRuleset(ctx context.Context) error {
 	dump, err := nftOutput(ctx, "list", "ruleset")
 	if err != nil {
 		return fmt.Errorf("read back egress ruleset: %w", err)
 	}
-	log.Printf("%s\n%s\n%s", rulesetBegin, strings.TrimRight(dump, "\n"), rulesetEnd)
+	evidence := fmt.Sprintf("%s\n%s\n%s", rulesetBegin, strings.TrimRight(dump, "\n"), rulesetEnd)
+	writeConsole(evidence)
+	log.Print(evidence) // journal copy, for a `journalctl` debug session inside the guest
 	return checkRuleset(dump)
+}
+
+// consoleDevice is the kernel console (hvc0 under vfkit, ttyS0 under firecracker — see
+// images/flake.nix's kernelParams), which is what the provider captures into the run's
+// console.log.
+const consoleDevice = "/dev/console"
+
+// writeConsole publishes msg to the serial console, which is the ONLY guest→host channel the
+// ruleset evidence can travel on. The agent's ordinary log output cannot carry it: krayt-agent
+// runs as a systemd unit with no StandardOutput override (images/flake.nix), so its stdout and
+// stderr go to the journal, which dies with the VM — nothing written there ever reaches the
+// host's console.log. Hence this explicit open-and-write rather than a log call.
+//
+// Best-effort by design: failing to publish the evidence must not fail a run whose ruleset is
+// fine. The verification itself is what fails closed (checkRuleset, above); this only makes the
+// result observable from the host. If the write is lost, TestEgressEnforcement's
+// assertGuestRuleset reports the missing dump rather than passing on an unverified guest.
+func writeConsole(msg string) {
+	f, err := os.OpenFile(consoleDevice, os.O_WRONLY, 0)
+	if err != nil {
+		log.Printf("egress ruleset evidence: open %s: %v (verification still ran; the host-side check will report it missing)", consoleDevice, err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := fmt.Fprintln(f, msg); err != nil {
+		log.Printf("egress ruleset evidence: write %s: %v", consoleDevice, err)
+	}
 }
 
 // checkRuleset asserts the invariants of the installed ruleset. Split out from the `nft` call so
