@@ -152,10 +152,12 @@ func TestEndToEndRealVM(t *testing.T) {
 // Mac/CI (§14). KRAYT_NETPROBE_IMAGE must be a linux/arm64 image whose entrypoint probes
 // egress and exits 0 only when: HTTPS to KRAYT_ALLOW_HOST via HTTPS_PROXY succeeds, HTTPS to
 // a non-allowlisted host fails, a raw TCP connect (ignoring HTTP(S)_PROXY) to a
-// non-allowlisted host:443 fails, AND (added for Phase 8) a CONNECT through the proxy to a
-// private-range target is refused with 403 — proving the §6.6 §2 hard SSRF block holds on a
-// real, spawned host process, not just in TestCheckDialAddr. See HUMAN_TODO.md for the
-// probe-image contract.
+// non-allowlisted host:443 fails, AND a CONNECT through the proxy to a private-range target is
+// refused with 403 — the on-hardware regression check for the §6.6 §2 SSRF block, which
+// TestCheckDialAddr only covers offline. Note it does NOT establish that the block is the
+// host-side proxy's: the guard predates Phase 8 (#40), so a guest still running the old in-guest
+// proxy answers this check identically — assertGuestRuleset is what pins down which architecture
+// actually served the run. See HUMAN_TODO.md for the probe-image contract.
 //
 // Together with TestContainerHardening's setuid(proxyd)=EPERM assertion, this is the on-hardware
 // egress-allowlist-bypass regression for finding #1 (fix-egress-allowlist-bypass.md). Before
@@ -168,8 +170,8 @@ func TestEndToEndRealVM(t *testing.T) {
 // which reads the LIVE ruleset off the guest console — the on-hardware counterpart to the
 // offline TestEgressRulesetShape (internal/guest/proxy), which can only see the constant.
 //
-// Re-verified against the Phase 8 design on darwin/vfkit; the Linux/firecracker re-run and the
-// first run of the assertGuestRuleset check are still open — see HUMAN_TODO.md.
+// Verified against the Phase 8 design on both backends (darwin/vfkit and linux/firecracker)
+// against image 4fe2b0b7…, assertGuestRuleset included — see HUMAN_TODO.md.
 func TestEgressEnforcement(t *testing.T) {
 	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
 	image := os.Getenv("KRAYT_NETPROBE_IMAGE")

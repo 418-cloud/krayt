@@ -2122,7 +2122,7 @@ Both items need a `.proto`/image change, so they share one guest image rebuild a
 - [x] **Done when:** the Phase 2 end-to-end test passes unmodified on a Linux host via the firecracker provider. ✅ **Verified on real hardware** (GCP VM, nested virt, Intel VT-x): `TestEndToEndRealVM` — the Phase 2 test, body and assertions byte-identical, with only the provider construction swapped — boots the x86_64 image under Firecracker v1.16.1, streams in the image + repo bundle, runs the agent container, and returns a `changes.patch` that `patch.Apply` lands cleanly on a fresh clone (exit 0). Also green: `TestBootHello` (`Hello` round-trips over the vsock handshake), `TestGuestNetwork`, and `TestConcurrentRealVMs` (3 simultaneous VMs, unique taps/CIDs, patches provably not crossed, every tap reaped on teardown).
 - [x] **The Phase 3 security suite also re-verified on Linux** (not required by the "Done when", but the claim worth having before anyone runs untrusted code on this backend): `TestEgressEnforcement`, `TestContainerHardening`, `TestRootImageFailsClosed`, `TestGuestGitConfigInjectionInert`, `TestSecretConfinementInArtifacts` — all green against firecracker. The two that matter: a non-allowlisted host is refused by the proxy **and** a raw socket that ignores the proxy is dropped by nftables (`1.1.1.1:443` → timeout), while `setuid(proxyd)` fails `EPERM` — so the finding-#1 egress bypass is closed on this backend too. This required writing `hack/netprobe`, which the spec assumed existed but which had never been committed.
 
-### Phase 8 — Host-side egress proxy, step 1 (`move-egress-proxy-to-host.md`) ⏳
+### Phase 8 — Host-side egress proxy, step 1 (`move-egress-proxy-to-host.md`) ✅
 Step 1 of the three-step host-side-proxy arc (`docs/ai-tasks/README.md`). Moves the L7
 allowlist proxy off the guest entirely, behind a new guest-initiated vsock channel — a
 behavior-preserving, security-strictly-improving change for the container (§6.6).
@@ -2164,31 +2164,42 @@ behavior-preserving, security-strictly-improving change for the container (§6.6
   the forwarder's splice/concurrency/teardown behavior
   (`cmd/krayt-vsock-forward/forward_test.go`), and `proxy.log` redaction
   (`TestEgressProxyWriteLogRedactsSecrets`). ✅
-- [ ] **Done when (hardware, `[HUMAN]`):** the guest image rebuilds with `krayt-vsock-forward`
+- [x] **Done when (hardware, `[HUMAN]`):** the guest image rebuilds with `krayt-vsock-forward`
   in place of `krayt-proxy` (§11 image lockstep — `PinnedRef` cannot be bumped until CI
   publishes the new digest), then the re-verification suite in `HUMAN_TODO.md` passes on
   both backends: allowlisted reach / non-allowlisted block / raw-socket block (now via the
   host proxy), `nft list ruleset` in the guest contains no `skuid` rule, a container attempt
   to reach the **host** on a private address is refused, and `TestConcurrentRealVMs` shows
   two simultaneous VMs each getting their own egress socket + child process with no
-  cross-VM reachability. **Partly run.** Done on darwin/vfkit against image `9c3712d5…`: the
-  allowlisted-reach / non-allowlisted-block / raw-socket-block trio, the private-address
-  refusal (`hack/netprobe` check 4 → 403), and `TestConcurrentRealVMs`. Still open: the
-  Linux/firecracker re-run, and the `skuid`-free ruleset check — written since
-  (`verifyInstalledRuleset` + `TestEgressEnforcement`'s `assertGuestRuleset`) but guest-side,
-  so it needs one more image rebuild + `PinnedRef` bump to run. See `HUMAN_TODO.md`.
+  cross-VM reachability. ✅ **Verified on both backends** against image
+  `sha256:4fe2b0b78581d5194ded643fbe5b73c5d69372e70955a37ab716d680974f5014` — darwin/vfkit on
+  an Apple-Silicon Mac and linux/firecracker under KVM, `hack/run-integration-tests.sh` green
+  end to end on each. The ruleset clause is proven by the live `nft list ruleset` dump the
+  guest publishes to `/dev/console` and `assertGuestRuleset` reads back: `table inet
+  krayt_egress` with `policy drop` + `oif "lo" accept`, and no `skuid` in the whole ruleset
+  (NixOS's own input-only `nixos-fw` table included). The private-address refusal is
+  `hack/netprobe` check 4 → 403.
+  - **One clause holds by construction, not by assertion:** `TestConcurrentRealVMs` sets no
+    `NetworkPolicy`, so it never exercises egress. What its 3 concurrent runs do prove is that
+    each simultaneous VM gets its own egress socket + child process — `spawnEgressProxy` runs
+    unconditionally per run, and a shared or colliding socket would have failed them. Cross-VM
+    *unreachability* is structural rather than tested: each VM dials `provider.EgressPort` on
+    its own CID and the provider binds a distinct host socket per VM, so a guest has no way to
+    name another run's proxy. This is the same reasoning the test already applies to patch
+    isolation ("isolation is checked by construction, not by inspection"). An assertion would
+    need per-run allowlists in the netprobe; logged here rather than claimed as tested.
 
 ### Phase 9 — TLS MITM & credential injection, step 2 (`add-tls-mitm-credential-injection.md`) ⏳
 Step 2 of the three-step host-side-proxy arc (`docs/ai-tasks/README.md`; depends on Phase 8,
 step 1). Opt-in TLS termination at the host proxy so an HTTP-shaped agent credential never
 enters the VM at all (§6.6.1, §6.8, §6.14).
 
-> **Started ahead of Phase 8's hardware re-verification.** Phase 8 is offline-complete but its
-> hardware "Done when" is still open (`HUMAN_TODO.md`) — this repo's own practice (every prior
-> phase's offline-complete-then-hardware-handoff pattern) is to keep building on offline-verified
-> work rather than block on a hardware slot with no ETA. Both phases' hardware verification is
-> tracked together in `HUMAN_TODO.md`; this phase's own hardware "Done when" is additionally
-> gated on Phase 8's landing for real.
+> **Phase 8's hardware gate has cleared.** This phase was started ahead of it, following the
+> repo's offline-complete-then-hardware-handoff pattern rather than blocking on a hardware slot.
+> Phase 8 is now verified on both backends against image `4fe2b0b7…`, so the dependency is
+> discharged and this phase's own hardware "Done when" is unblocked — its guest-side pieces
+> (`/run/krayt/ca.crt`, the `KRAYT_CA_CERT` env vars) ride that same image. What it still needs
+> is its own verification: a live Anthropic credential and a real MITM run (`HUMAN_TODO.md`).
 
 - [x] `task.NetworkPolicy` extended with `MITM`/`Passthrough`/`Inject` (+ `InjectRule`/
   `RefreshRule`); `task.ValidateNetworkPolicy` enforces every §8.1 pre-flight rule
@@ -2231,8 +2242,10 @@ enters the VM at all (§6.6.1, §6.8, §6.14).
   container hold **no** credential (absence asserted, not just success); the same run with
   `mitm: false` is unchanged; `npm install` (or an equivalent TLS-heavy fetch) succeeds through
   the MITM path in each of the three agent images (the `NODE_EXTRA_CA_CERTS` check — the most
-  likely thing to break); the full Phase 3 security suite re-run on both backends. Blocked on
-  Phase 8's own hardware verification landing first — see `HUMAN_TODO.md`. **Not yet run.**
+  likely thing to break); the full Phase 3 security suite re-run on both backends. No longer
+  blocked — Phase 8's hardware verification landed against image `4fe2b0b7…`, which carries this
+  phase's guest-side pieces too. **Not yet run** (needs a live Anthropic credential) — see
+  `HUMAN_TODO.md`.
 
 ---
 
