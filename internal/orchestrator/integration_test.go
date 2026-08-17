@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -243,6 +244,55 @@ const (
 	guestRulesetEnd   = "krayt: END egress ruleset"
 )
 
+// loopbackAcceptRE, tableBlock and chainBlock are duplicated from internal/guest/proxy for the
+// same cross-platform reason as the markers above: that package is linux-only and this test also
+// runs on darwin. Keep in sync with firewall_linux.go.
+var loopbackAcceptRE = regexp.MustCompile(`oif (?:"lo"|1) accept`)
+
+// tableBlock returns the brace-delimited body of `table <name> { … }` from an `nft list ruleset`
+// dump.
+func tableBlock(dump, name string) (string, bool) {
+	head := "table " + name + " {"
+	i := strings.Index(dump, head)
+	if i < 0 {
+		return "", false
+	}
+	depth := 0
+	for j := i + len(head) - 1; j < len(dump); j++ {
+		switch dump[j] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				return dump[i : j+1], true
+			}
+		}
+	}
+	return "", false // unterminated table block: treat as absent rather than guessing
+}
+
+// chainBlock returns the brace-delimited body of `chain <name> { … }` within a table block (as
+// returned by tableBlock).
+func chainBlock(table, name string) (string, bool) {
+	head := "chain " + name + " {"
+	i := strings.Index(table, head)
+	if i < 0 {
+		return "", false
+	}
+	depth := 0
+	for j := i + len(head) - 1; j < len(table); j++ {
+		switch table[j] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				return table[i : j+1], true
+			}
+		}
+	}
+	return "", false // unterminated chain block: treat as absent rather than guessing
+}
+
 // assertGuestRuleset is the §14 Phase 8 hardware check: `nft list ruleset` on the LIVE guest
 // contains no `skuid` rule. The guest agent dumps its installed ruleset to the serial console
 // between the markers above (internal/guest/proxy.verifyInstalledRuleset), and this reads it
@@ -289,10 +339,22 @@ func assertGuestRuleset(t *testing.T, runDir string) {
 		t.Errorf("live guest ruleset gates egress on a uid (`skuid`):\n%s", dump)
 	}
 	// Confirm the dump is the real lock and not an empty/unrelated ruleset that would make the
-	// skuid check pass for the wrong reason.
-	for _, want := range []string{"table inet krayt_egress", "policy drop"} {
-		if !strings.Contains(dump, want) {
-			t.Errorf("live guest ruleset missing %q — the default-deny egress lock is not installed:\n%s", want, dump)
+	// skuid check pass for the wrong reason. Scoped to krayt_egress's own `output` chain, not
+	// the dump as a whole: a table-wide (or even table-scoped but chain-unscoped) substring
+	// check would pass on a ruleset whose `output` chain is wide open as long as SOME other
+	// chain in the dump default-denies and accepts loopback — see firewall_linux.go's
+	// checkRuleset, which this hardware assertion mirrors.
+	table, ok := tableBlock(dump, "inet krayt_egress")
+	if !ok {
+		t.Errorf("live guest ruleset has no `table inet krayt_egress` — the default-deny egress lock is not installed:\n%s", dump)
+	} else if chain, ok := chainBlock(table, "output"); !ok || !strings.Contains(chain, "hook output") {
+		t.Errorf("live guest krayt_egress table has no `output` chain bound to the output hook:\n%s", table)
+	} else {
+		if !strings.Contains(chain, "policy drop") {
+			t.Errorf("live guest krayt_egress output chain does not default-deny (no `policy drop`):\n%s", chain)
+		}
+		if !loopbackAcceptRE.MatchString(chain) {
+			t.Errorf("live guest krayt_egress output chain has no loopback accept:\n%s", chain)
 		}
 	}
 	t.Logf("live guest nftables ruleset (no skuid rule):\n%s", strings.TrimSpace(dump))

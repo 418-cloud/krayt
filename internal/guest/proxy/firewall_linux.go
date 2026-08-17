@@ -133,15 +133,22 @@ func checkRuleset(dump string) error {
 	if strings.Contains(dump, "skuid") {
 		return fmt.Errorf("installed ruleset gates egress on a uid (`skuid`) — the L7 proxy is host-side since §14 Phase 8, so no uid may be load-bearing:\n%s", dump)
 	}
-	block, ok := tableBlock(dump, "inet krayt_egress")
+	table, ok := tableBlock(dump, "inet krayt_egress")
 	if !ok {
 		return fmt.Errorf("installed ruleset has no `table inet krayt_egress` — the default-deny egress lock is not in place:\n%s", dump)
 	}
-	if !strings.Contains(block, "policy drop") {
-		return fmt.Errorf("krayt_egress output chain does not default-deny (no `policy drop`):\n%s", block)
+	// Scoped to the `output` chain specifically, not the table as a whole: a table with an
+	// `output` chain that accepts plus some unrelated chain that default-denies and permits
+	// loopback would satisfy a table-wide substring check while leaving egress wide open.
+	chain, ok := chainBlock(table, "output")
+	if !ok || !strings.Contains(chain, "hook output") {
+		return fmt.Errorf("krayt_egress has no `output` chain bound to the output hook — the default-deny egress lock is not wired up:\n%s", table)
 	}
-	if !loopbackAcceptRE.MatchString(block) {
-		return fmt.Errorf("krayt_egress has no loopback accept — the vsock forwarder would be unreachable:\n%s", block)
+	if !strings.Contains(chain, "policy drop") {
+		return fmt.Errorf("krayt_egress output chain does not default-deny (no `policy drop`):\n%s", chain)
+	}
+	if !loopbackAcceptRE.MatchString(chain) {
+		return fmt.Errorf("krayt_egress output chain has no loopback accept — the vsock forwarder would be unreachable:\n%s", chain)
 	}
 	return nil
 }
@@ -167,6 +174,29 @@ func tableBlock(dump, name string) (string, bool) {
 		}
 	}
 	return "", false // unterminated table block: treat as absent rather than guessing
+}
+
+// chainBlock returns the brace-delimited body of `chain <name> { … }` within a table block (as
+// returned by tableBlock). Scoping to the specific chain keeps an unrelated chain's `policy
+// drop`/loopback accept from standing in for the `output` chain's — see checkRuleset.
+func chainBlock(table, name string) (string, bool) {
+	head := "chain " + name + " {"
+	i := strings.Index(table, head)
+	if i < 0 {
+		return "", false
+	}
+	depth := 0
+	for j := i + len(head) - 1; j < len(table); j++ {
+		switch table[j] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				return table[i : j+1], true
+			}
+		}
+	}
+	return "", false // unterminated chain block: treat as absent rather than guessing
 }
 
 // nft pipes a ruleset/command to `nft -f -`.

@@ -126,6 +126,22 @@ func TestCheckRulesetRejects(t *testing.T) {
 			"table inet other {\n\tchain output {\n\t\ttype filter hook output priority filter; policy drop;\n\t}\n}\n",
 		want: "does not default-deny",
 	}, {
+		// The exact bypass a table-wide substring check would miss: krayt_egress's own
+		// `output` chain is wide open, but a second chain in the SAME table default-denies
+		// and accepts loopback. The check must be scoped to the output chain's own block.
+		name: "output chain open, sibling chain in same table default-denies",
+		dump: `table inet krayt_egress {
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+	chain input {
+		type filter hook input priority filter; policy drop;
+		oif "lo" accept
+	}
+}
+`,
+		want: "does not default-deny",
+	}, {
 		name: "loopback accept missing",
 		dump: strings.Replace(installedDump, "\t\toif \"lo\" accept\n", "", 1),
 		want: "no loopback accept",
