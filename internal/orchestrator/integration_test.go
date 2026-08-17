@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -47,10 +48,12 @@ import (
 	"github.com/418-cloud/krayt/internal/task"
 )
 
-// logConsoleOnFailure prints the guest's serial console log — the guest-agent's own
-// stdout/stderr and anything it execs (proxyd included) — which is not part of
-// logs/agent.log (that file is the container's stdout/stderr only, streamed over the control
-// protocol). orchestrator.Run copies it out of the VM's directory before Destroy removes it,
+// logConsoleOnFailure prints the guest's serial console log: kernel and systemd output, plus
+// whatever the guest writes to /dev/console explicitly (the egress-ruleset evidence, §14 Phase
+// 8). It does NOT contain the guest-agent's own stdout/stderr — krayt-agent is a systemd unit
+// with no StandardOutput override (images/flake.nix), so its log goes to the journal and dies
+// with the VM. Nor is it logs/agent.log, which is the container's stdout/stderr only, streamed
+// over the control protocol. orchestrator.Run copies it out of the VM's directory before Destroy removes it,
 // but t.TempDir() still deletes the whole run dir when this test function returns, so a
 // failure that needs it must log it now, in the same -test.v output the failure itself
 // appears in, or it is gone before any human or CI log viewer could ever read it.
@@ -150,10 +153,12 @@ func TestEndToEndRealVM(t *testing.T) {
 // Mac/CI (§14). KRAYT_NETPROBE_IMAGE must be a linux/arm64 image whose entrypoint probes
 // egress and exits 0 only when: HTTPS to KRAYT_ALLOW_HOST via HTTPS_PROXY succeeds, HTTPS to
 // a non-allowlisted host fails, a raw TCP connect (ignoring HTTP(S)_PROXY) to a
-// non-allowlisted host:443 fails, AND (added for Phase 8) a CONNECT through the proxy to a
-// private-range target is refused with 403 — proving the §6.6 §2 hard SSRF block holds on a
-// real, spawned host process, not just in TestCheckDialAddr. See HUMAN_TODO.md for the
-// probe-image contract.
+// non-allowlisted host:443 fails, AND a CONNECT through the proxy to a private-range target is
+// refused with 403 — the on-hardware regression check for the §6.6 §2 SSRF block, which
+// TestCheckDialAddr only covers offline. Note it does NOT establish that the block is the
+// host-side proxy's: the guard predates Phase 8 (#40), so a guest still running the old in-guest
+// proxy answers this check identically — assertGuestRuleset is what pins down which architecture
+// actually served the run. See HUMAN_TODO.md for the probe-image contract.
 //
 // Together with TestContainerHardening's setuid(proxyd)=EPERM assertion, this is the on-hardware
 // egress-allowlist-bypass regression for finding #1 (fix-egress-allowlist-bypass.md). Before
@@ -162,9 +167,12 @@ func TestEndToEndRealVM(t *testing.T) {
 // correctness depended on both together. Since Phase 8 the guest lock is loopback-only and
 // keys on no uid at all, so there is nothing left for a capability regression to unlock; the
 // EPERM assertion is kept as a still-useful non-root regression check, not because the egress
-// lock depends on it anymore. The cheap offline counterpart is TestEgressRulesetShape in
-// internal/guest/proxy, which also now asserts `skuid` is absent from the ruleset. **Not yet
-// re-run against the Phase 8 design on real hardware — see HUMAN_TODO.md.**
+// lock depends on it anymore. What proves the lock's own shape now is assertGuestRuleset below,
+// which reads the LIVE ruleset off the guest console — the on-hardware counterpart to the
+// offline TestEgressRulesetShape (internal/guest/proxy), which can only see the constant.
+//
+// Verified against the Phase 8 design on both backends (darwin/vfkit and linux/firecracker)
+// against image 4fe2b0b7…, assertGuestRuleset included — see HUMAN_TODO.md.
 func TestEgressEnforcement(t *testing.T) {
 	kernel, initrd, rootfs := os.Getenv("KRAYT_KERNEL"), os.Getenv("KRAYT_INITRD"), os.Getenv("KRAYT_ROOTFS")
 	image := os.Getenv("KRAYT_NETPROBE_IMAGE")
@@ -223,6 +231,133 @@ func TestEgressEnforcement(t *testing.T) {
 			"raw-socket block, or allowlisted-but-private-target block did not behave as expected "+
 			"— see the guest console log above", res.ExitCode)
 	}
+	assertGuestRuleset(t, runDir)
+}
+
+// Ruleset dump markers, duplicated from internal/guest/proxy (rulesetBegin/rulesetEnd). They
+// cannot be imported: that package is //go:build linux and this test also runs on darwin, where
+// the guest half of the tree does not build. TestEgressRulesetShape's package holds the
+// authoritative copy — if these drift, assertGuestRuleset stops finding the dump and fails
+// loudly rather than passing vacuously (see its "no ruleset dump" branch).
+const (
+	guestRulesetBegin = "krayt: BEGIN egress ruleset"
+	guestRulesetEnd   = "krayt: END egress ruleset"
+)
+
+// loopbackAcceptRE, tableBlock and chainBlock are duplicated from internal/guest/proxy for the
+// same cross-platform reason as the markers above: that package is linux-only and this test also
+// runs on darwin. Keep in sync with firewall_linux.go.
+var loopbackAcceptRE = regexp.MustCompile(`oif (?:"lo"|1) accept`)
+
+// tableBlock returns the brace-delimited body of `table <name> { … }` from an `nft list ruleset`
+// dump.
+func tableBlock(dump, name string) (string, bool) {
+	head := "table " + name + " {"
+	i := strings.Index(dump, head)
+	if i < 0 {
+		return "", false
+	}
+	depth := 0
+	for j := i + len(head) - 1; j < len(dump); j++ {
+		switch dump[j] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				return dump[i : j+1], true
+			}
+		}
+	}
+	return "", false // unterminated table block: treat as absent rather than guessing
+}
+
+// chainBlock returns the brace-delimited body of `chain <name> { … }` within a table block (as
+// returned by tableBlock).
+func chainBlock(table, name string) (string, bool) {
+	head := "chain " + name + " {"
+	i := strings.Index(table, head)
+	if i < 0 {
+		return "", false
+	}
+	depth := 0
+	for j := i + len(head) - 1; j < len(table); j++ {
+		switch table[j] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				return table[i : j+1], true
+			}
+		}
+	}
+	return "", false // unterminated chain block: treat as absent rather than guessing
+}
+
+// assertGuestRuleset is the §14 Phase 8 hardware check: `nft list ruleset` on the LIVE guest
+// contains no `skuid` rule. The guest agent dumps its installed ruleset to the serial console
+// between the markers above (internal/guest/proxy.verifyInstalledRuleset), and this reads it
+// back out of the run's persisted console.log.
+//
+// It has to be done from here rather than from the probe container: the container drops all
+// capabilities (§6.10), so `nft list ruleset` inside it fails on CAP_NET_ADMIN — and granting
+// that capability to read the ruleset would weaken the very hardening TestContainerHardening
+// exists to prove. The guest agent already runs as root in the VM's own netns, so it is the one
+// place the live ruleset is legible without loosening anything.
+//
+// The guest-side check fails the run closed, so a bad ruleset normally surfaces as
+// orchestrator.Run erroring above. This assertion is what makes the evidence observable — it
+// proves the check ran against a real kernel ruleset on this hardware, rather than being
+// satisfied by a guest that silently skipped it.
+func assertGuestRuleset(t *testing.T, runDir string) {
+	t.Helper()
+	b, err := os.ReadFile(orchestrator.ConsoleLogPath(runDir))
+	if err != nil {
+		t.Fatalf("read guest console log: %v", err)
+	}
+	console := string(b)
+	i := strings.Index(console, guestRulesetBegin)
+	j := strings.Index(console, guestRulesetEnd)
+	if i < 0 || j < i {
+		// Dump the console before failing. "The marker is missing" has several very different
+		// causes — a stale image, a guest that could not open /dev/console, a boot that never
+		// reached ApplyFirewall — and they are indistinguishable without seeing what the console
+		// DOES contain. Without this the failure costs a second hardware run to diagnose.
+		logConsoleOnFailure(t, runDir)
+		t.Fatalf("no ruleset dump between %q and %q in the guest console log — the guest agent "+
+			"did not verify its installed ruleset. Either the VM image predates §14 Phase 8's "+
+			"verifyInstalledRuleset, or it ran but could not publish the evidence to "+
+			"/dev/console. Check the console log above: if it has systemd unit messages but no "+
+			"krayt ruleset lines, the image is stale; note the agent's own log goes to the "+
+			"journal, not here, so its absence is expected", guestRulesetBegin, guestRulesetEnd)
+	}
+	dump := console[i+len(guestRulesetBegin) : j]
+
+	// The Phase 8 assertion proper: the L7 proxy is host-side now, so nothing in the guest may
+	// gate egress on a process identity. A `skuid` accept here would mean the pre-Phase-8 lock
+	// came back and the container-hardening controls are silently load-bearing for egress again.
+	if strings.Contains(dump, "skuid") {
+		t.Errorf("live guest ruleset gates egress on a uid (`skuid`):\n%s", dump)
+	}
+	// Confirm the dump is the real lock and not an empty/unrelated ruleset that would make the
+	// skuid check pass for the wrong reason. Scoped to krayt_egress's own `output` chain, not
+	// the dump as a whole: a table-wide (or even table-scoped but chain-unscoped) substring
+	// check would pass on a ruleset whose `output` chain is wide open as long as SOME other
+	// chain in the dump default-denies and accepts loopback — see firewall_linux.go's
+	// checkRuleset, which this hardware assertion mirrors.
+	table, ok := tableBlock(dump, "inet krayt_egress")
+	if !ok {
+		t.Errorf("live guest ruleset has no `table inet krayt_egress` — the default-deny egress lock is not installed:\n%s", dump)
+	} else if chain, ok := chainBlock(table, "output"); !ok || !strings.Contains(chain, "hook output") {
+		t.Errorf("live guest krayt_egress table has no `output` chain bound to the output hook:\n%s", table)
+	} else {
+		if !strings.Contains(chain, "policy drop") {
+			t.Errorf("live guest krayt_egress output chain does not default-deny (no `policy drop`):\n%s", chain)
+		}
+		if !loopbackAcceptRE.MatchString(chain) {
+			t.Errorf("live guest krayt_egress output chain has no loopback accept:\n%s", chain)
+		}
+	}
+	t.Logf("live guest nftables ruleset (no skuid rule):\n%s", strings.TrimSpace(dump))
 }
 
 // TestContainerHardening is the real-VM proof of the least-privilege OCI spec (§6.10, §10,

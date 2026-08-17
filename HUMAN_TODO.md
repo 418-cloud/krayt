@@ -7,25 +7,20 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
-**Open:** `move-egress-proxy-to-host.md` (Phase 8, §14) needs a guest image rebuild (it changes
-`cmd/krayt-vsock-forward` + `internal/guest/proxy`), a `PinnedRef` bump to the new digest once CI
-publishes it, and the Phase-3 egress hardware suite re-run against the new host-side design —
-see the `[hardware]` entry below. **Blocking**: nothing else in the repo currently depends on it,
-but no run with a real host-side egress proxy can boot until the image is rebuilt and re-pinned,
-so the feature is offline-complete only until this lands.
+**Open (two loose ends, both small):** `add-tls-mitm-credential-injection.md` (Phase 9, §14) is
+**complete and its §14 checkbox is ticked** — verified with live credentials across two providers
+(`run_c654e575` Anthropic injection, `run_117d6f75` the `mitm: false` mirror, `run_e19488dd`
+Gemini/Node), each with the negative control that makes its positive mean something. See the
+`[hardware]` entry below for the evidence. What that phase left behind:
 
-**Open:** `add-tls-mitm-credential-injection.md` (Phase 9, §14) is offline-complete — CA/leaf
-generation, the MITM CONNECT path, header injection, secrets partitioning, the stdin/fd-4 child
-contract, and hostile-input handling are all real code, exercised by `go test -race ./...`. It
-needs the same class of hardware verification as Phase 8 (real Mac/vfkit + real Linux/KVM,
-**plus a live Anthropic credential** this one), and additionally depends on Phase 8's own
-hardware verification landing first — this task's guest-side pieces (`/run/krayt/ca.crt`, the
-`KRAYT_CA_CERT` env vars, the three reference entrypoints) ride the SAME image rebuild Phase 8 is
-already waiting on, so there is no separate image to build; the two can be verified together in
-one hardware session once a Mac/Linux-KVM box is available. See the `[hardware]` entry below.
-**Blocking**: no — nothing else in the repo depends on `network.mitm` landing; it is a purely
-opt-in feature and every other run is byte-identical whether or not this verification has
-happened.
+1. **The `gemini-cli` entrypoint fix has never actually run** — the folder-trust bug (`[BUG]`
+   entry) was worked around config-side with `env: {GEMINI_CLI_TRUST_WORKSPACE: "true"}` to
+   unblock the verification, so the fix committed to `entrypoint.sh` is still unexercised. It
+   needs an `agent-images.yml` republish, then one run against `:latest` **without** the
+   config-side override to confirm the image stands on its own.
+2. **The `opencode` `NODE_EXTRA_CA_CERTS` check** was re-homed to that image's `[tooling]` entry
+   (gated on it being published, not on any MITM code). Recorded there as required, with the full
+   method — it is the one clause of Phase 9's "each of the three agent images" not yet run.
 
 **Open:** the `krayt-agent-claude-code`, `krayt-agent-gemini-cli`, and (new)
 `krayt-agent-opencode` published images each need a real CI run + a real live onboarding run —
@@ -64,80 +59,128 @@ only tracks what's still open.
 
 ---
 
-## [hardware] `move-egress-proxy-to-host.md` — image rebuild, `PinnedRef` bump, and Phase-3 egress suite re-verification
+## [hardware] `move-egress-proxy-to-host.md` — image rebuild, `PinnedRef` bump, and Phase-3 egress suite re-verification — ✅ DONE
 
-- **Needed:** (1) push these changes so the RC image-build workflow publishes a new guest image
-  digest (the guest side changed: `cmd/krayt-vsock-forward` replaces `cmd/krayt-proxy`,
-  `internal/guest/proxy` is simplified); (2) read that digest from the workflow run and bump
-  `internal/vmimage/pinned.go`'s `PinnedRef`; (3) re-run the hardware egress suite against the
-  new host-side proxy design on **both** backends (Apple Silicon/vfkit and Linux/KVM/firecracker).
-- **Why the agent can't:** `PinnedRef` is a single hardcoded digest that does not exist until CI
-  builds and publishes the new image (§11, §14) — it cannot be guessed or fabricated. The actual
-  boot + egress-enforcement tests need real virtualization (vz on Apple Silicon, KVM on Linux),
-  neither of which this sandbox has.
-- **Exact steps/commands:**
-  1. Push this branch/PR — `.github/workflows/vmimage-rc.yml` is path-triggered on
-     `images/**`, `internal/guest/**`, `cmd/krayt-agent/**`, `cmd/krayt-vsock-forward/**`,
-     `cmd/krayt-ask/**`, all of which this task touches, so it fires automatically (see
-     `RELEASING.md`).
-  2. Read the published RC tag/digest from the workflow run (or `oras manifest fetch` the tag it
-     prints) and set `internal/vmimage/pinned.go`'s `PinnedRef` to it.
-  3. `go test -tags integration ./internal/orchestrator/... -run TestEgressEnforcement` and
-     `-run TestContainerHardening` on a Mac with vfkit installed (`KRAYT_KERNEL`/`KRAYT_INITRD`/
-     `KRAYT_ROOTFS`/`KRAYT_NETPROBE_IMAGE`/`KRAYT_ALLOW_HOST`/`KRAYT_HARDENING_IMAGE` per each
-     test's header comment) and on a Linux/KVM box for the firecracker backend — same tests, same
-     env vars, `hack/run-integration-tests.sh` auto-detects which backend to use.
-  4. `-run TestConcurrentRealVMs` on both backends (needs `KRAYT_IMAGE`, a real agent image) —
-     asserts two simultaneous VMs each get their own egress socket + child process with no
-     cross-VM reachability, the concurrency property this task's vsock design is supposed to buy
-     over a gateway-bound TCP proxy.
-  5. **New checks this task adds that the existing probes don't cover yet** — write these as real
-     test/probe code before running them, don't skip straight to manual verification:
-     - `nft list ruleset` inside the guest, over a debug shell or an extended probe image,
-       contains **no `skuid` rule** (the existing `hardening-probe` only checks that
-       `setuid(proxyd)` itself fails `EPERM`, which is still worth keeping as a non-root
-       regression check, but no longer proves the egress lock's correctness — the ruleset shape
-       does. `TestEgressRulesetShape` (`internal/guest/proxy/firewall_internal_test.go`) is the
-       offline counterpart; this hardware check confirms the *installed* ruleset on a live guest
-       matches it, not just the constant.
-     - A container attempt to reach the **host** itself on a private address (e.g. the vfkit/
-       firecracker host's own LAN IP) is refused by the SSRF guard — extend `hack/netprobe` with
-       a fourth check (a new exit code) that CONNECTs through the proxy to a private-range target
-       and asserts it gets a 403, proving the §2 hard-block change actually holds on hardware, not
-       just in `TestCheckDialAddr`.
-- **Verify success by:** all of the above tests/probes passing (`--- PASS`) on both backends,
-  with the new image's digest recorded in `PinnedRef`. Update `KRAYT_SPEC.md` §14's Phase 8 "Done
-  when (hardware)" checkbox from `[ ]` to `[x]` and this section's status line once confirmed —
-  do not mark it done without a real boot + real test run.
-- **Blocking:** no (nothing else in the repo currently depends on this landing), but the run
-  supervisor cannot boot a VM with a working egress path against the *old* pinned image (guest
-  side is now `krayt-vsock-forward`, not `krayt-proxy`) — so this is the one step standing between
-  "offline-complete" and "actually usable" for this task specifically. See the top-of-file Status
-  note.
+Verified on **both** backends against image
+`sha256:4fe2b0b78581d5194ded643fbe5b73c5d69372e70955a37ab716d680974f5014` — an Apple-Silicon Mac
+(vfkit) and a Linux/KVM box (firecracker), `hack/run-integration-tests.sh` green end to end on
+each: `TestBootHello`, `TestEndToEndRealVM`, `TestEgressEnforcement`, `TestContainerHardening`,
+`TestRootImageFailsClosed`, `TestGuestGitConfigInjectionInert`, `TestSecretConfinementInArtifacts`,
+`TestConcurrentRealVMs`.
+
+Both checks this task added are confirmed for real:
+
+- **No `skuid` rule in the live guest ruleset.** The guest reads back its own installed ruleset
+  after applying it (`verifyInstalledRuleset`), fails the run closed if the lock is wrong, and
+  publishes the dump to `/dev/console`; `assertGuestRuleset` reads it out of the run's
+  `console.log`. Confirmed identical on both backends: `table inet krayt_egress` with
+  `policy drop` + `oif "lo" accept`, and no `skuid` anywhere in the ruleset — NixOS's own
+  `nixos-fw` table (input/prerouting only, no bearing on egress) included in the scan.
+- **A private-range target through the proxy is refused.** `hack/netprobe` check 4 (exit 24) →
+  403 on both backends.
+
+Two things this took three hardware runs to get right, worth knowing before writing the next
+guest-side check:
+
+1. **A stale image passes the whole netprobe.** The first run was against a pre-Phase-8 image,
+   and every netprobe check passed anyway — allowlisted reachable, non-allowlisted blocked, raw
+   socket blocked, private target 403 — because that image's deleted in-guest L7 proxy enforces
+   exactly the same observable behavior, and the SSRF guard predates Phase 8 (#40). The netprobe
+   cannot distinguish the two architectures; the ruleset shape is the only thing that can. That
+   is the whole reason this check exists, and it caught the stale image on its first run.
+2. **The guest agent's log does not reach the host.** `krayt-agent` is a systemd unit with no
+   `StandardOutput` override (`images/flake.nix`), and journald has no `ForwardToConsole`, so its
+   stdout/stderr go to the journal and die with the VM. The first implementation used
+   `log.Printf` and failed on hardware for that reason alone. The evidence is now written to
+   `/dev/console` explicitly. Note the wider gap this exposes: a guest-agent error during a
+   hardware run is currently invisible from the host — `StandardOutput=journal+console` on the
+   unit would fix that, and is not done here.
+
+`KRAYT_SPEC.md` §14's Phase 8 "Done when (hardware)" is ticked, with one clause recorded there as
+holding **by construction rather than by assertion**: `TestConcurrentRealVMs` sets no
+`NetworkPolicy`, so it proves each concurrent VM gets its own egress socket + child process
+(`spawnEgressProxy` runs per run; a colliding socket would fail them) but never asserts cross-VM
+egress unreachability. That is structural — each VM dials `provider.EgressPort` on its own CID
+against a per-VM host socket, so a guest cannot name another run's proxy. Asserting it would need
+per-run allowlists in the netprobe.
+
 
 ## [hardware] `add-tls-mitm-credential-injection.md` — real MITM run, `NODE_EXTRA_CA_CERTS` check, and Phase-3 re-verification
 
-- **Needed:** (1) the SAME guest image rebuild Phase 8 above is already waiting on (this task's
-  guest-side pieces — `/run/krayt/ca.crt`, `KRAYT_CA_CERT` + trust-store env vars — ride it too,
-  no separate rebuild needed) and the resulting `PinnedRef` bump; (2) a real `claude-code` image
-  run with `mitm: true` and `inject:` for `ANTHROPIC_API_KEY`, confirming the agent authenticates
-  successfully while `env` and `/run/secrets` inside the container hold **no** credential (assert
-  the absence with `env | grep -i anthropic` and `ls -la /run/secrets` — or their absence —
-  inside the container, not just that the run succeeded); (3) the same run with `mitm: false`,
-  confirming it is unchanged (regression); (4) `npm install` (or an equivalent TLS-heavy fetch)
+- **Needed:** (1) ~~the SAME guest image rebuild Phase 8 above is already waiting on~~ — **done**:
+  this task's guest-side pieces (`/run/krayt/ca.crt`, `KRAYT_CA_CERT` + trust-store env vars) ride
+  image `4fe2b0b7…`, already pinned and verified on both backends, so there is no image left to
+  build and nothing here is blocked any more; (2) ~~a real `claude-code` image run with
+  `mitm: true`~~ — **done, run `run_c654e575` on darwin/vfkit with a live `ANTHROPIC_API_KEY`.
+  Every clause held:**
+    - `/run/secrets` **does not exist at all** inside the container — stronger than "exists
+      without the key". The injected key was the only secret, so withholding it left the bundle
+      empty and no tmpfs was mounted.
+    - `ANTHROPIC_API_KEY=krayt-injected-at-host-proxy` (the entrypoint's placeholder, not a
+      credential) and `KRAYT_INJECTED_CREDENTIAL=ANTHROPIC_API_KEY`. Note the variable IS present
+      — asserting its absence would be wrong; the value is what matters.
+    - A `curl` sending **no** `x-api-key` and no `Authorization` got `http_code=200` and a real
+      model list. A client with no credential receiving an authenticated response is the claim,
+      demonstrated directly.
+    - `openssl s_client -proxy 127.0.0.1:3128` showed leaf `CN = api.anthropic.com` issued by
+      `krayt ephemeral MITM CA (run_c654e575)` — interception proven by the chain itself, with
+      the per-run CA identity visible in the issuer.
+    - `claude -p` itself completed exit 0 through the MITM path, so the real client authenticated,
+      not just curl.
+    - Both `default-trust=200` and `explicit-ca=200`, which settles an open question: Debian
+      curl **does** honor the entrypoint's `SSL_CERT_FILE` (the concatenated distro+krayt bundle),
+      so the §8.2 approach works for OpenSSL clients and not only for explicitly-flagged ones.
+  (3) ~~the same run with `mitm: false`, confirming it is unchanged (regression)~~ — **done, run
+  `run_117d6f75`, an exact mirror of the injected run**: `/run/secrets/ANTHROPIC_API_KEY` present
+  (108 bytes, 0644, readable by the non-root agent as designed), the real key in the env, all
+  four `KRAYT_*`/CA vars unset, and the same no-auth `curl` answered **401
+  `x-api-key header is required`**. That 401 is what makes the pair conclusive: it rules out any
+  ambient auth and pins the injected run's 200 to the injection specifically.
+    - **Also surfaced a real §10 residual, now documented as redaction gap (3).** krayt's
+      `[REDACTED]` marker never appeared in this run's artifacts. The agent masked the middle of
+      the key itself before writing the report, so no verbatim match existed for the `Redactor`
+      to find, and a 19-character `sk-ant-` prefix persisted into `report.md` and
+      `logs/agent.log`. Exact-match redaction cannot catch a transformed secret — and this was a
+      *cooperative* agent. It is also the cleanest argument for this whole task: the companion
+      `mitm: true` run had no credential in the VM to leak in any form.
+  (4) `npm install` (or an equivalent TLS-heavy fetch)
   through the MITM path in **each** of the three agent images — this exercises
-  `NODE_EXTRA_CA_CERTS` and is the most likely thing to break, since none of the three entrypoint
-  changes have ever run against a real `npm`/`pip`/`curl` through a real intercepted TLS
-  connection; (5) the full Phase 3 security suite re-run on both backends, with `TestEgressEnforcement`
-  and `TestSecretConfinementInArtifacts` in particular.
+  `NODE_EXTRA_CA_CERTS` and is the most likely thing to break. **Partly done and partly not
+  applicable as written**: `krayt-agent-claude-code` has no `npm` or `node` (it is
+  `debian:bookworm-slim` + `ca-certificates curl git bash` + the native `claude` binary), so the
+  "equivalent TLS-heavy fetch" clause is what it can satisfy, and curl did — but nothing in that
+  image demonstrably reads `NODE_EXTRA_CA_CERTS`. The genuine `NODE_EXTRA_CA_CERTS` exercise
+  needs the node-based images. **`krayt-agent-gemini-cli`: done** (`run_e19488dd`, after the
+  folder-trust bug above was worked around config-side):
+    - `npm install` of a real package through the MITM proxy succeeded, `strict-ssl` confirmed
+      `true` so the check means something.
+    - **Negative control failed as required**: the same install with only `NODE_EXTRA_CA_CERTS`
+      removed died with `SELF_SIGNED_CERT_IN_CHAIN` / "self-signed certificate in certificate
+      chain". That is what proves the variable is load-bearing rather than the install having
+      succeeded for some unrelated reason.
+    - `openssl s_client` through the proxy showed `issuer=O = "krayt (ephemeral, per-run)",
+      CN = krayt ephemeral MITM CA (run_e19488dd)` — the install really did traverse the
+      intercepted path.
+    - **Methodology note worth keeping:** the first negative control *passed* because npm served
+      the package from cache without any network request. The agent caught it, ran
+      `npm cache clean --force`, and re-ran **both** arms against an empty cache — which is why
+      the result stands. The persisted `report.md` does not mention the cache at all, so the
+      artifact alone would lead a reproducer straight back into the same false pass; the task
+      file now mandates a cache clear and requires reporting it.
+  **`krayt-agent-opencode`: not run** — still unpublished. This clause needs it before it can
+  close, since §14's wording is "each of the three agent images".
+  (5) ~~the full Phase 3 security suite re-run on both backends~~ — **done** against image
+  `4fe2b0b7…` (the same image carrying this task's guest-side pieces) as part of Phase 8's
+  verification: green on darwin/vfkit and linux/firecracker, `TestEgressEnforcement` and
+  `TestSecretConfinementInArtifacts` included. Those ran with `mitm` off, which is the point —
+  they are the "unchanged when not opted in" regression.
 - **Why the agent can't:** same reason as Phase 8 (no real Mac/vfkit or Linux/KVM in this
   sandbox), **plus** this task specifically needs a live Anthropic API key to prove the
   authenticate-without-a-credential-in-the-VM claim for real — a claim that cannot be honestly
   demonstrated any other way (a fake/mocked "credential" proves nothing about whether the actual
   injected header format Anthropic's API expects is correct).
 - **Exact steps/commands:**
-  1. Once Phase 8's image rebuild + `PinnedRef` bump has landed (this task rides the same image,
-     no separate rebuild), on a Mac with vfkit and/or a Linux/KVM box:
+  1. On a Mac with vfkit and/or a Linux/KVM box (the image this needs is already pinned):
      ```sh
      krayt run --image ghcr.io/418-cloud/krayt-agent-claude-code --agent claude-code \
        --task ./task.md --repo . --config ./krayt-mitm-test.yaml
@@ -347,7 +390,17 @@ now confirmed. No gaps remain.
 - Blocking: no — the gemini-cli/opencode agent-image tasks depend on this task's *code* (the
   `agent-images.yml` scaffolding + README table) having landed, not on this verification.
 
-## [tooling] Pin the `node:24-bookworm-slim` digest in `images/agents/gemini-cli/Dockerfile`
+## [tooling] Pin the `node:24-bookworm-slim` digest in `images/agents/gemini-cli/Dockerfile` — ✅ DONE
+
+Pinned in `3e1fc3f` ("chore: pin node.js to 3638d9a", #104) — `images/agents/gemini-cli/Dockerfile`
+now reads `FROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03`,
+via Renovate's `pinDigests` as option (a) below predicted. **Loose end:** the comment a few lines
+above that `FROM` still says "NOT digest-pinned: resolving the current node:24-bookworm-slim
+digest needs registry access" and now contradicts the line it describes — worth deleting next
+time that file is touched.
+
+<details><summary>Original entry (kept for the reasoning)</summary>
+
 - Needed: `images/agents/gemini-cli/Dockerfile` currently reads `FROM node:24-bookworm-slim`
   (tag only, no `@sha256:...`) — every other base image in this repo is digest-pinned, and
   `renovate.json`'s `pinDigests: true` (for the `dockerfile` manager) expects one to maintain.
@@ -366,6 +419,44 @@ now confirmed. No gaps remain.
   `agent-images.yml` still builds both arches successfully off it.
 - Blocking: no — the tag alone still resolves to a real, current image; this only affects
   reproducibility/supply-chain pinning, not whether the image builds or runs.
+
+</details>
+
+## [BUG] `krayt-agent-gemini-cli` as published cannot complete any task — folder-trust gate
+
+Found while running Phase 9's `NODE_EXTRA_CA_CERTS` check against the published image
+(`run_fae09765`, **exit 55**, no task work performed):
+
+```
+Approval mode overridden to "default" because the current folder is not trusted.
+Gemini CLI is not running in a trusted directory. To proceed, either use `--skip-trust`, set the
+`GEMINI_CLI_TRUST_WORKSPACE=true` environment variable, or trust this directory in interactive mode.
+```
+
+Gemini CLI gates tool use on a "trusted folder" heuristic. In a headless run an untrusted folder
+silently downgrades `--approval-mode yolo` back to `default` and then aborts — so the image runs,
+authenticates, sets up the MITM CA correctly, and then does nothing. `entrypoint.sh` had no trust
+handling at all.
+
+- **Fixed in the repo:** `images/agents/gemini-cli/entrypoint.sh` now exports
+  `GEMINI_CLI_TRUST_WORKSPACE=true` before invoking `gemini`. Chosen over the equivalent
+  `--skip-trust` flag so an upstream flag rename cannot turn this into an argument-parsing
+  failure. Trusting the folder is correct here, not just expedient: that prompt protects a
+  developer's own machine from a freshly cloned repo, whereas krayt already assumes the repo is
+  untrusted and puts the isolation boundary at the VM (§10).
+- **Needs a rebuild to take effect** — `agent-images.yml` must republish the image before any run
+  against `:latest` picks this up. Until then a config-side `env: {GEMINI_CLI_TRUST_WORKSPACE:
+  "true"}` does the same job.
+- **The fix itself is unverified.** Phase 9's Gemini verification (`run_e19488dd`) used the
+  config-side override, not this entrypoint line — so the committed fix has never executed. After
+  the republish, do one run **without** the config-side `env:` override: that, and only that,
+  confirms the image works unaided. A run that still carries the override would pass either way
+  and prove nothing about the fix.
+- **Blocks two entries:** Phase 9's `NODE_EXTRA_CA_CERTS` clause (nothing Node-based can be
+  exercised while the CLI refuses to run) and this image's own live-onboarding verification
+  below, which would have failed identically.
+- **Worth checking on the opencode image too** before its onboarding run — same class of
+  headless-refusal gate, different CLI.
 
 ## [tooling] Publish `krayt-agent-gemini-cli` — real workflow run + live onboarding run
 - Needed:
@@ -444,6 +535,24 @@ now confirmed. No gaps remain.
      that can't be verified without a real `opencode` process talking to a real socket, and the
      first time this image's specific MCP config shape (`type: "local"`, array `command`) has been
      exercised against a live opencode binary rather than just checked against docs.
+  4. **The `NODE_EXTRA_CA_CERTS` check for this image (§14 Phase 9's last clause).** Phase 9 was
+     closed with this one item deliberately re-homed here rather than left holding that phase
+     open, since it is gated on this image existing, not on any MITM code. It is not optional:
+     opencode is node-based, and Node does not read the system trust store at all, so if this
+     image's entrypoint CA plumbing is wrong then **every** TLS call from it fails whenever
+     `network.mitm` is on. Run it exactly as `krayt-agent-gemini-cli` was verified in
+     `run_e19488dd` — `mitm: true`, `registry.npmjs.org` allowlisted, then:
+     - `npm cache clean --force`, then a real `npm install` through the proxy — it must succeed,
+       with `npm config get strict-ssl` confirmed `true` or the check proves nothing;
+     - **the negative control**: cache clean again, then the same install with only
+       `NODE_EXTRA_CA_CERTS` removed, which must **fail** `SELF_SIGNED_CERT_IN_CHAIN`. Without
+       this arm a passing install shows only that Node trusted *something*. Clear the cache
+       before **both** installs — a cached package installs with no network request at all, and
+       skipping this is how the gemini run initially produced a false pass;
+     - `openssl s_client -proxy 127.0.0.1:3128` against the registry, confirming the issuer is
+       `krayt ephemeral MITM CA (run_…)`.
+     Check first whether opencode has a headless-refusal gate like the one that blocked
+     gemini-cli (see the `[BUG]` entry) — same class of problem, different CLI.
 - Why the agent can't: no `docker build`/push access, no live provider API key, and no way to
   drive a real `--on-question=wait` round-trip in this environment.
 - Exact steps/commands: push this change (or `gh workflow run agent-images.yml`) and watch the
