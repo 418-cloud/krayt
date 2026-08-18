@@ -25,6 +25,33 @@ const egressProxyListenerFD = 3
 // stdout/stderr (proxy.log), which is redacted-and-persisted, not structured.
 const egressProxyCACertFD = 4
 
+// EgressProxyLogRequestsEnv turns on the proxy's request-observation log for one run (§6.6,
+// internal/proxy/observe.go): every handled request's request line, host, and header NAMES land in
+// `.krayt/runs/<id>/proxy.log`, which otherwise records only failures and denials. Set it on the
+// `krayt run` invocation — the child inherits this process's environment — e.g.
+//
+//	KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config ./probe.yaml --task ./task.md
+//
+// Deliberately an env var and not a new flag: the flag set IS the KRAYT_EGRESS_PROXY_BIN swap
+// contract (see the command doc below), and a replacement binary built against it must not break
+// because krayt asked for extra diagnostics — an unrecognized env var is ignored, an unrecognized
+// flag is fatal. Only a boolean rides here; secret material still goes on stdin only (§6.6.1).
+const EgressProxyLogRequestsEnv = "KRAYT_PROXY_LOG_REQUESTS"
+
+// EgressProxyLogHeaderValuesEnv is a comma-separated list of header names whose VALUES the
+// observation log may record in full, e.g.
+//
+//	KRAYT_PROXY_LOG_HEADER_VALUES=authorization,anthropic-beta krayt run …
+//
+// It implies EgressProxyLogRequestsEnv. Header names alone are not always enough for a wire-format
+// probe: an API's required opt-in flags (a beta or version header) are non-secret facts that must
+// be recorded exactly, and guessing them is what
+// `docs/ai-tasks/inject-claude-oauth-token-at-proxy.md` forbids. A credential-bearing name never
+// yields its value — `authorization` and friends are reduced to scheme + length
+// (`internal/proxy`'s credentialShape), which is what answers "Bearer-prefixed or raw token?" and
+// "is the credential forwarded verbatim?" without putting one in the artifact.
+const EgressProxyLogHeaderValuesEnv = "KRAYT_PROXY_LOG_HEADER_VALUES"
+
 // newEgressProxyCmd is `krayt __egress-proxy`: the host-side L7 egress allowlist proxy,
 // spawned as a separate process by the run supervisor (never invoked directly by a user).
 // It must not share an address space with the process that holds the user's real credentials,
@@ -69,6 +96,8 @@ func newEgressProxyCmd() *cobra.Command {
 			policy := proxy.Policy{
 				Mode: mode, Allow: allow,
 				MITM: mitm, Passthrough: stdinCfg.Passthrough, Inject: stdinCfg.Inject,
+				LogRequests:     envEnabled(EgressProxyLogRequestsEnv),
+				LogHeaderValues: envList(EgressProxyLogHeaderValuesEnv),
 			}
 			h, ca, err := proxy.BuildHandler(policy, dns, runID)
 			if err != nil {
@@ -88,6 +117,28 @@ func newEgressProxyCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&mitm, "mitm", false, "terminate TLS and allow header injection (§6.6); default off")
 	cmd.Flags().StringVar(&runID, "run-id", "", "run id, folded into the ephemeral MITM CA's CN for operator legibility only")
 	return cmd
+}
+
+// envEnabled reports whether env var name is set to an affirmative value. Only an explicit
+// affirmative counts: `KRAYT_PROXY_LOG_REQUESTS=0` (or `=false`, or anything unrecognized) leaves
+// the feature off, so a value that reads as "no" never turns something on.
+func envEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// envList splits a comma-separated env var into non-empty trimmed items, or nil when unset.
+func envList(name string) []string {
+	var out []string
+	for _, item := range strings.Split(os.Getenv(name), ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // reportCACert writes ca's public cert PEM (or nothing, if ca is nil — MITM off) to fd, then

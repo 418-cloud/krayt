@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/418-cloud/krayt/internal/task"
 )
 
 // Input is what the run hands an adapter to prepare (§6.14). SecretKeys are the names — never
@@ -24,14 +26,22 @@ type Input struct {
 	QuestionsWait bool            // --on-question=wait: wire the krayt-ask front-end (§6.13)
 	AskSocket     string          // container path to the ask-bridge socket (§6.13)
 	InjectedKeys  map[string]bool // secrets-file keys withheld from SecretsBundle by network.inject (§6.6.1)
+	MITM          bool            // network.mitm is on (inject-claude-oauth-token-at-proxy.md): the
+	// adapter may respond by translating its selected credential's shape instead of shipping it
+	// via SecretsBundle at all. False for every existing caller/test unless set explicitly, so an
+	// adapter that doesn't check it keeps today's behavior byte for byte.
 }
 
 // Plan is an adapter's host-side contribution to a run: non-secret env additions for the
-// container, and the secret key it selected as the model credential (for the report — the
-// value stays in the secrets bundle, never here).
+// container, the secret key it selected as the model credential (for the report — the value
+// stays in the secrets bundle, never here), host-side injection rules the run should merge into
+// network.inject (inject-claude-oauth-token-at-proxy.md §2), and non-secret placeholder env vars
+// standing in for a credential delivered that way instead of via SecretsBundle.
 type Plan struct {
-	Env        map[string]string
-	Credential string
+	Env          map[string]string
+	Credential   string
+	Inject       []task.InjectRule // host-side injection the orchestrator applies; requires MITM
+	Placeholders map[string]string // container env standing in for a host-only secret; never a real value
 }
 
 // Adapter is one agent integration. Name is the config/flag value (§8.1 `agent.adapter`).

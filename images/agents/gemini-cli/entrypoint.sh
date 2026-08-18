@@ -12,6 +12,9 @@ set -euo pipefail
 SECRETS_DIR="${KRAYT_SECRETS_DIR:-/run/secrets}"
 WORKSPACE="${KRAYT_WORKSPACE:-/workspace}"
 TASK_FILE="${KRAYT_TASK:-/task/prompt.md}"
+# Overridable for the same reason SECRETS_DIR/WORKSPACE/TASK_FILE are: it lets
+# hack/test-entrypoint-credentials.sh exercise this script outside a container.
+OUTPUT_DIR="${KRAYT_OUTPUT:-/output}"
 SETTINGS_FILE="$HOME/.gemini/settings.json"
 
 # Export exactly one recognized credential from the secrets tmpfs (§6.14). The host adapter
@@ -25,11 +28,25 @@ for key in GEMINI_API_KEY GOOGLE_API_KEY; do
     break
   fi
 done
-# network.mitm + network.inject (§6.6.1, add-tls-mitm-credential-injection.md §2): this
-# credential is deliberately withheld from $SECRETS_DIR and attached to outgoing requests by the
-# host proxy instead. KRAYT_INJECTED_CREDENTIAL names it (never its value) so this loop can start
-# without a file that will never arrive; the placeholder below only satisfies Gemini CLI's "a
-# credential is configured" check — the real value never enters this container.
+# network.mitm shape translation (§6.6.1, §8.2): the credential is deliberately withheld from
+# $SECRETS_DIR and attached to outgoing requests by the HOST proxy instead, so no file will ever
+# arrive for it. krayt configures the container with the same credential env var carrying a
+# placeholder value, which only has to satisfy Gemini CLI's own "a credential is configured"
+# check — the real value never enters this container. Accepting an already-set var is what lets
+# krayt choose that placeholder (a self-describing sk-ant-…-do-not-use string, legible in a log);
+# without this branch a run using shape translation would find no file, conclude it has no
+# credential, and exit 78 before starting.
+if [ -z "$cred" ]; then
+  for key in GEMINI_API_KEY GOOGLE_API_KEY; do
+    if [ -n "${!key:-}" ]; then
+      cred="$key"
+      break
+    fi
+  done
+fi
+# Backward compatibility with the pre-shape-translation contract (§8.2): KRAYT_INJECTED_CREDENTIAL
+# names the withheld credential (never its value) for a krayt that sets the name but no placeholder
+# value. Ordered after the branch above so krayt's own placeholder wins when both are present.
 if [ -z "$cred" ] && [ -n "${KRAYT_INJECTED_CREDENTIAL:-}" ]; then
   cred="$KRAYT_INJECTED_CREDENTIAL"
   export "$cred=krayt-injected-at-host-proxy"
@@ -130,5 +147,5 @@ echo "[gemini-cli] running gemini -p in $(pwd) (model: ${GEMINI_MODEL:-default})
 # reads GEMINI_MODEL from the environment if set (falls back to settings.model.name, then "auto").
 # Tee the final response into /output/report.md so it surfaces in the krayt report's Notes;
 # pipefail keeps the pipeline's exit code Gemini's, not tee's.
-gemini --prompt "$(cat "$TASK_FILE")" --approval-mode yolo | tee /output/report.md
+gemini --prompt "$(cat "$TASK_FILE")" --approval-mode yolo | tee "$OUTPUT_DIR/report.md"
 echo "[gemini-cli] done"

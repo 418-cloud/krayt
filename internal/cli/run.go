@@ -285,22 +285,25 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		Container: f.container,
 	}
 
-	// network.mitm/passthrough/inject pre-flight (§1, add-tls-mitm-credential-injection.md):
-	// every rule is checked against the secrets file and the allow/passthrough lists before any
-	// VM or image work, so a typo fails fast instead of producing a run that fails opaquely once
-	// the agent actually tries to authenticate.
+	// Optional per-agent adapter (§6.14): validate auth (exactly-one, fail fast before any VM
+	// boots or image pull), merge its env additions — e.g. wiring krayt-ask when questions are
+	// enabled — under the user's env, which wins, and (network.mitm on, an observed credential
+	// shape — inject-claude-oauth-token-at-proxy.md §2/§4) merge its injection rule into
+	// spec.Network.Inject, again with the user's own network.inject winning any conflict.
 	secretKeys, err := loadSecretKeySet(spec.SecretsPath)
 	if err != nil {
 		return err
 	}
-	if err := task.ValidateNetworkPolicy(spec.Network, secretKeys); err != nil {
+	if err := applyAdapter(cmd.OutOrStdout(), &spec, f.agent, secretKeys); err != nil {
 		return err
 	}
 
-	// Optional per-agent adapter (§6.14): validate auth (exactly-one, fail fast before any VM
-	// boots or image pull) and merge its env additions — e.g. wiring krayt-ask when questions
-	// are enabled — under the user's env, which wins.
-	if err := applyAdapter(&spec, f.agent); err != nil {
+	// network.mitm/passthrough/inject pre-flight (§1, add-tls-mitm-credential-injection.md): every
+	// rule — adapter-supplied or hand-written, now merged into one set above — is checked against
+	// the secrets file and the allow/passthrough lists before any VM or image work, so a typo (or
+	// an adapter rule naming a host the user never allowlisted) fails fast instead of producing a
+	// run that fails opaquely once the agent actually tries to authenticate.
+	if err := task.ValidateNetworkPolicy(spec.Network, secretKeys); err != nil {
 		return err
 	}
 
@@ -394,44 +397,63 @@ func loadSecretKeySet(secretsPath string) (map[string]bool, error) {
 	return keys, nil
 }
 
-// applyAdapter runs the optional per-agent adapter's host-side pre-flight (§6.14): it loads the
-// per-task secrets file and passes only the credential key names — never the values — to the
-// adapter, which enforces the agent's exactly-one auth rule; then it merges the adapter's
-// non-secret env additions (e.g. the krayt-ask socket) under spec.Env so a user-set value always
-// wins. Called before the VM boots so a bad credential set fails fast.
-func applyAdapter(spec *task.RunSpec, name string) error {
+// applyAdapter runs the optional per-agent adapter's host-side pre-flight (§6.14): it passes only
+// the credential key NAMES — never the values — to the adapter, which enforces the agent's
+// exactly-one auth rule; then it merges the adapter's non-secret env additions (e.g. the
+// krayt-ask socket, or a shape-translation placeholder — inject-claude-oauth-token-at-proxy.md §3)
+// under spec.Env so a user-set value always wins, and unions any adapter-supplied injection rule
+// into spec.Network.Inject (§4) — logged to out so a user overriding an adapter-managed header
+// can see it happened. Called before the VM boots (and before task.ValidateNetworkPolicy, which
+// re-checks the merged set) so a bad credential set or a bad merged rule fails fast.
+func applyAdapter(out io.Writer, spec *task.RunSpec, name string, secretKeys map[string]bool) error {
 	ad, err := adapter.Get(name)
 	if err != nil {
 		return err
 	}
-	var secretKeys []string
-	if spec.SecretsPath != "" {
-		vals, err := secrets.Load(spec.SecretsPath)
-		if err != nil {
-			return fmt.Errorf("read secrets: %w", err)
-		}
-		for k := range vals {
-			secretKeys = append(secretKeys, k)
-		}
+	keys := make([]string, 0, len(secretKeys))
+	for k := range secretKeys {
+		keys = append(keys, k)
 	}
 	plan, err := ad.Prepare(adapter.Input{
-		SecretKeys:    secretKeys,
+		SecretKeys:    keys,
 		QuestionsWait: spec.Questions.Mode == task.QuestionWait,
 		AskSocket:     guest.ContainerAskSocket,
 		InjectedKeys:  spec.Network.InjectedSecretKeys(),
+		MITM:          spec.Network.MITM,
 	})
 	if err != nil {
 		return err
 	}
-	if len(plan.Env) > 0 && spec.Env == nil {
+	mergeEnv(spec, plan.Env)
+	mergeEnv(spec, plan.Placeholders)
+	if len(plan.Inject) > 0 {
+		merged, overrides := task.MergeInjectRules(spec.Network.Inject, plan.Inject)
+		spec.Network.Inject = merged
+		for _, o := range overrides {
+			if _, err := fmt.Fprintf(out, "network.inject: %s\n", o); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// mergeEnv adds every key in additions to spec.Env that spec.Env doesn't already set — a
+// user-provided value always wins, whether the addition came from an adapter's plain env or its
+// non-secret credential placeholder (Plan.Env and Plan.Placeholders get identical treatment here;
+// only their provenance differs).
+func mergeEnv(spec *task.RunSpec, additions map[string]string) {
+	if len(additions) == 0 {
+		return
+	}
+	if spec.Env == nil {
 		spec.Env = map[string]string{}
 	}
-	for k, v := range plan.Env {
+	for k, v := range additions {
 		if _, set := spec.Env[k]; !set {
 			spec.Env[k] = v
 		}
 	}
-	return nil
 }
 
 // acquireUserImage pulls the user image into the host cache and returns it (§6.11).

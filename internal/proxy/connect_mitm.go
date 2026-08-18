@@ -118,9 +118,18 @@ func (h *handler) connectMITM(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "krayt: upstream request failed", http.StatusBadGateway)
 		},
 	}
+	if h.obs != nil {
+		// Status-and-header-names only (observe.go). ModifyResponse must return nil here: a
+		// non-nil error would route the response into ErrorHandler and fail the guest's request,
+		// which an observation hook must never be able to do.
+		rp.ModifyResponse = func(resp *http.Response) error {
+			h.obs.response("mitm", authority, resp)
+			return nil
+		}
+	}
 
 	inner := &http.Server{
-		Handler:           injectingHandler(authority, rule, hasRule, rp),
+		Handler:           injectingHandler(authority, rule, hasRule, h.obs, rp),
 		ReadHeaderTimeout: 10 * time.Second,
 		MaxHeaderBytes:    maxMITMHeaderBytes,
 		IdleTimeout:       120 * time.Second,
@@ -138,13 +147,18 @@ func (h *handler) connectMITM(w http.ResponseWriter, r *http.Request) {
 // CONNECT authority only — never a header VALUE or the guest-supplied Host string, which is
 // attacker-controlled text on the untrusted side of this boundary (§6 "never log bodies;
 // headers may be logged name-only").
-func injectingHandler(authority string, rule InjectRule, hasRule bool, rp http.Handler) http.Handler {
+func injectingHandler(authority string, rule InjectRule, hasRule bool, obs *observer, rp http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Host != "" && !hostsEquivalent(req.Host, authority) {
 			log.Printf("krayt-egress-proxy: MITM %s: inner request Host does not match the CONNECT authority", authority)
 			http.Error(w, "krayt: request Host does not match the CONNECT authority", http.StatusBadRequest)
 			return
 		}
+		// Logged here — as the GUEST sent it, before Rewrite's strip/set runs — because what the
+		// client itself chose (host, path, auth header name) is precisely what a wire-format probe
+		// is trying to learn. Before the pre-flight check below, too, so a request that fails to
+		// resolve its credential is still observed. No-op when obs is nil.
+		obs.request("mitm", authority, req, hasRule)
 		if hasRule {
 			for name, val := range rule.Set {
 				if val == "" {

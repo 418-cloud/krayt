@@ -592,7 +592,33 @@ is the simplest correct choice. Enforcement layers:
   (DNS failure, connection refused, blocked-address guard, …) appears is the proxy's own
   server-side log. The run supervisor captures the child's stdout/stderr and, on teardown,
   redacts it against the task's secrets (the first HOST-side redaction path in krayt — §6.8) and
-  writes it to `.krayt/runs/<id>/proxy.log`.
+  writes it to `.krayt/runs/<id>/proxy.log`. What lands there is **failures and policy denials
+  only** — a run in which every request succeeded correctly leaves the file **empty**.
+- **`KRAYT_PROXY_LOG_REQUESTS=1` — the opt-in request-observation mode
+  (`internal/proxy/observe.go`).** Set on the `krayt run` invocation (the proxy child inherits the
+  environment), it adds one `proxy.log` line per handled request: the request line, the
+  already-approved host, header **names**, query-parameter **names**, and the response status —
+  never a header value, never a query value, never a body, the same rule §6.6.1 sets for
+  everything else this process logs. This is what makes the proxy an *instrument* — the only way
+  to answer "which host, path, and auth header did this agent actually use", which a wire-format
+  probe (§6.14, `inject-claude-oauth-token-at-proxy.md` P1–P4) must observe before an injection
+  rule may be written for a credential shape. Off by default, because an always-on version would
+  persist the hosts and paths every ordinary run visited. It is an env var rather than a flag on
+  purpose: the flag set is the `KRAYT_EGRESS_PROXY_BIN` swap contract above, and a replacement
+  binary must be able to ignore a diagnostics request instead of dying on an unknown flag.
+- **`KRAYT_PROXY_LOG_HEADER_VALUES=<names>` — the one narrow relaxation of "never a value".** A
+  comma-separated list of header names whose values the observation log may record in full (implies
+  the mode above). It exists because a header *name* is not always enough: an API's required opt-in
+  flags (a beta or version header) are non-secret facts a probe must record **exactly**, and guessing
+  them is precisely what the probe protocol forbids. A **credential-bearing** name never yields its
+  value — `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`, and
+  any header this run's own `network.inject[]` rules touch are reduced to
+  `<scheme="Bearer" credential_len=N>`: the public RFC 7235 scheme plus the length of the material
+  after it. That shape is what answers a probe's two remaining questions — "Bearer-prefixed or raw
+  token?" and "is the credential forwarded verbatim, or did the client exchange it first?" (compare
+  `credential_len` against the secrets-file value's own length) — without a credential ever entering
+  the artifact. Disclosing a high-entropy token's *length* into an already-redacted, per-run,
+  explicitly-opted-into log is the deliberate trade being made here.
 
 #### 6.6.1 TLS MITM & credential injection (`internal/proxy`, `add-tls-mitm-credential-injection.md`)
 > **Amended by `add-tls-mitm-credential-injection.md` (step 2 of the three-step host-side-proxy
@@ -663,11 +689,21 @@ and `.set` are separate lists on purpose: the header the container sends is not 
 header that goes upstream (`inject-claude-oauth-token-at-proxy.md`, step 3, removes one auth
 header and sets a different one). `set` values are secrets-file **key names**, resolved
 host-side; `set_literal` values are fixed, non-secret strings — kept syntactically distinct so a
-literal can never be mistaken for a resolved secret. Every rule is validated at `krayt run`
+literal can never be mistaken for a resolved secret. One further key exists because a credential's
+wire format is not always "this header = this value" (added by
+`inject-claude-oauth-token-at-proxy.md` from the 2026-08-17 subscription-token observation):
+- **`set_prefix`** — a literal prefix on a `set` header's resolved value, i.e. an auth **scheme**
+  (`authorization: Bearer <token>`). Folded in host-side while the secrets-file key is resolved, so
+  `internal/proxy`'s contract stays "set this header to this exact string" and no scheme knowledge
+  crosses that boundary. Skipped when the resolved value is empty, so the proxy's fail-closed
+  unresolved-credential check still fires instead of seeing a plausible bare `Bearer `.
+
+Every rule is validated at `krayt run`
 pre-flight, before any VM or image work: `inject` requires `mitm: true`; a rule's host must not
 be in `passthrough`, and (in `mode: allowlist`) must be in `allow`; every `set` key must exist in
 the secrets file; header names must be valid HTTP tokens and not hop-by-hop; `passthrough ⊆
-allow` in `mode: allowlist`. Injection targets **HTTPS only** — a plain-HTTP request to a host
+allow` in `mode: allowlist`; every `set_prefix` must name a header that `set` also names
+(case-insensitively) and carry a non-empty, CR/LF-free value. Injection targets **HTTPS only** — a plain-HTTP request to a host
 with an inject rule is refused outright (400) rather than forwarded unauthenticated or given the
 credential in cleartext; the MITM path is structurally the only place injection can fire.
 
@@ -705,9 +741,12 @@ request body up to 4 MiB to make the retry correct; a larger body skips the retr
 buffer without bound). A second `401` is always surfaced as-is — never a loop. The proxy stays
 generic on purpose: it has no idea what Anthropic (or anyone) is. Constructing the actual refresh
 request and parsing its response is vendor-specific knowledge that belongs in a per-agent adapter
-(§6.14), not the core — `inject-claude-oauth-token-at-proxy.md` (step 3) is the first consumer of
-this seam; with no `RefreshFunc` registered (true for every run until step 3 lands) it is a
-zero-overhead no-op and a `401` behaves exactly as it would with no `refresh` block at all.
+(§6.14), not the core — `inject-claude-oauth-token-at-proxy.md` (step 3, Phase 10) is the intended
+first consumer of this seam, but only if its P3 probe forces the fallback design (§6.14); the
+primary design (the one currently implemented) needs no `RefreshFunc` at all, since a
+translated-to-API-key credential never refreshes. With no `RefreshFunc` registered — true for
+every run today — this remains a zero-overhead no-op and a `401` behaves exactly as it would with
+no `refresh` block at all.
 
 **Delivering the CA to the container (§8.2).** The credential never enters the VM; the run's
 ephemeral CA's **public** certificate does, over the channel that already exists:
@@ -1209,11 +1248,19 @@ auth credential is set**, failing fast (or at minimum warning) when both appear.
 adapter logic, not core logic.
 
 **Caveats to weigh per task:**
-- **Headless billing.** Reports suggest `claude -p` with a subscription OAuth token may still
-  draw API credits in some versions; confirm before assuming a sandboxed run is covered by
-  the plan *(verify current)*. Relatedly, Bare mode (`--bare`) does not read
-  `CLAUDE_CODE_OAUTH_TOKEN` at all — a bare-mode invocation must use `ANTHROPIC_API_KEY` or an
-  `apiKeyHelper`.
+- **Headless billing — ANSWERED 2026-08-17 (P5, `inject-claude-oauth-token-at-proxy.md`).** A
+  headless `claude -p` on a `CLAUDE_CODE_OAUTH_TOKEN` is metered against the **subscription**, not
+  API credits: its `/v1/messages` responses carry `anthropic-ratelimit-unified-5h-*` /
+  `-7d-*` / `-overage-status` (the unified subscription windows) and **none** of the per-key
+  `anthropic-ratelimit-requests-*` / `-tokens-*` headers that the same task with a real
+  `ANTHROPIC_API_KEY` received in the mirror run. Evidence: `run_b408545b` vs. `run_99bd261c`,
+  recorded in `HUMAN_TODO.md`. Metering follows the credential shape that reaches Anthropic — which
+  under `mitm: true` shape translation is the shape the PROXY sends, not the one the container was
+  configured with. Relatedly, Bare mode (`--bare`) does not read `CLAUDE_CODE_OAUTH_TOKEN` at
+  all — a bare-mode invocation must use `ANTHROPIC_API_KEY` or an `apiKeyHelper`. It still
+  applies in full when `mitm` is off. **Under shape mirroring (2026-08-18) it applies to a
+  translated subscription token too** — the container really is OAuth-configured, by design. krayt
+  never invokes `--bare`, so nothing in krayt is affected.
 - **Concurrency tension** (touches the concurrent-runs model, §4): subscription auth suits
   roughly 1–3 steady agents; for many concurrent or overnight runs prefer an API key, since
   subscription plans carry weekly rate caps *(verify current)*.
@@ -1250,6 +1297,77 @@ concentrating more trust in the host proxy process (§10). It composes with ever
 which credential shape to use is unaffected, and the adapter's exactly-one rule still applies to
 whatever ends up in the secrets file — injection only changes *where* the chosen credential is
 attached, not which one is chosen.
+
+**Credential shape translation — hiding OAuth entirely (`inject-claude-oauth-token-at-proxy.md`,
+step 3 of the host-side-proxy arc).** Plain header injection above still delivers whichever
+credential the user actually configured, in its own shape — an OAuth-configured container is
+still OAuth-configured, just without the token in `/run/secrets`. Shape translation goes one step
+further: **when `network.mitm` is on and the selected credential's wire format has been observed**
+(`internal/adapter/anthropic_wire.go`), the container is configured with a **non-secret placeholder
+under the credential's own variable**, and the real value is attached entirely host-side in whatever
+shape the provider actually wants:
+
+| User's secrets file has | Container gets | Proxy sends upstream |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use` | `x-api-key: <real key>` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | `CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-krayt-placeholder-do-not-use` | `authorization: Bearer <real token>` |
+
+**Shape mirroring (owner decision, 2026-08-18).** The placeholder deliberately mirrors the *kind* of
+credential the user supplied, rather than presenting every credential to the container as an API key.
+The agent then runs its own code path for that credential — composing the `anthropic-beta` opt-in
+list, the request line, and every other shape-specific detail itself — and krayt substitutes exactly
+one header value, synthesizing nothing. The alternative (always configure `ANTHROPIC_API_KEY` and
+have the proxy build the OAuth request shape) requires krayt to guess which of the API-key path's
+beta flags an OAuth credential will accept, and to re-guess whenever either path changes.
+
+What mirroring gives up is the claim that the container cannot tell which credential kind is in use.
+That was never actually true: a subscription's own responses carry
+`anthropic-ratelimit-unified-5h-*`/`-7d-*` headers where an API key's carry
+`anthropic-ratelimit-requests-*`/`-tokens-*`, and the container reads the response either way.
+Preserving the illusion would mean fabricating response headers, which krayt does not do. Two
+consequences follow:
+- **The exactly-one rule still matters inside the container**, though it is not at risk: the
+  container is configured with exactly one credential variable, so the entrypoint's own
+  first-match-wins selection (§8.2) can never see two and pick the wrong one.
+- **Bare mode's `CLAUDE_CODE_OAUTH_TOKEN` caveat above still applies** to a translated subscription
+  token, since the container really is OAuth-configured. krayt never invokes `--bare`, so this
+  affects nobody today; it is recorded because the earlier design did obsolete this caveat and the
+  change is easy to miss.
+- **The container's `network.allow` stays minimal**: any refresh/token endpoint the real credential
+  needs is dialed by the *proxy*, upstream of the guest's own allowlist entirely, so it never needs
+  to appear in the guest's `network.allow`. The refresh case remains hypothetical for env-var
+  delivery — a CLI configured this way holds an access token and no refresh token, which is why
+  neither probe run contacted a token endpoint at all.
+
+**What's actually implemented vs. observed (2026-08-18).** The mechanism — adapter-produced
+`InjectRule`s, merge-with-user-config precedence (§8.1), pre-flight re-validation, the placeholder
+contract — is fully implemented and generic; it will translate ANY credential shape the vendor
+table has an entry for. Both Anthropic shapes are now in it, each backed by a live observation
+recorded in that file's PROVENANCE comment and pinned by a golden test:
+- **`ANTHROPIC_API_KEY` on `api.anthropic.com`** (strip `x-api-key`/`authorization`, set
+  `x-api-key`): observed live via `add-tls-mitm-credential-injection.md`'s hardware verification
+  (`run_c654e575`), reused rather than re-run.
+- **`CLAUDE_CODE_OAUTH_TOKEN` on `api.anthropic.com`** (strip both, set `authorization` to
+  `Bearer ` + the secret): observed live on 2026-08-17 from two like-for-like MITM runs of the same
+  task — `run_b408545b` with a genuine subscription token, `run_99bd261c` with a genuine API key.
+  Same host, same `POST /v1/messages` path in both; the token goes on the wire **verbatim**
+  (`credential_len` matched the secrets-file value's own length), so no exchange or refresh is
+  involved. Metering follows the credential, which settles this section's earlier
+  `(verify current)` on headless billing.
+
+**Still to verify on hardware:** that Claude Code accepts a *placeholder* on its OAuth path at
+startup, and that the whole run works end to end. It does for `ANTHROPIC_API_KEY` (`run_c654e575`
+authenticated with a prefix-less placeholder, which is also evidence the CLI does not validate
+credential format). See `HUMAN_TODO.md` for the run and its expected `proxy.log` lines.
+
+**Recommended default, updated.** Translation means a subscription token no longer outlives the
+run (it never enters the VM at all, and the proxy discards it at run teardown), so the
+blast-radius argument for preferring a scoped API key over a subscription token (below) **softens**
+under `mitm: true` with an observed shape — but it does **not disappear**: a compromised agent
+still has unlimited *authenticated* access to every allowlisted host, and can spend the seat's
+quota and rate budget, for the run's duration regardless of how the credential got attached. Prefer
+a scoped API key for untrusted code either way; translation narrows the cost of a subscription
+token's exposure, it doesn't remove the reason to be careful with one.
 
 ---
 
@@ -1371,6 +1489,28 @@ fails opaquely 30s into the agent); `passthrough ⊆ allow` in `mode: allowlist`
 intercepts **every** TLS connection the agent makes except those listed in `passthrough` — that
 is the point of `full`, stated plainly here so it isn't a surprise.
 
+**Adapter-supplied injection and merge precedence (`inject-claude-oauth-token-at-proxy.md` §2/§4).**
+An adapter's `Prepare` can return `Inject` rules of its own (§6.14's credential shape translation
+is the first and, so far, only user of this) alongside the `Env` additions it already contributed.
+Before any VM or image work:
+- The adapter's `Inject` rules are **unioned** into `network.inject` from the config file/flags —
+  `task.MergeInjectRules` — per host: a host the user never wrote a rule for gets the adapter's
+  rule verbatim; a host the user already has a rule for is merged header-by-header. On a
+  **conflict** (the same host AND the same header, matched case-insensitively, in either `set` or
+  `set_literal`) **the user's explicit config wins** and the run logs which adapter-supplied
+  header was overridden — a user who wrote their own `network.inject` rule for a host an adapter
+  also manages is never silently second-guessed.
+  `Strip` lists are unioned rather than conflict-checked (there's no "value" to disagree about); a
+  user-supplied `refresh` block for a host likewise always wins over an adapter-supplied one.
+- The **merged** set — adapter-supplied and hand-written rules alike — is re-run through the exact
+  same `ValidateNetworkPolicy` pre-flight described above. An adapter rule naming a host outside
+  `network.allow` (in `mode: allowlist`) fails the run before any VM boots, exactly as a typo'd
+  hand-written rule would — an adapter's suggestion is never exempt from the check a human's
+  config is held to.
+- The merged set is what actually gets serialized into the egress-proxy child's stdin config
+  (§6.6, §6.6.1) — adapter-supplied rules travel the identical path hand-written ones do; there is
+  no second, adapter-only channel into the proxy.
+
 ### 8.2 Container contract (convention)
 Injected by the tool, regardless of adapter:
 - `/workspace` — the repo snapshot (agent's working dir).
@@ -1409,14 +1549,21 @@ no mount, no env var, byte-identical to a run without the feature.
 
 **The `KRAYT_INJECTED_CREDENTIAL` contract (§6.14, only when the adapter's selected credential is
 named in `network.inject[].set`).** That credential is withheld from `SecretsBundle` entirely
-(§6.6.1) — no `/run/secrets/<key>` file ever arrives for it — so a compliant entrypoint that
-otherwise requires the file to exist before starting must instead check
-`KRAYT_INJECTED_CREDENTIAL` for the (non-secret) key **name** and, if it matches one of the
-credentials the agent recognizes, proceed with a placeholder value for it: the real value is
-attached to outgoing requests by the host proxy regardless of what the container sends, so the
-placeholder only needs to satisfy the agent's own "a credential is configured" check. Unset when
-injection isn't configured for the selected credential, which is the common case and adds no new
-behavior.
+(§6.6.1) — no `/run/secrets/<key>` file ever arrives for it — so a compliant entrypoint must not
+require the file before starting. It decides it has a credential, in this order:
+
+1. a `/run/secrets/<key>` file (ordinary delivery);
+2. **a recognized credential env var that is already set** — krayt configures the container with a
+   placeholder under the credential's own name (shape mirroring, §6.14), and the entrypoint must
+   accept that value **as-is**, never overwriting it; this is the shape-translation path;
+3. `KRAYT_INJECTED_CREDENTIAL` naming the (non-secret) key, for a krayt that set the name but no
+   value — the pre-shape-translation contract, kept for compatibility.
+
+The real value is attached to outgoing requests by the host proxy regardless of what the container
+sends, so a placeholder only needs to satisfy the agent's own "a credential is configured" check.
+Rule 2 is not optional: an entrypoint implementing only 1 and 3 exits `EX_CONFIG` (78) on every
+shape-translated run — which is exactly what every krayt agent image did until 2026-08-18, and what
+`hack/test-entrypoint-credentials.sh` now guards against.
 A compliant entrypoint that wants MITM'd hosts to verify, **and** wants `passthrough` hosts (which
 see the real upstream, not krayt's CA) to keep verifying too, must:
 - Check `KRAYT_CA_CERT` is set and non-empty before doing anything distro-specific.
@@ -1721,7 +1868,31 @@ exposed.
   credential** (`network.mitm` + `network.inject`, §6.6.1) — it never enters the VM, so there is
   nothing there for a compromise to steal; this residual is otherwise unchanged for any
   credential still delivered via `SecretsBundle` (the default, and the only option for anything
-  that isn't a bare HTTP header).
+  that isn't a bare HTTP header). **Softened further, not eliminated, by credential shape
+  translation** (`inject-claude-oauth-token-at-proxy.md`, §6.14): when `mitm` is on and the
+  selected shape is observed, a subscription token no longer outlives the run at all (it's
+  discarded with the proxy process at teardown, same as an injected API key) — but a compromised
+  agent can still spend that seat's quota and rate budget for the run's duration either way, so
+  "prefer a scoped API key for untrusted code" still stands; translation narrows the exposure
+  window, it doesn't remove the reason to be careful with a subscription token.
+- **Placeholder shape, one per credential kind** (`sk-ant-krayt-placeholder-do-not-use`,
+  `sk-ant-oat01-krayt-placeholder-do-not-use`). No client-side format check is known to exist:
+  `run_c654e575` authenticated fine with the entrypoint's prefix-less
+  `krayt-injected-at-host-proxy`, so the real thing's prefix is carried as cheap insurance, not to
+  satisfy a demonstrated requirement — the rest of each string is deliberately
+  human-legible-as-fake. Whether the OAuth path validates its token's format is the one thing the
+  pending hardware run settles. If a future probe (or a different vendor) forces a
+  stricter-looking placeholder, that requirement is itself a finding worth recording here, because
+  a placeholder forced to look more like a real credential is more likely to be mistaken for one by
+  a human reading a log.
+- **Accepted maintenance dependency on Anthropic's wire format** (`inject-claude-oauth-token-at-proxy.md`).
+  Credential shape translation makes krayt responsible for tracking exactly what headers/endpoints
+  Claude Code's API-key and subscription paths use — a fact that can change without notice on
+  Anthropic's side and silently break every translated run until caught. This is accepted, not
+  incidental: the mitigation is confining every such fact to one dated, golden-tested file
+  (`internal/adapter/anthropic_wire.go`) so a break is "the golden test fails, update one table" —
+  not "re-understand the proxy". `network.mitm: false` and non-translated credentials are entirely
+  unaffected by a wire-format change; the dependency is scoped to the opt-in translation path only.
 - **TLS MITM / credential injection — an honest trade, not a strict improvement** (§6.6.1,
   `add-tls-mitm-credential-injection.md`). Opt-in and off by default, but when on:
   - **It removes credential *theft*, not credential *use*.** The proxy cannot distinguish an
@@ -2277,6 +2448,65 @@ enters the VM at all (§6.6.1, §6.8, §6.14).
     `SELF_SIGNED_CERT_IN_CHAIN` negative control, and the issuer check). It is recorded there as
     required rather than optional, because Node reads no system trust store — broken CA plumbing
     in that entrypoint would fail every TLS call it makes under `network.mitm`.
+
+### Phase 10 — Credential shape translation, step 3 (`inject-claude-oauth-token-at-proxy.md`)
+Step 3 of the host-side-proxy arc (`docs/ai-tasks/README.md`; depends on Phase 9). Keeps the real
+credential out of the VM entirely: with `network.mitm` on, the container is configured with a
+non-secret placeholder under the credential's own variable, and the proxy attaches the real value in
+the shape the provider wants (§6.14, shape mirroring).
+
+> **Mechanism complete, both vendor shapes observed and implemented; one hardware run outstanding.**
+> The plumbing — adapter-produced `InjectRule`s, `task.MergeInjectRules` (user config wins on
+> conflict, §8.1), re-running pre-flight validation over the merged set, the non-secret placeholder
+> contract, `InjectRule.SetPrefix` for an auth scheme — is generic and fully implemented; it will
+> translate any credential shape `internal/adapter/anthropic_wire.go`'s table has an entry for. Both
+> Anthropic shapes are now in that table, each from a live observation (`run_c654e575`;
+> `run_b408545b` + `run_99bd261c`, 2026-08-17). What remains is one end-to-end hardware run of the
+> implemented `CLAUDE_CODE_OAUTH_TOKEN` rule — see `HUMAN_TODO.md`.
+
+- [x] `internal/adapter/anthropic_wire.go`: the one file in the repo allowed to encode an
+  Anthropic header/endpoint — a declarative `map[string]anthropicWireRule` plus the
+  per-shape `Placeholder` values, headed by a dated PROVENANCE comment naming which probe observed
+  which entry and recording the 2026-08-18 shape-mirroring decision. Pinned by `TestAnthropicWireRulesGolden`; `internal/proxy` verified to
+  contain no vendor identifiers by `TestProxyPackageHasNoAnthropicIdentifiers` (scoped to
+  non-test files — internal/proxy's pre-existing tests already used "api.anthropic.com" as
+  generic example data before this task, unrelated to it).
+- [x] `adapter.Plan` extended with `Inject []task.InjectRule` (reusing step 2's own domain type
+  rather than a parallel one — `internal/task` has no dependency on `internal/adapter`, so this
+  has no import-cycle cost) and `Placeholders map[string]string`; `adapter.Input` extended with
+  `MITM bool`. `claudeCode.Prepare` emits a translation rule + placeholder only when `in.MITM` is
+  true AND the selected credential has a table entry; otherwise unchanged
+  (`TestApplyAdapterMITMOff`, `TestApplyAdapterNoMITMSubscriptionTokenUnchanged`).
+- [x] `task.MergeInjectRules` (§8.1): unions adapter-produced rules into the user's own
+  `network.inject`, per-host, header-by-header, user wins on conflict, override logged
+  (`TestMergeInjectRules*`, `internal/task/network_test.go`). `krayt run`'s pre-flight now runs
+  the adapter first, merges, THEN validates the merged set once — an adapter rule is held to
+  exactly the same `ValidateNetworkPolicy` standard a hand-written one is
+  (`TestApplyAdapterUnallowlistedHostFailsPreflight`).
+- [x] Shape-mirroring proof: `TestMITMShapeTranslationPlaceholderMirrorsTheCredential` asserts every
+  observed credential shape produces its placeholder under its OWN env var and configures no other
+  credential variable. Written to iterate every *recognized* credential, not just the observed ones,
+  so a future table entry is covered for free.
+- [x] Container-side contract (§8.2): every agent entrypoint accepts an already-set credential env
+  var as satisfying its "a credential is configured" check, keeping `KRAYT_INJECTED_CREDENTIAL` as
+  the compatibility fallback. `hack/test-entrypoint-credentials.sh` exercises all three branches
+  offline against the real scripts — the seam that let every shape-translated run exit 78 until
+  2026-08-18 while every Go test passed.
+- [x] **Done when (offline):** `go build ./...` + `GOOS=linux GOARCH=arm64 go build ./...` +
+  `go test -race ./...` + `golangci-lint run` all green, including every offline test this task's
+  file lists that doesn't require the fallback design (not yet triggered — P3 hasn't run).
+- [x] **Done when (hardware, `[HUMAN]`):** ✅ **2026-08-18, `run_df97fffa`** (with `mitm: false`
+  control `run_10fc027d`). A live `CLAUDE_CODE_OAUTH_TOKEN` run under `mitm: true`: `200` on
+  `POST /v1/messages`, the real 108-byte token attached host-side (`sent=[…
+  authorization=<scheme="Bearer" credential_len=108>]`), the container's own request carrying a
+  28-byte placeholder, `/run/secrets` absent entirely, `secret-scan.json` clean, and the
+  subscription's `anthropic-ratelimit-unified-*` headers on the response — so the injected token
+  bills the subscription, not API credits. The control run, same task and image, found the real
+  token in `/run/secrets` as expected, which is what makes the first run's absence mean something.
+  Two facts observed for the first time here: Claude Code accepts a **placeholder** on its OAuth
+  path (a prefix-less 28-byte string, so it validates credential format on neither path), and it
+  **scrubs its credential from child-process environments** — `env` inside the agent cannot show it,
+  which is why the entrypoint's own line and the proxy log are the evidence.
 
 ---
 

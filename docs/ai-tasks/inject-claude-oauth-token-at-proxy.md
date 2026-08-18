@@ -43,6 +43,41 @@ This is a deliberate, accepted trade: krayt takes on a maintenance dependency on
 format, and will need an update when that format changes. That cost is accepted — see
 "Making the treadmill cheap" below, which is the engineering response to it.
 
+## DEVIATION — shape mirroring supersedes the design below (owner decision, 2026-08-18)
+
+**Read this before the design section.** The rule below — "the container is **always** configured
+API-key-shaped, whichever credential the user supplied" — was implemented, then changed by the
+owner after the P1–P3 probes came back. What ships instead:
+
+> **The container is configured with a placeholder under the credential's OWN variable.** An
+> `ANTHROPIC_API_KEY` secret gives the container a fake `ANTHROPIC_API_KEY`; a
+> `CLAUDE_CODE_OAUTH_TOKEN` secret gives it a fake `CLAUDE_CODE_OAUTH_TOKEN`. The agent then runs
+> its own code path for that shape, and the proxy substitutes exactly one header value.
+
+Why the change — the probe data is what motivated it:
+
+- **The two code paths differ by more than the auth header.** The subscription path sends
+  `anthropic-beta: …,oauth-2025-04-20,…`; the API-key path sends `context-1m-2025-08-07` and
+  `fallback-credit-2026-06-01` instead. Under the original design krayt would have to *synthesize*
+  the OAuth request shape from the API-key one — appending the OAuth flag and hoping the API-key
+  path's own flags are accepted alongside an OAuth credential — and re-do that analysis every time
+  either path changes. Mirroring makes the CLI compose its own list, correctly, for free.
+- **The hiding property the original design bought was never real.** "The container never learns
+  what kind of credential is in use" fails on the response: a subscription's replies carry
+  `anthropic-ratelimit-unified-5h-*`/`-7d-*` headers, an API key's carry
+  `anthropic-ratelimit-requests-*`/`-tokens-*`. Keeping the secret would mean fabricating response
+  headers, which is a worse trade than admitting the kind.
+- **"It removes the refresh problem" is moot for env-var delivery.** A CLI configured via
+  `CLAUDE_CODE_OAUTH_TOKEN` holds an access token and no refresh token — which is exactly why P4
+  found no token endpoint contacted in either run. The refresh problem belongs to the interactive
+  `/login` credential store, which krayt never uses.
+
+What this file still governs, unchanged: the probe protocol (P1–P5) and its findings, the
+"never guess a header shape" rule, the treadmill-cheap constraint (one dated, golden-tested vendor
+file), and the fallback design should a future probe show structural divergence. What it no longer
+governs: which env var the container's placeholder is delivered as, and the `--bare` / exactly-one
+consequences that followed from the always-API-key rule.
+
 ## The design (settled — do not redesign)
 
 ```
@@ -87,6 +122,11 @@ subscription token cannot authenticate an API-key-shaped request and header tran
 source of truth for Anthropic's wire format. **Do not implement against assumptions, including any
 written here.** Use step 2's own MITM proxy as the instrument, logging **request line, host, and header
 names only — never bodies, never values** (step 2 §6):
+
+**Every probe run below needs `KRAYT_PROXY_LOG_REQUESTS=1`** (§6.6,
+`internal/proxy/observe.go`). Step 2 shipped the proxy as an *enforcement point*, whose log records
+only failures and denials — so a successful probe run leaves `proxy.log` empty and proves nothing.
+That variable turns on the per-request observation log the recordings below assume.
 
 - **P1 — API-key baseline.** Run the `claude-code` image with a real `ANTHROPIC_API_KEY`, delivered the
   old way (`SecretsBundle`), under `mitm: true`. Record: hosts, paths, auth header name, any static

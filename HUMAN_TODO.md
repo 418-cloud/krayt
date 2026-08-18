@@ -7,6 +7,19 @@ hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
 ## Status
 
+**✅ DONE — `inject-claude-oauth-token-at-proxy.md` (step 3) is verified on hardware.**
+`run_df97fffa` on 2026-08-18, with its `mitm: false` control `run_10fc027d`: a live
+`CLAUDE_CODE_OAUTH_TOKEN` run returned **200** on `POST /v1/messages` with the real 108-byte token
+attached host-side, while the container held only a 28-byte placeholder and had no `/run/secrets`
+at all. The control run — same task, same image, token delivered the ordinary way — found the token
+in `/run/secrets`, which is what makes the first run's absence mean something. Details, including
+the two facts that run observed for the first time, are in the `[hardware]` entry below.
+
+**One follow-up, non-blocking:** republish the three agent images so the fixed entrypoint ships
+(`[BUG]` entry below). Today's `:latest` works via the `KRAYT_INJECTED_CREDENTIAL` compatibility
+branch — which is why the placeholder on the wire was the entrypoint's 28-byte string rather than
+krayt's own 41-byte self-describing one.
+
 **Open (two loose ends, both small):** `add-tls-mitm-credential-injection.md` (Phase 9, §14) is
 **complete and its §14 checkbox is ticked** — verified with live credentials across two providers
 (`run_c654e575` Anthropic injection, `run_117d6f75` the `mitm: false` mirror, `run_e19488dd`
@@ -206,6 +219,205 @@ per-run allowlists in the netprobe.
   to `[x]` and this section's status line once confirmed — do not mark it done without a real run.
 - **Blocking:** no — `network.mitm` is opt-in and defaults to false; every run that doesn't set
   it is unaffected regardless of whether this verification has happened.
+
+## [BUG] every agent entrypoint exited 78 on a shape-translated run — FIXED 2026-08-18, images need a republish
+
+**What was broken.** `claudeCode.Prepare`'s shape-translation path delivers the credential
+placeholder as ordinary container env and (by design) writes no `/run/secrets/<key>` file. But all
+three entrypoints (`images/agents/*/entrypoint.sh`) decided "do I have a credential?" by looking
+only for the FILE, then for `KRAYT_INJECTED_CREDENTIAL` — never for a credential variable that was
+**already set**. So every `mitm: true` run using shape translation would print "no credential in
+/run/secrets" and exit 78 (`EX_CONFIG`) before the agent started. No traffic, no proxy.log, nothing
+to debug.
+
+**Why no test caught it.** The Go tests assert the HOST side (`spec.Env` carries the placeholder),
+which was correct. The entrypoint is a shell script that nothing but a real container ever ran, so
+the contract between the two halves was unverified in both directions.
+
+**Fixed:** each entrypoint now accepts an already-set recognized credential var, keeping its value
+as-is (§8.2's contract, rewritten to list all three sources in order); `KRAYT_INJECTED_CREDENTIAL`
+remains as the compatibility branch. `hack/test-entrypoint-credentials.sh` exercises all three
+branches plus the fail-closed case against the real scripts, offline, with stubbed CLIs — it fails
+against the pre-fix entrypoints, which is what makes it a regression test rather than a tautology.
+Two smaller fixes rode along: `KRAYT_OUTPUT` overrides the hardcoded `/output` (so the script is
+runnable outside a container at all), and `${extra[@]+"${extra[@]}"}` in the claude-code entrypoint
+avoids bash 3.2's empty-array-under-`set -u` abort (macOS's bash; the image's own bash 5 was never
+affected).
+
+- **What a human still needs to do:** republish the three agent images so the fix is in
+  `:latest` — `agent-images.yml`. **Non-blocking:** the adapter now also sets
+  `KRAYT_INJECTED_CREDENTIAL`, which the *unrebuilt* published images already honor, so
+  shape-translated runs work against `:latest` today. The difference the rebuild makes is whose
+  placeholder value lands: krayt's self-describing `sk-ant-…-krayt-placeholder-do-not-use` (new
+  images) versus the entrypoint's own `krayt-injected-at-host-proxy` (current ones). Both are
+  non-secret; the former is far more legible in a log, and is the one the OAuth path may need if
+  Claude Code turns out to validate token format.
+- **Verify success by:** `./hack/test-entrypoint-credentials.sh` green (11/11 locally; 8 of those
+  fail against the pre-fix entrypoints, which is what makes it a regression test). The hardware run
+  below then confirmed the compatibility path end to end: `run_df97fffa` started fine against
+  today's unrebuilt `:latest`, taking the `KRAYT_INJECTED_CREDENTIAL` branch — visible in the wire
+  log as a 28-byte placeholder (the entrypoint's own value) rather than krayt's 41-byte one. After
+  the republish, expect that to read 41.
+
+## [hardware] `inject-claude-oauth-token-at-proxy.md` — wire-format probe + end-to-end verification — ✅ DONE 2026-08-18
+
+**Needed:** step 3 of the host-side-proxy arc hides OAuth entirely by configuring the container
+API-key-shaped no matter which credential the user really supplied, and having the host proxy
+translate shape on the wire. That only works if Claude Code's subscription request path differs
+from its API-key request path in **headers only** (same host, same path, same body shape) — and
+that can only be confirmed by watching a real subscription token go through step 2's own MITM
+proxy. This environment has no live Anthropic credential of either kind and cannot fake one
+(`CLAUDE.md`: "never fabricate a result for a human-only step" — a mocked "credential" proves
+nothing about what Anthropic's real API expects). The task file names this probe P1–P5;
+**P1 is already answered** by existing evidence (below) and needs no new run. **P2, P3, and P4
+genuinely need a fresh run** with a real subscription token. P5 is documentation-only and gates
+nothing.
+
+**P1 — already done, reusing existing evidence (no new run needed).** The `add-tls-mitm-credential-injection.md`
+hardware verification above already ran exactly the API-key baseline this probe asks for
+(`run_c654e575`, live `ANTHROPIC_API_KEY`, `mitm: true`), and recorded precisely the fields P1
+asks for:
+- Host: `api.anthropic.com`.
+- Auth header: `x-api-key` (a curl sending neither `x-api-key` nor `Authorization` got a real
+  `200`; the `mitm:false` mirror run `run_117d6f75` sending the same unauthenticated request got a
+  `401 x-api-key header is required` — which is what pins the shape to exactly `x-api-key`, not
+  just "some header").
+- No static opt-in headers were needed for the run to succeed.
+- This is already encoded in `internal/adapter/anthropic_wire.go`'s `anthropicWireRules["ANTHROPIC_API_KEY"]`
+  and pinned by `TestAnthropicWireRulesGolden`.
+
+**P2 — subscription baseline. NOT done — this is the blocking part.**
+1. Get a real `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token` on a machine with a browser and an
+   active Pro/Max/Team/Enterprise subscription — prints the token, saves it nowhere, §6.14).
+2. Put it alone in a scratch secrets file: `CLAUDE_CODE_OAUTH_TOKEN=<token>` (no `ANTHROPIC_API_KEY`
+   alongside it — the exactly-one rule would otherwise pick the wrong one).
+3. Run the `claude-code` image with `mitm: true` and **no `network.inject[]`** (nothing to inject
+   yet — the point of this probe is to observe, not to configure translation):
+   ```yaml
+   # krayt-oauth-probe.yaml
+   image: ghcr.io/418-cloud/krayt-agent-claude-code
+   secrets: ./oauth-secrets.env
+   network:
+     mode: allowlist
+     allow: [api.anthropic.com]   # widen this list if the run reports a blocked host — see P3/P4
+     mitm: true
+   agent:
+     adapter: none                # deliberately bypass the claude-code adapter for this probe —
+                                   # it doesn't yet know how to translate this shape, and forcing
+                                   # it to try would fail the run before any traffic is observed
+   ```
+   ```sh
+   KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config krayt-oauth-probe.yaml --task ./task.md --repo .
+   ```
+   **`KRAYT_PROXY_LOG_REQUESTS=1` is mandatory for this probe, and an earlier version of these
+   steps was wrong to omit it.** Without it the proxy logs only failures and policy denials, so a
+   run in which everything *worked* leaves `proxy.log` **empty** — which is exactly what a first
+   attempt at this probe produced (`run_f47f5066`: exit 0, MITM CA trusted, `claude -p` completed,
+   0-byte `proxy.log`). The observation mode (`internal/proxy/observe.go`, §6.6) adds one line per
+   request — request line, host, header names, query-parameter names, response status, never a
+   value — and is what makes the proxy an instrument rather than just an enforcement point.
+   Since `mitm: true` with no `inject:` for `CLAUDE_CODE_OAUTH_TOKEN` still ships it via
+   `SecretsBundle` as normal (network.inject is opt-in), this run authenticates exactly like any
+   other subscription-token run — the ONLY thing new here is that the traffic passes through the
+   MITM proxy, which can now see it.
+4. Record from `.krayt/runs/<id>/proxy.log` (host, path, header **names** — never values, per §6
+   of `add-tls-mitm-credential-injection.md`) and, if a debug shell into the running container is
+   available, `curl -v` against the same endpoint to get the exact request line:
+   - Host(s) contacted (is it `api.anthropic.com`, same as the API-key run, or something else —
+     e.g. a subscription-specific host?).
+   - Path(s) contacted for the actual inference call (same path as an API-key `claude -p` run?).
+   - The auth header name (`Authorization: Bearer …`? Still `x-api-key`? Something else?) and its
+     VALUE'S SHAPE only (e.g. "Bearer-prefixed", "raw token") — never the value itself.
+   - Any other headers present on the API-key run but absent here, or vice versa.
+
+**P2 + P1b — RECORDED 2026-08-17. Two like-for-like runs, same task, same instrument
+(`KRAYT_PROXY_LOG_HEADER_VALUES`): `run_b408545b` with a live `CLAUDE_CODE_OAUTH_TOKEN`,
+`run_99bd261c` with a live `ANTHROPIC_API_KEY`. Both `mitm: true`, no `inject[]`, `adapter: none`.**
+
+| | subscription token | API key |
+|---|---|---|
+| Host | `api.anthropic.com` | `api.anthropic.com` — **same** |
+| Inference | `POST /v1/messages?beta=…` | `POST /v1/messages?beta=…` — **same path and query** |
+| Auth header | `authorization: Bearer …`, `credential_len=108` | `x-api-key` |
+| Pre-flight calls | `GET /api/claude_code/settings` (404), `/policy_limits` (200), with `anthropic-beta: oauth-2025-04-20` | the **same two calls**, with `x-api-key` and **no** `anthropic-beta` |
+| `anthropic-beta` on inference | …`oauth-2025-04-20`…`extended-cache-ttl-2025-04-11` | …`context-1m-2025-08-07`…`fallback-credit-2026-06-01` |
+| Response rate-limit headers | `anthropic-ratelimit-unified-5h-*`, `-7d-*`, `-overage-status` | `anthropic-ratelimit-requests-*`, `-tokens-*`, `-input-tokens-*` |
+
+Everything the probe asked for, now answered:
+
+- **P3 → PRIMARY design.** Same host, same path, same body shape; the difference is the auth header.
+  No structural divergence, so the fallback (`RefreshRule` response rewriting) stays unimplemented.
+- **The token is forwarded VERBATIM.** `credential_len=108` equals the secrets-file value's own
+  length, so Claude Code does **not** exchange the long-lived `sk-ant-oat01-…` token for a
+  short-lived one. This is the single fact the whole primary design rests on — the proxy holds
+  everything the request needs.
+- **The auth scheme is `Bearer ` (trailing space).** Observed, not assumed.
+- **`oauth-2025-04-20` is the OAuth-only `anthropic-beta` item**, and it appears alone on the two
+  `/api/claude_code/*` calls of the OAuth run while the API-key run sends no `anthropic-beta` there
+  at all — which is what makes it look required for OAuth-token acceptance rather than incidental.
+- **P4 → no refresh.** No token/refresh endpoint, no `401`, in either run. Consistent with §6.14's
+  "long-lived token"; a deliberately long/idling run is still what would let "never refreshes" be
+  asserted outright.
+- **P5 → metering follows the credential.** The OAuth run draws on the unified 5h/7d subscription
+  windows; the API-key run reports per-key request/token limits. §6.14's `(verify current)` marker on
+  this point is answered by the header sets themselves.
+- **Correction to an earlier reading of the P2-only run:** the `/api/claude_code/settings` +
+  `/policy_limits` calls are **not** OAuth-specific. The API-key run makes exactly the same two
+  calls. They are unconditional Claude Code startup calls, so shape translation does not have to
+  suppress or account for them.
+
+**Implemented from this recording (this branch):**
+`anthropicWireRules["CLAUDE_CODE_OAUTH_TOKEN"]` = strip `x-api-key` + `authorization`, set
+`authorization` = `"Bearer "` + the secret. `InjectRule.SetPrefix` carries the scheme (folded into
+the value host-side, so `internal/proxy` still just sets a string). Under the 2026-08-18 shape-
+mirroring decision the container is configured `CLAUDE_CODE_OAUTH_TOKEN=<placeholder>`, so Claude
+Code emits `oauth-2025-04-20` and the rest of its beta list itself — krayt synthesizes nothing, and
+the `AppendCSV` mechanism that existed only for that synthesis is gone.
+`TestAnthropicInjectRuleForUnobservedShape` is gone too — `TestAnthropicWireRulesPassRealValidation`
+now runs every table entry through `ValidateNetworkPolicy` instead, so a future probe cannot add an
+entry the run pre-flight rejects.
+
+**✅ VERIFIED END TO END — `run_df97fffa`, 2026-08-18** (harness:
+`/tmp/claude/krayt-oauth-verify`, two runs). Every substantive claim held:
+
+- **`200` on `POST /v1/messages`** with `sent=[… authorization=<scheme="Bearer" credential_len=108>]`
+  — the real token, attached host-side, accepted by Anthropic.
+- **The container never held it:** its own request carried
+  `authorization=<scheme="Bearer" credential_len=28>` (a placeholder), `/run/secrets` did not exist,
+  `secret-scan.json` was clean, and no `x-api-key` appeared anywhere — the container was
+  OAuth-shaped, as shape mirroring intends.
+- **The CLI composed `oauth-2025-04-20` itself**, on the request krayt received. krayt added nothing
+  to `anthropic-beta`, which is the whole point of mirroring the shape.
+- **Metering follows the injected credential:** the `200` carried
+  `anthropic-ratelimit-unified-5h-*`/`-7d-*`, so a translated run bills the subscription, not API
+  credits. That is P5 answered for the injected path, not just the direct one.
+- **Control run `run_10fc027d`** (same task, same image, `mitm: false`): `/run/secrets/CLAUDE_CODE_OAUTH_TOKEN`
+  present at 108 bytes, no placeholder, no injection. Without this, run 1's "no credential here"
+  would have been unfalsifiable.
+
+**Two things observed for the first time, both worth carrying forward:**
+
+1. **Claude Code validates credential format on neither path.** The placeholder it accepted was the
+   *entrypoint's* prefix-less `krayt-injected-at-host-proxy` (28 bytes), not krayt's
+   `sk-ant-oat01-…` — because `:latest` predates the §8.2 entrypoint fix and substituted its own
+   value. So the `sk-ant-` prefixes in `anthropicWireRules` are insurance, not a requirement.
+2. **Claude Code scrubs its credential from child-process environments** (`CLAUDE_CODE_CHILD_SESSION=1`
+   in the agent's own report). An agent running `env` inside the container cannot see the
+   placeholder *however the run is configured* — so "no credential in env", reported by an agent, is
+   not evidence in either direction. The entrypoint's startup line and the proxy's observation log
+   are. Three of this harness's assertions initially pointed at `logs/console.log` (the VM serial
+   console, which carries no agent output at all); one of them consequently passed vacuously. Fixed,
+   and re-checked against the real artifacts of both runs.
+
+- **Why the agent couldn't:** no live Anthropic credential of either kind in this sandbox, and no
+  guessed header name or endpoint may ship — "an honestly-blocked handoff beats a plausible
+  invention." Every fact in `anthropicWireRules` came from one of these runs.
+- **Still open, and genuinely minor:** P4 can only be *strengthened*, not completed, by a short run —
+  no refresh appeared in any of the four runs so far, but asserting "never refreshes" outright wants
+  a deliberately long or idling one.
+- **Verified:** `KRAYT_SPEC.md` §14's Phase 10 "Done when (hardware)" is ticked and
+  `docs/ai-tasks/README.md`'s status cell updated, both citing these run ids.
+- **Blocking:** nothing.
 
 ## [tooling/CI] vmimage RC/graduate workflows — ✅ DONE
 

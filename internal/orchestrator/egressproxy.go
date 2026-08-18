@@ -216,7 +216,18 @@ func buildEgressStdinConfig(np task.NetworkPolicy, secretsPath string) ([]byte, 
 		for _, r := range np.Inject {
 			set := make(map[string]string, len(r.Set))
 			for header, key := range r.Set {
-				set[header] = values[key]
+				v := values[key]
+				// The prefix (an auth scheme, e.g. "Bearer ") is folded in HERE, not in the proxy:
+				// the proxy's contract stays "set this header to this exact string" and no scheme
+				// knowledge crosses that boundary (§6.6.1). Skipped for an empty value so the
+				// proxy's fail-closed check for an unresolved credential still fires — a bare
+				// "Bearer " would look like a resolved value and be sent upstream unauthenticated.
+				if v != "" {
+					if prefix, ok := task.LookupHeader(r.SetPrefix, header); ok {
+						v = prefix + v
+					}
+				}
+				set[header] = v
 			}
 			pr := proxy.InjectRule{Host: r.Host, Strip: r.Strip, Set: set, SetLiteral: r.SetLiteral}
 			if r.Refresh != nil {

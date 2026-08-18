@@ -171,6 +171,72 @@ func TestCredentialInjectionSignal(t *testing.T) {
 	}
 }
 
+// TestMITMShapeTranslationPlaceholderMirrorsTheCredential is the thesis test for SHAPE MIRRORING
+// (internal/adapter/anthropic_wire.go's PROVENANCE, owner decision 2026-08-18): every credential
+// shape produces a placeholder delivered under ITS OWN env var, never translated into another
+// shape's variable. That is what makes the agent run its own code path for the credential the user
+// actually supplied — so krayt never has to reproduce the request that path would have built.
+//
+// It iterates every credential claude-code recognizes rather than hardcoding the observed ones, so
+// a future probe that adds a table entry gets this property asserted for free.
+func TestMITMShapeTranslationPlaceholderMirrorsTheCredential(t *testing.T) {
+	ad, err := adapter.Get("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cred := range []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"} {
+		plan, err := ad.Prepare(adapter.Input{SecretKeys: []string{cred}, MITM: true})
+		if err != nil {
+			t.Fatalf("%s: %v", cred, err)
+		}
+		if len(plan.Inject) == 0 {
+			// No wire rule for this shape yet — correctly falls back to SecretsBundle, and there is
+			// no placeholder to assert anything about.
+			continue
+		}
+		if len(plan.Placeholders) != 1 {
+			t.Errorf("%s: Placeholders = %v, want exactly one entry", cred, plan.Placeholders)
+		}
+		got, ok := plan.Placeholders[cred]
+		if !ok {
+			t.Errorf("%s: Placeholders = %v, want the placeholder under the credential's OWN name", cred, plan.Placeholders)
+			continue
+		}
+		if got == "" {
+			t.Errorf("%s: empty placeholder value", cred)
+		}
+		// A placeholder that looked like the real thing would be indistinguishable from a leak in a
+		// log; a human who finds one must be able to tell immediately (§3).
+		if !strings.Contains(got, "krayt-placeholder-do-not-use") {
+			t.Errorf("%s: placeholder %q is not self-describing", cred, got)
+		}
+		// The container is configured for exactly one credential, so the entrypoint's exactly-one
+		// selection can never see two and pick the wrong one.
+		for other := range plan.Placeholders {
+			if other != cred {
+				t.Errorf("%s: placeholder also configures %q", cred, other)
+			}
+		}
+	}
+}
+
+// TestMITMShapeTranslationRequiresMITM proves the observed-shape injection path only ever
+// activates when network.mitm is actually on — the same credential with in.MITM false must fall
+// back to plain SecretsBundle delivery (mitm:false byte-identical regression).
+func TestMITMShapeTranslationRequiresMITM(t *testing.T) {
+	ad, err := adapter.Get("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := ad.Prepare(adapter.Input{SecretKeys: []string{"ANTHROPIC_API_KEY"}, MITM: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Inject) != 0 || len(plan.Placeholders) != 0 {
+		t.Errorf("mitm:false must not translate; plan = %+v", plan)
+	}
+}
+
 func TestGetUnknown(t *testing.T) {
 	if _, err := adapter.Get("clyde"); err == nil {
 		t.Error("unknown adapter should error")

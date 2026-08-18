@@ -264,6 +264,78 @@ Run it exactly like any other task — `krayt run --config krayt.yaml --task ./t
 `report.md`/`meta.json` show which keys were injected (names only, never values) so you can
 confirm the container ran without them.
 
+**Seeing what the agent actually sent.** `.krayt/runs/<id>/proxy.log` records only failures and
+policy denials, so a run where everything worked leaves it **empty**. To watch the traffic itself,
+set `KRAYT_PROXY_LOG_REQUESTS=1` on the run:
+
+```sh
+KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config krayt.yaml --task ./task.md
+```
+
+Each intercepted request then logs its request line, host, header **names**, query-parameter
+**names**, and response status — never a header value, a query value, or a body:
+
+```
+krayt-egress-proxy: observe CONNECT "api.anthropic.com:443" via=mitm
+krayt-egress-proxy: observe mitm POST host="api.anthropic.com:443" path="/v1/messages" headers=[accept,content-type,x-api-key] inject=true
+krayt-egress-proxy: observe mitm response host="api.anthropic.com:443" path="/v1/messages" status=200 headers=[content-type,request-id]
+```
+
+Off by default so ordinary runs don't persist every host and path the agent visited. Hosts you
+listed under `network.passthrough` are tunneled, not intercepted, so they log the `CONNECT` line
+only — their contents stay encrypted end to end.
+
+When a name isn't enough — you need an API's required beta/version header *value*, say — name those
+headers explicitly with `KRAYT_PROXY_LOG_HEADER_VALUES=anthropic-beta,anthropic-version`. Anything
+credential-bearing (`authorization`, `x-api-key`, `cookie`, … or any header your `network.inject[]`
+rules touch) is reduced to its shape instead of its value. The response line additionally reports
+what the proxy actually sent upstream (`sent=[…]`), which is the only place credential injection is
+visible — the request line shows what the container sent, placeholder and all:
+
+```
+values=[anthropic-beta="oauth-2026-01-01" authorization=<scheme="Bearer" credential_len=108>]
+```
+
+**Credential shape translation (`--agent claude-code` + `mitm: true`, zero `network.inject[]`
+needed).** For Claude Code specifically, the adapter can skip hand-writing `network.inject`
+entirely: with `--agent claude-code` and `network.mitm: true`, the adapter emits the injection
+rule itself — the container gets a placeholder that satisfies Claude Code's own "a credential is
+configured" check, and the real value never leaves the host:
+
+```yaml
+# krayt.yaml
+secrets: ./secrets.env          # ANTHROPIC_API_KEY OR CLAUDE_CODE_OAUTH_TOKEN — exactly one
+network:
+  mode: allowlist
+  allow: [api.anthropic.com]
+  mitm: true                    # that's it — no network.inject[] to write
+agent:
+  adapter: claude-code
+```
+
+```sh
+krayt run --config krayt.yaml --agent claude-code --task ./task.md --repo .
+```
+
+Both credential shapes are handled, and **the placeholder mirrors the kind of credential you
+supplied**:
+
+| Your secrets file has | The container is configured with | The proxy sends upstream |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use` | `x-api-key: <your key>` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | `CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-krayt-placeholder-do-not-use` | `authorization: Bearer <your token>` |
+
+Mirroring the shape means Claude Code runs its own code path for the credential you actually have —
+composing the `anthropic-beta` opt-in flags and everything else itself — so krayt substitutes one
+header value and invents nothing. The container holds no credential either way; it can still tell
+it is on a subscription, because Anthropic's own responses say so in their rate-limit headers.
+
+Both wire shapes come from live MITM observation of Claude Code itself, dated and recorded in
+`internal/adapter/anthropic_wire.go`'s PROVENANCE comment (a golden test pins the table, so the day
+Anthropic changes something that test's diff *is* the changelog). The subscription shape is newly
+landed and its own end-to-end run is still pending — see `HUMAN_TODO.md`; `KRAYT_SPEC.md` §6.14 has
+the full design.
+
 ### Agent images
 
 krayt publishes official, minimal, version-pinned container images with an agent already
