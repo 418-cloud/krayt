@@ -120,10 +120,10 @@ func TestApplyAdapterMITMInjectsObservedShape(t *testing.T) {
 
 // TestApplyAdapterMITMSubscriptionTokenTranslatesShape is the end-to-end form of the 2026-08-17
 // probe result (internal/adapter/anthropic_wire.go's PROVENANCE): a CLAUDE_CODE_OAUTH_TOKEN secret
-// under mitm:true now produces the OAuth wire rule — Bearer on authorization, the OAuth beta flag
-// appended — while the CONTAINER still sees nothing but the same API-key-shaped placeholder every
-// other credential shape produces. That last part is the §6.14 claim this whole task exists for: the
-// container never learns which kind of credential is really in use.
+// under mitm:true now produces the OAuth wire rule — Bearer on authorization, with the token forwarded
+// verbatim — while the CONTAINER sees an OAuth-shaped placeholder under CLAUDE_CODE_OAUTH_TOKEN, the
+// same variable the user supplied (SHAPE MIRRORING). That is the §6.14 claim this whole task exists
+// for: the real credential never rides SecretsBundle, and Claude Code runs its own OAuth code path.
 func TestApplyAdapterMITMSubscriptionTokenTranslatesShape(t *testing.T) {
 	spec := &task.RunSpec{
 		Questions: task.QuestionsPolicy{Mode: task.QuestionFail},
@@ -145,7 +145,7 @@ func TestApplyAdapterMITMSubscriptionTokenTranslatesShape(t *testing.T) {
 		t.Errorf("adapter-produced rule failed re-validation: %v", err)
 	}
 	// The token is withheld from the guest bundle entirely, and the container is configured
-	// API-key-shaped with the placeholder — indistinguishable from a real API-key run.
+	// OAuth-shaped with the placeholder under its own env var (SHAPE MIRRORING, not API-key-shaped).
 	if !spec.Network.InjectedSecretKeys()["CLAUDE_CODE_OAUTH_TOKEN"] {
 		t.Error("the OAuth token must be withheld from SecretsBundle once it is injected host-side")
 	}

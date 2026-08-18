@@ -123,7 +123,7 @@ func (o *observer) request(via, host string, r *http.Request, injected bool) {
 //
 // It also reports the request AS SENT upstream (the `sent=` fragment), which is the only place
 // injection can be observed taking effect: observer.request logs what the GUEST sent, before
-// strip/set/append ran. Without this, a run using shape translation shows a placeholder going in
+// strip/set ran. Without this, a run using shape translation shows a placeholder going in
 // and a 200 coming back, with the actual translated credential shape invisible — exactly the thing
 // a verification run needs to confirm. Credential-bearing headers are reduced to scheme + length
 // here as everywhere else, so the injected value itself never appears.
@@ -186,21 +186,23 @@ func credentialShape(v string) string {
 	return fmt.Sprintf("<scheme=%q credential_len=%d>", scheme, len(rest))
 }
 
-// isSchemeToken reports whether s is a plausible RFC 7235 auth-scheme token, so a value that
-// merely happens to contain a space (an unusual credential, a malformed header) is reported as
-// scheme-less rather than having its first bytes printed as if they were a scheme name.
+// authSchemes is the IANA-registered HTTP authentication scheme names (RFC 7235 §5.1 and the
+// "Hypertext Transfer Protocol (HTTP) Authentication Scheme Registry"), matched case-insensitively.
+// This is a fixed, public list, not vendor knowledge — it does not grow to fit any one credential.
+var authSchemes = map[string]bool{
+	"basic": true, "bearer": true, "digest": true, "hoba": true, "mutual": true,
+	"negotiate": true, "oauth": true, "scram-sha-1": true, "scram-sha-256": true,
+	"vapid": true, "aws4-hmac-sha256": true, "concealed": true, "dpop": true,
+}
+
+// isSchemeToken reports whether s is one of the fixed, recognized auth-scheme names in
+// authSchemes. Checking against a closed list — rather than merely "looks token-shaped" — matters
+// because a credential's own first word can otherwise look like a plausible scheme (e.g. a
+// passphrase-style secret containing a space): printing it verbatim as "the scheme" would defeat
+// credentialShape's entire purpose of never reproducing credential bytes. A value that isn't a
+// recognized scheme is reported as scheme-less instead.
 func isSchemeToken(s string) bool {
-	if s == "" || len(s) > 32 {
-		return false
-	}
-	for _, c := range s {
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '-':
-		default:
-			return false
-		}
-	}
-	return true
+	return authSchemes[strings.ToLower(s)]
 }
 
 // urlPath is u's path, or "" for a nil URL. Deliberately path-only: a query string can carry a

@@ -168,6 +168,13 @@ type InjectRule struct {
 	SetPrefix  map[string]string // header name (must be in Set) -> literal prefix the value carries
 	SetLiteral map[string]string // header name -> fixed literal value (never a secret)
 	Refresh    *RefreshRule      // optional host-side credential refresh (plumbing only; step 3 fills in execution)
+
+	// Withheld names secrets-file keys that must stay out of SecretsBundle even though this rule
+	// no longer sets any header from them — e.g. an adapter-selected credential whose header the
+	// user's own network.inject rule claimed instead (MergeInjectRules). Without this, dropping
+	// the adapter's Set entry on conflict would also drop it from InjectedSecretKeys(), and the
+	// credential the adapter deliberately kept out of the guest would ride SecretsBundle in.
+	Withheld []string
 }
 
 // RefreshRule declaratively names an upstream credential-refresh endpoint for one InjectRule

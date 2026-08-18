@@ -70,10 +70,10 @@ func TestAnthropicWireRulesSelfConsistent(t *testing.T) {
 
 // TestAnthropicWireRulesPassRealValidation runs every table entry through the SAME validator a
 // user-written network.inject rule faces (task.ValidateNetworkPolicy), so a future probe cannot add
-// an entry the run pre-flight would then reject at `krayt run` time — a malformed prefix, an
-// append item with a comma in it, a hop-by-hop target. This replaced an earlier tripwire test that
-// asserted CLAUDE_CODE_OAUTH_TOKEN had NO entry; the 2026-08-17 probe (see PROVENANCE) gave it one,
-// which is exactly the event that test existed to flag.
+// an entry the run pre-flight would then reject at `krayt run` time — a malformed prefix, a
+// hop-by-hop target. This replaced an earlier tripwire test that asserted CLAUDE_CODE_OAUTH_TOKEN
+// had NO entry; the 2026-08-17 probe (see PROVENANCE) gave it one, which is exactly the event that
+// test existed to flag.
 func TestAnthropicWireRulesPassRealValidation(t *testing.T) {
 	for cred := range anthropicWireRules {
 		rule, _, ok := anthropicInjectRuleFor(cred)
@@ -125,10 +125,11 @@ func TestAnthropicInjectRuleForOAuthShape(t *testing.T) {
 }
 
 // TestAnthropicInjectRuleForObservedShape is the direct proof of the design table in
-// inject-claude-oauth-token-at-proxy.md's "The design" section for the one shape that's actually
-// observed: the rule strips the guest's own auth headers and sets the real value on x-api-key,
-// keyed by the credential's own secrets-file name so orchestrator resolution (which only knows
-// secrets-file key names) needs no Anthropic-specific code.
+// inject-claude-oauth-token-at-proxy.md's "The design" section for the API-key shape (the OAuth
+// shape has its own proof, TestAnthropicInjectRuleForOAuthShape above): the rule strips the guest's
+// own auth headers and sets the real value on x-api-key, keyed by the credential's own
+// secrets-file name so orchestrator resolution (which only knows secrets-file key names) needs no
+// Anthropic-specific code.
 func TestAnthropicInjectRuleForObservedShape(t *testing.T) {
 	rule, placeholders, ok := anthropicInjectRuleFor("ANTHROPIC_API_KEY")
 	if !ok {

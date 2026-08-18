@@ -332,9 +332,9 @@ it is on a subscription, because Anthropic's own responses say so in their rate-
 
 Both wire shapes come from live MITM observation of Claude Code itself, dated and recorded in
 `internal/adapter/anthropic_wire.go`'s PROVENANCE comment (a golden test pins the table, so the day
-Anthropic changes something that test's diff *is* the changelog). The subscription shape is newly
-landed and its own end-to-end run is still pending — see `HUMAN_TODO.md`; `KRAYT_SPEC.md` §6.14 has
-the full design.
+Anthropic changes something that test's diff *is* the changelog). The subscription shape has been
+verified end to end (`run_df97fffa`) — see `HUMAN_TODO.md`; `KRAYT_SPEC.md` §6.14 has the full
+design.
 
 ### Agent images
 

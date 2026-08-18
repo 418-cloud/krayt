@@ -300,6 +300,11 @@ func TestMergeInjectRulesSameHeaderUserWins(t *testing.T) {
 	if _, added := merged[0].Set["x-api-key"]; added {
 		t.Errorf("adapter's differently-cased header must not also be added: %+v", merged[0])
 	}
+	if got := (NetworkPolicy{Inject: merged}).InjectedSecretKeys(); !got["ANTHROPIC_API_KEY"] {
+		t.Errorf("InjectedSecretKeys() = %v, want the overridden adapter credential ANTHROPIC_API_KEY "+
+			"still withheld even though its header lost to the user's own rule — otherwise it rides "+
+			"SecretsBundle into the guest, defeating host-side-only injection", got)
+	}
 }
 
 // TestMergeInjectRulesRefreshUserWins mirrors the header-conflict rule for the Refresh block: a

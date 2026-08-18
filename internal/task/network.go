@@ -32,6 +32,9 @@ func (np NetworkPolicy) InjectedSecretKeys() map[string]bool {
 		for _, k := range r.Set {
 			keys[k] = true
 		}
+		for _, k := range r.Withheld {
+			keys[k] = true
+		}
 	}
 	return keys
 }
@@ -77,6 +80,10 @@ func MergeInjectRules(user, adapterRules []InjectRule) (merged []InjectRule, ove
 		for h, key := range ar.Set {
 			if claimed[lower(h)] {
 				overrides = append(overrides, fmt.Sprintf("user config overrides adapter-supplied header %q on host %q", h, ar.Host))
+				// The adapter's header entry is dropped, but its credential must still never reach
+				// SecretsBundle — that's the whole point of injecting it host-side. Withhold it
+				// independently of Set so InjectedSecretKeys() still catches it.
+				dst.Withheld = appendUnique(dst.Withheld, key)
 				continue // and its SetPrefix below is skipped with it: prefixing the USER'S value would corrupt it
 			}
 			if dst.Set == nil {
@@ -136,11 +143,24 @@ func cloneInjectRule(r InjectRule) InjectRule {
 			out.SetLiteral[k] = v
 		}
 	}
+	if r.Withheld != nil {
+		out.Withheld = append([]string(nil), r.Withheld...)
+	}
 	return out
 }
 
-// LookupHeader returns m's value for header h under any casing. Exported because header-keyed
-// maps on an InjectRule (SetPrefix, AppendCSV) are consumed outside this package —
+// appendUnique appends v to ss unless it's already present.
+func appendUnique(ss []string, v string) []string {
+	for _, s := range ss {
+		if s == v {
+			return ss
+		}
+	}
+	return append(ss, v)
+}
+
+// LookupHeader returns m's value for header h under any casing. Exported because SetPrefix, a
+// header-keyed map on an InjectRule, is consumed outside this package —
 // internal/orchestrator resolves SetPrefix while resolving Set — and every consumer must agree
 // that header names are case-insensitive (RFC 7230 §3.2) while Go map keys are not.
 func LookupHeader(m map[string]string, h string) (string, bool) {

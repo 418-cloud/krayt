@@ -1355,10 +1355,11 @@ recorded in that file's PROVENANCE comment and pinned by a golden test:
   involved. Metering follows the credential, which settles this section's earlier
   `(verify current)` on headless billing.
 
-**Still to verify on hardware:** that Claude Code accepts a *placeholder* on its OAuth path at
-startup, and that the whole run works end to end. It does for `ANTHROPIC_API_KEY` (`run_c654e575`
-authenticated with a prefix-less placeholder, which is also evidence the CLI does not validate
-credential format). See `HUMAN_TODO.md` for the run and its expected `proxy.log` lines.
+**Verified on hardware:** Claude Code accepts a *placeholder* on its OAuth path at startup, and the
+whole run works end to end (`run_df97fffa`, 2026-08-18, with `mitm: false` control `run_10fc027d`).
+It also does for `ANTHROPIC_API_KEY` (`run_c654e575` authenticated with a prefix-less placeholder,
+which is also evidence the CLI does not validate credential format). See `HUMAN_TODO.md` for both
+runs and their `proxy.log` lines.
 
 **Recommended default, updated.** Translation means a subscription token no longer outlives the
 run (it never enters the VM at all, and the proxy discards it at run teardown), so the
@@ -1880,19 +1881,25 @@ exposed.
   `run_c654e575` authenticated fine with the entrypoint's prefix-less
   `krayt-injected-at-host-proxy`, so the real thing's prefix is carried as cheap insurance, not to
   satisfy a demonstrated requirement — the rest of each string is deliberately
-  human-legible-as-fake. Whether the OAuth path validates its token's format is the one thing the
-  pending hardware run settles. If a future probe (or a different vendor) forces a
+  human-legible-as-fake. The OAuth path validates neither path's credential format either: the
+  `run_df97fffa` hardware run authenticated with the entrypoint's own prefix-less
+  `krayt-injected-at-host-proxy` placeholder, same as the API-key path did. If a future probe (or a
+  different vendor) forces a
   stricter-looking placeholder, that requirement is itself a finding worth recording here, because
   a placeholder forced to look more like a real credential is more likely to be mistaken for one by
   a human reading a log.
 - **Accepted maintenance dependency on Anthropic's wire format** (`inject-claude-oauth-token-at-proxy.md`).
   Credential shape translation makes krayt responsible for tracking exactly what headers/endpoints
   Claude Code's API-key and subscription paths use — a fact that can change without notice on
-  Anthropic's side and silently break every translated run until caught. This is accepted, not
-  incidental: the mitigation is confining every such fact to one dated, golden-tested file
-  (`internal/adapter/anthropic_wire.go`) so a break is "the golden test fails, update one table" —
-  not "re-understand the proxy". `network.mitm: false` and non-translated credentials are entirely
-  unaffected by a wire-format change; the dependency is scoped to the opt-in translation path only.
+  Anthropic's side and silently break every translated run until caught. The golden test
+  (`TestAnthropicWireRulesGolden`) is offline and cannot detect that change itself — it only pins
+  `internal/adapter/anthropic_wire.go`'s table against its own literal, so it fails if the two
+  drift apart, not if Anthropic's live behavior does. A live failure or a re-probe is what surfaces
+  the actual change; this is accepted, not incidental: the mitigation is confining every such fact
+  to one dated, golden-tested file so that once a change is found, fixing it is "update one table,
+  update the golden literal alongside it — the diff IS the changelog" — not "re-understand the
+  proxy". `network.mitm: false` and non-translated credentials are entirely unaffected by a
+  wire-format change; the dependency is scoped to the opt-in translation path only.
 - **TLS MITM / credential injection — an honest trade, not a strict improvement** (§6.6.1,
   `add-tls-mitm-credential-injection.md`). Opt-in and off by default, but when on:
   - **It removes credential *theft*, not credential *use*.** The proxy cannot distinguish an
@@ -2455,14 +2462,14 @@ credential out of the VM entirely: with `network.mitm` on, the container is conf
 non-secret placeholder under the credential's own variable, and the proxy attaches the real value in
 the shape the provider wants (§6.14, shape mirroring).
 
-> **Mechanism complete, both vendor shapes observed and implemented; one hardware run outstanding.**
+> **Mechanism complete, both vendor shapes observed, implemented, and verified end to end.**
 > The plumbing — adapter-produced `InjectRule`s, `task.MergeInjectRules` (user config wins on
 > conflict, §8.1), re-running pre-flight validation over the merged set, the non-secret placeholder
 > contract, `InjectRule.SetPrefix` for an auth scheme — is generic and fully implemented; it will
 > translate any credential shape `internal/adapter/anthropic_wire.go`'s table has an entry for. Both
 > Anthropic shapes are now in that table, each from a live observation (`run_c654e575`;
-> `run_b408545b` + `run_99bd261c`, 2026-08-17). What remains is one end-to-end hardware run of the
-> implemented `CLAUDE_CODE_OAUTH_TOKEN` rule — see `HUMAN_TODO.md`.
+> `run_b408545b` + `run_99bd261c`, 2026-08-17), and the implemented `CLAUDE_CODE_OAUTH_TOKEN` rule
+> has an end-to-end hardware run confirming it (`run_df97fffa`, 2026-08-18) — see `HUMAN_TODO.md`.
 
 - [x] `internal/adapter/anthropic_wire.go`: the one file in the repo allowed to encode an
   Anthropic header/endpoint — a declarative `map[string]anthropicWireRule` plus the
@@ -2494,7 +2501,8 @@ the shape the provider wants (§6.14, shape mirroring).
   2026-08-18 while every Go test passed.
 - [x] **Done when (offline):** `go build ./...` + `GOOS=linux GOARCH=arm64 go build ./...` +
   `go test -race ./...` + `golangci-lint run` all green, including every offline test this task's
-  file lists that doesn't require the fallback design (not yet triggered — P3 hasn't run).
+  file lists that doesn't require the fallback design (unused — P3 found headers-only differences
+  and selected the primary design).
 - [x] **Done when (hardware, `[HUMAN]`):** ✅ **2026-08-18, `run_df97fffa`** (with `mitm: false`
   control `run_10fc027d`). A live `CLAUDE_CODE_OAUTH_TOKEN` run under `mitm: true`: `200` on
   `POST /v1/messages`, the real 108-byte token attached host-side (`sent=[…

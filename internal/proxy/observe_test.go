@@ -303,6 +303,9 @@ func TestCredentialShape(t *testing.T) {
 		// A value whose first word is not a scheme token must not have those bytes printed as if
 		// it were one — the credential could be anything, including something with a space in it.
 		{"sk-ant-01-with space", `<scheme=none credential_len=20>`},
+		// A first word that merely LOOKS token-shaped (letters only, no digits) must not be
+		// mistaken for a real scheme either — otherwise those credential bytes are printed verbatim.
+		{"secret phrase", `<scheme=none credential_len=13>`},
 		{"", `<scheme=none credential_len=0>`},
 	}
 	for _, tc := range tests {
