@@ -154,12 +154,27 @@ type NetworkPolicy struct {
 // key names, resolved host-side to real values) and SetLiteral (fixed, non-secret values).
 // Strip and Set are deliberately separate — the header the container sends is not necessarily
 // the header that goes upstream (step 3 removes one auth header and sets a different one).
+//
+// SetPrefix exists because a credential's wire format is not always "this header = this value"
+// (§6.6.1, and the 2026-08-17 subscription-token observation in
+// internal/adapter/anthropic_wire.go): it prefixes a Set header's resolved value with a literal —
+// an auth SCHEME, e.g. `authorization: Bearer <token>`. Applied host-side while the secrets-file
+// key is resolved (internal/orchestrator's buildEgressStdinConfig), so the proxy's contract stays
+// the simple "set this header to this exact string" and no scheme knowledge reaches it.
 type InjectRule struct {
 	Host       string
 	Strip      []string          // header names to delete from the guest's request first
 	Set        map[string]string // header name -> secrets-file key name, resolved host-side
+	SetPrefix  map[string]string // header name (must be in Set) -> literal prefix the value carries
 	SetLiteral map[string]string // header name -> fixed literal value (never a secret)
 	Refresh    *RefreshRule      // optional host-side credential refresh (plumbing only; step 3 fills in execution)
+
+	// Withheld names secrets-file keys that must stay out of SecretsBundle even though this rule
+	// no longer sets any header from them — e.g. an adapter-selected credential whose header the
+	// user's own network.inject rule claimed instead (MergeInjectRules). Without this, dropping
+	// the adapter's Set entry on conflict would also drop it from InjectedSecretKeys(), and the
+	// credential the adapter deliberately kept out of the guest would ride SecretsBundle in.
+	Withheld []string
 }
 
 // RefreshRule declaratively names an upstream credential-refresh endpoint for one InjectRule

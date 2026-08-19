@@ -50,6 +50,16 @@ type Policy struct {
 	MITM        bool         // terminate TLS and allow header injection; default false (§1)
 	Passthrough []string     // hosts tunneled (never MITM'd) even when MITM is on
 	Inject      []InjectRule // per-host header injection rules; requires MITM
+
+	// LogRequests turns on the request-observation log (observe.go): one line per handled
+	// request carrying the request line, host, and header NAMES only. Off by default — without
+	// it proxy.log records only failures and denials, so a successful run leaves it empty.
+	LogRequests bool
+
+	// LogHeaderValues names headers whose VALUES may also be logged (implies LogRequests). For
+	// recording an API's required non-secret opt-in headers exactly rather than guessing them; a
+	// credential-bearing name is reduced to its shape instead (observe.go's credentialShape).
+	LogHeaderValues []string
 }
 
 // InjectRule is one resolved network.inject[] rule (§1, §4.5): for a MITM'd request to Host,
@@ -243,6 +253,7 @@ func newHandler(p Policy, rt http.RoundTripper, dial dialFunc, ca *CA, refresh R
 	return &handler{
 		mode: p.Mode, allow: allow, transport: rt, dial: dial,
 		mitm: p.MITM, passthrough: passthrough, inject: inject, ca: ca, refresh: refresh,
+		obs: newObserver(p),
 	}
 }
 
@@ -337,11 +348,20 @@ type handler struct {
 	inject      map[string]InjectRule // by lowercased host
 	ca          *CA
 	refresh     RefreshFunc
+
+	// obs is the request-observation log's configuration, or nil when it is off (observe.go).
+	obs *observer
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := requestHost(r)
 	if !h.allowed(host) {
+		// Logged unconditionally, not just under logRequests: on a CONNECT the guest's client
+		// discards this 403's body (see tunnel's comment below), so without this line a
+		// policy denial — the single most likely reason a run fails — leaves NO trace anywhere,
+		// which is the exact gap proxy.log exists to close (§6.6, §9). %q because a blocked host
+		// is guest-supplied text.
+		log.Printf("krayt-egress-proxy: %s %q: blocked by the network policy (mode=%s)", r.Method, host, h.mode)
 		http.Error(w, "krayt: egress to "+host+" is blocked by the network policy", http.StatusForbidden)
 		return
 	}
@@ -378,9 +398,11 @@ func (h *handler) allowed(host string) bool {
 // reachable no matter what the MITM path does.
 func (h *handler) connect(w http.ResponseWriter, r *http.Request) {
 	if !h.mitm || h.ca == nil || h.passthrough[strings.ToLower(requestHost(r))] {
+		h.obs.connect(r.Host, false)
 		h.tunnel(w, r)
 		return
 	}
+	h.obs.connect(r.Host, true)
 	h.connectMITM(w, r)
 }
 
@@ -428,18 +450,21 @@ func (h *handler) tunnel(w http.ResponseWriter, r *http.Request) {
 
 // forward proxies a plain-HTTP request to the (already allowed) target.
 func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
-	r.RequestURI = "" // must be cleared before re-sending as a client request
+	host := requestHost(r)
+	h.obs.request("http", host, r, false) // before RequestURI is cleared, while r still carries the guest's request line
+	r.RequestURI = ""                     // must be cleared before re-sending as a client request
 	resp, err := h.transport.RoundTrip(r)
 	if err != nil {
 		if errors.Is(err, errBlockedAddr) {
 			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
 			return
 		}
-		log.Printf("krayt-egress-proxy: %s %s: upstream request failed: %v", r.Method, requestHost(r), err)
+		log.Printf("krayt-egress-proxy: %s %s: upstream request failed: %v", r.Method, host, err)
 		http.Error(w, "krayt: upstream request failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+	h.obs.response("http", host, resp)
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)

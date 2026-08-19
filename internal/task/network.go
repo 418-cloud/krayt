@@ -32,8 +32,167 @@ func (np NetworkPolicy) InjectedSecretKeys() map[string]bool {
 		for _, k := range r.Set {
 			keys[k] = true
 		}
+		for _, k := range r.Withheld {
+			keys[k] = true
+		}
 	}
 	return keys
+}
+
+// MergeInjectRules unions adapter-produced inject rules into the user's own network.inject
+// (§4, inject-claude-oauth-token-at-proxy.md): "adapter-supplied rules travel the same path as
+// user-supplied ones; there is no second channel." adapterRules is folded in per-host — a host
+// the user never mentioned is added as a new rule; a host the user already has a rule for is
+// merged header-by-header, and on a shared header (in Set or SetLiteral, matched
+// case-insensitively) the USER'S value wins and the collision is skipped rather than silently
+// overwritten. Strip lists are unioned (no "value" to conflict over). A user Refresh block always
+// wins over an adapter one for the same host. Returns the merged rule set plus one human-readable
+// line per overridden header, for the caller to log — so a user who wrote their own rule for an
+// adapter-managed host can see exactly what was and wasn't taken from the adapter.
+//
+// The result still needs ValidateNetworkPolicy — this function only merges, it enforces nothing
+// (an adapter rule naming an unallowlisted host, for instance, is caught there, not here).
+func MergeInjectRules(user, adapterRules []InjectRule) (merged []InjectRule, overrides []string) {
+	merged = make([]InjectRule, len(user))
+	byHost := make(map[string]int, len(user)) // lower(host) -> index into merged
+	for i, r := range user {
+		merged[i] = cloneInjectRule(r)
+		byHost[lower(r.Host)] = i
+	}
+
+	for _, ar := range adapterRules {
+		idx, exists := byHost[lower(ar.Host)]
+		if !exists {
+			byHost[lower(ar.Host)] = len(merged)
+			merged = append(merged, cloneInjectRule(ar))
+			continue
+		}
+		dst := &merged[idx]
+		dst.Strip = unionHeaders(dst.Strip, ar.Strip)
+
+		claimed := map[string]bool{}
+		for h := range dst.Set {
+			claimed[lower(h)] = true
+		}
+		for h := range dst.SetLiteral {
+			claimed[lower(h)] = true
+		}
+		for h, key := range ar.Set {
+			if claimed[lower(h)] {
+				overrides = append(overrides, fmt.Sprintf("user config overrides adapter-supplied header %q on host %q", h, ar.Host))
+				// The adapter's header entry is dropped, but its credential must still never reach
+				// SecretsBundle — that's the whole point of injecting it host-side. Withhold it
+				// independently of Set so InjectedSecretKeys() still catches it.
+				dst.Withheld = appendUnique(dst.Withheld, key)
+				continue // and its SetPrefix below is skipped with it: prefixing the USER'S value would corrupt it
+			}
+			if dst.Set == nil {
+				dst.Set = map[string]string{}
+			}
+			dst.Set[h] = key
+			claimed[lower(h)] = true
+			if prefix, ok := LookupHeader(ar.SetPrefix, h); ok {
+				if dst.SetPrefix == nil {
+					dst.SetPrefix = map[string]string{}
+				}
+				dst.SetPrefix[h] = prefix
+			}
+		}
+		for h, v := range ar.SetLiteral {
+			if claimed[lower(h)] {
+				overrides = append(overrides, fmt.Sprintf("user config overrides adapter-supplied header %q on host %q", h, ar.Host))
+				continue
+			}
+			if dst.SetLiteral == nil {
+				dst.SetLiteral = map[string]string{}
+			}
+			dst.SetLiteral[h] = v
+			claimed[lower(h)] = true
+		}
+		if dst.Refresh == nil {
+			dst.Refresh = ar.Refresh
+		} else if ar.Refresh != nil {
+			overrides = append(overrides, fmt.Sprintf("user config overrides adapter-supplied refresh block on host %q", ar.Host))
+		}
+	}
+	return merged, overrides
+}
+
+// cloneInjectRule deep-copies the maps/slice a rule owns, so MergeInjectRules never mutates a
+// caller's InjectRule in place.
+func cloneInjectRule(r InjectRule) InjectRule {
+	out := InjectRule{Host: r.Host, Refresh: r.Refresh}
+	if r.Strip != nil {
+		out.Strip = append([]string(nil), r.Strip...)
+	}
+	if r.Set != nil {
+		out.Set = make(map[string]string, len(r.Set))
+		for k, v := range r.Set {
+			out.Set[k] = v
+		}
+	}
+	if r.SetPrefix != nil {
+		out.SetPrefix = make(map[string]string, len(r.SetPrefix))
+		for k, v := range r.SetPrefix {
+			out.SetPrefix[k] = v
+		}
+	}
+	if r.SetLiteral != nil {
+		out.SetLiteral = make(map[string]string, len(r.SetLiteral))
+		for k, v := range r.SetLiteral {
+			out.SetLiteral[k] = v
+		}
+	}
+	if r.Withheld != nil {
+		out.Withheld = append([]string(nil), r.Withheld...)
+	}
+	return out
+}
+
+// appendUnique appends v to ss unless it's already present.
+func appendUnique(ss []string, v string) []string {
+	for _, s := range ss {
+		if s == v {
+			return ss
+		}
+	}
+	return append(ss, v)
+}
+
+// LookupHeader returns m's value for header h under any casing. Exported because SetPrefix, a
+// header-keyed map on an InjectRule, is consumed outside this package —
+// internal/orchestrator resolves SetPrefix while resolving Set — and every consumer must agree
+// that header names are case-insensitive (RFC 7230 §3.2) while Go map keys are not.
+func LookupHeader(m map[string]string, h string) (string, bool) {
+	for k, v := range m {
+		if lower(k) == lower(h) {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// unionHeaders merges two header-name lists, deduplicating case-insensitively while preserving a's
+// original casing for anything already in it.
+func unionHeaders(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, h := range a {
+		if !seen[lower(h)] {
+			seen[lower(h)] = true
+			out = append(out, h)
+		}
+	}
+	for _, h := range b {
+		if !seen[lower(h)] {
+			seen[lower(h)] = true
+			out = append(out, h)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ValidateNetworkPolicy fail-fasts every network.mitm/passthrough/inject rule at `krayt run`
@@ -126,6 +285,20 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 			}
 			setNames[lower(h)] = true
 		}
+		// set_prefix modifies a set header's value rather than naming a header of its own, so it
+		// must reference one — a prefix with nothing to prefix is a config error, not a no-op that
+		// silently sends the credential without its scheme.
+		for h, prefix := range rule.SetPrefix {
+			if err := validateHeaderName(h); err != nil {
+				return fmt.Errorf("network: inject[%d] (%s) set_prefix: %w", i, host, err)
+			}
+			if !hasHeaderKey(rule.Set, h) {
+				return fmt.Errorf("network: inject[%d] (%s): set_prefix[%q] has no matching set[%q] entry to prefix", i, host, h, h)
+			}
+			if err := validateHeaderValue(prefix); err != nil {
+				return fmt.Errorf("network: inject[%d] (%s) set_prefix[%q]: %w", i, host, h, err)
+			}
+		}
 
 		if rule.Refresh != nil {
 			r := rule.Refresh
@@ -134,6 +307,31 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 					"least one response_token_fields entry", i, host)
 			}
 		}
+	}
+	return nil
+}
+
+// hasHeaderKey reports whether m contains h under any casing — header names are case-insensitive
+// (RFC 7230 §3.2) but Go map keys are not, so `Authorization` in set and `authorization` in
+// set_prefix must still count as the same header.
+func hasHeaderKey(m map[string]string, h string) bool {
+	for k := range m {
+		if lower(k) == lower(h) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateHeaderValue rejects a non-empty literal that could not be sent as a header value: CR/LF
+// would let a rule split one header into several (response/request splitting), and an empty value
+// means the config expressed an intent it cannot carry out.
+func validateHeaderValue(v string) error {
+	if v == "" {
+		return fmt.Errorf("value is empty")
+	}
+	if strings.ContainsAny(v, "\r\n") {
+		return fmt.Errorf("value contains a CR or LF")
 	}
 	return nil
 }

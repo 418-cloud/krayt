@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/418-cloud/krayt/internal/provider"
 	"github.com/418-cloud/krayt/internal/provider/fake"
+	"github.com/418-cloud/krayt/internal/proxy"
 	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
 )
@@ -276,5 +278,71 @@ func TestEgressProxyWriteLogRedactsSecrets(t *testing.T) {
 	}
 	if !strings.Contains(string(b), secrets.RedactionMarker) {
 		t.Errorf("proxy.log does not show the redaction marker in place of the secret; got %q", b)
+	}
+}
+
+// TestBuildEgressStdinConfigAppliesSetPrefix covers the host side of the shape-translation wire
+// format (task.InjectRule.SetPrefix): the auth SCHEME is folded into the resolved value here, so the
+// proxy child receives one exact string to set and never learns what a scheme is.
+func TestBuildEgressStdinConfigAppliesSetPrefix(t *testing.T) {
+	secret := "sk-ant-oat01-token-value"
+	secretsFile := filepath.Join(t.TempDir(), "secrets.env")
+	if err := os.WriteFile(secretsFile, []byte("CLAUDE_CODE_OAUTH_TOKEN="+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	np := task.NetworkPolicy{
+		Mode: task.NetworkAllowlist, Allow: []string{"api.example.com"}, MITM: true,
+		Inject: []task.InjectRule{{
+			Host:      "api.example.com",
+			Strip:     []string{"x-api-key", "authorization"},
+			Set:       map[string]string{"authorization": "CLAUDE_CODE_OAUTH_TOKEN"},
+			SetPrefix: map[string]string{"authorization": "Bearer "},
+		}},
+	}
+
+	b, err := buildEgressStdinConfig(np, secretsFile)
+	if err != nil {
+		t.Fatalf("buildEgressStdinConfig: %v", err)
+	}
+	var cfg proxy.StdinConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(cfg.Inject) != 1 {
+		t.Fatalf("want one rule, got %+v", cfg.Inject)
+	}
+	if got, want := cfg.Inject[0].Set["authorization"], "Bearer "+secret; got != want {
+		t.Errorf("resolved authorization = %q, want %q", got, want)
+	}
+}
+
+// TestBuildEgressStdinConfigPrefixDoesNotMaskAnEmptySecret guards the fail-closed path: prefixing an
+// empty resolved value would hand the proxy a plausible-looking "Bearer " and send the request
+// upstream unauthenticated, defeating internal/proxy's empty-value check (§7). The value must stay
+// empty so that check still fires.
+func TestBuildEgressStdinConfigPrefixDoesNotMaskAnEmptySecret(t *testing.T) {
+	secretsFile := filepath.Join(t.TempDir(), "secrets.env")
+	if err := os.WriteFile(secretsFile, []byte("CLAUDE_CODE_OAUTH_TOKEN=\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	np := task.NetworkPolicy{
+		Mode: task.NetworkAllowlist, Allow: []string{"api.example.com"}, MITM: true,
+		Inject: []task.InjectRule{{
+			Host:      "api.example.com",
+			Set:       map[string]string{"authorization": "CLAUDE_CODE_OAUTH_TOKEN"},
+			SetPrefix: map[string]string{"authorization": "Bearer "},
+		}},
+	}
+
+	b, err := buildEgressStdinConfig(np, secretsFile)
+	if err != nil {
+		t.Fatalf("buildEgressStdinConfig: %v", err)
+	}
+	var cfg proxy.StdinConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := cfg.Inject[0].Set["authorization"]; got != "" {
+		t.Errorf("resolved authorization = %q, want empty so the proxy's fail-closed check fires", got)
 	}
 }

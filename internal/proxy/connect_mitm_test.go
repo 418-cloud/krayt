@@ -63,13 +63,17 @@ func (e *echoTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if hdr.Get("Content-Type") == "" && e.bodyFn == nil {
 		hdr.Set("Content-Type", "text/plain")
 	}
+	// Request is set for the same reason net/http's own transport sets it (persistConn.readResponse):
+	// it is the request that OBTAINED this response — here the post-Rewrite outbound one — which is
+	// what lets ReverseProxy's ModifyResponse hook see what actually went upstream (observe.go's
+	// `sent=` fragment). A fake that left it nil would hide a real production behavior.
 	if e.bodyFn != nil {
 		pr, pw := io.Pipe()
 		go e.bodyFn(pw)
-		return &http.Response{StatusCode: status, Header: hdr, Body: pr, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1}, nil
+		return &http.Response{StatusCode: status, Header: hdr, Body: pr, Request: r, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1}, nil
 	}
 	return &http.Response{
-		StatusCode: status, Header: hdr, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		StatusCode: status, Header: hdr, Request: r, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
 		Body: io.NopCloser(strings.NewReader(e.body)),
 	}, nil
 }

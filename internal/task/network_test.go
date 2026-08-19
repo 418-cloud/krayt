@@ -1,6 +1,9 @@
 package task
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidateNetworkPolicyValid(t *testing.T) {
 	cases := []struct {
@@ -219,4 +222,245 @@ func TestInjectedSecretKeysEmpty(t *testing.T) {
 	if got := (NetworkPolicy{}).InjectedSecretKeys(); got != nil {
 		t.Errorf("InjectedSecretKeys() = %v, want nil for no inject rules", got)
 	}
+}
+
+// TestMergeInjectRulesNoOverlap: an adapter rule for a host the user never mentioned is added
+// as-is, alongside the user's own untouched rule (§4, inject-claude-oauth-token-at-proxy.md).
+func TestMergeInjectRulesNoOverlap(t *testing.T) {
+	user := []InjectRule{{Host: "example.com", Set: map[string]string{"x-token": "EX_KEY"}}}
+	adapterRules := []InjectRule{{Host: "api.anthropic.com", Strip: []string{"x-api-key"}, Set: map[string]string{"x-api-key": "ANTHROPIC_API_KEY"}}}
+
+	merged, overrides := MergeInjectRules(user, adapterRules)
+	if len(overrides) != 0 {
+		t.Errorf("no overlap should log no overrides, got %v", overrides)
+	}
+	if len(merged) != 2 {
+		t.Fatalf("want 2 rules, got %+v", merged)
+	}
+	byHost := map[string]InjectRule{}
+	for _, r := range merged {
+		byHost[r.Host] = r
+	}
+	if byHost["example.com"].Set["x-token"] != "EX_KEY" {
+		t.Errorf("user rule not preserved: %+v", byHost["example.com"])
+	}
+	if byHost["api.anthropic.com"].Set["x-api-key"] != "ANTHROPIC_API_KEY" {
+		t.Errorf("adapter rule not added: %+v", byHost["api.anthropic.com"])
+	}
+}
+
+// TestMergeInjectRulesSameHostDifferentHeaders: same host, non-conflicting headers — merged into
+// one rule, strip lists unioned, no override logged.
+func TestMergeInjectRulesSameHostDifferentHeaders(t *testing.T) {
+	user := []InjectRule{{Host: "api.anthropic.com", Strip: []string{"x-custom"}, SetLiteral: map[string]string{"x-krayt": "1"}}}
+	adapterRules := []InjectRule{{Host: "api.anthropic.com", Strip: []string{"x-api-key", "authorization"}, Set: map[string]string{"x-api-key": "ANTHROPIC_API_KEY"}}}
+
+	merged, overrides := MergeInjectRules(user, adapterRules)
+	if len(overrides) != 0 {
+		t.Errorf("non-conflicting headers should log no overrides, got %v", overrides)
+	}
+	if len(merged) != 1 {
+		t.Fatalf("want 1 merged rule, got %+v", merged)
+	}
+	r := merged[0]
+	if r.Set["x-api-key"] != "ANTHROPIC_API_KEY" {
+		t.Errorf("adapter's Set not merged in: %+v", r)
+	}
+	if r.SetLiteral["x-krayt"] != "1" {
+		t.Errorf("user's SetLiteral not preserved: %+v", r)
+	}
+	wantStrip := map[string]bool{"x-custom": true, "x-api-key": true, "authorization": true}
+	if len(r.Strip) != len(wantStrip) {
+		t.Fatalf("Strip = %v, want union of %v", r.Strip, wantStrip)
+	}
+	for _, h := range r.Strip {
+		if !wantStrip[h] {
+			t.Errorf("unexpected Strip entry %q", h)
+		}
+	}
+}
+
+// TestMergeInjectRulesSameHeaderUserWins is the §4 conflict rule: same host AND same header
+// (case-insensitively) — the user's value wins, and MergeInjectRules reports the override rather
+// than silently dropping it.
+func TestMergeInjectRulesSameHeaderUserWins(t *testing.T) {
+	user := []InjectRule{{Host: "api.anthropic.com", Set: map[string]string{"X-Api-Key": "MY_OWN_KEY"}}}
+	adapterRules := []InjectRule{{Host: "api.anthropic.com", Set: map[string]string{"x-api-key": "ANTHROPIC_API_KEY"}}}
+
+	merged, overrides := MergeInjectRules(user, adapterRules)
+	if len(overrides) != 1 {
+		t.Fatalf("want exactly one logged override, got %v", overrides)
+	}
+	if len(merged) != 1 {
+		t.Fatalf("want 1 merged rule, got %+v", merged)
+	}
+	if got := merged[0].Set["X-Api-Key"]; got != "MY_OWN_KEY" {
+		t.Errorf("Set[X-Api-Key] = %q, want the user's MY_OWN_KEY to survive untouched", got)
+	}
+	if _, added := merged[0].Set["x-api-key"]; added {
+		t.Errorf("adapter's differently-cased header must not also be added: %+v", merged[0])
+	}
+	if got := (NetworkPolicy{Inject: merged}).InjectedSecretKeys(); !got["ANTHROPIC_API_KEY"] {
+		t.Errorf("InjectedSecretKeys() = %v, want the overridden adapter credential ANTHROPIC_API_KEY "+
+			"still withheld even though its header lost to the user's own rule — otherwise it rides "+
+			"SecretsBundle into the guest, defeating host-side-only injection", got)
+	}
+}
+
+// TestMergeInjectRulesRefreshUserWins mirrors the header-conflict rule for the Refresh block: a
+// user-supplied Refresh for a host is never replaced by an adapter one, and the collision is
+// logged the same way a header collision is.
+func TestMergeInjectRulesRefreshUserWins(t *testing.T) {
+	userRefresh := &RefreshRule{Host: "auth.example.com", PathPrefix: "/user", ResponseTokenFields: []string{"token"}}
+	user := []InjectRule{{Host: "api.anthropic.com", Set: map[string]string{"x-a": "A"}, Refresh: userRefresh}}
+	adapterRules := []InjectRule{{
+		Host: "api.anthropic.com", Set: map[string]string{"x-b": "B"},
+		Refresh: &RefreshRule{Host: "auth.anthropic.com", PathPrefix: "/adapter", ResponseTokenFields: []string{"access_token"}},
+	}}
+
+	merged, overrides := MergeInjectRules(user, adapterRules)
+	if merged[0].Refresh != userRefresh {
+		t.Errorf("Refresh = %+v, want the user's own block untouched", merged[0].Refresh)
+	}
+	if len(overrides) != 1 {
+		t.Errorf("want the refresh collision logged, got %v", overrides)
+	}
+}
+
+// TestMergeInjectRulesDoesNotMutateInputs: MergeInjectRules must not mutate either input slice's
+// backing maps — a caller reusing spec.Network.Inject after the call must see it unchanged.
+func TestMergeInjectRulesDoesNotMutateInputs(t *testing.T) {
+	user := []InjectRule{{Host: "api.anthropic.com", Set: map[string]string{"x-a": "A"}}}
+	adapterRules := []InjectRule{{Host: "api.anthropic.com", Set: map[string]string{"x-b": "B"}}}
+
+	if _, _ = MergeInjectRules(user, adapterRules); len(user[0].Set) != 1 {
+		t.Errorf("MergeInjectRules mutated the user's own InjectRule.Set: %+v", user[0].Set)
+	}
+	if len(adapterRules[0].Set) != 1 {
+		t.Errorf("MergeInjectRules mutated the adapter's own InjectRule.Set: %+v", adapterRules[0].Set)
+	}
+}
+
+// TestValidateNetworkPolicySetPrefix covers the mechanism shape translation added
+// (InjectRule.SetPrefix): it must be rejected at `krayt run` pre-flight when it expresses an intent
+// it cannot carry out, rather than silently degrading at request time — a prefix with no value to
+// prefix would send a credential without its scheme.
+func TestValidateNetworkPolicySetPrefix(t *testing.T) {
+	base := func(r InjectRule) NetworkPolicy {
+		r.Host = "api.example.com"
+		return NetworkPolicy{
+			Mode: NetworkAllowlist, Allow: []string{"api.example.com"}, MITM: true,
+			Inject: []InjectRule{r},
+		}
+	}
+	keys := map[string]bool{"TOKEN": true}
+
+	tests := []struct {
+		name    string
+		rule    InjectRule
+		wantErr string // substring; empty means the rule must validate
+	}{
+		{
+			name: "valid prefix",
+			rule: InjectRule{
+				Set:       map[string]string{"authorization": "TOKEN"},
+				SetPrefix: map[string]string{"authorization": "Bearer "},
+			},
+		},
+		{
+			name: "prefix casing need not match set's casing",
+			rule: InjectRule{
+				Set:       map[string]string{"Authorization": "TOKEN"},
+				SetPrefix: map[string]string{"authorization": "Bearer "},
+			},
+		},
+		{
+			name: "prefix without a matching set entry",
+			rule: InjectRule{
+				Set:       map[string]string{"authorization": "TOKEN"},
+				SetPrefix: map[string]string{"x-other": "Bearer "},
+			},
+			wantErr: "no matching set",
+		},
+		{
+			name: "empty prefix",
+			rule: InjectRule{
+				Set:       map[string]string{"authorization": "TOKEN"},
+				SetPrefix: map[string]string{"authorization": ""},
+			},
+			wantErr: "value is empty",
+		},
+		{
+			name: "prefix carrying CRLF",
+			rule: InjectRule{
+				Set:       map[string]string{"authorization": "TOKEN"},
+				SetPrefix: map[string]string{"authorization": "Bearer \r\nx-evil: 1"},
+			},
+			wantErr: "CR or LF",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateNetworkPolicy(base(tc.rule), keys)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("ValidateNetworkPolicy = %v, want nil", err)
+			case tc.wantErr != "" && err == nil:
+				t.Errorf("ValidateNetworkPolicy = nil, want an error containing %q", tc.wantErr)
+			case tc.wantErr != "" && err != nil && !strings.Contains(err.Error(), tc.wantErr):
+				t.Errorf("ValidateNetworkPolicy = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestMergeInjectRulesCarriesPrefix proves SetPrefix obeys the SAME user-wins rule as
+// set/set_literal: an adapter prefix rides along with the adapter's set when it is taken, and is
+// dropped with it when the user has claimed that header — prefixing the USER'S value would corrupt
+// a credential they configured deliberately.
+func TestMergeInjectRulesCarriesPrefix(t *testing.T) {
+	adapterRule := InjectRule{
+		Host:      "api.example.com",
+		Strip:     []string{"x-api-key", "authorization"},
+		Set:       map[string]string{"authorization": "TOKEN"},
+		SetPrefix: map[string]string{"authorization": "Bearer "},
+	}
+
+	t.Run("no user rule: adapter rule taken whole", func(t *testing.T) {
+		merged, overrides := MergeInjectRules(nil, []InjectRule{adapterRule})
+		if len(merged) != 1 || len(overrides) != 0 {
+			t.Fatalf("merged = %+v, overrides = %v", merged, overrides)
+		}
+		if merged[0].SetPrefix["authorization"] != "Bearer " {
+			t.Errorf("prefix not carried: %+v", merged[0])
+		}
+	})
+
+	t.Run("user claims the auth header: adapter prefix dropped with it", func(t *testing.T) {
+		user := []InjectRule{{
+			Host: "api.example.com",
+			Set:  map[string]string{"authorization": "MY_OWN_TOKEN"},
+		}}
+		merged, overrides := MergeInjectRules(user, []InjectRule{adapterRule})
+		if len(merged) != 1 {
+			t.Fatalf("merged = %+v", merged)
+		}
+		if merged[0].Set["authorization"] != "MY_OWN_TOKEN" {
+			t.Errorf("user value must win, got %v", merged[0].Set)
+		}
+		if _, prefixed := merged[0].SetPrefix["authorization"]; prefixed {
+			t.Errorf("adapter prefix must not be applied to the user's own value; got %v", merged[0].SetPrefix)
+		}
+		if len(overrides) == 0 {
+			t.Error("the override should be reported to the user")
+		}
+	})
+
+	t.Run("clone does not alias the adapter table", func(t *testing.T) {
+		merged, _ := MergeInjectRules(nil, []InjectRule{adapterRule})
+		merged[0].SetPrefix["authorization"] = "corrupted"
+		if adapterRule.SetPrefix["authorization"] != "Bearer " {
+			t.Error("MergeInjectRules mutated the caller's rule in place")
+		}
+	})
 }

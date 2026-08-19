@@ -12,6 +12,9 @@ set -euo pipefail
 SECRETS_DIR="${KRAYT_SECRETS_DIR:-/run/secrets}"
 WORKSPACE="${KRAYT_WORKSPACE:-/workspace}"
 TASK_FILE="${KRAYT_TASK:-/task/prompt.md}"
+# Overridable for the same reason SECRETS_DIR/WORKSPACE/TASK_FILE are: it lets
+# hack/test-entrypoint-credentials.sh exercise this script outside a container.
+OUTPUT_DIR="${KRAYT_OUTPUT:-/output}"
 
 # Export exactly one recognized credential from the secrets tmpfs (§6.14). The host adapter
 # already guaranteed exactly one is present; this just turns the file into an env var Claude
@@ -24,11 +27,25 @@ for key in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN; do
     break
   fi
 done
-# network.mitm + network.inject (§6.6.1, add-tls-mitm-credential-injection.md §2): this
-# credential is deliberately withheld from $SECRETS_DIR and attached to outgoing requests by the
-# host proxy instead. KRAYT_INJECTED_CREDENTIAL names it (never its value) so this loop can start
-# without a file that will never arrive; the placeholder below only satisfies Claude Code's "a
-# credential is configured" check — the real value never enters this container.
+# network.mitm shape translation (§6.6.1, §8.2): the credential is deliberately withheld from
+# $SECRETS_DIR and attached to outgoing requests by the HOST proxy instead, so no file will ever
+# arrive for it. krayt configures the container with the same credential env var carrying a
+# placeholder value, which only has to satisfy Claude Code's own "a credential is configured"
+# check — the real value never enters this container. Accepting an already-set var is what lets
+# krayt choose that placeholder (a self-describing sk-ant-…-do-not-use string, legible in a log);
+# without this branch a run using shape translation would find no file, conclude it has no
+# credential, and exit 78 before starting.
+if [ -z "$cred" ]; then
+  for key in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN; do
+    if [ -n "${!key:-}" ]; then
+      cred="$key"
+      break
+    fi
+  done
+fi
+# Backward compatibility with the pre-shape-translation contract (§8.2): KRAYT_INJECTED_CREDENTIAL
+# names the withheld credential (never its value) for a krayt that sets the name but no placeholder
+# value. Ordered after the branch above so krayt's own placeholder wins when both are present.
 if [ -z "$cred" ] && [ -n "${KRAYT_INJECTED_CREDENTIAL:-}" ]; then
   cred="$KRAYT_INJECTED_CREDENTIAL"
   export "$cred=krayt-injected-at-host-proxy"
@@ -102,5 +119,9 @@ echo "[claude-code] running claude -p in $(pwd) (model: ${ANTHROPIC_MODEL:-defau
 # the krayt micro-VM, so the tool-permission prompts add nothing. Claude reads ANTHROPIC_MODEL
 # from the environment if set. Tee its final summary into /output/report.md so it surfaces in the
 # krayt report's Notes; pipefail keeps the pipeline's exit code Claude's, not tee's.
-claude -p "$(cat "$TASK_FILE")" --dangerously-skip-permissions "${extra[@]}" | tee /output/report.md
+# ${extra[@]+"${extra[@]}"} rather than a bare "${extra[@]}": under `set -u`, bash 3.2 (what macOS
+# ships) treats an EMPTY array's expansion as unbound and aborts. The image's own bash is 5.x and
+# does not care, but hack/test-entrypoint-credentials.sh runs this script with the host's bash to
+# exercise the credential logic offline, and that path must not depend on the host's bash version.
+claude -p "$(cat "$TASK_FILE")" --dangerously-skip-permissions ${extra[@]+"${extra[@]}"} | tee "$OUTPUT_DIR/report.md"
 echo "[claude-code] done"

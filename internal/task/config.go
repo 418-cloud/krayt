@@ -57,6 +57,7 @@ type ConfigInjectRule struct {
 	Host       string            `yaml:"host"`
 	Strip      []string          `yaml:"strip"`
 	Set        map[string]string `yaml:"set"`
+	SetPrefix  map[string]string `yaml:"set_prefix"`
 	SetLiteral map[string]string `yaml:"set_literal"`
 	Refresh    *ConfigRefresh    `yaml:"refresh"`
 }
@@ -78,7 +79,10 @@ func InjectRulesFromConfig(crs []ConfigInjectRule) []InjectRule {
 	}
 	out := make([]InjectRule, 0, len(crs))
 	for _, cr := range crs {
-		r := InjectRule{Host: cr.Host, Strip: cr.Strip, Set: cr.Set, SetLiteral: cr.SetLiteral}
+		r := InjectRule{
+			Host: cr.Host, Strip: cr.Strip, Set: cr.Set,
+			SetPrefix: cr.SetPrefix, SetLiteral: cr.SetLiteral,
+		}
 		if cr.Refresh != nil {
 			r.Refresh = &RefreshRule{
 				Host: cr.Refresh.Host, PathPrefix: cr.Refresh.PathPrefix,
