@@ -84,6 +84,19 @@ func (e *echoTransport) lastRequest() *http.Request {
 	return e.last
 }
 
+// mustLastRequest fails the test if the upstream never received a request, otherwise returns it.
+// Isolating the nil check here (rather than inline at each call site) keeps staticcheck's SA5011
+// from misreading the surrounding multi-statement test bodies as a possible nil dereference — see
+// https://github.com/dominikh/go-tools/issues/656 (a known false positive around t.Fatal).
+func mustLastRequest(t *testing.T, upstream *echoTransport) *http.Request {
+	t.Helper()
+	req := upstream.lastRequest()
+	if req == nil {
+		t.Fatal("upstream never received a request")
+	}
+	return req
+}
+
 // blockedDialTransport simulates what h.transport does when the SSRF guard's Control hook
 // refuses the resolved address — mirrors the existing blockingTransport used for the
 // tunnel/forward paths (proxy_internal_test.go), applied to the MITM upstream dial.
@@ -156,10 +169,7 @@ func TestMITMInjectionReplacesAndStrips(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	upstreamReq := upstream.lastRequest()
-	if upstreamReq == nil {
-		t.Fatal("upstream never received a request")
-	}
+	upstreamReq := mustLastRequest(t, upstream)
 	if got := upstreamReq.Header.Values("X-Api-Key"); len(got) != 1 || got[0] != "resolved-secret-value" {
 		t.Errorf("upstream X-Api-Key = %v, want exactly [resolved-secret-value] (replaced, not appended)", got)
 	}
@@ -184,10 +194,7 @@ func TestMITMNonMatchingHostGetsNoInjection(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	upstreamReq := upstream.lastRequest()
-	if upstreamReq == nil {
-		t.Fatal("upstream never received a request")
-	}
+	upstreamReq := mustLastRequest(t, upstream)
 	if got := upstreamReq.Header.Get("X-Api-Key"); got != "guest-value-unchanged" {
 		t.Errorf("X-Api-Key = %q, want untouched guest value (no matching inject rule)", got)
 	}
@@ -516,10 +523,7 @@ func TestMITMConnectionHeaderCannotStripInjectedCredential(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	upstreamReq := upstream.lastRequest()
-	if upstreamReq == nil {
-		t.Fatal("upstream never received a request")
-	}
+	upstreamReq := mustLastRequest(t, upstream)
 	if got := upstreamReq.Header.Get("X-Api-Key"); got != "resolved-secret-value" {
 		t.Errorf("upstream X-Api-Key = %q, want resolved-secret-value (a smuggled Connection header must not strip the injected credential)", got)
 	}
