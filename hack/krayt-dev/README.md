@@ -26,6 +26,10 @@ tees its summary to `/output/report.md`.
   `protoc` (no reliable `go install` path), pinned by `GH_CLI_VERSION`. Authenticated only when the
   optional `GH_TOKEN` secret is supplied (see **The `GH_TOKEN` secret** and **Egress** below);
   unauthenticated otherwise.
+- `hadolint` — lints the Dockerfiles across this repo (agent images, `krayt-dev` itself), per the
+  `hadolint`-the-Dockerfile step called out in `docs/ai-tasks/*.md`'s verification sections. Fetched
+  as a prebuilt release binary like `protoc` (Haskell, no `go install` path), pinned by
+  `HADOLINT_VERSION`.
 - **Nix** (single-user, agent-owned `/nix`, flakes enabled) — so the agent can regenerate the
   guest-agent's `vendorHash` in `images/flake.nix` when a guest dependency changes. See
   **Regenerating vendorHash (Nix)** below.
@@ -37,8 +41,8 @@ tees its summary to `/output/report.md`.
 
 Tool versions are pinned via Dockerfile `ARG`s (`PROTOC_VERSION`, `PROTOC_GEN_GO_VERSION`,
 `PROTOC_GEN_GO_GRPC_VERSION`, `BUF_VERSION`, `ORAS_VERSION`, `GOLANGCI_LINT_VERSION`,
-`GH_CLI_VERSION`) that Renovate's custom regex manager (`renovate.json`) tracks against each tool's
-real upstream repo/module, independently of the base image tag.
+`GH_CLI_VERSION`, `HADOLINT_VERSION`) that Renovate's custom regex manager (`renovate.json`) tracks
+against each tool's real upstream repo/module, independently of the base image tag.
 
 Krayt's own source is **not** `COPY`'d into the image — only `go.mod`/`go.sum` (for the
 module cache prebake). The repo itself arrives at `/workspace` at run time, injected by krayt

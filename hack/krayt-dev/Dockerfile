@@ -19,6 +19,7 @@ ARG BUF_VERSION=v1.71.0
 ARG ORAS_VERSION=v1.3.2
 ARG GOLANGCI_LINT_VERSION=v2.12.2
 ARG GH_CLI_VERSION=2.96.0
+ARG HADOLINT_VERSION=2.15.1
 
 # git: repo ops + module fetches; curl + ca-certificates: installers/HTTPS; bash: entrypoint +
 # proto-direct.sh; unzip: protoc's release archive is a zip; xz-utils: the Nix installer's tarball
@@ -52,6 +53,19 @@ RUN set -eu; \
  && tar -xzf /tmp/gh.tar.gz -C /tmp \
  && install -m 0755 "/tmp/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}/bin/gh" /usr/local/bin/gh \
  && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}"
+
+# hadolint lints the agent images' Dockerfiles (see docs/ai-tasks/*.md's verification steps); like
+# protoc it ships as a prebuilt release binary (Haskell, no `go install` story), and like protoc its
+# arch names aren't Docker's TARGETARCH verbatim.
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) hadolint_arch=x86_64 ;; \
+      arm64) hadolint_arch=arm64 ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/hadolint \
+      "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-linux-${hadolint_arch}" \
+ && chmod 0755 /usr/local/bin/hadolint
 
 # Non-root agent user (uid 1000) — Claude Code refuses uid 0 (§6.14/§8.2). Everything below
 # runs as this user so it owns its own Go/lint caches (see ENV block).
