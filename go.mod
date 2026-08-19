@@ -3,7 +3,7 @@ module github.com/418-cloud/krayt
 go 1.26.3
 
 require (
-	github.com/containerd/containerd/v2 v2.3.3
+	github.com/containerd/containerd/v2 v2.3.4
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/crc-org/vfkit v0.6.4
 	github.com/klauspost/compress v1.19.2
@@ -15,7 +15,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.83.0
-	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
+	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	oras.land/oras-go/v2 v2.6.2
 )
