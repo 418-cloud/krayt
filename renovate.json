@@ -74,6 +74,15 @@
     },
     {
       "customType": "regex",
+      "description": "hack/krayt-dev/Dockerfile: hadolint, fetched as a release binary (no go install story)",
+      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "matchStrings": ["ARG HADOLINT_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "hadolint/hadolint",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
       "description": "images/agents/claude-code/Dockerfile: Claude Code CLI, installed via the native installer (no Dockerfile-manager datasource); the npm package mirrors CLI release versions",
       "managerFilePatterns": ["^images/agents/claude-code/Dockerfile$"],
       "matchStrings": ["ARG CLAUDE_CODE_VERSION=(?<currentValue>.*?)\\n"],
