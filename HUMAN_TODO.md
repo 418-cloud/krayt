@@ -3,6 +3,10 @@
 Single handoff log for steps the coding agent cannot complete itself (credentials, real
 hardware, a Linux builder, live secrets). Template per `KRAYT_SPEC.md` §14.
 
+**Entries are deleted once verified, not marked done** (§14, `CLAUDE.md`): record the outcome in the
+§14 phase checkbox / `docs/ai-tasks/README.md` / the relevant code comment first, then remove the
+entry. This file lists only what is still outstanding; `git log` holds everything that was here.
+
 ---
 
 ## Status

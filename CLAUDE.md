@@ -18,6 +18,11 @@ working. This file is the standing agreement for how to build it.
   1. Do everything around the step that you can (write the config, scripts, CI YAML, commands, tests).
   2. Append a structured entry to `HUMAN_TODO.md` (template in §14).
   3. Then: if non-blocking, log and continue; if blocking, **stop and ask me**, referencing the entry.
+- **When an entry is verified done, DELETE it** — never leave a `✅ DONE` entry behind. `HUMAN_TODO.md`
+  is a queue of outstanding work, not an archive: what was verified belongs in the durable places
+  (§14's phase checkboxes with the run id, `docs/ai-tasks/README.md`'s status table, the code comment
+  carrying the provenance), and `git log` keeps the rest. Record the outcome there **first**, then
+  remove the entry — deleting before the evidence has a permanent home loses it. See §14.
 - **Never fabricate a result** for a human-only step — no fake signatures, invented image
   digests, or "boot succeeded" without a real boot. An honestly-blocked step is correct.
 

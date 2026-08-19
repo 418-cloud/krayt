@@ -2244,6 +2244,14 @@ correct; a faked one is a defect.
 - Blocking: yes/no — <what is blocked if yes>
 ```
 
+**Entry lifecycle — a done entry is deleted, not ticked.** `HUMAN_TODO.md` answers one question:
+what still needs a human? An entry that has been verified is removed from the file entirely, so that
+question stays cheap to answer as the project grows. Before removing it, record the outcome where it
+belongs permanently — the relevant phase's `Done when (hardware)` checkbox below (with the run id
+that proved it), `docs/ai-tasks/README.md`'s status table, and any code comment that carries the
+vendor/provenance fact. `git log` preserves the entry's full text either way, so nothing is lost by
+deleting; something *is* lost by deleting before the evidence has a durable home.
+
 Tasks marked **[HUMAN]** below are the expected handoff points.
 
 ### Phase 0 — Foundations ✅
