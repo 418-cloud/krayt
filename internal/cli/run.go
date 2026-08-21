@@ -647,8 +647,9 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 		s := cfg.Secrets
 		if auto {
 			// An auto-loaded config may point at a secrets file, but only one the repo itself
-			// carries — `secrets: ../../.env` or an absolute path would let a poisoned repo ship
-			// an arbitrary host file into the guest as the run's SecretsBundle (§8.3, §10).
+			// carries — `secrets: ../../.env`, an absolute path, or a symlink out of the repo
+			// would let a poisoned repo ship an arbitrary host file into the guest as the run's
+			// SecretsBundle (§8.3, §10).
 			if s, err = containedRepoPath(repoRoot, s); err != nil {
 				return fmt.Errorf("config %s: secrets: %w", path, err)
 			}
@@ -753,10 +754,11 @@ func rejectAutoLoadedPolicy(path string, cfg *task.Config) error {
 }
 
 // containedRepoPath resolves p — a path read out of an auto-loaded repo config — against the repo
-// root and refuses anything that leaves it: an absolute path, or one that climbs out with "..".
-// The returned path keeps root's own form (relative stays relative to the working directory, as
-// the repo root itself is), so `secrets: secrets.env` in a repo run from its own directory
-// resolves exactly as it did before this containment existed.
+// root and refuses anything that leaves it: an absolute path, one that climbs out with "..", or
+// one whose spelling stays inside but whose symlinks do not. The returned path keeps root's own
+// form (relative stays relative to the working directory, as the repo root itself is), so
+// `secrets: secrets.env` in a repo run from its own directory resolves exactly as it did before
+// this containment existed.
 func containedRepoPath(root, p string) (string, error) {
 	if filepath.IsAbs(p) {
 		return "", fmt.Errorf("%q is an absolute path; an auto-loaded repo config may only name a file inside the repo", p)
@@ -765,7 +767,53 @@ func containedRepoPath(root, p string) (string, error) {
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%q escapes the repo root; an auto-loaded repo config may only name a file inside the repo", p)
 	}
-	return filepath.Join(root, clean), nil
+	joined := filepath.Join(root, clean)
+	// The checks above constrain the spelling only. A poisoned repo can also keep the spelling
+	// inside the repo and ship a symlink that points out of it — `secrets.env -> ~/.aws/credentials`
+	// — and the path is later handed to secrets.Load, which os.Opens it and follows the link. Judge
+	// containment by what will actually be read, not by how it was written (§8.3, §10).
+	if err := checkSymlinkContained(root, joined); err != nil {
+		return "", fmt.Errorf("%q %w; an auto-loaded repo config may only name a file inside the repo", p, err)
+	}
+	return joined, nil
+}
+
+// checkSymlinkContained reports whether target — already lexically inside root — is still inside
+// root once every symlink in both paths is resolved. A target that does not exist is accepted:
+// there is nothing to follow, and letting it through keeps secrets.Load's "no such file" error
+// rather than reporting a missing file as an escape. Any other resolution failure is refused,
+// since an unreadable path cannot be shown to be contained.
+func checkSymlinkContained(root, target string) error {
+	realRoot, err := resolveAbs(root)
+	if err != nil {
+		return fmt.Errorf("cannot be checked against the repo root: %w", err)
+	}
+	realTarget, err := resolveAbs(target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot be resolved: %w", err)
+	}
+	rel, err := filepath.Rel(realRoot, realTarget)
+	if err != nil {
+		return fmt.Errorf("cannot be checked against the repo root: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("resolves through a symlink to %s, outside the repo root", realTarget)
+	}
+	return nil
+}
+
+// resolveAbs returns path with every symlink resolved and made absolute, in that order: the repo
+// root itself often sits under a symlinked prefix (macOS /var -> /private/var, /tmp -> /private/tmp),
+// so both sides of a containment check have to be resolved the same way to be comparable.
+func resolveAbs(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(resolved)
 }
 
 // printNetworkPolicy writes the run's resolved egress policy to w before the VM boots — the
