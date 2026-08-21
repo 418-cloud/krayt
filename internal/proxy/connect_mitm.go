@@ -30,7 +30,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -271,19 +270,35 @@ func validateConnectAuthority(authority string) error {
 	return nil
 }
 
-// hostsEquivalent compares two host[:port]/host strings by bare hostname only, case-insensitive
-// — an inner request's Host header legitimately may (RFC 7230) or may not carry the port the
-// CONNECT authority does.
+// hostsEquivalent compares two host[:port]/host strings by bare hostname only — an inner
+// request's Host header legitimately may (RFC 7230) or may not carry the port the CONNECT
+// authority does — under this package's single definition of "the same hostname" (normalizeHost).
+//
+// It used to compare with strings.EqualFold, which is a UNICODE fold: it treats U+212A KELVIN
+// SIGN as 'K', so a guest could satisfy this hostile-input guard with a spelling normalizeHost
+// refuses everywhere else. Nothing was exploitable through it — Rewrite sends the request to the
+// approved authority whatever the inner Host says — but it was the last place in the package where
+// a rune folded onto an ASCII letter, which is the primitive the whole allowlist bypass was built
+// out of (see normalizeHost). An empty (unusable) fold never matches.
 func hostsEquivalent(a, b string) bool {
-	return strings.EqualFold(hostOnly(a), hostOnly(b))
+	ha, hb := hostOnly(a), hostOnly(b)
+	return ha != "" && ha == hb
 }
 
-// hostOnly strips a trailing :port, if present.
+// hostOnly strips a trailing :port, if present, and folds what is left into the canonical host
+// form. It returns "" for anything that is not a host krayt will speak to at all — a non-ASCII
+// spelling included — so a caller comparing two of its results can never match on a fold this
+// package refuses.
 func hostOnly(hostport string) string {
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		return h
+	h := hostport
+	if bare, _, err := net.SplitHostPort(hostport); err == nil {
+		h = bare
 	}
-	return hostport
+	folded, ok := normalizeHost(h)
+	if !ok {
+		return ""
+	}
+	return folded
 }
 
 // onceListener adapts a single already-established net.Conn (the just-handshaken TLS
