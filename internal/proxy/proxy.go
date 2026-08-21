@@ -501,9 +501,17 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.forward(w, r, host)
 }
 
-// allowed applies the policy to a bare host (no port) that has ALREADY been through
-// normalizeHost — it does no folding of its own on purpose, so there is exactly one definition
-// of "the same hostname" in this package and no way to reach the map with an unfolded key.
+// allowed applies the policy to a bare host (no port). ServeHTTP has already put its argument
+// through normalizeHost — the enforcement point still folds it again with foldHostASCII, the
+// SAME fold, so the lookup is total rather than merely correct-by-caller-discipline: an unfolded
+// or non-ASCII string handed to it by any future caller is answered on the one definition of "the
+// same hostname" this package has, not silently missed as a map key.
+//
+// Re-folding is a no-op on a normalized host, so this changes no decision the proxy makes today;
+// it only removes the assumption. foldHostASCII, not normalizeHost, because the enforcement point
+// must not be the place that tolerates surrounding whitespace: trimming belongs at ingest (see
+// normalizeHost), and a host that reaches here still carrying spaces is a caller bug, not a name
+// to be cleaned up and approved.
 func (h *handler) allowed(host string) bool {
 	switch h.mode {
 	case ModeFull:
@@ -511,7 +519,8 @@ func (h *handler) allowed(host string) bool {
 	case ModeNone:
 		return false
 	default: // allowlist
-		return h.allow[host]
+		key, ok := foldHostASCII(host)
+		return ok && h.allow[key]
 	}
 }
 
@@ -700,7 +709,16 @@ func requestHost(r *http.Request) string {
 // agreement: if one starts accepting or mapping a byte the other does not, config validation and
 // the running proxy no longer agree on what host a rule names.
 func normalizeHost(host string) (string, bool) {
-	host = strings.TrimSpace(host)
+	return foldHostASCII(strings.TrimSpace(host))
+}
+
+// foldHostASCII is normalizeHost's fold with no whitespace trimming: the equality half of
+// "the same hostname", separated from the ingest half so both callers use one definition of the
+// former. Trimming exists only because a policy entry is hand-written config (internal/task's
+// pre-flight validation trims too — hostagreement_test.go pins that agreement); it is not part of
+// what makes two host strings the same name, and the enforcement point (handler.allowed) uses this
+// stricter function for that reason.
+func foldHostASCII(host string) (string, bool) {
 	if host == "" {
 		return "", false
 	}

@@ -70,6 +70,35 @@ func TestAllowed(t *testing.T) {
 	}
 }
 
+// TestAllowedFoldsItsOwnArgument pins the enforcement point as total rather than
+// correct-by-caller-discipline: ServeHTTP normalizes before calling allowed, but allowed must not
+// depend on that. Re-folding is a no-op on an already-normalized host, so none of this changes a
+// decision the running proxy makes — it only stops a future caller's unfolded string from missing
+// the map (a silent deny) or, worse, from being compared under some other fold.
+func TestAllowedFoldsItsOwnArgument(t *testing.T) {
+	h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, nil, nil, nil, nil)
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"api.anthropic.com", true},
+		{"API.ANTHROPIC.COM", true}, // the same DNS name, unfolded
+		{"api.anthropİc.com", false},
+		{"api.anthropic.com.", false},
+		{"api.xn--anthropic-dkf.com", false},
+		// Whitespace is an INGEST concern (normalizeHost trims a hand-written config entry); the
+		// enforcement point is deliberately the stricter of the two and never cleans up a request
+		// host it is asked to approve.
+		{" api.anthropic.com", false},
+		{"api.anthropic.com\t", false},
+	}
+	for _, tc := range cases {
+		if got := h.allowed(tc.host); got != tc.want {
+			t.Errorf("allowed(%q) = %v, want %v", tc.host, got, tc.want)
+		}
+	}
+}
+
 // lookalikeHost is "api.anthropic.com" with its 'i' replaced by U+0130 (LATIN CAPITAL LETTER I
 // WITH DOT ABOVE) — the single rune whose Unicode simple case folding (strings.ToLower) yields an
 // ASCII letter while UTS-46 (every http.Transport dial) yields a punycode label instead. An
