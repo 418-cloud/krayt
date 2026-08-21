@@ -29,6 +29,46 @@ import (
 // classic Go pattern, see climit_test.go's TestMain) instead of mocking spawnEgressProxy.
 const EgressProxyBinEnv = "KRAYT_EGRESS_PROXY_BIN"
 
+// egressProxyChildEnvKeys is the COMPLETE set of environment variables the egress-proxy child is
+// given — each one forwarded only if this process already has it set, never invented. This list is
+// a security boundary, not tidiness: an unset cmd.Env would run the child with os.Environ(), so the
+// component §6.6.1 singles out as "the component most directly exposed to untrusted, adversarial
+// network input" would carry every ANTHROPIC_API_KEY, GITHUB_TOKEN, or AWS_* the operator happened
+// to have exported when they typed `krayt run` (a direnv is enough), readable from
+// /proc/<pid>/environ. That readability is precisely why §6.6.1 routes krayt's OWN injected
+// credential over stdin instead; inheriting the operator's other secrets here would undercut that
+// rationale for no benefit. Anything added below must come with a comment saying why the child
+// genuinely needs it.
+var egressProxyChildEnvKeys = []string{
+	"PATH", // basic process hygiene; the Go runtime and any libc helper the child touches expect it
+	"HOME",
+	// Needed to verify UPSTREAM certificates on the Linux distributions where Go's root pool is
+	// only discoverable through them. Forwarded when the operator set them; never fabricated.
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	// The request-observation contract internal/cli/egressproxy.go defines
+	// (EgressProxyLogRequestsEnv / EgressProxyLogHeaderValuesEnv, read there via envEnabled and
+	// envList). Spelled as literals because internal/cli imports this package, not the reverse —
+	// they must stay in sync with those constants or `KRAYT_PROXY_LOG_REQUESTS=1 krayt run …`
+	// silently stops logging. Only a boolean and header NAMES ride here, never a value (§6.6.1).
+	"KRAYT_PROXY_LOG_REQUESTS",
+	"KRAYT_PROXY_LOG_HEADER_VALUES",
+}
+
+// egressProxyChildEnv materializes egressProxyChildEnvKeys against this process's environment,
+// dropping the ones that aren't set. The result is always non-nil so it can be assigned to
+// exec.Cmd.Env without silently meaning "inherit everything" (an empty non-nil slice is an empty
+// environment; nil is os.Environ()).
+func egressProxyChildEnv() []string {
+	env := make([]string, 0, len(egressProxyChildEnvKeys))
+	for _, k := range egressProxyChildEnvKeys {
+		if v, ok := os.LookupEnv(k); ok {
+			env = append(env, k+"="+v)
+		}
+	}
+	return env
+}
+
 // egressProxyKillWait bounds how long stop() waits for the child to exit after Kill — the
 // same 2-second kill/drain shape internal/guest/proxy/controller_linux.go used before this
 // task moved the L7 proxy off the guest, now living host-side instead.
@@ -137,6 +177,7 @@ func spawnEgressProxy(ctx context.Context, lis net.Listener, np task.NetworkPoli
 		}
 		cmd = exec.CommandContext(ctx, self, append([]string{"__egress-proxy"}, args...)...)
 	}
+	cmd.Env = egressProxyChildEnv() // explicit and minimal, NOT os.Environ() — see egressProxyChildEnvKeys
 	cmd.ExtraFiles = []*os.File{f, caW}
 	cmd.Stdin = bytes.NewReader(stdinPayload)
 	out := &syncBuffer{}
