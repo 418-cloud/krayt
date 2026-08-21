@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -142,15 +143,106 @@ func Serve(ctx context.Context, lis net.Listener, p Policy, factory Factory) err
 // loop Serve uses, exposed directly for a caller that built its handler via BuildHandler (the
 // `krayt __egress-proxy` child, so it can retain the *CA reference for the fd-4 handoff, §2b/§5).
 func ServeHandler(ctx context.Context, lis net.Listener, h http.Handler) error {
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	return serveHandler(ctx, lis, h, outerIdleTimeout, maxAcceptedConns)
+}
+
+// Outer-server resource bounds. The guest is the only client, but it is the untrusted side: it
+// chooses how many connections to open and how long to leave them idle, and every accepted
+// connection costs the HOST an fd and a goroutine for the rest of the run (krayt-vsock-forward
+// opens one vsock connection per guest-side TCP connection, by design, so each becomes one accept
+// here).
+const (
+	// outerIdleTimeout closes a keep-alive connection the guest is not using. Matches the inner
+	// MITM server (connect_mitm.go). Without it Go sets NO read deadline at all on an idle
+	// connection once its first request has been read — ReadHeaderTimeout stops applying then —
+	// so one completed request (even a 403 under mode: none) pinned an fd until teardown.
+	outerIdleTimeout = 120 * time.Second
+
+	// maxOuterHeaderBytes bounds one request's headers, as maxMITMHeaderBytes does for the
+	// decrypted inner request. Go's 1 MiB default is the same number; setting it explicitly keeps
+	// the bound a decision rather than an inherited default.
+	maxOuterHeaderBytes = 1 << 20
+
+	// maxAcceptedConns caps concurrently accepted connections. Sized well above what a real agent
+	// run needs — a busy agent holds a handful of keep-alive connections plus a few CONNECT
+	// tunnels, and the transport pools upstream connections separately (MaxIdleConns: 100) — while
+	// still bounding a hostile guest to a fixed cost. Excess connections wait in the kernel's
+	// accept backlog rather than being refused, so a legitimate burst is delayed, never dropped.
+	maxAcceptedConns = 256
+)
+
+// serveHandler is ServeHandler with the resource bounds injectable, so tests can assert them
+// without waiting out outerIdleTimeout or opening maxAcceptedConns sockets.
+func serveHandler(ctx context.Context, lis net.Listener, h http.Handler, idle time.Duration, maxConns int) error {
+	srv := &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       idle,
+		MaxHeaderBytes:    maxOuterHeaderBytes,
+	}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	if err := srv.Serve(lis); err != nil && err != http.ErrServerClosed {
+	if err := srv.Serve(newLimitListener(lis, maxConns)); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("proxy: serve: %w", err)
 	}
 	return nil
+}
+
+// limitListener caps the number of connections accepted from an underlying listener at once. It
+// is a local ~30 lines rather than golang.org/x/net/netutil because that module is not in the
+// pinned dependency list (§9.1) and this is all of it that is needed.
+//
+// A slot is taken before Accept and released on the accepted conn's Close — which is what makes
+// this correct on the hijacked CONNECT/MITM paths too: http.Server stops tracking a hijacked
+// connection, but tunnel() and connectMITM() still Close it (directly, or via the inner
+// http.Server), and Close is the only release path.
+type limitListener struct {
+	net.Listener
+	sem       chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newLimitListener(l net.Listener, n int) *limitListener {
+	return &limitListener{Listener: l, sem: make(chan struct{}, n), done: make(chan struct{})}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	// Waiting on done as well as on a free slot is what lets Close unblock a listener sitting at
+	// its cap: without it, ctx cancellation could not stop a Serve loop whose every slot is held
+	// by a hijacked tunnel http.Server will never close for us.
+	select {
+	case l.sem <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: func() { <-l.sem }}, nil
+}
+
+func (l *limitListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return l.Listener.Close()
+}
+
+// limitConn releases its listener slot exactly once, however many times it is closed (both the
+// tunnel path and http.Server's own cleanup can close the same connection).
+type limitConn struct {
+	net.Conn
+	release func()
+	once    sync.Once
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 // HandRolled is the default allowlist forward proxy: it tunnels CONNECT (HTTPS) and
@@ -449,7 +541,10 @@ func (h *handler) tunnel(w http.ResponseWriter, r *http.Request, host, authority
 		// server-side so the real reason (DNS failure, connection refused, timeout, …) is
 		// visible in proxy.log (§6.6, §9 of move-egress-proxy-to-host.md), the only place a
 		// denial reason survives.
-		log.Printf("krayt-egress-proxy: CONNECT %s: upstream dial failed: %v", authority, err)
+		// %q on the authority because it is guest-controlled text (see ServeHTTP). The %v error
+		// embeds that same already-validated authority and nothing else guest-derived, so it needs
+		// no quoting of its own.
+		log.Printf("krayt-egress-proxy: CONNECT %q: upstream dial failed: %v", authority, err)
 		http.Error(w, "krayt: upstream dial failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -485,18 +580,27 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request, host string) {
 	authority := normalizedAuthority(r, host)
 	r.URL.Host = authority
 	r.Host = authority
+	// RFC 7230 §6.1 cleanup, in BOTH directions. The MITM path gets this for free from
+	// httputil.ReverseProxy; this path is hand-rolled, so it must do it itself. The one header
+	// that matters beyond correctness is Proxy-Authorization: it is a credential for THIS hop, and
+	// forwarding it would leak a guest's proxy credentials to every allowlisted host it talks to.
+	stripHopByHop(r.Header)
 	resp, err := h.transport.RoundTrip(r)
 	if err != nil {
 		if errors.Is(err, errBlockedAddr) {
 			http.Error(w, blockedAddrMsg(host), http.StatusForbidden)
 			return
 		}
-		log.Printf("krayt-egress-proxy: %s %s: upstream request failed: %v", r.Method, host, err)
+		// %q on the host because it is guest-controlled text (see ServeHTTP). The %v error is
+		// safe unquoted for the same reason the quoting exists: the only guest-derived string it
+		// can embed is this same already-validated host.
+		log.Printf("krayt-egress-proxy: %s %q: upstream request failed: %v", r.Method, host, err)
 		http.Error(w, "krayt: upstream request failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	h.obs.response("http", host, resp)
+	stripHopByHop(resp.Header)
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -504,6 +608,41 @@ func (h *handler) forward(w http.ResponseWriter, r *http.Request, host string) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// hopByHopHeaders is the fixed RFC 7230 §6.1 set: headers that are meaningful for one
+// transport-level hop only and must never be forwarded to the next one. Proxy-Authorization and
+// Proxy-Authenticate are credentials/challenges for the proxy hop itself; the rest describe this
+// connection's framing, which the next connection redefines for itself.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection", // non-standard, but universally sent and universally stripped
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// stripHopByHop deletes every hop-by-hop header from h: first the ones the Connection field
+// itself names (RFC 7230 §6.1 lets a hop declare additional per-connection headers), then the
+// fixed set above. Order matters — Connection must be read before it is deleted.
+//
+// Header.Del canonicalizes its argument, so "TE"/"te"/"Te" and a Connection token in any case all
+// hit the same map key.
+func stripHopByHop(h http.Header) {
+	for _, v := range h.Values("Connection") {
+		for _, name := range strings.Split(v, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				h.Del(name)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
 }
 
 // requestHost extracts the bare hostname (no port) a request targets. For CONNECT the
