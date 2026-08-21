@@ -1585,6 +1585,37 @@ Completion = container process exit. Exit code is surfaced in `meta.json`.
 ### 8.3 Flag/file precedence
 CLI flags override config file values, which override built-in defaults.
 
+**Auto-loaded vs. explicit configs.** A `krayt.yaml` reaches a run one of two ways, and they are
+*not* equally trusted. An **explicit** `--config <path>` is the operator naming the file: it is
+honored in full. An **auto-loaded** `<repo>/krayt.yaml` (no `--config` passed) is a file that ships
+inside the repo the agent is about to work on — it is untrusted input (§10), so it may configure a
+run but may not write the run's security policy:
+
+| Field | Auto-loaded `<repo>/krayt.yaml` | Explicit `--config` |
+|---|---|---|
+| `network.mitm: true` | **error** | honored |
+| `network.inject` (non-empty) | **error** | honored |
+| `network.passthrough` (non-empty) | **error** | honored |
+| `network.mode: full` | **error** | honored |
+| `secrets:` | honored only if the resolved path stays inside the repo root | honored |
+| everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `container`, `questions`, …) | honored | honored |
+
+A refused field is an **error, not a warning and not a silent ignore** — the run stops, naming the
+field, the file, and the `krayt run --config <path>` opt-in. Silently dropping it would leave the
+operator believing a policy that is not in force.
+
+`secrets:` is contained rather than refused, because a repo's own tracked config legitimately names
+its gitignored secrets file. The value is resolved against the repo root and `filepath.Clean`ed;
+an absolute path (`/Users/x/.env`) or one that climbs out (`../../.env`) is rejected — otherwise a
+poisoned repo could ship an arbitrary host file into the guest as the run's `SecretsBundle`.
+
+**Pre-boot policy summary.** Every run prints its resolved egress policy to stderr before the VM
+boots — mode, allowlist, MITM on/off, passthrough list, and each inject rule's host and header
+**names** (never a value, never a secrets-file key's contents). It is printed after adapter merging
+and `ValidateNetworkPolicy`, so it is the final policy, and before any VM or image work, so it is
+the operator's last chance to notice a host they did not choose. `meta.json`/`report.md` (§8.4)
+only record the policy after the fact.
+
 ### 8.4 Run output artifacts (`.krayt/runs/<id>/`)
 Every run produces a self-contained directory the human reviews from:
 
@@ -1795,6 +1826,7 @@ exposed.
 | Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
 | Secrets | tmpfs only, never on disk, destroyed with VM; **redacted in the guest** from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted** (redacting hunks would break `git apply`); a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
 | TLS MITM / credential injection | **Opt-in, default off** (`network.mitm`, §6.6.1). An injected secrets-file key is **withheld from `SecretsBundle` entirely** — the container never holds it, closing "Auth-credential blast radius" (below) for that credential. Ephemeral per-run CA, in memory only, private key never exported. Trades a HOST-process compromise for a *stronger* claim than plain egress enforcement: the proxy process now also holds real user credentials, not just a policy decision (residual below) |
+| Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy** — `network.mitm`, `network.inject`, `network.passthrough` and `network.mode: full` are refused with an error, and `secrets:` is contained to the repo root (no absolute path, no `..` escape). Without this split a poisoned repo could turn on MITM and name the operator's own secrets-file key as the credential injected into an attacker-controlled host, with every consistency check passing because the file is only ever compared against itself |
 | Persistence | CoW disk destroyed on teardown; fresh VM per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
 

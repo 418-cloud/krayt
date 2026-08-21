@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -76,10 +78,15 @@ type runFlags struct {
 
 	// mitm/passthrough/inject are resolved from krayt.yaml's `network:` block
 	// (add-tls-mitm-credential-injection.md §1); config-file only, no CLI flags, so they stay the
-	// secure zero value (mitm off) when no config is present.
+	// secure zero value (mitm off) when no config is present. Only an explicit --config may set
+	// them — see applyConfig.
 	mitm        bool
 	passthrough []string
 	inject      []task.InjectRule
+
+	// configPath is the krayt.yaml actually loaded (explicit or auto-discovered), or "" when the
+	// run is flags-only; it names the provenance of the policy in the pre-boot summary.
+	configPath string
 }
 
 func newRunCmd() *cobra.Command {
@@ -304,6 +311,18 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	// an adapter rule naming a host the user never allowlisted) fails fast instead of producing a
 	// run that fails opaquely once the agent actually tries to authenticate.
 	if err := task.ValidateNetworkPolicy(spec.Network, secretKeys); err != nil {
+		return err
+	}
+
+	// Show the operator the policy that is about to be in force — after the adapter merge and
+	// validation, so this is the final resolved set, and before any VM/image work, so a host or an
+	// injected header they did not choose is still catchable. stderr: it's an advisory, not part of
+	// the command's output.
+	policySource := f.configPath
+	if policySource == "" {
+		policySource = "flags"
+	}
+	if err := printNetworkPolicy(cmd.ErrOrStderr(), spec.Network, policySource); err != nil {
 		return err
 	}
 
@@ -581,9 +600,21 @@ func spawnDetached(exe string, args, env []string, logPath string) (int, error) 
 // applyConfig loads krayt.yaml (explicit --config, else <repo>/krayt.yaml if present) and
 // overlays it under the flags: a config value is used only when its flag was not set on the
 // command line, so flags always win (§8.3).
+//
+// An auto-loaded <repo>/krayt.yaml is untrusted input (§10): it ships inside the very repo the
+// agent is about to work on, so a poisoned repo would otherwise get to write the run's own
+// security policy — turn on MITM, name which secrets-file key is injected into which host's
+// requests, exempt a host from interception, or drop the allowlist. It gets the ordinary
+// configuration surface (image, agent, env, resources, allowlist, …) and is refused that
+// security-relevant subset, plus contained to the repo root for `secrets:`. Naming the same file
+// with --config is the operator vouching for it, and honors everything (§8.3).
 func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	path := f.config
-	if path == "" {
+	auto := path == ""
+	// Containment root for an auto-loaded config's `secrets:` — the directory the file was found
+	// in. Captured before the overlay below, which may rewrite f.repo from the file itself.
+	repoRoot := f.repo
+	if auto {
 		def := filepath.Join(f.repo, "krayt.yaml")
 		if _, err := os.Stat(def); err != nil {
 			if os.IsNotExist(err) {
@@ -597,6 +628,12 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	if err != nil {
 		return err
 	}
+	if auto {
+		if err := rejectAutoLoadedPolicy(path, cfg); err != nil {
+			return err
+		}
+	}
+	f.configPath = path
 	changed := func(name string) bool { return cmd.Flags().Changed(name) }
 	str := func(name, v string, dst *string) {
 		if !changed(name) && v != "" {
@@ -606,13 +643,26 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	str("image", cfg.Image, &f.image)
 	str("task", cfg.Task, &f.taskFile)
 	str("repo", cfg.Repo, &f.repo)
-	str("secrets", cfg.Secrets, &f.secretsFile)
+	if !changed("secrets") && cfg.Secrets != "" {
+		s := cfg.Secrets
+		if auto {
+			// An auto-loaded config may point at a secrets file, but only one the repo itself
+			// carries — `secrets: ../../.env` or an absolute path would let a poisoned repo ship
+			// an arbitrary host file into the guest as the run's SecretsBundle (§8.3, §10).
+			if s, err = containedRepoPath(repoRoot, s); err != nil {
+				return fmt.Errorf("config %s: secrets: %w", path, err)
+			}
+		}
+		f.secretsFile = s
+	}
 	str("net", cfg.Network.Mode, &f.netMode)
 	if !changed("allow") && len(cfg.Network.Allow) > 0 {
 		f.allow = cfg.Network.Allow
 	}
 	// mitm/passthrough/inject are config-file only (no CLI flags, like container: above), so
-	// there is no flag-precedence check here — the file is the only source.
+	// there is no flag-precedence check here — the file is the only source. rejectAutoLoadedPolicy
+	// above has already refused them for an auto-loaded config, so reaching a non-zero value here
+	// means the operator named the file with --config.
 	f.mitm = cfg.Network.MITM
 	f.passthrough = cfg.Network.Passthrough
 	f.inject = task.InjectRulesFromConfig(cfg.Network.Inject)
@@ -675,6 +725,97 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 		ReadonlyRootfs:    cfg.Container.ReadonlyRootfs != nil && *cfg.Container.ReadonlyRootfs,
 	}
 	return nil
+}
+
+// rejectAutoLoadedPolicy refuses the security-relevant subset of krayt.yaml when the file was
+// auto-discovered at <repo>/krayt.yaml rather than named with --config (§8.3, §10). These four
+// fields are the ones that decide where the operator's credentials can go and whether egress is
+// inspected at all, so a repo the operator did not write must not be able to set them. The error
+// names the field, the file, and the way to opt in — silently ignoring the field would leave the
+// operator believing a policy that isn't in force.
+func rejectAutoLoadedPolicy(path string, cfg *task.Config) error {
+	var field, why string
+	switch {
+	case cfg.Network.MITM:
+		field, why = "network.mitm", "turn on TLS interception"
+	case len(cfg.Network.Inject) > 0:
+		field, why = "network.inject", "name which credential is injected into which host's requests"
+	case len(cfg.Network.Passthrough) > 0:
+		field, why = "network.passthrough", "exempt a host from interception"
+	case cfg.Network.Mode == string(task.NetworkFull):
+		field, why = "network.mode: full", "drop the egress allowlist entirely"
+	default:
+		return nil
+	}
+	return fmt.Errorf("%s sets %s, which an auto-loaded repo config may not do\n"+
+		"(a repo you did not write must not be able to %s).\n"+
+		"Pass it explicitly if you meant it:\n    krayt run --config %s …", path, field, why, path)
+}
+
+// containedRepoPath resolves p — a path read out of an auto-loaded repo config — against the repo
+// root and refuses anything that leaves it: an absolute path, or one that climbs out with "..".
+// The returned path keeps root's own form (relative stays relative to the working directory, as
+// the repo root itself is), so `secrets: secrets.env` in a repo run from its own directory
+// resolves exactly as it did before this containment existed.
+func containedRepoPath(root, p string) (string, error) {
+	if filepath.IsAbs(p) {
+		return "", fmt.Errorf("%q is an absolute path; an auto-loaded repo config may only name a file inside the repo", p)
+	}
+	clean := filepath.Clean(p)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%q escapes the repo root; an auto-loaded repo config may only name a file inside the repo", p)
+	}
+	return filepath.Join(root, clean), nil
+}
+
+// printNetworkPolicy writes the run's resolved egress policy to w before the VM boots — the
+// operator's last chance to notice a host or an injected header they did not choose, since
+// meta.json/report.md only record it after the fact. Inject rules are summarized by host and
+// header NAME only: the values are secrets-file key names that resolve to real credentials
+// host-side, and neither the key name's value nor a literal belongs on a terminal.
+func printNetworkPolicy(w io.Writer, p task.NetworkPolicy, source string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "network policy (from %s): mode=%s", source, p.Mode)
+	if p.Mode == task.NetworkAllowlist {
+		fmt.Fprintf(&b, " allow=%s", strings.Join(p.Allow, ","))
+	}
+	fmt.Fprintf(&b, " mitm=%t\n", p.MITM)
+	if len(p.Passthrough) > 0 {
+		fmt.Fprintf(&b, "  passthrough (not intercepted): %s\n", strings.Join(p.Passthrough, ","))
+	}
+	for _, r := range p.Inject {
+		fmt.Fprintf(&b, "  inject %s:", r.Host)
+		if len(r.Strip) > 0 {
+			fmt.Fprintf(&b, " strip=%s", strings.Join(sortedCopy(r.Strip), ","))
+		}
+		if hs := injectedHeaderNames(r); len(hs) > 0 {
+			fmt.Fprintf(&b, " set=%s", strings.Join(hs, ","))
+		}
+		b.WriteString("\n")
+	}
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+// injectedHeaderNames returns the sorted header names a rule sets, across all three set forms —
+// names only, never the mapped values (a secrets-file key name for Set/SetPrefix, a literal for
+// SetLiteral).
+func injectedHeaderNames(r task.InjectRule) []string {
+	names := make([]string, 0, len(r.Set)+len(r.SetPrefix)+len(r.SetLiteral))
+	for _, m := range []map[string]string{r.Set, r.SetPrefix, r.SetLiteral} {
+		for k := range m {
+			names = append(names, k)
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// sortedCopy returns a sorted copy of s, leaving the caller's slice alone.
+func sortedCopy(s []string) []string {
+	out := slices.Clone(s)
+	slices.Sort(out)
+	return out
 }
 
 // newRunID returns a short unique run identifier, e.g. "run_2f9c1a3b".
