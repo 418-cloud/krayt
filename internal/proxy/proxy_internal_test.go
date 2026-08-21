@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestAllowed exercises the L7 decision engine across modes and host matching, with no
@@ -420,6 +422,214 @@ func TestServeHTTPForwarding(t *testing.T) {
 			t.Errorf("blocked request reached upstream %q", reached)
 		}
 	})
+}
+
+// hopTransport records the headers the upstream would see and replies with a canned response
+// whose headers the guest would see.
+type hopTransport struct {
+	seen     http.Header // request headers as they reached the "upstream"
+	respHdrs http.Header
+}
+
+func (t *hopTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	t.seen = r.Header.Clone()
+	hdr := t.respHdrs.Clone()
+	if hdr == nil {
+		hdr = make(http.Header)
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader("upstream-ok")),
+		Header:     hdr,
+	}, nil
+}
+
+// TestForwardStripsHopByHopHeadersBothWays is the permanent regression for the plain-HTTP path
+// having no RFC 7230 §6.1 cleanup at all: it handed the server's request straight to RoundTrip and
+// copied the response headers back verbatim, while the MITM path got both directions for free from
+// httputil.ReverseProxy.
+//
+// The header that makes this more than tidiness is Proxy-Authorization: it is a credential for the
+// proxy hop, so a guest tool configured with proxy credentials leaked them to every allowlisted
+// host it spoke to.
+func TestForwardStripsHopByHopHeadersBothWays(t *testing.T) {
+	tr := &hopTransport{respHdrs: http.Header{
+		"Connection":         {"X-Upstream-Hop"},
+		"X-Upstream-Hop":     {"upstream-connection-scoped"},
+		"Keep-Alive":         {"timeout=5"},
+		"Proxy-Authenticate": {"Basic realm=upstream"},
+		"Content-Type":       {"application/json"},
+	}}
+	h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}}, tr, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "http://api.anthropic.com/v1/messages", nil)
+	req.Header.Set("Connection", "X-Guest-Hop")
+	req.Header.Set("X-Guest-Hop", "guest-connection-scoped")
+	req.Header.Set("Proxy-Authorization", "Basic Z3Vlc3Q6cHc=")
+	req.Header.Set("Proxy-Connection", "keep-alive")
+	req.Header.Set("Te", "trailers")
+	req.Header.Set("Authorization", "Bearer end-to-end") // NOT hop-by-hop: must survive
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	for _, name := range []string{"Connection", "X-Guest-Hop", "Proxy-Authorization", "Proxy-Connection", "Te"} {
+		if got := tr.seen.Values(name); len(got) != 0 {
+			t.Errorf("upstream saw hop-by-hop request header %s=%v, want it stripped", name, got)
+		}
+	}
+	if got := tr.seen.Get("Authorization"); got != "Bearer end-to-end" {
+		t.Errorf("upstream saw Authorization = %q, want the end-to-end header forwarded intact", got)
+	}
+	for _, name := range []string{"Connection", "X-Upstream-Hop", "Keep-Alive", "Proxy-Authenticate"} {
+		if got := rec.Header().Values(name); len(got) != 0 {
+			t.Errorf("guest saw hop-by-hop response header %s=%v, want it stripped", name, got)
+		}
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("guest saw Content-Type = %q, want the end-to-end header forwarded intact", got)
+	}
+}
+
+// TestStripHopByHop pins the helper itself, including the case-insensitivity of Connection tokens
+// and of the fixed set, and a multi-valued Connection field.
+func TestStripHopByHop(t *testing.T) {
+	h := http.Header{
+		"Connection":        {"x-one", "X-Two, x-three"},
+		"X-One":             {"1"},
+		"X-Two":             {"2"},
+		"X-Three":           {"3"},
+		"Transfer-Encoding": {"chunked"},
+		"Upgrade":           {"websocket"},
+		"Trailer":           {"X-Checksum"},
+		"X-Keep":            {"kept"},
+	}
+	stripHopByHop(h)
+	if len(h) != 1 || h.Get("X-Keep") != "kept" {
+		t.Errorf("after strip, headers = %v; want only X-Keep", h)
+	}
+}
+
+// serveTestHandler starts serveHandler on a real loopback listener with the given bounds and
+// returns its address; the server is stopped when the test ends.
+func serveTestHandler(t *testing.T, h http.Handler, idle time.Duration, maxConns int) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveHandler(ctx, lis, h, idle, maxConns) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("serveHandler: %v", err)
+		}
+	})
+	return lis.Addr().String()
+}
+
+// getOnce writes one request on c and returns the first response line.
+func getOnce(t *testing.T, c net.Conn) (string, error) {
+	t.Helper()
+	if _, err := io.WriteString(c, "GET http://api.anthropic.com/ HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n"); err != nil {
+		return "", err
+	}
+	line, err := bufio.NewReader(c).ReadString('\n')
+	return line, err
+}
+
+// TestOuterServerClosesIdleConnections is the permanent regression for the outer server having no
+// idle timeout: ReadHeaderTimeout stops applying once a request has been read, and with IdleTimeout
+// and ReadTimeout both zero Go sets NO read deadline at all on an idle keep-alive connection. One
+// completed request per connection — even a 403 — therefore pinned a host fd and goroutine for the
+// rest of the run.
+func TestOuterServerClosesIdleConnections(t *testing.T) {
+	addr := serveTestHandler(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), 100*time.Millisecond, maxAcceptedConns) // short override, not a 120 s sleep
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := getOnce(t, c); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	// Now go idle. The server must close the connection on its own; generous deadline so a slow
+	// CI machine cannot make this flaky in the passing direction.
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.Copy(io.Discard, c); err != nil {
+		t.Fatalf("idle connection was not closed by the server: %v", err)
+	}
+}
+
+// TestOuterServerCapsConcurrentConnections asserts the accept cap actually bounds how many
+// connections the host will service at once: a hostile guest opens N connections, each costing an
+// fd and a goroutine here, and nothing else limited N.
+func TestOuterServerCapsConcurrentConnections(t *testing.T) {
+	const connCap = 2
+	// A long idle timeout, so a served connection keeps holding its slot — the point of the test.
+	addr := serveTestHandler(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), time.Minute, connCap)
+
+	var held []net.Conn
+	defer func() {
+		for _, c := range held {
+			_ = c.Close()
+		}
+	}()
+	for i := 0; i < connCap; i++ {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		held = append(held, c)
+		if _, err := getOnce(t, c); err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+
+	// One more. The TCP connect completes (the kernel's accept backlog takes it), but the server
+	// must not accept and serve it while every slot is held.
+	extra, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial extra: %v", err)
+	}
+	held = append(held, extra)
+	_ = extra.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	if line, err := getOnce(t, extra); err == nil {
+		t.Fatalf("connection %d past the cap of %d was served: %q", connCap+1, connCap, line)
+	}
+
+	// Closing one served connection releases its slot, and the waiting connection is served.
+	_ = held[0].Close()
+	_ = extra.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := getOnce(t, extra); err != nil {
+		t.Fatalf("after a slot was released, the waiting connection was still not served: %v", err)
+	}
+}
+
+// TestServeHandlerRejectsUnusableConnCap covers the bounds being injectable: a maxConns of 0 would
+// build an unbuffered sem no Accept can ever send on (a proxy that listens but serves nothing), and
+// a negative one would panic inside make(chan). Both must fail loudly at the seam instead.
+func TestServeHandlerRejectsUnusableConnCap(t *testing.T) {
+	for _, maxConns := range []int{0, -1} {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		err = serveHandler(context.Background(), lis, http.NotFoundHandler(), time.Minute, maxConns)
+		_ = lis.Close()
+		if err == nil {
+			t.Errorf("serveHandler(maxConns=%d) = nil; want an error", maxConns)
+		}
+	}
 }
 
 // TestConnectBlocked checks a CONNECT to a non-allowlisted host is refused before any dial

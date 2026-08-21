@@ -10,6 +10,13 @@ package proxy
 // every log.Printf in this file names only the CONNECT authority (already approved by the
 // allowlist, so not secret) and Go error values — never a header, a body, or any other
 // guest-controlled byte. Keep it that way when touching this file.
+//
+// The authority is nonetheless %q-quoted at every site, per observe.go's rule for guest-derived
+// text: no guest byte reaches a log line unquoted, so the "a hostile guest cannot forge a log
+// line" invariant rests on this package's own quoting rather than on two stdlib validators
+// (net/url's host parser and httpguts.ValidHostHeader) happening to refuse control bytes. The %v
+// error arguments alongside them embed that same validated authority and nothing else
+// guest-derived, so they are safe unquoted.
 
 import (
 	"bytes"
@@ -72,7 +79,7 @@ func (h *handler) connectMITM(w http.ResponseWriter, _ *http.Request, host, auth
 	// goroutine (and the underlying fd) open forever.
 	_ = tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("krayt-egress-proxy: MITM %s: TLS handshake failed: %v", authority, err)
+		log.Printf("krayt-egress-proxy: MITM %q: TLS handshake failed: %v", authority, err)
 		_ = tlsConn.Close()
 		return
 	}
@@ -115,7 +122,7 @@ func (h *handler) connectMITM(w http.ResponseWriter, _ *http.Request, host, auth
 		},
 		FlushInterval: -1, // ReverseProxy only auto-flushes text/event-stream; NDJSON/long-poll need this too
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
-			log.Printf("krayt-egress-proxy: MITM %s %s: upstream request failed: %v", req.Method, authority, err)
+			log.Printf("krayt-egress-proxy: MITM %s %q: upstream request failed: %v", req.Method, authority, err)
 			if errors.Is(err, errBlockedAddr) {
 				http.Error(w, blockedAddrMsg(host), http.StatusForbidden)
 				return
@@ -155,7 +162,7 @@ func (h *handler) connectMITM(w http.ResponseWriter, _ *http.Request, host, auth
 func injectingHandler(authority string, rule InjectRule, hasRule bool, obs *observer, rp http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Host != "" && !hostsEquivalent(req.Host, authority) {
-			log.Printf("krayt-egress-proxy: MITM %s: inner request Host does not match the CONNECT authority", authority)
+			log.Printf("krayt-egress-proxy: MITM %q: inner request Host does not match the CONNECT authority", authority)
 			http.Error(w, "krayt: request Host does not match the CONNECT authority", http.StatusBadRequest)
 			return
 		}
@@ -171,7 +178,7 @@ func injectingHandler(authority string, rule InjectRule, hasRule bool, obs *obse
 					// secrets-file KEY exists, not that its value is non-empty — an empty value
 					// reaching here is a programming/config error, not a guest action. Fail
 					// closed rather than send the request upstream unauthenticated (§7).
-					log.Printf("krayt-egress-proxy: MITM %s: injected header %q resolved to an empty value", authority, name)
+					log.Printf("krayt-egress-proxy: MITM %q: injected header %q resolved to an empty value", authority, name)
 					http.Error(w, "krayt: injected credential unavailable", http.StatusInternalServerError)
 					return
 				}
