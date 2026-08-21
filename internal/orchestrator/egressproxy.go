@@ -107,6 +107,12 @@ func spawnEgressProxy(ctx context.Context, lis net.Listener, np task.NetworkPoli
 		return nil, err
 	}
 
+	// The comma-joined allowlist (split back apart in internal/cli's egress-proxy command) is
+	// safe ONLY because task.validateHostEntry refuses a comma in any host string at `krayt run`
+	// pre-flight: without that, `allow: ["a.example,evil.example"]` would ride this join through
+	// argv and come out the other side as two allowlisted hosts. The CSV shape is a documented
+	// contract of the KRAYT_EGRESS_PROXY_BIN swap seam (§6.6), so it is validation, not the
+	// encoding, that closes the hole — if that check ever loosens, this join must change with it.
 	args := []string{"--mode", string(np.Mode), "--allow", strings.Join(np.Allow, ",")}
 	if np.MITM {
 		args = append(args, "--mitm")

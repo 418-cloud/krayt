@@ -204,9 +204,11 @@ func TestValidateNetworkPolicyInvalid(t *testing.T) {
 // TestValidateNetworkPolicyHostEntries pins the pre-flight half of "one definition of the same
 // hostname". internal/proxy's newHandler drops a host entry its normalizeHost refuses, so any
 // entry accepted here that the proxy would refuse means the run silently enforces a policy the
-// user did not write — an allowlist entry, or an inject rule, quietly absent. The bad cases below
-// are exactly the ones internal/proxy's TestNormalizeHost refuses; the good ones are exactly what
-// it accepts and folds to the same bare key.
+// user did not write — an allowlist entry, or an inject rule, quietly absent. The good cases are
+// exactly what internal/proxy's normalizeHost accepts and folds to the same bare key; the bad ones
+// are what it refuses, plus the entries this side is deliberately stricter about (brackets, and
+// label shapes that fold fine but can never match a request host). TestHostRulesAgree in
+// internal/proxy holds that one-directional invariant to the two implementations directly.
 func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 	bad := map[string]string{
 		// Written as escapes on purpose: these three are the runes that look like ASCII (or fold
@@ -225,6 +227,29 @@ func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 		"unbalanced bracket":    "[2606:4700:4700::1111",
 		"whitespace-only":       "   ",
 		"empty allow entry":     "",
+		// A comma would survive internal/orchestrator's comma-joined --allow argv and come back
+		// out of internal/cli's split as TWO allowlisted hosts, so it must never validate.
+		"comma":             "a.example,evil.example",
+		"interior space":    "api.example.com evil.example",
+		"tab":               "api.example.com\tevil.example",
+		"control char":      "api.example\x00.com",
+		"DEL":               "api.example\x7f.com",
+		"empty label":       "a..example",
+		"leading dot":       ".example.com",
+		"trailing dot":      "example.com.",
+		"leading hyphen":    "-example.com",
+		"trailing hyphen":   "example.com-",
+		"label ends hyphen": "sub-.example.com",
+		// A ':' exempts a host from the label rules only because IPv6 literals have no labels. It
+		// must not be usable as a way to smuggle a non-address past them: the proxy matches request
+		// hosts with the port stripped (requestHost), so none of these can ever match, and accepting
+		// them means an allow/inject rule silently absent from the policy the run enforces.
+		"host with a port":      "api.example.com:443",
+		"trailing colon":        "example.com:",
+		"leading colon":         ":443",
+		"colon, not an address": "a:b",
+		"IPv4 with a port":      "10.0.0.1:8080",
+		"truncated IPv6":        "2606:4700:4700::gggg",
 	}
 	for name, host := range bad {
 		t.Run("allow: "+name, func(t *testing.T) {
@@ -256,7 +281,12 @@ func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 		"api.anthropic.com", "API.Anthropic.COM", "  api.example.com  ",
 		"xn--80ak6aa92e.com", // punycode is ordinary ASCII LDH
 		"host-1.sub.example", "1.2.3.4",
-		"2606:4700:4700::1111", // an IPv6 literal, written bare
+		"sub.domain.example", "10.0.0.1",
+		"2606:4700:4700::1111", "::1", // IPv6 literals, written bare
+		// This repo's own krayt.yaml allowlist, verbatim — the config krayt runs itself under
+		// must keep validating.
+		"proxy.golang.org", "sum.golang.org", "storage.googleapis.com",
+		"cache.nixos.org", "github.com", "codeload.github.com", "api.github.com",
 	}
 	for _, host := range good {
 		t.Run("allow: "+host, func(t *testing.T) {
@@ -264,6 +294,35 @@ func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 				t.Errorf("ValidateNetworkPolicy(allow: %q) = %v, want nil", host, err)
 			}
 		})
+	}
+
+	// A refresh host is dialed by the proxy like any other, so it goes through the same check.
+	refreshRule := func(refreshHost string) NetworkPolicy {
+		return NetworkPolicy{
+			Mode: NetworkFull, MITM: true,
+			Inject: []InjectRule{{
+				Host: "api.example.com",
+				Set:  map[string]string{"authorization": "K"},
+				Refresh: &RefreshRule{
+					Host: refreshHost, PathPrefix: "/oauth/token",
+					ResponseTokenFields: []string{"access_token"},
+				},
+			}},
+		}
+	}
+	secrets := map[string]bool{"K": true}
+	for name, host := range bad {
+		if host == "" {
+			continue // an empty refresh host has its own "refresh requires host" error
+		}
+		t.Run("refresh: "+name, func(t *testing.T) {
+			if err := ValidateNetworkPolicy(refreshRule(host), secrets); err == nil {
+				t.Errorf("ValidateNetworkPolicy(refresh.host: %q) = nil, want an error", host)
+			}
+		})
+	}
+	if err := ValidateNetworkPolicy(refreshRule("auth.example.com"), secrets); err != nil {
+		t.Errorf("ValidateNetworkPolicy(refresh.host: auth.example.com) = %v, want nil", err)
 	}
 }
 

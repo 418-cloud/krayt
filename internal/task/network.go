@@ -324,6 +324,11 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 				return fmt.Errorf("network: inject[%d] (%s): refresh requires host, path_prefix, and at "+
 					"least one response_token_fields entry", i, host)
 			}
+			// A refresh host is dialed by the proxy like any other and is matched against the
+			// same policy, so a shape the proxy could never honor is as broken here as in allow.
+			if err := validateHostEntry(r.Host); err != nil {
+				return fmt.Errorf("network: inject[%d] (%s) refresh: %w", i, host, err)
+			}
 		}
 	}
 	return nil
@@ -408,6 +413,18 @@ func isTokenChar(r rune) bool {
 // through, so without this check an `allow: ["api.examplİ.com"]` (or a URL, or a host with a
 // stray '/') validated clean while newHandler dropped it, and the run started with an allowlist
 // quietly missing an entry. See normalizeHost's comment for why refusing beats translating.
+//
+// The shape rules at the end are the second place this function is deliberately stricter than
+// normalizeHost: ".example", "example." and "a..example" all fold to a perfectly usable map key,
+// as do "api.example.com:443" and "a:b", they just name a host no request can ever carry — the
+// proxy matches on the port-stripped host — so the proxy would store a rule nothing matches while
+// the config reads as though egress were permitted. Pre-flight is where that is cheap to say out
+// loud.
+//
+// One consequence of validating every host string is load-bearing elsewhere: because a comma is
+// refused here, internal/orchestrator can keep passing the allowlist to the egress proxy as a
+// comma-joined argv value (egressproxy.go, the KRAYT_EGRESS_PROXY_BIN swap seam, §6.6) without
+// an `allow: ["a.example,evil.example"]` entry silently becoming two allowlisted hosts.
 func validateHostEntry(h string) error {
 	s := strings.TrimSpace(h)
 	if s == "" {
@@ -433,6 +450,35 @@ func validateHostEntry(h string) error {
 		default:
 			return fmt.Errorf("host %q is not a bare hostname: write the host alone — letters, "+
 				"digits, '.', '-', or an IPv6 literal — with no scheme, path or userinfo", h)
+		}
+	}
+	// A host carrying ':' is an IPv6 literal (brackets were refused above), whose grammar is
+	// colon-separated groups rather than dot-separated labels — "::1" has no labels to check and
+	// would fail every rule below for no reason. The colon has to earn that exemption, though:
+	// "api.example.com:443", "a:b" and "example.com:" are not addresses, and skipping the label
+	// rules for them merely on the strength of a ':' let them validate clean. They can never match
+	// anything — requestHost (proxy.go) runs net.SplitHostPort over every request host and matches
+	// on the bare host, so no request ever presents a key with a port in it — which is precisely the
+	// silently-ineffective allow/passthrough/inject entry this function exists to refuse.
+	//
+	// An Is4 check like the bracketed branch's would be dead here: a string containing ':' never
+	// parses as an IPv4 address, so ParseAddr succeeding already means an IPv6 literal.
+	if strings.Contains(s, ":") {
+		if _, err := netip.ParseAddr(s); err != nil {
+			return fmt.Errorf("host %q is neither a bare hostname nor an IPv6 literal: a host rule "+
+				"names the host alone and the proxy matches request hosts with the port stripped, so "+
+				"a ':' here can only be part of an IPv6 address — drop the port", h)
+		}
+		return nil
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" {
+			return fmt.Errorf("host %q has an empty label: a leading or trailing '.', or two "+
+				"in a row, can never match a real host", h)
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("host %q has a label (%q) that starts or ends with '-': that can "+
+				"never match a real host", h, label)
 		}
 	}
 	return nil
