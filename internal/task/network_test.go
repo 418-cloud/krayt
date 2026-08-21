@@ -240,6 +240,16 @@ func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 		"leading hyphen":    "-example.com",
 		"trailing hyphen":   "example.com-",
 		"label ends hyphen": "sub-.example.com",
+		// A ':' exempts a host from the label rules only because IPv6 literals have no labels. It
+		// must not be usable as a way to smuggle a non-address past them: the proxy matches request
+		// hosts with the port stripped (requestHost), so none of these can ever match, and accepting
+		// them means an allow/inject rule silently absent from the policy the run enforces.
+		"host with a port":      "api.example.com:443",
+		"trailing colon":        "example.com:",
+		"leading colon":         ":443",
+		"colon, not an address": "a:b",
+		"IPv4 with a port":      "10.0.0.1:8080",
+		"truncated IPv6":        "2606:4700:4700::gggg",
 	}
 	for name, host := range bad {
 		t.Run("allow: "+name, func(t *testing.T) {

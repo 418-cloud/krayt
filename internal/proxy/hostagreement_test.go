@@ -67,6 +67,15 @@ func TestHostRulesAgree(t *testing.T) {
 		{host: "example.com.", proxyOK: true, why: "trailing dot: same"},
 		{host: "-example.com", proxyOK: true, why: "leading hyphen: same"},
 		{host: "sub-.example.com", proxyOK: true, why: "label ends with a hyphen: same"},
+		{host: "api.example.com:443", proxyOK: true,
+			why: "normalizeHost passes ':' through for IPv6 literals, so a host:port folds to a usable " +
+				"key — but requestHost strips the port off every request host before matching, so no " +
+				"request can ever present that key; pre-flight refuses the port instead"},
+		{host: "10.0.0.1:8080", proxyOK: true, why: "IPv4 with a port: same"},
+		{host: "example.com:", proxyOK: true, why: "trailing colon, not an address: same"},
+		{host: ":443", proxyOK: true, why: "leading colon, not an address: same"},
+		{host: "a:b", proxyOK: true, why: "a ':' does not make it an IPv6 literal: same"},
+		{host: "2606:4700:4700::gggg", proxyOK: true, why: "colon-shaped but not a parseable address: same"},
 	}
 
 	for _, tc := range cases {
