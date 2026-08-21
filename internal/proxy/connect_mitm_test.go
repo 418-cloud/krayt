@@ -524,6 +524,32 @@ func TestMITMInnerHostMismatchRejected(t *testing.T) {
 	}
 }
 
+// TestHostsEquivalentUsesTheOneHostFold pins the inner-Host guard to normalizeHost. It used to
+// compare with strings.EqualFold, a UNICODE fold under which U+212A KELVIN SIGN equals 'K' — so
+// the guard accepted a spelling every other decision in this package refuses. Nothing was
+// exploitable through it (the upstream target is the CONNECT authority regardless of the inner
+// Host), but it was the package's last rune-folds-onto-ASCII comparison, which is the primitive
+// the allowlist bypass was built out of.
+func TestHostsEquivalentUsesTheOneHostFold(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"api.example.com", "api.example.com:443", true},   // port present on one side only (RFC 7230)
+		{"API.Example.COM:443", "api.example.com", true},   // ASCII case is the same name
+		{"evil.example.com:443", "api.example.com", false}, // the smuggled-Host case
+		{"key.example.com", "Key.example.com", false},      // KELVIN SIGN is not 'K' here
+		{"api.anthropic.com", lookalikeHost, false},        // nor is U+0130 an 'i'
+		{"", "", false}, // an unusable host matches nothing, itself included
+		{"Key.example.com", "Key.example.com", false},
+	}
+	for _, tc := range cases {
+		if got := hostsEquivalent(tc.a, tc.b); got != tc.want {
+			t.Errorf("hostsEquivalent(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
 func TestMITMSmuggledDuplicateInjectedHeaderStripped(t *testing.T) {
 	upstream := &echoTransport{}
 	rule := InjectRule{Host: "api.example.com", Strip: []string{"x-api-key"}, Set: map[string]string{"x-api-key": "resolved-secret-value"}}
