@@ -2,6 +2,7 @@ package task
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 )
 
@@ -209,6 +210,20 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 	if len(np.Inject) > 0 && !np.MITM {
 		return fmt.Errorf("network: inject requires mitm: true")
 	}
+	// Host entries are checked for shape BEFORE any cross-referencing, so a name the proxy could
+	// never honor fails the run here rather than vanishing from the effective policy later (see
+	// validateHostEntry).
+	for i, h := range np.Allow {
+		if err := validateHostEntry(h); err != nil {
+			return fmt.Errorf("network: allow[%d]: %w", i, err)
+		}
+	}
+	for i, h := range np.Passthrough {
+		if err := validateHostEntry(h); err != nil {
+			return fmt.Errorf("network: passthrough[%d]: %w", i, err)
+		}
+	}
+
 	allow := lowerSet(np.Allow)
 	passthrough := lowerSet(np.Passthrough)
 
@@ -225,6 +240,9 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 		host := lower(rule.Host)
 		if host == "" {
 			return fmt.Errorf("network: inject[%d]: host is required", i)
+		}
+		if err := validateHostEntry(rule.Host); err != nil {
+			return fmt.Errorf("network: inject[%d]: %w", i, err)
 		}
 		if seenHost[host] {
 			return fmt.Errorf("network: inject: host %q has more than one rule", host)
@@ -374,6 +392,59 @@ func isTokenChar(r rune) bool {
 	return false
 }
 
+// validateHostEntry rejects an allow/passthrough/inject host the running proxy could never match,
+// so the failure is a pre-flight config error naming the entry instead of a silent difference
+// between the policy the user wrote and the one the run enforces.
+//
+// It is the pre-flight half of internal/proxy's normalizeHost (proxy.go). The invariant is
+// one-directional: everything this function ACCEPTS, normalizeHost must also accept and fold to
+// the same bare form. It may be stricter — pre-flight strictness can only fail a run before it
+// starts, never let through something the proxy would drop — and it is, for bracketed IPv6:
+// normalizeHost unwraps "[::1]" to "::1", but this package's own cross-checks (passthrough ⊆
+// allow, inject.host ∈ allow) key on lower(), which does not, so "[::1]" in one list and "::1" in
+// another would fail to cross-match here. One spelling, demanded up front.
+//
+// lower() alone is not enough — it only case-folds ASCII bytes and passes everything else
+// through, so without this check an `allow: ["api.examplİ.com"]` (or a URL, or a host with a
+// stray '/') validated clean while newHandler dropped it, and the run started with an allowlist
+// quietly missing an entry. See normalizeHost's comment for why refusing beats translating.
+func validateHostEntry(h string) error {
+	s := strings.TrimSpace(h)
+	if s == "" {
+		return fmt.Errorf("host is empty")
+	}
+	if inner, ok := strings.CutPrefix(s, "["); ok {
+		if inner, ok := strings.CutSuffix(inner, "]"); ok {
+			if addr, err := netip.ParseAddr(inner); err == nil && !addr.Is4() {
+				return fmt.Errorf("host %q must be written without brackets, as %q — brackets are "+
+					"URL authority syntax, not part of the address", h, inner)
+			}
+		}
+		return fmt.Errorf("host %q is bracketed but is not an IPv6 literal", h)
+	}
+	for _, c := range []byte(s) {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '.', c == '-', c == ':':
+		case c >= 0x80:
+			return fmt.Errorf("host %q is not an ASCII hostname: krayt matches host rules "+
+				"byte-wise over ASCII and never translates, so an internationalized name must be "+
+				"written as its punycode (\"xn--\") form", h)
+		default:
+			return fmt.Errorf("host %q is not a bare hostname: write the host alone — letters, "+
+				"digits, '.', '-', or an IPv6 literal — with no scheme, path or userinfo", h)
+		}
+	}
+	return nil
+}
+
+// lower folds a host/header name byte-wise over ASCII only — deliberately NOT strings.ToLower,
+// whose Unicode simple case folding maps U+0130 ('İ') onto ASCII 'i'. It only FOLDS, though; what
+// is acceptable as a host at all is validateHostEntry's job, and every host rule goes through
+// both. Together they are the pre-flight counterpart of internal/proxy's normalizeHost
+// (proxy.go), which enforces the same ASCII-only rule at the running proxy's choke point. The two
+// sides must stay in agreement: if either starts accepting or mapping a byte the other does not,
+// pre-flight validation and the proxy stop agreeing on what host a rule names.
 func lower(s string) string {
 	s = strings.TrimSpace(s)
 	b := []byte(s)

@@ -45,8 +45,10 @@ const refreshBodyCap = 4 << 20 // 4 MiB
 // fails the connection outright rather than falling back to a plain tunnel (§7): a silent
 // fallback would drop injection and send the agent out unauthenticated, a confusing failure far
 // from its cause.
-func (h *handler) connectMITM(w http.ResponseWriter, r *http.Request) {
-	authority := r.Host
+// host is the normalizeHost'd bare host ServeHTTP approved and authority is that host with the
+// request's port re-attached — never r.Host, so the name certified, looked up and dialed here is
+// byte-identical to the one the allowlist approved.
+func (h *handler) connectMITM(w http.ResponseWriter, _ *http.Request, host, authority string) {
 	if err := validateConnectAuthority(authority); err != nil {
 		http.Error(w, "krayt: "+err.Error(), http.StatusBadRequest)
 		return
@@ -65,8 +67,7 @@ func (h *handler) connectMITM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sni := hostOnly(authority)
-	tlsConn := tls.Server(client, h.ca.tlsConfigFor(sni))
+	tlsConn := tls.Server(client, h.ca.tlsConfigFor(host))
 	// Bound the handshake so a client that never speaks TLS after CONNECT can't hold this
 	// goroutine (and the underlying fd) open forever.
 	_ = tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -77,7 +78,11 @@ func (h *handler) connectMITM(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = tlsConn.SetDeadline(time.Time{}) // handshake bound only; request/response streaming is unbounded (SSE, §6)
 
-	rule, hasRule := h.inject[strings.ToLower(sni)]
+	// Keyed on the normalized host — the SAME string the allowlist approved and h.inject was
+	// built from. strings.ToLower here used to fold U+0130 into 'i', so a CONNECT to a
+	// lookalike spelling selected the rule written for the real host and would have attached the
+	// real credential to a request bound for someone else's domain (see normalizeHost).
+	rule, hasRule := h.inject[host]
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -112,7 +117,7 @@ func (h *handler) connectMITM(w http.ResponseWriter, r *http.Request) {
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 			log.Printf("krayt-egress-proxy: MITM %s %s: upstream request failed: %v", req.Method, authority, err)
 			if errors.Is(err, errBlockedAddr) {
-				http.Error(w, blockedAddrMsg(hostOnly(authority)), http.StatusForbidden)
+				http.Error(w, blockedAddrMsg(host), http.StatusForbidden)
 				return
 			}
 			http.Error(w, "krayt: upstream request failed", http.StatusBadGateway)
@@ -232,7 +237,16 @@ func (t *refreshingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	return t.base.RoundTrip(req2) // exactly one retry; a second 401 here is returned as-is
 }
 
-// validateConnectAuthority rejects a CONNECT authority that is not a valid host:port (§6).
+// validateConnectAuthority rejects a CONNECT authority that is not a valid host:port (§6), and
+// one whose host is not ASCII LDH.
+//
+// The non-ASCII rejection is deliberate and explicit. It used to happen by accident, one layer
+// down: generateLeaf (mitm.go) puts the SNI in x509.Certificate.DNSNames and x509's encoder
+// refuses a non-ASCII DNSName, so the handshake died before any rule lookup. That was the
+// certificate encoder, not a check anyone wrote — and the rule lookup it was accidentally
+// standing in front of would have attached a real credential to an attacker's domain
+// (normalizeHost). Punycoding the SNI "to make IDN hosts work" would have silently turned that
+// into credential exfiltration. The check now lives here, where it can be seen and tested.
 func validateConnectAuthority(authority string) error {
 	h, p, err := net.SplitHostPort(authority)
 	if err != nil {
@@ -240,6 +254,9 @@ func validateConnectAuthority(authority string) error {
 	}
 	if h == "" {
 		return fmt.Errorf("invalid CONNECT authority %q: empty host", authority)
+	}
+	if _, ok := normalizeHost(h); !ok {
+		return fmt.Errorf("invalid CONNECT authority %q: host is not an ASCII hostname", authority)
 	}
 	if _, err := strconv.Atoi(p); err != nil {
 		return fmt.Errorf("invalid CONNECT authority %q: invalid port %q", authority, p)
