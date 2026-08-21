@@ -615,6 +615,23 @@ func TestOuterServerCapsConcurrentConnections(t *testing.T) {
 	}
 }
 
+// TestServeHandlerRejectsUnusableConnCap covers the bounds being injectable: a maxConns of 0 would
+// build an unbuffered sem no Accept can ever send on (a proxy that listens but serves nothing), and
+// a negative one would panic inside make(chan). Both must fail loudly at the seam instead.
+func TestServeHandlerRejectsUnusableConnCap(t *testing.T) {
+	for _, maxConns := range []int{0, -1} {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		err = serveHandler(context.Background(), lis, http.NotFoundHandler(), time.Minute, maxConns)
+		_ = lis.Close()
+		if err == nil {
+			t.Errorf("serveHandler(maxConns=%d) = nil; want an error", maxConns)
+		}
+	}
+}
+
 // TestConnectBlocked checks a CONNECT to a non-allowlisted host is refused before any dial
 // (the allow path's byte-tunnel is covered by the real-VM integration test).
 func TestConnectBlocked(t *testing.T) {

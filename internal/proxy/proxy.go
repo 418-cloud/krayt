@@ -174,6 +174,13 @@ const (
 // serveHandler is ServeHandler with the resource bounds injectable, so tests can assert them
 // without waiting out outerIdleTimeout or opening maxAcceptedConns sockets.
 func serveHandler(ctx context.Context, lis net.Listener, h http.Handler, idle time.Duration, maxConns int) error {
+	// Reject rather than clamp an unusable cap. Both bad values fail silently or violently inside
+	// make(chan): maxConns < 0 panics ("makechan: size out of range"), and maxConns == 0 leaves an
+	// unbuffered sem no Accept can ever send on, so the proxy would listen while serving nothing.
+	// Clamping to 1 instead would trade that for an equally puzzling fully serialized proxy.
+	if maxConns < 1 {
+		return fmt.Errorf("proxy: serve: maxConns must be >= 1, got %d", maxConns)
+	}
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -205,6 +212,7 @@ type limitListener struct {
 	closeOnce sync.Once
 }
 
+// newLimitListener requires n >= 1; serveHandler, its only caller, rejects anything less.
 func newLimitListener(l net.Listener, n int) *limitListener {
 	return &limitListener{Listener: l, sem: make(chan struct{}, n), done: make(chan struct{})}
 }
