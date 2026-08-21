@@ -201,6 +201,72 @@ func TestValidateNetworkPolicyInvalid(t *testing.T) {
 	}
 }
 
+// TestValidateNetworkPolicyHostEntries pins the pre-flight half of "one definition of the same
+// hostname". internal/proxy's newHandler drops a host entry its normalizeHost refuses, so any
+// entry accepted here that the proxy would refuse means the run silently enforces a policy the
+// user did not write — an allowlist entry, or an inject rule, quietly absent. The bad cases below
+// are exactly the ones internal/proxy's TestNormalizeHost refuses; the good ones are exactly what
+// it accepts and folds to the same bare key.
+func TestValidateNetworkPolicyHostEntries(t *testing.T) {
+	bad := map[string]string{
+		// Written as escapes on purpose: these three are the runes that look like ASCII (or fold
+		// onto it), so a literal is exactly the thing an editor or a copy-paste can silently
+		// normalize away, leaving a test that passes while testing nothing.
+		"non-ASCII lookalike":   "api.anthrop\u0130c.com", // U+0130 'İ': ToLower folds it onto "api.anthropic.com"
+		"Kelvin sign":           "\u212Aey.example.com",   // U+212A KELVIN SIGN, indistinguishable from 'K'
+		"Cyrillic homoglyph":    "\u0430pi.anthropic.com", // U+0430 CYRILLIC SMALL A, indistinguishable from 'a'
+		"a URL, not a host":     "https://api.example.com",
+		"path":                  "api.example.com/v1",
+		"userinfo":              "user@api.example.com",
+		"percent-escape":        "api.anthrop%C4%B0c.com",
+		"CRLF":                  "api.example.com\r\nX: y",
+		"bracketed IPv6":        "[2606:4700:4700::1111]", // must be written bare, so both lists key alike
+		"bracketed non-literal": "[api.example.com]",
+		"unbalanced bracket":    "[2606:4700:4700::1111",
+		"whitespace-only":       "   ",
+		"empty allow entry":     "",
+	}
+	for name, host := range bad {
+		t.Run("allow: "+name, func(t *testing.T) {
+			if err := ValidateNetworkPolicy(NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{host}}, nil); err == nil {
+				t.Errorf("ValidateNetworkPolicy(allow: %q) = nil, want an error — the proxy will drop this entry", host)
+			}
+		})
+		if host == "" {
+			continue // an empty inject host has its own, more specific "host is required" error
+		}
+		t.Run("inject: "+name, func(t *testing.T) {
+			np := NetworkPolicy{
+				Mode: NetworkFull, MITM: true,
+				Inject: []InjectRule{{Host: host, Set: map[string]string{"x-api-key": "K"}}},
+			}
+			if err := ValidateNetworkPolicy(np, map[string]bool{"K": true}); err == nil {
+				t.Errorf("ValidateNetworkPolicy(inject.host: %q) = nil, want an error", host)
+			}
+		})
+		t.Run("passthrough: "+name, func(t *testing.T) {
+			np := NetworkPolicy{Mode: NetworkFull, MITM: true, Passthrough: []string{host}}
+			if err := ValidateNetworkPolicy(np, nil); err == nil {
+				t.Errorf("ValidateNetworkPolicy(passthrough: %q) = nil, want an error", host)
+			}
+		})
+	}
+
+	good := []string{
+		"api.anthropic.com", "API.Anthropic.COM", "  api.example.com  ",
+		"xn--80ak6aa92e.com", // punycode is ordinary ASCII LDH
+		"host-1.sub.example", "1.2.3.4",
+		"2606:4700:4700::1111", // an IPv6 literal, written bare
+	}
+	for _, host := range good {
+		t.Run("allow: "+host, func(t *testing.T) {
+			if err := ValidateNetworkPolicy(NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{host}}, nil); err != nil {
+				t.Errorf("ValidateNetworkPolicy(allow: %q) = %v, want nil", host, err)
+			}
+		})
+	}
+}
+
 func TestInjectedSecretKeys(t *testing.T) {
 	np := NetworkPolicy{Inject: []InjectRule{
 		{Host: "a.example.com", Set: map[string]string{"x-api-key": "KEY_A"}},

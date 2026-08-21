@@ -237,8 +237,11 @@ func newHandler(p Policy, rt http.RoundTripper, dial dialFunc, ca *CA, refresh R
 	// with a different function (strings.ToLower, say) is exactly the divergence that made the
 	// allowlist approve one host while the transport dialed another. An entry normalizeHost
 	// refuses (non-ASCII, so never equal to any request host — those are refused at the choke
-	// point) is dropped rather than stored under a key nothing can ever match; rejecting such
-	// entries at config time is task 03's job.
+	// point) is dropped rather than stored under a key nothing can ever match. Such an entry
+	// never reaches here in a real run: task.ValidateNetworkPolicy applies the same acceptance
+	// rule at pre-flight and fails the run before any VM boots, so the two stages cannot disagree
+	// about the effective policy. This drop is the belt-and-braces half of that pair, for a
+	// Policy built by some other route (a test, a future caller).
 	allow := make(map[string]bool, len(p.Allow))
 	for _, a := range p.Allow {
 		if a, ok := normalizeHost(a); ok {
@@ -534,17 +537,38 @@ func requestHost(r *http.Request) string {
 // construction, so an IDN request host can only ever be a mismatch, and refusing it needs no
 // IDNA library (adding one would need a spec change, CLAUDE.md / §9.1). Folding is therefore
 // byte-wise ASCII and NEVER strings.ToLower — no Unicode rune may fold into an ASCII letter
-// here. Anything outside [a-z0-9.-], plus '[', ']' and ':' so IPv6 literals survive, is refused;
-// so is the empty string.
+// here. Anything outside [a-z0-9.-], plus ':' so IPv6 literals survive, is refused; so is the
+// empty string.
 //
-// internal/task's lower() (network.go) is the pre-flight-validation counterpart and is
-// deliberately ASCII-only for the same reason. The two must stay in agreement: if one starts
-// accepting or mapping a byte the other does not, config validation and the running proxy no
-// longer agree on what host a rule names.
+// Brackets are URL *authority* syntax, not part of the address: "[2001:db8::1]" and
+// "2001:db8::1" name the same target, so the canonical form is the bare one and a bracketed
+// input is unwrapped here. Otherwise the same literal took two different keys depending on how
+// it arrived — a CONNECT authority always carries a port, so net.SplitHostPort strips its
+// brackets in requestHost, while a plain "http://[2001:db8::1]/" has no port to split and kept
+// them — and one spelling matched an allowlist entry while the other did not. Brackets are
+// re-attached only where an authority is built, in normalizedAuthority.
+//
+// internal/task's lower()/validateHostEntry (network.go) are the pre-flight-validation
+// counterpart and are deliberately ASCII-only for the same reason. The two must stay in
+// agreement: if one starts accepting or mapping a byte the other does not, config validation and
+// the running proxy no longer agree on what host a rule names.
 func normalizeHost(host string) (string, bool) {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return "", false
+	}
+	if inner, ok := strings.CutPrefix(host, "["); ok {
+		// A bracketed host is an IPv6 literal or it is malformed — there is no third case
+		// (RFC 3986 §3.2.2), so anything else is refused rather than folded into a key that
+		// could never match. Is4 excludes "[1.2.3.4]", which is not legal bracketed syntax.
+		inner, ok := strings.CutSuffix(inner, "]")
+		if !ok {
+			return "", false
+		}
+		if addr, err := netip.ParseAddr(inner); err != nil || addr.Is4() {
+			return "", false
+		}
+		host = inner
 	}
 	b := []byte(host)
 	for i, c := range b {
@@ -552,7 +576,7 @@ func normalizeHost(host string) (string, bool) {
 		case c >= 'A' && c <= 'Z':
 			b[i] = c + ('a' - 'A')
 		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '.', c == '-',
-			c == ':', c == '[', c == ']': // ':' / brackets: IPv6 literals
+			c == ':': // ':': IPv6 literals (unbracketed by the time we get here)
 		default:
 			return "", false
 		}
@@ -563,6 +587,10 @@ func normalizeHost(host string) (string, bool) {
 // normalizedAuthority rebuilds r's authority from an already-normalized host, keeping the port
 // the request asked for. This is what makes the string dialed byte-identical to the string the
 // policy approved, rather than merely equivalent under some folding.
+//
+// This is the one place brackets go back on: normalizeHost keeps IPv6 in its bare canonical
+// form, but an authority (a URL host, a dial address) needs them so the colons are not read as a
+// port separator. JoinHostPort already does it for the with-port case.
 func normalizedAuthority(r *http.Request, host string) string {
 	raw := r.Host
 	if r.Method != http.MethodConnect && r.URL != nil && r.URL.Host != "" {
@@ -570,6 +598,9 @@ func normalizedAuthority(r *http.Request, host string) string {
 	}
 	if _, port, err := net.SplitHostPort(raw); err == nil {
 		return net.JoinHostPort(host, port)
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
 	}
 	return host
 }

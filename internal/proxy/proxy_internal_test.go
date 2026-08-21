@@ -165,6 +165,72 @@ func TestForwardPathDialsExactlyTheApprovedHost(t *testing.T) {
 	}
 }
 
+// TestIPv6LiteralIsOneKeyOnEveryPath is the regression for the bracket half of "one host, one
+// key": a CONNECT authority always carries a port, so net.SplitHostPort stripped its brackets in
+// requestHost, while a plain "http://[2606:4700:4700::1111]/" had no port to split and kept them
+// — so one allowlist entry matched the same target through CONNECT and denied it over plain HTTP.
+// normalizeHost now unwraps brackets, and normalizedAuthority puts them back only to build an
+// authority, so every path agrees on the bare literal and still dials a syntactically valid one.
+func TestIPv6LiteralIsOneKeyOnEveryPath(t *testing.T) {
+	const literal = "2606:4700:4700::1111"
+	pol := Policy{Mode: ModeAllowlist, Allow: []string{literal}}
+
+	// The same policy written with brackets must fold to the same key, not a second unreachable one.
+	if len(newHandler(Policy{Mode: ModeAllowlist, Allow: []string{"[" + literal + "]"}}, nil, nil, nil, nil).allow) != 1 {
+		t.Fatal("a bracketed allow entry did not survive normalization")
+	}
+	for _, entry := range []string{literal, "[" + literal + "]"} {
+		h := newHandler(Policy{Mode: ModeAllowlist, Allow: []string{entry}}, nil, nil, nil, nil)
+		if !h.allow[literal] {
+			t.Errorf("allow entry %q keyed as %v, want the bare literal", entry, h.allow)
+		}
+	}
+
+	t.Run("plain HTTP, no port", func(t *testing.T) {
+		var reached string
+		h := newHandler(pol, &fakeTransport{reached: &reached}, nil, nil, nil)
+		req := httptest.NewRequest(http.MethodGet, "http://["+literal+"]/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 — the allowlist named this exact target", rec.Code)
+		}
+		// Brackets go back on for the outbound authority: "2606:...:1111" as a URL host would have
+		// its colons read as a port separator.
+		if want := "[" + literal + "]"; reached != want {
+			t.Errorf("dialed %q, want %q", reached, want)
+		}
+	})
+
+	t.Run("CONNECT, with port", func(t *testing.T) {
+		dialed := ""
+		h := newHandler(pol, nil, func(_ context.Context, _, addr string) (net.Conn, error) {
+			dialed = addr
+			return nil, errors.New("dial refused in test")
+		}, nil, nil)
+		req := httptest.NewRequest(http.MethodConnect, "//["+literal+"]:443", nil)
+		req.Host = "[" + literal + "]:443"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code == http.StatusForbidden {
+			t.Fatalf("status = 403; the allowlist named this exact target")
+		}
+		if want := "[" + literal + "]:443"; dialed != want {
+			t.Errorf("dialed %q, want %q", dialed, want)
+		}
+	})
+
+	t.Run("an unlisted literal is still refused", func(t *testing.T) {
+		var reached string
+		h := newHandler(pol, &fakeTransport{reached: &reached}, nil, nil, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://[2606:4700:4700::1112]/", nil))
+		if rec.Code != http.StatusForbidden || reached != "" {
+			t.Errorf("status = %d, upstream = %q; want 403 and no dial", rec.Code, reached)
+		}
+	})
+}
+
 // TestNormalizeHost pins the fold itself: ASCII-only, byte-wise, never strings.ToLower.
 func TestNormalizeHost(t *testing.T) {
 	ok := map[string]string{
@@ -175,7 +241,8 @@ func TestNormalizeHost(t *testing.T) {
 		"xn--80ak6aa92e.com":    "xn--80ak6aa92e.com",
 		"host-1.sub.example":    "host-1.sub.example",
 		"2606:4700:4700::1111":  "2606:4700:4700::1111",
-		"[2606:4700:4700::11]":  "[2606:4700:4700::11]",
+		"[2606:4700:4700::11]":  "2606:4700:4700::11", // brackets are authority syntax: unwrapped to the one canonical key
+		"[2606:4700:4700::AA]":  "2606:4700:4700::aa",
 		"1.2.3.4":               "1.2.3.4",
 		"2606:4700:4700::AAAA":  "2606:4700:4700::aaaa",
 		"UPPER.EXAMPLE.COM:443": "upper.example.com:443",
@@ -198,6 +265,10 @@ func TestNormalizeHost(t *testing.T) {
 		"fe80::1%25eth0",          // IPv6 zone id (percent-escaped, as net/url yields it)
 		"exàmple.com",             // ordinary non-ASCII
 		"аpi.anthropic.com",       // Cyrillic 'а' homoglyph
+		"[2606:4700:4700::11",     // unbalanced bracket
+		"[api.example.com]",       // brackets are IPv6-literal syntax and nothing else
+		"[1.2.3.4]",               // ... which does not include IPv4
+		"[]",
 	}
 	for _, in := range bad {
 		if got, ok := normalizeHost(in); ok {
