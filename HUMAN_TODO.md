@@ -24,12 +24,37 @@ record of what was verified, and how, lives in `git log` (this file's history th
 4. **A known defect** in the agent images' `/output/report.md` contract (`[BUG]` below), which will
    corrupt the opencode verification the same way it corrupted a gemini one unless the task writes
    somewhere else.
+5. **One live-run security check** — that the egress-proxy child's real environment on macOS carries
+   no operator credentials (`[security]` below, report §6 item 4).
 
 The host-side-proxy arc (all three steps) is **done and verified on hardware**: the egress proxy
 runs host-side over vsock, terminates TLS for allowlisted hosts, and attaches the real credential
 itself — a subscription token now never enters the VM (`run_df97fffa`, control `run_10fc027d`), and
 Node trusts the ephemeral CA through `NODE_EXTRA_CA_CERTS` (`run_c74208b4`, with `proxy.log`
 corroborating the negative control independently of the agent's own report).
+
+---
+
+## [security] confirm the live egress-proxy child carries no operator credentials
+- Needed: on the Mac, **during a run**, check the real child process's environment. This is item 4
+  of `docs/security-review-host-proxy-report.md` §6 — the live-run half of the F6 fix that gave the
+  child an explicit, minimal environment (`egressProxyChildEnvKeys`,
+  `internal/orchestrator/egressproxy.go`).
+- Why the agent can't: needs a live `krayt run` on real hardware; `ps -E` is macOS-only, and the
+  offline tests can only assert what this process constructs, not what a Mac kernel shows.
+- Exact steps/commands:
+  ```sh
+  # on the Mac, during a run:
+  pgrep -f '__egress-proxy' | head -1 | xargs -I{} ps -E -p {} | tr ' ' '\n' | grep -E 'KEY|TOKEN|SECRET|AWS|PASS'
+  ```
+  Worth running from a shell that has `ANTHROPIC_API_KEY` (or any such variable) exported, so the
+  check can actually fail if the fix regressed.
+- Verify success by: **no matches.** The child's full environment should be only `PATH`, `HOME`,
+  and whichever of `SSL_CERT_FILE`/`SSL_CERT_DIR`/`KRAYT_PROXY_LOG_REQUESTS`/
+  `KRAYT_PROXY_LOG_HEADER_VALUES` were set on the `krayt run` invocation. Drop the `grep` to see
+  the whole list.
+- Blocking: no — the offline half (`TestSpawnEgressProxySecretNeverInArgvEnvOrOutput`,
+  `TestSpawnEgressProxyForwardsLogRequestsEnv`) already guards the code path in CI.
 
 ---
 

@@ -35,6 +35,45 @@ import (
 	"strings"
 )
 
+// LogRequestsEnv turns the request-observation log above on for one run (§6.6): every handled
+// request's request line, host, and header NAMES land in `.krayt/runs/<id>/proxy.log`, which
+// otherwise records only failures and denials. Set it on the `krayt run` invocation — the
+// orchestrator forwards it to the proxy child — e.g.
+//
+//	KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config ./probe.yaml --task ./task.md
+//
+// Deliberately an env var and not a new flag: the flag set IS the KRAYT_EGRESS_PROXY_BIN swap
+// contract (see internal/cli's __egress-proxy command), and a replacement binary built against it
+// must not break because krayt asked for extra diagnostics — an unrecognized env var is ignored, an
+// unrecognized flag is fatal. Only a boolean rides here; secret material still goes on stdin only
+// (§6.6.1).
+//
+// It lives HERE, next to the feature it controls, rather than in internal/cli (which reads it, via
+// envEnabled) or internal/orchestrator (which forwards it, via egressProxyChildEnvKeys): those two
+// cannot share a constant through each other — internal/cli imports internal/orchestrator, not the
+// reverse — but both already import this package. Spelling the name as a literal in either place
+// instead would put the reader and the forwarder one silent typo apart, and the failure mode is
+// invisible: the run still works, the diagnostics just stop.
+const LogRequestsEnv = "KRAYT_PROXY_LOG_REQUESTS"
+
+// LogHeaderValuesEnv is a comma-separated list of header names whose VALUES the observation log may
+// record in full, e.g.
+//
+//	KRAYT_PROXY_LOG_HEADER_VALUES=authorization,x-api-version krayt run …
+//
+// It implies LogRequestsEnv. Header names alone are not always enough for a wire-format probe: an
+// API's required opt-in flags (a beta or version header) are non-secret facts that must be recorded
+// exactly, and guessing them is what `docs/ai-tasks/inject-claude-oauth-token-at-proxy.md` forbids.
+// The example is deliberately a generic header: this package names no API vendor at all (§6.6,
+// enforced by the grep-style guard test in internal/adapter), so the concrete vendor-specific
+// spelling this doc used to carry stays behind in internal/cli, on the caller side of that boundary.
+// A credential-bearing name never yields its value — `authorization` and friends are reduced to
+// scheme + length (credentialShape below), which is what answers "Bearer-prefixed or raw token?"
+// and "is the credential forwarded verbatim?" without putting one in the artifact.
+//
+// Same reason as LogRequestsEnv for living in this package.
+const LogHeaderValuesEnv = "KRAYT_PROXY_LOG_HEADER_VALUES"
+
 // credentialHeaders are header names whose values are NEVER logged in full, however explicitly
 // they are opted in via Policy.LogHeaderValues — they are reduced to credentialShape instead. This
 // is generic HTTP credential hygiene, not vendor knowledge (this package stays free of that, §6.6):

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -175,6 +176,10 @@ func TestSpawnEgressProxySecretNeverInArgvEnvOrOutput(t *testing.T) {
 		t.Skip("EgressProxyBinEnv not set — this package's TestMain (climit_test.go) sets it; run via `go test`")
 	}
 	const secret = "sk-ant-PLANTED-0123456789-do-not-leak"
+	// Plant it in THIS process's environment too, exactly as an operator's shell or direnv would
+	// have it when they type `krayt run`: with an inherited (nil) cmd.Env this is what lands in the
+	// child's /proc/<pid>/environ, which is the leak egressProxyChildEnvKeys exists to close.
+	t.Setenv("ANTHROPIC_API_KEY", secret)
 	secretsFile := filepath.Join(t.TempDir(), "secrets.env")
 	if err := os.WriteFile(secretsFile, []byte("ANTHROPIC_API_KEY="+secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -213,12 +218,35 @@ func TestSpawnEgressProxySecretNeverInArgvEnvOrOutput(t *testing.T) {
 			t.Errorf("secret leaked into argv: %v", ep.cmd.Args)
 		}
 	}
-	// env, as constructed — nil means full-inherit of THIS test process's own environment, which
-	// never carries the secret either (it only ever lives in the secrets file + stdin payload).
+	// env, as constructed. A nil cmd.Env is NOT "no environment" — it is os.Environ(), i.e. every
+	// secret the operator had exported (the ANTHROPIC_API_KEY planted above included). So this
+	// asserts the whole environment against egressProxyChildEnvKeys, by key, rather than only
+	// scanning for the planted value: scanning alone passes vacuously when Env is nil, which is the
+	// bug this test used to have. Optional keys may legitimately be absent; unexpected ones may not.
+	if ep.cmd.Env == nil {
+		t.Fatal("cmd.Env is nil — the child inherits this process's entire environment, including any operator credentials")
+	}
+	allowed := map[string]bool{}
+	for _, k := range egressProxyChildEnvKeys {
+		allowed[k] = true
+	}
 	for _, e := range ep.cmd.Env {
-		if strings.Contains(e, secret) {
-			t.Errorf("secret leaked into env: %v", e)
+		k, _, ok := strings.Cut(e, "=")
+		if !ok {
+			t.Errorf("malformed child env entry %q", e)
+			continue
 		}
+		if !allowed[k] {
+			t.Errorf("unexpected variable %q in the child's environment; the child gets exactly egressProxyChildEnvKeys", k)
+		}
+		if strings.Contains(e, secret) {
+			t.Errorf("secret leaked into env via %q", k)
+		}
+	}
+	// PATH is set in every environment this suite can run in, so it pins the forwarding direction:
+	// without it, an env-building bug that dropped everything would look identical to a correct one.
+	if !slices.ContainsFunc(ep.cmd.Env, func(e string) bool { return strings.HasPrefix(e, "PATH=") }) {
+		t.Errorf("PATH missing from the child's environment: %v", ep.cmd.Env)
 	}
 	// Stronger, real-process assertions on Linux: read the actual argv/environ of the live child
 	// from /proc, not just what this process intended to pass.
@@ -235,6 +263,79 @@ func TestSpawnEgressProxySecretNeverInArgvEnvOrOutput(t *testing.T) {
 	ep.stop()
 	if strings.Contains(string(ep.out.Bytes()), secret) {
 		t.Errorf("secret leaked into the child's full stdout/stderr output: %q", ep.out.Bytes())
+	}
+}
+
+// TestSpawnEgressProxyForwardsLogRequestsEnv proves the one feature that reaches the child through
+// its environment still works now that the environment is an explicit allowlist
+// (egressProxyChildEnvKeys): KRAYT_PROXY_LOG_REQUESTS=1 on the `krayt run` invocation must arrive at
+// the child and actually turn the observation log on (§6.6, internal/proxy/observe.go). Dropping it
+// from that list would be a silent failure — the run still works, the diagnostics just stop — so
+// this drives a real request through the real child and asserts on its captured output, not on the
+// variable's presence alone.
+func TestSpawnEgressProxyForwardsLogRequestsEnv(t *testing.T) {
+	if os.Getenv(EgressProxyBinEnv) == "" {
+		t.Skip("EgressProxyBinEnv not set — this package's TestMain (climit_test.go) sets it; run via `go test`")
+	}
+	t.Setenv(proxy.LogRequestsEnv, "1")
+
+	// A loopback literal rather than an httptest.Server's address: the request below deliberately
+	// omits a port, so it was never going to reach such a server anyway — it passes the L7 allowlist
+	// and then dies at the SSRF guard, which is precisely the path that proves the observation log
+	// ran BEFORE the block. Naming the address outright also keeps the URL well-formed: httptest
+	// binds [::1] on an IPv6-only host, and "http://" + "::1" + path is not a parseable URL without
+	// brackets.
+	const allowedHost = "127.0.0.1"
+
+	ctx := context.Background()
+	p := fake.New()
+	vm, err := p.Create(ctx, provider.VMSpec{ID: "run_egress_observe"})
+	if err != nil {
+		t.Fatalf("fake provider Create: %v", err)
+	}
+	defer func() { _ = vm.Destroy(ctx) }()
+	lis, err := vm.ListenEgress(ctx, provider.EgressPort)
+	if err != nil {
+		t.Fatalf("ListenEgress: %v", err)
+	}
+	sockPath := lis.Addr().String()
+
+	np := task.NetworkPolicy{Mode: task.NetworkAllowlist, Allow: []string{allowedHost}}
+	ep, err := spawnEgressProxy(ctx, lis, np, "run_egress_observe", t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("spawnEgressProxy: %v", err)
+	}
+	// Backstop only: the explicit ep.stop() below must still run where it is, because the
+	// assertions need the child reaped and its output flushed first. This defer exists so a
+	// t.Fatalf on any path in between (client.Get, say) cannot leak the child process. stop() is
+	// safe to call twice — it kills an already-reaped process with a discarded error, reads an
+	// already-closed waited channel, and rewrites proxy.log with identical bytes.
+	defer ep.stop()
+	if !slices.Contains(ep.cmd.Env, proxy.LogRequestsEnv+"=1") {
+		t.Errorf("%s not forwarded to the child: %v", proxy.LogRequestsEnv, ep.cmd.Env)
+	}
+
+	proxyURL, _ := url.Parse("http://proxy.invalid:0")
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sockPath) // stand in for krayt-vsock-forward
+			},
+		},
+	}
+	resp, err := client.Get("http://" + allowedHost + "/observed-path")
+	if err != nil {
+		t.Fatalf("GET via egress proxy child: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	ep.stop() // flushes and reaps the child, so its full stderr is in ep.out
+	out := string(ep.out.Bytes())
+	if !strings.Contains(out, "observe http GET") || !strings.Contains(out, "/observed-path") {
+		t.Errorf("observation log absent from the child's output — KRAYT_PROXY_LOG_REQUESTS did not take effect:\n%s", out)
 	}
 }
 

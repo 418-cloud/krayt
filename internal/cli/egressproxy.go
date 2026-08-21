@@ -25,32 +25,21 @@ const egressProxyListenerFD = 3
 // stdout/stderr (proxy.log), which is redacted-and-persisted, not structured.
 const egressProxyCACertFD = 4
 
-// EgressProxyLogRequestsEnv turns on the proxy's request-observation log for one run (§6.6,
-// internal/proxy/observe.go): every handled request's request line, host, and header NAMES land in
-// `.krayt/runs/<id>/proxy.log`, which otherwise records only failures and denials. Set it on the
-// `krayt run` invocation — the child inherits this process's environment — e.g.
+// The request-observation log's two env vars (proxy.LogRequestsEnv / proxy.LogHeaderValuesEnv) are
+// defined in internal/proxy, next to the feature they control, so that this package — which READS
+// them below — and internal/orchestrator — which FORWARDS them to the proxy child — share one
+// definition instead of two literals that can silently drift apart. See internal/proxy/observe.go
+// for the full contract.
 //
-//	KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config ./probe.yaml --task ./task.md
+// The vendor-specific spelling of the header-values probe lives here rather than there, because
+// internal/proxy names no API vendor (§6.6). For an Anthropic wire-format probe that is:
 //
-// Deliberately an env var and not a new flag: the flag set IS the KRAYT_EGRESS_PROXY_BIN swap
-// contract (see the command doc below), and a replacement binary built against it must not break
-// because krayt asked for extra diagnostics — an unrecognized env var is ignored, an unrecognized
-// flag is fatal. Only a boolean rides here; secret material still goes on stdin only (§6.6.1).
-const EgressProxyLogRequestsEnv = "KRAYT_PROXY_LOG_REQUESTS"
-
-// EgressProxyLogHeaderValuesEnv is a comma-separated list of header names whose VALUES the
-// observation log may record in full, e.g.
+//	KRAYT_PROXY_LOG_REQUESTS=1 \
+//	KRAYT_PROXY_LOG_HEADER_VALUES=authorization,anthropic-beta,anthropic-version \
+//	  krayt run --config ./probe.yaml --task ./task.md
 //
-//	KRAYT_PROXY_LOG_HEADER_VALUES=authorization,anthropic-beta krayt run …
-//
-// It implies EgressProxyLogRequestsEnv. Header names alone are not always enough for a wire-format
-// probe: an API's required opt-in flags (a beta or version header) are non-secret facts that must
-// be recorded exactly, and guessing them is what
-// `docs/ai-tasks/inject-claude-oauth-token-at-proxy.md` forbids. A credential-bearing name never
-// yields its value — `authorization` and friends are reduced to scheme + length
-// (`internal/proxy`'s credentialShape), which is what answers "Bearer-prefixed or raw token?" and
-// "is the credential forwarded verbatim?" without putting one in the artifact.
-const EgressProxyLogHeaderValuesEnv = "KRAYT_PROXY_LOG_HEADER_VALUES"
+// `authorization` still yields only scheme + length (internal/proxy's credentialShape), never the
+// credential itself — the beta/version headers are the non-secret facts the probe actually needs.
 
 // newEgressProxyCmd is `krayt __egress-proxy`: the host-side L7 egress allowlist proxy,
 // spawned as a separate process by the run supervisor (never invoked directly by a user).
@@ -96,8 +85,8 @@ func newEgressProxyCmd() *cobra.Command {
 			policy := proxy.Policy{
 				Mode: mode, Allow: allow,
 				MITM: mitm, Passthrough: stdinCfg.Passthrough, Inject: stdinCfg.Inject,
-				LogRequests:     envEnabled(EgressProxyLogRequestsEnv),
-				LogHeaderValues: envList(EgressProxyLogHeaderValuesEnv),
+				LogRequests:     envEnabled(proxy.LogRequestsEnv),
+				LogHeaderValues: envList(proxy.LogHeaderValuesEnv),
 			}
 			h, ca, err := proxy.BuildHandler(policy, dns, runID)
 			if err != nil {

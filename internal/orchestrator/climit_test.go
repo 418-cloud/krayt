@@ -25,9 +25,12 @@ const (
 	slotHelperHold = "KRAYT_TEST_SLOT_HOLD_MS"
 )
 
-// egressHelperFlag flags a re-exec of this test binary as the egress-proxy child instead of
-// the slot helper or the test suite — see the TestMain doc below.
-const egressHelperFlag = "KRAYT_TEST_EGRESS_HELPER"
+// egressHelperArg is the first argv element spawnEgressProxy gives a KRAYT_EGRESS_PROXY_BIN
+// replacement (`--mode <mode> …`), and so is how a re-exec of this test binary recognizes itself as
+// the egress-proxy child rather than the slot helper or the test suite — see the TestMain doc
+// below. It is argv and not an env var on purpose: spawnEgressProxy hands the child an explicit,
+// minimal environment (egressProxyChildEnvKeys), so no test-only marker can ride along in it.
+const egressHelperArg = "--mode"
 
 // TestMain triples as: (1) the slot-acquiring helper process used by
 // TestAcquireSlotCrossProcess, (2) the egress-proxy child process EVERY orchestrator.Run call
@@ -36,13 +39,13 @@ const egressHelperFlag = "KRAYT_TEST_EGRESS_HELPER"
 // suite itself.
 //
 // For (2): rather than hand every orchestrator.Run call site a purpose-built stub binary, this
-// test binary points orchestrator.EgressProxyBinEnv at itself before running the suite. Any
-// child spawned that way inherits egressHelperFlag=1 through the default (nil Cmd.Env, i.e.
-// full-environment-inherit) exec.Cmd behavior — since this process sets it on itself with
-// os.Setenv before m.Run(), every subprocess m.Run() goes on to spawn sees it too, and reruns
-// this same TestMain, which recognizes the flag and behaves as the child (adopt fd 3, run the
-// real proxy.Serve loop) instead of recursing into the suite. This exercises the genuine
-// fd-passing + allowlist-enforcement path end to end in every orchestrator test, not a mock.
+// test binary points orchestrator.EgressProxyBinEnv at itself before running the suite. Every
+// child spawned that way reruns this same TestMain, which recognizes the proxy contract's leading
+// `--mode` argument (egressHelperArg) and behaves as the child (adopt fd 3, run the real
+// proxy.Serve loop) instead of recursing into the suite. The marker has to be argv: spawnEgressProxy
+// gives the child an explicit, minimal environment (egressProxyChildEnvKeys), so an env-var flag
+// set on this process before m.Run() would NOT reach it. This exercises the genuine fd-passing +
+// allowlist-enforcement path end to end in every orchestrator test, not a mock.
 func TestMain(m *testing.M) {
 	if dir := os.Getenv(slotHelperDir); dir != "" {
 		hold, _ := strconv.Atoi(os.Getenv(slotHelperHold))
@@ -57,12 +60,11 @@ func TestMain(m *testing.M) {
 		rel()
 		os.Exit(0)
 	}
-	if os.Getenv(egressHelperFlag) == "1" {
+	if len(os.Args) > 1 && os.Args[1] == egressHelperArg {
 		os.Exit(runEgressHelper())
 	}
 	if self, err := os.Executable(); err == nil {
 		_ = os.Setenv(orchestrator.EgressProxyBinEnv, self)
-		_ = os.Setenv(egressHelperFlag, "1")
 	}
 	os.Exit(m.Run())
 }
@@ -96,7 +98,17 @@ func runEgressHelper() int {
 		fmt.Fprintln(os.Stderr, "egress-helper:", err)
 		return 1
 	}
-	policy := proxy.Policy{Mode: *mode, Allow: allow, MITM: *mitm, Passthrough: stdinCfg.Passthrough, Inject: stdinCfg.Inject}
+	policy := proxy.Policy{
+		Mode: *mode, Allow: allow, MITM: *mitm,
+		Passthrough: stdinCfg.Passthrough, Inject: stdinCfg.Inject,
+		// Mirrors internal/cli/egressproxy.go's envEnabled(proxy.LogRequestsEnv): the observation
+		// log is the one feature that reaches the child through its environment, so a stand-in that
+		// ignored it would let spawnEgressProxy quietly stop forwarding the variable without any
+		// test noticing (TestSpawnEgressProxyForwardsLogRequestsEnv). Reading the SAME constant the
+		// real reader and forwarder use is what keeps this helper from passing while the real
+		// contract breaks.
+		LogRequests: os.Getenv(proxy.LogRequestsEnv) == "1",
+	}
 	h, ca, err := proxy.BuildHandler(policy, "", *runID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "egress-helper:", err)
