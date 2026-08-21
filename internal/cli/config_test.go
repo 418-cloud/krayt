@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/418-cloud/krayt/internal/task"
 )
 
 // TestConfigPrecedence checks defaults → file → flags: the file supplies values, an explicit
@@ -198,6 +200,80 @@ func TestApplyConfigAutoLoadedSecurityFields(t *testing.T) {
 		yaml:    "secrets: config/../../../.env\n",
 		wantErr: "escapes the repo root",
 		check:   func(*testing.T, *runFlags) {},
+	}, {
+		// repo: is refused outright rather than contained — a repo's own config redirecting which
+		// directory krayt bundles into the VM has no legitimate use, and a sibling private repo is
+		// the working shape of the attack (the bundler needs a real git repo).
+		name:    "repo relative sibling",
+		yaml:    "repo: ../victim-private-repo\n",
+		wantErr: "sets repo:",
+		// The explicit half only asserts the file is accepted: this helper always passes --repo, so
+		// the flag wins over the file's value (§8.3). That the explicit config's `repo:` is honored
+		// when no --repo is given is TestApplyConfigExplicitConfigHonorsRepo.
+		check: func(*testing.T, *runFlags) {},
+	}, {
+		name:    "repo absolute",
+		yaml:    "repo: /srv/private\n",
+		wantErr: "sets repo:",
+		check:   func(*testing.T, *runFlags) {},
+	}, {
+		name:    "task escaping the repo",
+		yaml:    "task: ../../../etc/hostname\n",
+		wantErr: "escapes the repo root",
+		check: func(t *testing.T, f *runFlags) {
+			if f.taskFile != "../../../etc/hostname" {
+				t.Errorf("task = %q, want the explicit config's path verbatim", f.taskFile)
+			}
+		},
+	}, {
+		name:    "task absolute",
+		yaml:    "task: /etc/hostname\n",
+		wantErr: "absolute path",
+		check: func(t *testing.T, f *runFlags) {
+			if f.taskFile != "/etc/hostname" {
+				t.Errorf("task = %q, want the explicit config's path verbatim", f.taskFile)
+			}
+		},
+	}, {
+		name: "task inside the repo",
+		yaml: "task: ./task.md\n",
+		check: func(t *testing.T, f *runFlags) {
+			// Auto-loaded, the path is resolved under the repo root; explicit, it is taken verbatim.
+			if base := filepath.Base(f.taskFile); base != "task.md" {
+				t.Errorf("task = %q, want it to resolve to task.md", f.taskFile)
+			}
+		},
+	}, {
+		// A grantable capability, so the explicit half exercises the honored path. A denylisted one
+		// (NET_ADMIN) is refused twice over — by this guard when auto-loaded, and by
+		// task.NormalizeCapabilities regardless of provenance; the auto-load half of that is
+		// TestConfigFieldsAccountedFor.
+		name:    "container capabilities",
+		yaml:    "container:\n  capabilities: [NET_BIND_SERVICE]\n",
+		wantErr: "container.capabilities",
+		check: func(t *testing.T, f *runFlags) {
+			if len(f.container.AddCapabilities) != 1 || f.container.AddCapabilities[0] != "CAP_NET_BIND_SERVICE" {
+				t.Errorf("capabilities = %v, want the explicit config's one cap", f.container.AddCapabilities)
+			}
+		},
+	}, {
+		name:    "container seccomp unconfined",
+		yaml:    "container:\n  seccomp: unconfined\n",
+		wantErr: "container.seccomp: unconfined",
+		check: func(t *testing.T, f *runFlags) {
+			if !f.container.SeccompUnconfined {
+				t.Error("seccomp unconfined = false, want true from the explicit config")
+			}
+		},
+	}, {
+		// readonly_rootfs only tightens, so a repo asking for it is harmless and stays auto-loadable.
+		name: "container readonly rootfs",
+		yaml: "container:\n  readonly_rootfs: true\n",
+		check: func(t *testing.T, f *runFlags) {
+			if !f.container.ReadonlyRootfs {
+				t.Error("readonly_rootfs = false, want true from the file")
+			}
+		},
 	}}
 
 	for _, tc := range cases {
@@ -227,6 +303,153 @@ func TestApplyConfigAutoLoadedSecurityFields(t *testing.T) {
 			}
 			tc.check(t, f)
 		})
+	}
+}
+
+// TestApplyConfigExplicitConfigHonorsRepo is the other side of the `repo:` refusal: an explicit
+// --config is the operator naming the file, so it may still say which repo to bundle. No --repo
+// flag here, since a flag would win over the file either way (§8.3).
+func TestApplyConfigExplicitConfigHonorsRepo(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "krayt.yaml")
+	if err := os.WriteFile(cfgPath, []byte("repo: /srv/other-repo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var f runFlags
+	cmd := &cobra.Command{Use: "run", RunE: func(*cobra.Command, []string) error { return nil }}
+	bindRunFlags(cmd, &f)
+	if err := cmd.ParseFlags([]string{"--config", cfgPath}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyConfig(cmd, &f); err != nil {
+		t.Fatalf("applyConfig with an explicit --config: %v, want repo: honored", err)
+	}
+	if f.repo != "/srv/other-repo" {
+		t.Errorf("repo = %q, want the explicit config's value", f.repo)
+	}
+}
+
+// TestApplyConfigAutoLoadedTaskResolvesUnderRepo pins the accepted half of the `task:` containment:
+// a prompt the repo carries is resolved against the repo root, exactly as `secrets:` is, so it
+// still works when krayt is run from anywhere.
+func TestApplyConfigAutoLoadedTaskResolvesUnderRepo(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "task.md"), []byte("do the thing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := applyConfigFromFile(t, repo, "task: ./task.md\n", false)
+	if err != nil {
+		t.Fatalf("applyConfig: %v, want the in-repo task prompt accepted", err)
+	}
+	if want := filepath.Join(repo, "task.md"); f.taskFile != want {
+		t.Errorf("task = %q, want %q", f.taskFile, want)
+	}
+}
+
+// configFieldCase is one entry of the trust-boundary checklist below: a name, and the mutation
+// that puts that field in its interesting state on a fresh task.Config.
+type configFieldCase struct {
+	name string
+	set  func(*task.Config)
+}
+
+// TestConfigFieldsAccountedFor is the checklist that stops the next field added to task.Config
+// from silently repeating this bug (the way `task:`/`repo:`/`container.*` slipped past the first
+// pass, which enumerated only `network.*` and `secrets:`). Every field of task.Config appears in
+// exactly one of the three buckets below — REFUSED for an auto-loaded config, CONTAINED to the
+// repo root, or deliberately SAFE to auto-load — and the first two buckets are asserted against
+// the real guards rather than trusted from a comment. No reflection: when you add a field to
+// task.Config, add it here and to KRAYT_SPEC.md §8.3's table.
+//
+// task.Config fields, as of internal/task/config.go:
+//
+//	Image           SAFE       names the OCI image to run — already the repo's choice of toolchain
+//	Task            CONTAINED  host file read, shipped into the guest as the run's prompt
+//	Repo            REFUSED    redirects what is bundled, and where .krayt is written on the host
+//	Secrets         CONTAINED  host file read, shipped into the guest as SecretsBundle
+//	IncludeDirty    SAFE       bundles the operator's own working tree of the same repo
+//	BundleDepth     SAFE       how much of that same repo's history is bundled
+//	Env             SAFE       non-secret container env; guest-side only
+//	Network.Mode    REFUSED for "full" only — allowlist|none do not widen egress
+//	Network.Allow   SAFE by decision (§8.3): widening, but surfaced by the pre-boot policy print
+//	Network.MITM         REFUSED
+//	Network.Passthrough  REFUSED
+//	Network.Inject       REFUSED
+//	Resources.*     SAFE       guest sizing and the run's own deadline
+//	Questions.*     SAFE       whether the run pauses for operator input
+//	Agent.Adapter   SAFE       which agent runs inside the guest
+//	Container.Capabilities   REFUSED
+//	Container.Seccomp        REFUSED for "unconfined" only
+//	Container.ReadonlyRootfs SAFE — it only tightens
+func TestConfigFieldsAccountedFor(t *testing.T) {
+	refused := []configFieldCase{
+		{"network.mitm", func(c *task.Config) { c.Network.MITM = true }},
+		{"network.inject", func(c *task.Config) { c.Network.Inject = []task.ConfigInjectRule{{Host: "h"}} }},
+		{"network.passthrough", func(c *task.Config) { c.Network.Passthrough = []string{"h"} }},
+		{"network.mode: full", func(c *task.Config) { c.Network.Mode = "full" }},
+		{"repo:", func(c *task.Config) { c.Repo = "../elsewhere" }},
+		{"container.capabilities", func(c *task.Config) { c.Container.Capabilities = []string{"NET_ADMIN"} }},
+		{"container.seccomp: unconfined", func(c *task.Config) { c.Container.Seccomp = "unconfined" }},
+	}
+	for _, r := range refused {
+		var cfg task.Config
+		r.set(&cfg)
+		err := rejectAutoLoadedPolicy("/repo/krayt.yaml", &cfg)
+		if err == nil {
+			t.Errorf("rejectAutoLoadedPolicy accepted %s, want it refused", r.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), r.name) {
+			t.Errorf("error for %s = %q, want it to name the field", r.name, err)
+		}
+	}
+
+	// CONTAINED: not refused outright, but resolved through containedRepoPath, so a path leaving
+	// the repo is an error. The escape cases themselves are covered by the table test above.
+	contained := []configFieldCase{
+		{"task", func(c *task.Config) { c.Task = "../../../etc/hostname" }},
+		{"secrets", func(c *task.Config) { c.Secrets = "../../.env" }},
+	}
+	for _, c := range contained {
+		var cfg task.Config
+		c.set(&cfg)
+		if err := rejectAutoLoadedPolicy("/repo/krayt.yaml", &cfg); err != nil {
+			t.Errorf("%s is contained, not refused, but rejectAutoLoadedPolicy refused it: %v", c.name, err)
+		}
+		if _, err := containedRepoPath("/repo", "../../.env"); err == nil {
+			t.Errorf("containedRepoPath accepted an escaping %s path, want it refused", c.name)
+		}
+	}
+
+	// SAFE: the guard stays narrow — none of the ordinary configuration surface is refused.
+	safe := []configFieldCase{
+		{"image", func(c *task.Config) { c.Image = "img:1" }},
+		{"task", func(c *task.Config) { c.Task = "./task.md" }},
+		{"secrets", func(c *task.Config) { c.Secrets = "secrets.env" }},
+		{"include_dirty", func(c *task.Config) { b := true; c.IncludeDirty = &b }},
+		{"bundle_depth", func(c *task.Config) { d := 0; c.BundleDepth = &d }},
+		{"env", func(c *task.Config) { c.Env = map[string]string{"K": "v"} }},
+		{"network.mode: allowlist", func(c *task.Config) { c.Network.Mode = "allowlist" }},
+		{"network.mode: none", func(c *task.Config) { c.Network.Mode = "none" }},
+		{"network.allow", func(c *task.Config) { c.Network.Allow = []string{"api.anthropic.com"} }},
+		{"resources", func(c *task.Config) {
+			n := 4
+			c.Resources.CPUs, c.Resources.Memory = &n, "8GiB"
+			c.Resources.Disk, c.Resources.Timeout = "20GiB", "45m"
+		}},
+		{"questions", func(c *task.Config) {
+			c.Questions.Mode, c.Questions.Timeout, c.Questions.OnTimeout = "wait", "5m", "abort"
+		}},
+		{"agent", func(c *task.Config) { c.Agent.Adapter = "claude-code" }},
+		{"container.seccomp: default", func(c *task.Config) { c.Container.Seccomp = "default" }},
+		{"container.readonly_rootfs", func(c *task.Config) { b := true; c.Container.ReadonlyRootfs = &b }},
+	}
+	for _, s := range safe {
+		var cfg task.Config
+		s.set(&cfg)
+		if err := rejectAutoLoadedPolicy("/repo/krayt.yaml", &cfg); err != nil {
+			t.Errorf("rejectAutoLoadedPolicy refused %s: %v, want it auto-loadable", s.name, err)
+		}
 	}
 }
 

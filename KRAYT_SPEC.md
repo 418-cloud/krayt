@@ -1591,27 +1591,44 @@ honored in full. An **auto-loaded** `<repo>/krayt.yaml` (no `--config` passed) i
 inside the repo the agent is about to work on — it is untrusted input (§10), so it may configure a
 run but may not write the run's security policy:
 
-| Field | Auto-loaded `<repo>/krayt.yaml` | Explicit `--config` |
-|---|---|---|
-| `network.mitm: true` | **error** | honored |
-| `network.inject` (non-empty) | **error** | honored |
-| `network.passthrough` (non-empty) | **error** | honored |
-| `network.mode: full` | **error** | honored |
-| `secrets:` | honored only if the resolved path stays inside the repo root | honored |
-| everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `container`, `questions`, …) | honored | honored |
+This table is the **whole** boundary — every field of the config is in exactly one row, so a field's
+treatment is stated in one place rather than discovered one field at a time. A field added to
+`krayt.yaml` must be added here too.
+
+| Field | Auto-loaded `<repo>/krayt.yaml` | Explicit `--config` | Why |
+|---|---|---|---|
+| `network.mitm: true` | **error** | honored | turns on TLS interception |
+| `network.inject` (non-empty) | **error** | honored | names which credential is injected into which host's requests |
+| `network.passthrough` (non-empty) | **error** | honored | exempts a host from interception |
+| `network.mode: full` | **error** | honored | drops the egress allowlist entirely |
+| `repo:` | **error** | honored | redirects **which host directory is bundled into the VM** — and is also the run-artifact root `.krayt/` is written under |
+| `container.capabilities` (non-empty) | **error** | honored | re-grants Linux capabilities the run drops by default (§8.1) |
+| `container.seccomp: unconfined` | **error** | honored | disables the seccomp profile (§8.1) |
+| `secrets:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read, shipped into the guest as the run's `SecretsBundle` |
+| `task:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read, shipped into the guest as the run's prompt |
+| everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `questions`, `include_dirty`, `bundle_depth`, `container.readonly_rootfs`) | honored | honored | configures the run without redirecting what krayt reads/writes on the host or relaxing the container's confinement |
 
 A refused field is an **error, not a warning and not a silent ignore** — the run stops, naming the
 field, the file, and the `krayt run --config <path>` opt-in. Silently dropping it would leave the
 operator believing a policy that is not in force.
 
-`secrets:` is contained rather than refused, because a repo's own tracked config legitimately names
-its gitignored secrets file. The value is resolved against the repo root and `filepath.Clean`ed;
-an absolute path (`/Users/x/.env`) or one that climbs out (`../../.env`) is rejected — otherwise a
-poisoned repo could ship an arbitrary host file into the guest as the run's `SecretsBundle`.
-Containment is judged on the path that will actually be **opened**, not on how it is spelled: every
-symlink in the value and in the repo root is resolved first, so a repo shipping
-`secrets.env -> ~/.aws/credentials` is rejected too. A path that does not exist is not an escape —
-there is nothing to follow, and the missing file is reported when the secrets file is read.
+`repo:` is refused rather than contained: a repo's own config redirecting *which repo to bundle* is
+self-referential nonsense with no legitimate use, so refusing is both simpler and stricter than a
+containment check. Untreated, `repo: ../sibling` makes krayt bundle a **different, private repo's
+git history** into the VM for an attacker-influenced agent to read, and writes that run's `.krayt/`
+artifacts into whatever directory the poisoned file named, at the operator's uid.
+`container.readonly_rootfs` is *not* refused — it only tightens, so a repo asking for it is harmless.
+
+`secrets:` and `task:` are contained rather than refused, because a repo's own tracked config
+legitimately names its gitignored secrets file and its checked-in task prompt. The value is resolved
+against the repo root and `filepath.Clean`ed; an absolute path (`/Users/x/.env`, `/etc/hostname`) or
+one that climbs out (`../../.env`) is rejected — otherwise a poisoned repo could ship an arbitrary
+host file into the guest, as the run's `SecretsBundle` or as its prompt (which the agent can then
+echo into `report.md` or `changes.patch`). Containment is judged on the path that will actually be
+**opened**, not on how it is spelled: every symlink in the value and in the repo root is resolved
+first, so a repo shipping `secrets.env -> ~/.aws/credentials` is rejected too. A path that does not
+exist is not an escape — there is nothing to follow, and the missing file is reported when the file
+is read.
 
 **Pre-boot policy summary.** Every run prints its resolved egress policy to stderr before the VM
 boots — mode, allowlist, MITM on/off, passthrough list, and each inject rule's host and header
@@ -1830,7 +1847,7 @@ exposed.
 | Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
 | Secrets | tmpfs only, never on disk, destroyed with VM; **redacted in the guest** from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted** (redacting hunks would break `git apply`); a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
 | TLS MITM / credential injection | **Opt-in, default off** (`network.mitm`, §6.6.1). An injected secrets-file key is **withheld from `SecretsBundle` entirely** — the container never holds it, closing "Auth-credential blast radius" (below) for that credential. Ephemeral per-run CA, in memory only, private key never exported. Trades a HOST-process compromise for a *stronger* claim than plain egress enforcement: the proxy process now also holds real user credentials, not just a policy decision (residual below) |
-| Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy** — `network.mitm`, `network.inject`, `network.passthrough` and `network.mode: full` are refused with an error, and `secrets:` is contained to the repo root (no absolute path, no `..` escape, no symlink resolving out). Without this split a poisoned repo could turn on MITM and name the operator's own secrets-file key as the credential injected into an attacker-controlled host, with every consistency check passing because the file is only ever compared against itself |
+| Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3, whose table is the full field-by-field boundary): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy, redirect what krayt reads or writes on the host, or relax the container's confinement**. Refused with an error: `network.mitm`, `network.inject`, `network.passthrough`, `network.mode: full`, `repo:`, `container.capabilities`, `container.seccomp: unconfined`. Contained to the repo root (no absolute path, no `..` escape, no symlink resolving out): `secrets:`, `task:`. Without this split a poisoned repo could turn on MITM and name the operator's own secrets-file key as the credential injected into an attacker-controlled host, bundle a *different*, private repo into the VM for the agent to read, read an arbitrary host file in as the run's prompt, or hand the container back the capabilities and seccomp profile §8.1 takes away — with every consistency check passing, because the file is only ever compared against itself |
 | Persistence | CoW disk destroyed on teardown; fresh VM per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
 
