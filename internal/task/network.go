@@ -374,6 +374,12 @@ func isTokenChar(r rune) bool {
 	return false
 }
 
+// lower folds a host/header name byte-wise over ASCII only — deliberately NOT strings.ToLower,
+// whose Unicode simple case folding maps U+0130 ('İ') onto ASCII 'i'. It is the pre-flight
+// counterpart of internal/proxy's normalizeHost (proxy.go), which enforces the same ASCII-only
+// rule at the running proxy's choke point. The two must stay in agreement: if either starts
+// accepting or mapping a byte the other does not, pre-flight validation and the proxy stop
+// agreeing on what host a rule names.
 func lower(s string) string {
 	s = strings.TrimSpace(s)
 	b := []byte(s)

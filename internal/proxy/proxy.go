@@ -232,21 +232,28 @@ type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 // newHandler builds the proxy with an injectable transport + dialer (tests pass fakes so no
 // real network is needed) and an optional CA (nil disables the MITM path entirely, §4).
 func newHandler(p Policy, rt http.RoundTripper, dial dialFunc, ca *CA, refresh RefreshFunc) *handler {
+	// Every map key is folded with normalizeHost — the SAME fold ServeHTTP applies to the
+	// request host. Both sides of a lookup must agree byte for byte: folding config entries
+	// with a different function (strings.ToLower, say) is exactly the divergence that made the
+	// allowlist approve one host while the transport dialed another. An entry normalizeHost
+	// refuses (non-ASCII, so never equal to any request host — those are refused at the choke
+	// point) is dropped rather than stored under a key nothing can ever match; rejecting such
+	// entries at config time is task 03's job.
 	allow := make(map[string]bool, len(p.Allow))
 	for _, a := range p.Allow {
-		if a = strings.ToLower(strings.TrimSpace(a)); a != "" {
+		if a, ok := normalizeHost(a); ok {
 			allow[a] = true
 		}
 	}
 	passthrough := make(map[string]bool, len(p.Passthrough))
 	for _, h := range p.Passthrough {
-		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+		if h, ok := normalizeHost(h); ok {
 			passthrough[h] = true
 		}
 	}
 	inject := make(map[string]InjectRule, len(p.Inject))
 	for _, r := range p.Inject {
-		if h := strings.ToLower(strings.TrimSpace(r.Host)); h != "" {
+		if h, ok := normalizeHost(r.Host); ok {
 			inject[h] = r
 		}
 	}
@@ -345,7 +352,7 @@ type handler struct {
 	// byte-identical to before this task.
 	mitm        bool
 	passthrough map[string]bool       // hosts tunneled (never MITM'd) even when mitm is on
-	inject      map[string]InjectRule // by lowercased host
+	inject      map[string]InjectRule // by normalizeHost'd host
 	ca          *CA
 	refresh     RefreshFunc
 
@@ -354,7 +361,18 @@ type handler struct {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	host := requestHost(r)
+	// ONE normalization, here, before any policy decision — and the result is what every step
+	// below (allowed, the passthrough/inject lookups, and both dial paths) sees. A request host
+	// that is not already ASCII LDH is refused outright: see normalizeHost for why.
+	raw := requestHost(r)
+	host, ok := normalizeHost(raw)
+	if !ok {
+		// %q because this is guest-controlled text and, by construction, is non-ASCII or
+		// otherwise unprintable — the whole point of the refusal.
+		log.Printf("krayt-egress-proxy: %s %q: refused, host is not an ASCII hostname", r.Method, raw)
+		http.Error(w, "krayt: egress to a non-ASCII or malformed host is refused", http.StatusForbidden)
+		return
+	}
 	if !h.allowed(host) {
 		// Logged unconditionally, not just under logRequests: on a CONNECT the guest's client
 		// discards this 403's body (see tunnel's comment below), so without this line a
@@ -366,21 +384,23 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodConnect {
-		h.connect(w, r)
+		h.connect(w, r, host)
 		return
 	}
 	// Injection targets HTTPS only (§1, §4.5): the MITM path is the only place a credential is
 	// attached, and a plain-HTTP request never goes through it. Refuse outright for a host with
 	// an injection rule rather than silently forwarding it unauthenticated or attaching a
 	// credential to a cleartext request.
-	if _, ok := h.inject[strings.ToLower(host)]; ok {
+	if _, ok := h.inject[host]; ok {
 		http.Error(w, "krayt: "+host+" requires HTTPS (credential injection configured); plain HTTP is refused", http.StatusBadRequest)
 		return
 	}
-	h.forward(w, r)
+	h.forward(w, r, host)
 }
 
-// allowed applies the policy to a bare host (no port).
+// allowed applies the policy to a bare host (no port) that has ALREADY been through
+// normalizeHost — it does no folding of its own on purpose, so there is exactly one definition
+// of "the same hostname" in this package and no way to reach the map with an unfolded key.
 func (h *handler) allowed(host string) bool {
 	switch h.mode {
 	case ModeFull:
@@ -388,7 +408,7 @@ func (h *handler) allowed(host string) bool {
 	case ModeNone:
 		return false
 	default: // allowlist
-		return h.allow[strings.ToLower(host)]
+		return h.allow[host]
 	}
 }
 
@@ -396,25 +416,28 @@ func (h *handler) allowed(host string) bool {
 // A passthrough host, or MITM being off entirely, always gets the tunnel — pinned clients and
 // non-HTTP-over-TLS (git+ssh on 443) survive only because this fallback exists, so it must stay
 // reachable no matter what the MITM path does.
-func (h *handler) connect(w http.ResponseWriter, r *http.Request) {
-	if !h.mitm || h.ca == nil || h.passthrough[strings.ToLower(requestHost(r))] {
-		h.obs.connect(r.Host, false)
-		h.tunnel(w, r)
+// host is the normalizeHost'd bare host ServeHTTP approved; authority re-attaches the request's
+// port to it, so the tunnel dials (and the MITM path certifies) the exact bytes the policy saw.
+func (h *handler) connect(w http.ResponseWriter, r *http.Request, host string) {
+	authority := normalizedAuthority(r, host)
+	if !h.mitm || h.ca == nil || h.passthrough[host] {
+		h.obs.connect(authority, false)
+		h.tunnel(w, r, host, authority)
 		return
 	}
-	h.obs.connect(r.Host, true)
-	h.connectMITM(w, r)
+	h.obs.connect(authority, true)
+	h.connectMITM(w, r, host, authority)
 }
 
 // tunnel is the original CONNECT behavior, preserved verbatim (§4.2): dial the (already
 // allowed) target and splice bytes both ways with no inspection. This is the fallback when
 // anything about MITM is inapplicable or misbehaves, so it must never be modified to depend on
 // MITM state.
-func (h *handler) tunnel(w http.ResponseWriter, r *http.Request) {
-	upstream, err := h.dial(r.Context(), "tcp", r.Host)
+func (h *handler) tunnel(w http.ResponseWriter, r *http.Request, host, authority string) {
+	upstream, err := h.dial(r.Context(), "tcp", authority)
 	if err != nil {
 		if errors.Is(err, errBlockedAddr) {
-			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
+			http.Error(w, blockedAddrMsg(host), http.StatusForbidden)
 			return
 		}
 		// net/http's CONNECT-proxy client path (what every proxy-aware caller, including
@@ -423,7 +446,7 @@ func (h *handler) tunnel(w http.ResponseWriter, r *http.Request) {
 		// server-side so the real reason (DNS failure, connection refused, timeout, …) is
 		// visible in proxy.log (§6.6, §9 of move-egress-proxy-to-host.md), the only place a
 		// denial reason survives.
-		log.Printf("krayt-egress-proxy: CONNECT %s: upstream dial failed: %v", r.Host, err)
+		log.Printf("krayt-egress-proxy: CONNECT %s: upstream dial failed: %v", authority, err)
 		http.Error(w, "krayt: upstream dial failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -448,15 +471,21 @@ func (h *handler) tunnel(w http.ResponseWriter, r *http.Request) {
 	_ = client.Close()
 }
 
-// forward proxies a plain-HTTP request to the (already allowed) target.
-func (h *handler) forward(w http.ResponseWriter, r *http.Request) {
-	host := requestHost(r)
+// forward proxies a plain-HTTP request to the (already allowed) target. host is the
+// normalizeHost'd bare host ServeHTTP approved.
+func (h *handler) forward(w http.ResponseWriter, r *http.Request, host string) {
 	h.obs.request("http", host, r, false) // before RequestURI is cleared, while r still carries the guest's request line
 	r.RequestURI = ""                     // must be cleared before re-sending as a client request
+	// Re-point the outbound request at the approved bytes. The transport resolves r.URL.Host,
+	// not the string the allowlist checked, so leaving the guest's spelling here is what let the
+	// two diverge; overwriting it makes "approved" and "dialed" the same string by construction.
+	authority := normalizedAuthority(r, host)
+	r.URL.Host = authority
+	r.Host = authority
 	resp, err := h.transport.RoundTrip(r)
 	if err != nil {
 		if errors.Is(err, errBlockedAddr) {
-			http.Error(w, blockedAddrMsg(requestHost(r)), http.StatusForbidden)
+			http.Error(w, blockedAddrMsg(host), http.StatusForbidden)
 			return
 		}
 		log.Printf("krayt-egress-proxy: %s %s: upstream request failed: %v", r.Method, host, err)
@@ -483,6 +512,64 @@ func requestHost(r *http.Request) string {
 	}
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		return h
+	}
+	return host
+}
+
+// normalizeHost folds a request host (or a policy entry) into the single canonical form this
+// package makes every decision on, and reports whether it is usable at all.
+//
+// It exists because two definitions of "the same hostname" used to sit on either side of the
+// policy decision: allowed() folded with strings.ToLower (Unicode simple case folding, under
+// which U+0130 'İ' becomes ASCII 'i'), while every http.Transport dial folds with UTS-46
+// (under which U+0130 becomes the punycode label "xn--..."). For an allowlist entry
+// "api.example.com" a guest could therefore send `http://api.examplİ.com/` — reachable through a
+// proxy at all because net/url percent-decodes the host — have the allowlist approve it as the
+// listed host, and have the transport dial the attacker's registered "xn--" domain instead: a
+// complete egress-allowlist bypass in the default configuration.
+// The same primitive selected an inject rule (and therefore a real credential) for a host the
+// rule was never written for.
+//
+// The fix is to refuse rather than to translate: krayt's allow/inject entries are ASCII by
+// construction, so an IDN request host can only ever be a mismatch, and refusing it needs no
+// IDNA library (adding one would need a spec change, CLAUDE.md / §9.1). Folding is therefore
+// byte-wise ASCII and NEVER strings.ToLower — no Unicode rune may fold into an ASCII letter
+// here. Anything outside [a-z0-9.-], plus '[', ']' and ':' so IPv6 literals survive, is refused;
+// so is the empty string.
+//
+// internal/task's lower() (network.go) is the pre-flight-validation counterpart and is
+// deliberately ASCII-only for the same reason. The two must stay in agreement: if one starts
+// accepting or mapping a byte the other does not, config validation and the running proxy no
+// longer agree on what host a rule names.
+func normalizeHost(host string) (string, bool) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", false
+	}
+	b := []byte(host)
+	for i, c := range b {
+		switch {
+		case c >= 'A' && c <= 'Z':
+			b[i] = c + ('a' - 'A')
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '.', c == '-',
+			c == ':', c == '[', c == ']': // ':' / brackets: IPv6 literals
+		default:
+			return "", false
+		}
+	}
+	return string(b), true
+}
+
+// normalizedAuthority rebuilds r's authority from an already-normalized host, keeping the port
+// the request asked for. This is what makes the string dialed byte-identical to the string the
+// policy approved, rather than merely equivalent under some folding.
+func normalizedAuthority(r *http.Request, host string) string {
+	raw := r.Host
+	if r.Method != http.MethodConnect && r.URL != nil && r.URL.Host != "" {
+		raw = r.URL.Host
+	}
+	if _, port, err := net.SplitHostPort(raw); err == nil {
+		return net.JoinHostPort(host, port)
 	}
 	return host
 }

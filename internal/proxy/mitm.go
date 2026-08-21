@@ -177,6 +177,11 @@ func (c *CA) generateLeaf(sni string) (*tls.Certificate, error) {
 	if ip := net.ParseIP(sni); ip != nil {
 		tmpl.IPAddresses = []net.IP{ip}
 	} else {
+		// x509.CreateCertificate below refuses a non-ASCII DNSName. That refusal is now
+		// belt-and-braces, NOT the primary check: a non-ASCII host is rejected by normalizeHost
+		// in ServeHTTP and again by validateConnectAuthority, both of which run before this. It
+		// used to be the only thing standing between a guest and an injected credential — see
+		// validateConnectAuthority's comment before relying on it again.
 		tmpl.DNSNames = []string{sni}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.cert, &key.PublicKey, c.key)

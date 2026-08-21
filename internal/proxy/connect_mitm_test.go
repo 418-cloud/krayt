@@ -200,6 +200,53 @@ func TestMITMNonMatchingHostGetsNoInjection(t *testing.T) {
 	}
 }
 
+// TestMITMInjectRuleNotSelectedForLookalikeHost is the permanent regression for the credential
+// half of the Unicode-folding bug: the rule lookup was h.inject[strings.ToLower(sni)], which
+// folds U+0130 onto ASCII 'i', so a CONNECT to lookalikeHost selected the rule written for
+// api.anthropic.com — Rewrite would have attached the real credential and SetURL would have sent
+// it to a domain the attacker registered.
+//
+// It did not fire before only by accident: x509.CreateCertificate refuses the non-ASCII DNSName
+// generateLeaf puts in the leaf, so the handshake died first. That accident is not the check any
+// more — the host is refused at the handler's choke point, and validateConnectAuthority refuses
+// it again deliberately. Both are asserted here, because the first one passing is what makes the
+// second look unnecessary.
+func TestMITMInjectRuleNotSelectedForLookalikeHost(t *testing.T) {
+	upstream := &echoTransport{}
+	rule := InjectRule{Host: "api.anthropic.com", Set: map[string]string{"x-api-key": "real-secret-value"}}
+	dialed := ""
+	dial := func(_ context.Context, _, addr string) (net.Conn, error) {
+		dialed = addr
+		return nil, fmt.Errorf("dial must not be reached")
+	}
+	pol := Policy{Mode: ModeAllowlist, Allow: []string{"api.anthropic.com"}, MITM: true, Inject: []InjectRule{rule}}
+	h := newHandler(pol, upstream, dial, mustCA(t), nil)
+
+	req := httptest.NewRequest(http.MethodConnect, "//"+lookalikeHost+":443", nil)
+	req.Host = lookalikeHost + ":443"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+	if dialed != "" {
+		t.Errorf("dialed %q for a host with no rule and no allowlist entry", dialed)
+	}
+	if got := upstream.lastRequest(); got != nil {
+		t.Errorf("upstream reached with %v", got.URL)
+	}
+	// The rule map itself cannot be reached with an unfolded key: there is no entry under any
+	// spelling but the normalized one.
+	if _, hasRule := h.inject[lookalikeHost]; hasRule {
+		t.Error("inject rule is reachable under the lookalike spelling")
+	}
+	// And the deliberate check that replaced the x509 encoder's accidental one.
+	if err := validateConnectAuthority(lookalikeHost + ":443"); err == nil {
+		t.Error("validateConnectAuthority accepted a non-ASCII authority")
+	}
+}
+
 func TestMITMSetLiteral(t *testing.T) {
 	upstream := &echoTransport{}
 	rule := InjectRule{Host: "api.example.com", SetLiteral: map[string]string{"x-krayt-mitm": "1"}}
