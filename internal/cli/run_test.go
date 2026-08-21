@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/418-cloud/krayt/internal/orchestrator"
+	"github.com/418-cloud/krayt/internal/task"
 )
 
 // newTestRunCmd builds a run command with flags bound to a fresh runFlags, mirroring the
@@ -273,5 +274,57 @@ func TestRunRunResourcePreflightBypassedBySkipFlag(t *testing.T) {
 	err := runRun(cmd, &f)
 	if err != nil && strings.Contains(err.Error(), "insufficient free memory") {
 		t.Fatalf("runRun err = %v, want --skip-resource-check to bypass the resource preflight", err)
+	}
+}
+
+// TestPrintNetworkPolicy checks the pre-boot summary shows the operator every host and header
+// name the policy touches — and no secret material: an inject rule's values are secrets-file key
+// names that resolve host-side to real credentials, so only the header names may be printed.
+func TestPrintNetworkPolicy(t *testing.T) {
+	p := task.NetworkPolicy{
+		Mode:        task.NetworkAllowlist,
+		Allow:       []string{"api.anthropic.com", "proxy.golang.org"},
+		MITM:        true,
+		Passthrough: []string{"proxy.golang.org"},
+		Inject: []task.InjectRule{{
+			Host:       "api.anthropic.com",
+			Strip:      []string{"x-api-key"},
+			Set:        map[string]string{"authorization": "ANTHROPIC_API_KEY"},
+			SetLiteral: map[string]string{"anthropic-beta": "oauth-2025-04-20"},
+		}},
+	}
+	var b strings.Builder
+	if err := printNetworkPolicy(&b, p, "/repo/krayt.yaml"); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{
+		"/repo/krayt.yaml", "mode=allowlist", "api.anthropic.com", "proxy.golang.org",
+		"mitm=true", "passthrough", "inject api.anthropic.com",
+		"strip=x-api-key", "set=anthropic-beta,authorization",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing %q:\n%s", want, out)
+		}
+	}
+	// The mapped values name a secrets-file key and a literal; neither belongs on the terminal.
+	for _, leak := range []string{"ANTHROPIC_API_KEY", "oauth-2025-04-20"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("summary leaks %q:\n%s", leak, out)
+		}
+	}
+}
+
+// TestPrintNetworkPolicyFlagsOnly covers the default run: no config file, no MITM. The summary
+// still prints, because a run that never names a policy still has one.
+func TestPrintNetworkPolicyFlagsOnly(t *testing.T) {
+	var b strings.Builder
+	p := task.NetworkPolicy{Mode: task.NetworkNone}
+	if err := printNetworkPolicy(&b, p, "flags"); err != nil {
+		t.Fatal(err)
+	}
+	out := strings.TrimSpace(b.String())
+	if want := "network policy (from flags): mode=none mitm=false"; out != want {
+		t.Errorf("summary = %q, want %q", out, want)
 	}
 }
