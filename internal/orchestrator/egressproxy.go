@@ -46,13 +46,14 @@ var egressProxyChildEnvKeys = []string{
 	// only discoverable through them. Forwarded when the operator set them; never fabricated.
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
-	// The request-observation contract internal/cli/egressproxy.go defines
-	// (EgressProxyLogRequestsEnv / EgressProxyLogHeaderValuesEnv, read there via envEnabled and
-	// envList). Spelled as literals because internal/cli imports this package, not the reverse —
-	// they must stay in sync with those constants or `KRAYT_PROXY_LOG_REQUESTS=1 krayt run …`
-	// silently stops logging. Only a boolean and header NAMES ride here, never a value (§6.6.1).
-	"KRAYT_PROXY_LOG_REQUESTS",
-	"KRAYT_PROXY_LOG_HEADER_VALUES",
+	// The request-observation contract (§6.6), read back out by internal/cli/egressproxy.go via
+	// envEnabled and envList. These come from internal/proxy — the package that OWNS the feature
+	// and that both this package and internal/cli already import — so the forwarder here and the
+	// reader there cannot drift: a literal in either place would be one typo away from
+	// `KRAYT_PROXY_LOG_REQUESTS=1 krayt run …` silently logging nothing. Only a boolean and header
+	// NAMES ride here, never a value (§6.6.1).
+	proxy.LogRequestsEnv,
+	proxy.LogHeaderValuesEnv,
 }
 
 // egressProxyChildEnv materializes egressProxyChildEnvKeys against this process's environment,

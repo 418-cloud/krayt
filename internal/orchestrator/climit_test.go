@@ -101,11 +101,13 @@ func runEgressHelper() int {
 	policy := proxy.Policy{
 		Mode: *mode, Allow: allow, MITM: *mitm,
 		Passthrough: stdinCfg.Passthrough, Inject: stdinCfg.Inject,
-		// Mirrors internal/cli/egressproxy.go's envEnabled(EgressProxyLogRequestsEnv): the
-		// observation log is the one feature that reaches the child through its environment, so a
-		// stand-in that ignored it would let spawnEgressProxy quietly stop forwarding the variable
-		// without any test noticing (TestSpawnEgressProxyForwardsLogRequestsEnv).
-		LogRequests: os.Getenv("KRAYT_PROXY_LOG_REQUESTS") == "1",
+		// Mirrors internal/cli/egressproxy.go's envEnabled(proxy.LogRequestsEnv): the observation
+		// log is the one feature that reaches the child through its environment, so a stand-in that
+		// ignored it would let spawnEgressProxy quietly stop forwarding the variable without any
+		// test noticing (TestSpawnEgressProxyForwardsLogRequestsEnv). Reading the SAME constant the
+		// real reader and forwarder use is what keeps this helper from passing while the real
+		// contract breaks.
+		LogRequests: os.Getenv(proxy.LogRequestsEnv) == "1",
 	}
 	h, ca, err := proxy.BuildHandler(policy, "", *runID)
 	if err != nil {

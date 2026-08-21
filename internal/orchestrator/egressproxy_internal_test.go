@@ -277,15 +277,15 @@ func TestSpawnEgressProxyForwardsLogRequestsEnv(t *testing.T) {
 	if os.Getenv(EgressProxyBinEnv) == "" {
 		t.Skip("EgressProxyBinEnv not set — this package's TestMain (climit_test.go) sets it; run via `go test`")
 	}
-	// The contract constant is internal/cli's (EgressProxyLogRequestsEnv); spelled out here because
-	// that package imports this one, not the reverse — same reason egressProxyChildEnvKeys does.
-	t.Setenv("KRAYT_PROXY_LOG_REQUESTS", "1")
+	t.Setenv(proxy.LogRequestsEnv, "1")
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusTeapot)
-	}))
-	defer srv.Close()
-	allowedHost := srv.Listener.Addr().(*net.TCPAddr).IP.String() // loopback: passes L7, dies at the SSRF guard — after observe
+	// A loopback literal rather than an httptest.Server's address: the request below deliberately
+	// omits a port, so it was never going to reach such a server anyway — it passes the L7 allowlist
+	// and then dies at the SSRF guard, which is precisely the path that proves the observation log
+	// ran BEFORE the block. Naming the address outright also keeps the URL well-formed: httptest
+	// binds [::1] on an IPv6-only host, and "http://" + "::1" + path is not a parseable URL without
+	// brackets.
+	const allowedHost = "127.0.0.1"
 
 	ctx := context.Background()
 	p := fake.New()
@@ -305,8 +305,14 @@ func TestSpawnEgressProxyForwardsLogRequestsEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spawnEgressProxy: %v", err)
 	}
-	if !slices.Contains(ep.cmd.Env, "KRAYT_PROXY_LOG_REQUESTS=1") {
-		t.Errorf("KRAYT_PROXY_LOG_REQUESTS not forwarded to the child: %v", ep.cmd.Env)
+	// Backstop only: the explicit ep.stop() below must still run where it is, because the
+	// assertions need the child reaped and its output flushed first. This defer exists so a
+	// t.Fatalf on any path in between (client.Get, say) cannot leak the child process. stop() is
+	// safe to call twice — it kills an already-reaped process with a discarded error, reads an
+	// already-closed waited channel, and rewrites proxy.log with identical bytes.
+	defer ep.stop()
+	if !slices.Contains(ep.cmd.Env, proxy.LogRequestsEnv+"=1") {
+		t.Errorf("%s not forwarded to the child: %v", proxy.LogRequestsEnv, ep.cmd.Env)
 	}
 
 	proxyURL, _ := url.Parse("http://proxy.invalid:0")
