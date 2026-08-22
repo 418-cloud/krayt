@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.9.0](https://github.com/418-cloud/krayt/compare/v0.8.0...v0.9.0) (2026-08-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* an auto-loaded <repo>/krayt.yaml setting repo:, container.capabilities or container.seccomp: unconfined now fails the run, and task: must resolve inside the repo root. Pass the file as --config to k old behavior.
+* refuse an auto-loaded repo krayt.yaml the run's security policy ([#120](https://github.com/418-cloud/krayt/issues/120))
+
+### Features
+
+* add opencode adapter for krayt and add a base opecode image ([#105](https://github.com/418-cloud/krayt/issues/105)) ([08fe560](https://github.com/418-cloud/krayt/commit/08fe560fd8977c554b77a9ac780f529ed9d891b8))
+* add TLS MITM credential injection to the egress proxy ([#110](https://github.com/418-cloud/krayt/issues/110)) ([7d63e2c](https://github.com/418-cloud/krayt/commit/7d63e2c5b4c45edcf295eb546d1d770d926550e4))
+* run the egress allowlist proxy on the host over vsock ([#108](https://github.com/418-cloud/krayt/issues/108)) ([c9a7c77](https://github.com/418-cloud/krayt/commit/c9a7c778aafd95decf1ba71698239df0ca1ce3f1))
+* translate a subscription token's wire shape at the host proxy ([#115](https://github.com/418-cloud/krayt/issues/115)) ([df67e94](https://github.com/418-cloud/krayt/commit/df67e942b01941fd4ce2c95d5e100902cd1b7893))
+* verify the guest's installed nftables ruleset on every run ([#112](https://github.com/418-cloud/krayt/issues/112)) ([6d6f90a](https://github.com/418-cloud/krayt/commit/6d6f90a372954e41ae68bd61c647a901d74733d4))
+
+
+### Bug Fixes
+
+* bound the outer proxy server and strip hop-by-hop headers on the… ([#123](https://github.com/418-cloud/krayt/issues/123)) ([eaf6912](https://github.com/418-cloud/krayt/commit/eaf69124887f26d50f407e63b8bd03579c0758e1))
+* close the config fields the trust-boundary split left unguarded ([#126](https://github.com/418-cloud/krayt/issues/126)) ([bd8ac17](https://github.com/418-cloud/krayt/commit/bd8ac17133633677534f0ac156deb91b5465dcce))
+* give the egress-proxy child an explicit, minimal environment ([#124](https://github.com/418-cloud/krayt/issues/124)) ([42bd1be](https://github.com/418-cloud/krayt/commit/42bd1be46c87b1754c2c336564f1ff7cecc45a42))
+* normalize request hosts once, so the allowlist and the dial agree ([#121](https://github.com/418-cloud/krayt/issues/121)) ([415f09b](https://github.com/418-cloud/krayt/commit/415f09bc1db59d7d2be2c28817471277bbb875c2))
+* refuse an auto-loaded repo krayt.yaml the run's security policy ([#120](https://github.com/418-cloud/krayt/issues/120)) ([3296d36](https://github.com/418-cloud/krayt/commit/3296d36ca5afdac6e48aeb22c464a0bbd954160a))
+* security review tests kept locally failed, this fixes the outstanding ones ([#125](https://github.com/418-cloud/krayt/issues/125)) ([e9f5fe2](https://github.com/418-cloud/krayt/commit/e9f5fe26f0e1f3686248e5cca71267daae6205ff))
+* validate host strings in the network policy at pre-flight ([#122](https://github.com/418-cloud/krayt/issues/122)) ([4002b75](https://github.com/418-cloud/krayt/commit/4002b75d1c2fedcdb05342e107fe80f1e1691c2c))
+
+
+### Dependencies
+
+* update gomod non-major dependencies ([#109](https://github.com/418-cloud/krayt/issues/109)) ([98792a0](https://github.com/418-cloud/krayt/commit/98792a0f10a632434dcd7a6414ddf35496d691c3))
+* update pinned vmimage version to 0.5.0 ([#118](https://github.com/418-cloud/krayt/issues/118)) ([27fc0ad](https://github.com/418-cloud/krayt/commit/27fc0ada5bfc89dc23049ba77dee4cb47436ccd0))
+
 ## [0.8.0](https://github.com/418-cloud/krayt/compare/v0.7.1...v0.8.0) (2026-08-12)
 
 
