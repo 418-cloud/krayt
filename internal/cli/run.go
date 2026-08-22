@@ -604,15 +604,20 @@ func spawnDetached(exe string, args, env []string, logPath string) (int, error) 
 // An auto-loaded <repo>/krayt.yaml is untrusted input (§10): it ships inside the very repo the
 // agent is about to work on, so a poisoned repo would otherwise get to write the run's own
 // security policy — turn on MITM, name which secrets-file key is injected into which host's
-// requests, exempt a host from interception, or drop the allowlist. It gets the ordinary
-// configuration surface (image, agent, env, resources, allowlist, …) and is refused that
-// security-relevant subset, plus contained to the repo root for `secrets:`. Naming the same file
-// with --config is the operator vouching for it, and honors everything (§8.3).
+// requests, exempt a host from interception, drop the allowlist, redirect which directory krayt
+// bundles into the VM, or relax the container's hardening. It gets the ordinary configuration
+// surface (image, agent, env, resources, allowlist, …) and is refused that security-relevant
+// subset, plus contained to the repo root for the two path-shaped fields it may still name
+// (`secrets:`, `task:`). Naming the same file with --config is the operator vouching for it, and
+// honors everything (§8.3).
 func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	path := f.config
 	auto := path == ""
-	// Containment root for an auto-loaded config's `secrets:` — the directory the file was found
-	// in. Captured before the overlay below, which may rewrite f.repo from the file itself.
+	// Containment root for an auto-loaded config's `secrets:`/`task:` — the directory the file was
+	// found in. Captured before the overlay below; on the explicit-config path that overlay may
+	// still rewrite f.repo from the file itself, and containment must not follow it there.
+	// rejectAutoLoadedPolicy refuses `repo:` outright for an auto-loaded config, so on the path
+	// where repoRoot is actually used it can no longer be rewritten.
 	repoRoot := f.repo
 	if auto {
 		def := filepath.Join(f.repo, "krayt.yaml")
@@ -641,7 +646,22 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 		}
 	}
 	str("image", cfg.Image, &f.image)
-	str("task", cfg.Task, &f.taskFile)
+	if !changed("task") && cfg.Task != "" {
+		t := cfg.Task
+		if auto {
+			// Same containment as `secrets:` below, for the same reason: readTaskPrompt os.Opens
+			// this path and ships its contents into the guest as the run's prompt, from where the
+			// agent can echo it into report.md or changes.patch. `task: ./task.md` inside the repo
+			// keeps working; `../../../etc/hostname` or an absolute path is an arbitrary host-file
+			// read (§8.3, §10).
+			if t, err = containedRepoPath(repoRoot, t); err != nil {
+				return fmt.Errorf("config %s: task: %w", path, err)
+			}
+		}
+		f.taskFile = t
+	}
+	// `repo:` has no auto-loaded branch: rejectAutoLoadedPolicy has already refused it above, so
+	// reaching here means the operator named the file with --config.
 	str("repo", cfg.Repo, &f.repo)
 	if !changed("secrets") && cfg.Secrets != "" {
 		s := cfg.Secrets
@@ -729,11 +749,17 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 }
 
 // rejectAutoLoadedPolicy refuses the security-relevant subset of krayt.yaml when the file was
-// auto-discovered at <repo>/krayt.yaml rather than named with --config (§8.3, §10). These four
-// fields are the ones that decide where the operator's credentials can go and whether egress is
-// inspected at all, so a repo the operator did not write must not be able to set them. The error
-// names the field, the file, and the way to opt in — silently ignoring the field would leave the
-// operator believing a policy that isn't in force.
+// auto-discovered at <repo>/krayt.yaml rather than named with --config (§8.3, §10). These fields
+// are the ones that decide where the operator's credentials can go, whether egress is inspected at
+// all, which host directory is bundled into the VM, and how hard the container's own confinement
+// is, so a repo the operator did not write must not be able to set them. The error names the
+// field, the file, and the way to opt in — silently ignoring the field would leave the operator
+// believing a policy that isn't in force.
+//
+// The two path-shaped fields that are *not* here — `secrets:` and `task:` — are contained to the
+// repo root in applyConfig instead of refused, because a repo's own config legitimately names its
+// gitignored secrets file and its checked-in task prompt. `container.readonly_rootfs` is absent on
+// purpose: it only tightens, so a repo asking for it is harmless.
 func rejectAutoLoadedPolicy(path string, cfg *task.Config) error {
 	var field, why string
 	switch {
@@ -745,6 +771,15 @@ func rejectAutoLoadedPolicy(path string, cfg *task.Config) error {
 		field, why = "network.passthrough", "exempt a host from interception"
 	case cfg.Network.Mode == string(task.NetworkFull):
 		field, why = "network.mode: full", "drop the egress allowlist entirely"
+	case cfg.Repo != "":
+		// Refused rather than contained: a repo's own config redirecting which repo to bundle is
+		// self-referential nonsense with no legitimate use, and f.repo reaches further than the
+		// bundle — it is also the run-artifact root krayt writes .krayt/ into at the operator's uid.
+		field, why = "repo:", "redirect which directory krayt bundles into the VM"
+	case len(cfg.Container.Capabilities) > 0:
+		field, why = "container.capabilities", "re-grant Linux capabilities the run drops by default"
+	case cfg.Container.Seccomp == string(task.SeccompUnconfined):
+		field, why = "container.seccomp: unconfined", "disable the seccomp profile"
 	default:
 		return nil
 	}
@@ -753,7 +788,7 @@ func rejectAutoLoadedPolicy(path string, cfg *task.Config) error {
 		"Pass it explicitly if you meant it:\n    krayt run --config %s …", path, field, why, path)
 }
 
-// containedRepoPath resolves p — a path read out of an auto-loaded repo config — against the repo
+// containedRepoPath resolves p — `secrets:` or `task:` read out of an auto-loaded repo config — against the repo
 // root and refuses anything that leaves it: an absolute path, one that climbs out with "..", or
 // one whose spelling stays inside but whose symlinks do not. The returned path keeps root's own
 // form (relative stays relative to the working directory, as the repo root itself is), so
@@ -770,7 +805,7 @@ func containedRepoPath(root, p string) (string, error) {
 	joined := filepath.Join(root, clean)
 	// The checks above constrain the spelling only. A poisoned repo can also keep the spelling
 	// inside the repo and ship a symlink that points out of it — `secrets.env -> ~/.aws/credentials`
-	// — and the path is later handed to secrets.Load, which os.Opens it and follows the link. Judge
+	// — and the path is later os.Opened (secrets.Load, readTaskPrompt), which follows the link. Judge
 	// containment by what will actually be read, not by how it was written (§8.3, §10).
 	if err := checkSymlinkContained(root, joined); err != nil {
 		return "", fmt.Errorf("%q %w; an auto-loaded repo config may only name a file inside the repo", p, err)
