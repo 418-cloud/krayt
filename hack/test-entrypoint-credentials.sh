@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Exercises the credential-detection block of every agent image's entrypoint (§6.14, §8.2) — the
 # seam no Go test covers, because these are shell scripts that only ever run inside a container.
+# krayt-dev has no entrypoint of its own (it inherits krayt-agent-claude-code's), so the branches
+# it depends on are exercised here too, at the bottom.
 #
 # It exists because that gap hid a real bug: krayt's shape-translation path configures the container
 # with a credential env var and no /run/secrets file, and every entrypoint decided "do I have a
@@ -36,10 +38,10 @@ run_entrypoint() {
 
   # Stub every command the entrypoint invokes after the credential block. Each echoes the
   # credential it was handed via the environment, which is how the assertions below see it.
-  for cmd in claude gemini opencode git node npm; do
+  for cmd in claude gemini opencode git node npm gh; do
     cat > "$stub/$cmd" <<STUB
 #!/usr/bin/env bash
-echo "STUB:$cmd ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-} CLAUDE_CODE_OAUTH_TOKEN=\${CLAUDE_CODE_OAUTH_TOKEN:-} GEMINI_API_KEY=\${GEMINI_API_KEY:-} OPENAI_API_KEY=\${OPENAI_API_KEY:-}"
+echo "STUB:$cmd args=[\$*] ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-} CLAUDE_CODE_OAUTH_TOKEN=\${CLAUDE_CODE_OAUTH_TOKEN:-} GEMINI_API_KEY=\${GEMINI_API_KEY:-} OPENAI_API_KEY=\${OPENAI_API_KEY:-}"
 exit 0
 STUB
     chmod +x "$stub/$cmd"
@@ -78,11 +80,11 @@ trap 'rm -rf "$empty_secrets" "$file_secrets"' EXIT
 
 printf '\n\033[1mclaude-code\033[0m\n'
 check "1. a /run/secrets file is read and exported" \
-  "STUB:claude ANTHROPIC_API_KEY=sk-ant-real-key-from-the-secrets-tmpfs" \
+  "ANTHROPIC_API_KEY=sk-ant-real-key-from-the-secrets-tmpfs" \
   claude-code "$file_secrets"
 
 check "2. an ALREADY-SET credential env var satisfies the check, value untouched" \
-  "STUB:claude ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use" \
+  "ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use" \
   claude-code "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use
 
 check "3. shape mirroring: an already-set OAuth var is accepted as the credential" \
@@ -94,11 +96,11 @@ check "4. the OAuth placeholder reaches the agent verbatim" \
   claude-code "$empty_secrets" CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-krayt-placeholder-do-not-use
 
 check "5. KRAYT_INJECTED_CREDENTIAL still works (pre-shape-translation krayt)" \
-  "STUB:claude ANTHROPIC_API_KEY=krayt-injected-at-host-proxy" \
+  "ANTHROPIC_API_KEY=krayt-injected-at-host-proxy" \
   claude-code "$empty_secrets" KRAYT_INJECTED_CREDENTIAL=ANTHROPIC_API_KEY
 
 check "6. an already-set value WINS over the KRAYT_INJECTED_CREDENTIAL fallback" \
-  "STUB:claude ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use" \
+  "ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use" \
   claude-code "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use KRAYT_INJECTED_CREDENTIAL=ANTHROPIC_API_KEY
 
 check_exit "7. no credential anywhere still fails closed with EX_CONFIG" 78 \
@@ -115,6 +117,37 @@ check "10. an already-set ANTHROPIC_API_KEY satisfies the check" \
   "STUB:opencode" \
   opencode "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use
 check_exit "11. no credential fails closed" 78 opencode "$empty_secrets"
+
+printf '\n\033[1mkrayt-dev\033[0m (it has no entrypoint — these are the base branches it relies on)\n'
+
+# krayt-dev sets CLAUDE_MODEL/CLAUDE_EFFORT as image ENV and krayt.yaml's `env:` overrides them per
+# run; the flags themselves are the base's to pass, since it is the image that ships `claude`.
+check "12. CLAUDE_MODEL and CLAUDE_EFFORT become --model/--effort" \
+  "args=[-p do nothing --dangerously-skip-permissions --model claude-sonnet-5 --effort high]" \
+  claude-code "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use \
+  CLAUDE_MODEL=claude-sonnet-5 CLAUDE_EFFORT=high
+
+# Unset, no flag at all — krayt-agent-claude-code's own default, and what keeps that branch
+# invisible to every user of the published onboarding image.
+check "13. neither var set passes no model/effort flag" \
+  "args=[-p do nothing --dangerously-skip-permissions]" \
+  claude-code "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use
+
+check "14. either var alone passes only its own flag" \
+  "args=[-p do nothing --dangerously-skip-permissions --effort max]" \
+  claude-code "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use CLAUDE_EFFORT=max
+
+# No entrypoint touches GH_TOKEN anywhere, on purpose: krayt.yaml injects it at the host proxy, so
+# `gh` reads the placeholder straight from the environment and the proxy swaps in the real token.
+# A `gh auth login` creeping into an entrypoint would be a regression — it would make a live
+# api.github.com call, and on the base image (which ships no gh) it could not even run. This is the
+# guard. `gh` IS stubbed on PATH here, so a `command -v gh` branch would fire if one were added.
+out="$(run_entrypoint claude-code "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use GH_TOKEN=krayt-injected-at-host-proxy)"
+if [[ "$out" == *"gh authenticating"* || "$out" == *"authenticated gh"* || "$out" == *"gh commands"* || "$out" == *"GH_TOKEN"* ]]; then
+  bad "15. no entrypoint touches GH_TOKEN — the proxy owns it"$'\n        got: '"${out//$'\n'/ | }"
+else
+  ok "15. no entrypoint touches GH_TOKEN — the proxy owns it"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 exit $((fail > 0))

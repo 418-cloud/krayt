@@ -26,12 +26,86 @@ record of what was verified, and how, lives in `git log` (this file's history th
    somewhere else.
 5. **One live-run security check** — that the egress-proxy child's real environment on macOS carries
    no operator credentials (`[security]` below, report §6 item 4).
+6. **A `krayt-dev` rebuild + repin** — the image was rebased onto the published
+   `krayt-agent-claude-code` and now inherits its entrypoint, and the repo's own `krayt.yaml`
+   injects both credentials at the host proxy. Neither change is in the pinned image yet
+   (`[tooling]` below). Until that lands, `krayt run --config krayt.yaml` exits 78.
 
 The host-side-proxy arc (all three steps) is **done and verified on hardware**: the egress proxy
 runs host-side over vsock, terminates TLS for allowlisted hosts, and attaches the real credential
 itself — a subscription token now never enters the VM (`run_df97fffa`, control `run_10fc027d`), and
 Node trusts the ephemeral CA through `NODE_EXTRA_CA_CERTS` (`run_c74208b4`, with `proxy.log`
 corroborating the negative control independently of the agent's own report).
+
+---
+
+## [tooling] rebuild `krayt-dev` on its new base, repin `krayt.yaml`, and verify the injected run
+
+Two changes land together here, and neither is in a published image yet:
+
+1. **`krayt-dev` was rebased** onto `ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226` and now
+   **has no entrypoint of its own** — `hack/krayt-dev/entrypoint.sh` is deleted, and the base's
+   `krayt-agent-entrypoint` is inherited. Nothing replaced it: `gh` authenticates from the injected
+   `GH_TOKEN` env var with no setup step. One `FROM`, everything else additive: Go arrives as the
+   official release tarball (`ARG GO_VERSION`, new Renovate manager), and `gcc`/`libc6-dev` are
+   added because the slim base has no C toolchain and `go test -race` needs cgo.
+2. **`krayt.yaml` runs with `network.mitm: true`**: the Anthropic credential is injected by the
+   claude-code adapter's own rule, `GH_TOKEN` by a hand-written `api.github.com` rule, so neither
+   reaches the VM. The §8.2 contracts that requires now live in the shared entrypoint.
+
+`krayt.yaml` still pins `ghcr.io/418-cloud/krayt-dev:sha-376210a`, which predates all of it. Run
+the current config against the current pin and it exits 78 before Claude starts.
+
+- **Needed:**
+  1. **Confirm the base tag exists and is anonymously pullable** —
+     `docker buildx imagetools inspect ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226` shows
+     `linux/amd64,linux/arm64`. This is a new hard dependency: `dev-image.yml` cannot build at all
+     without it, on PRs included. If that tag is missing, the `FROM` needs a tag that does exist.
+  2. Build and push `krayt-dev` from `main` (CI does this on merge; confirm the digest actually
+     moved rather than assuming it). Check the build log shows the base being pulled, not built.
+  3. **Get the base digest onto the `FROM` line** — Renovate should do it (`pinDigests: true`
+     covers the dockerfile manager); confirm its first PR actually lands, or add the digest by
+     hand. The line is tag-only today, deliberately: an invented digest is worse than an absent
+     one. **Do not leave it that way.** `agent-images.yml` re-points `:2.1.226` on every build off
+     `main`, so an unpinned `FROM` floats — krayt-dev would absorb base changes silently on any
+     unrelated rebuild, and the Renovate digest PR that is the intended delivery path for a base
+     change (see `dev-image.yml`'s `paths` comment) would never be opened.
+  4. Repin `image:` in `krayt.yaml` to the new `sha-<short>` tag.
+  5. One real run through the injected path, from the repo root:
+     ```sh
+     KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config krayt.yaml --task ./some-krayt-task.md
+     ```
+     with a task that runs `go build ./... && go test ./...` (exercises the `passthrough` hosts
+     under a CA-rewritten trust store) **and** one `gh api repos/418-cloud/krayt/pulls` call
+     (exercises the injected `api.github.com` rule).
+- **Why the agent can't:** no `docker build`/push access, no live subscription token or PAT, and no
+  Apple-Silicon Mac to boot a VM on. The offline half is done and passing:
+  `hack/test-entrypoint-credentials.sh` (now run by `ci.yml`) covers the shared entrypoint's
+  credential paths plus the branches krayt-dev relies on — model/effort, and that no entrypoint
+  touches GH_TOKEN at all (tests 12–15) — and `TestApplyConfigDogfoodsThisRepo` pins the config.
+  With no entrypoint left in the gh path, that Go test is the ONLY thing wiring GitHub auth: it
+  asserts both the `env.GH_TOKEN` placeholder and the `api.github.com` inject rule.
+- **Verify success by**, in order — each one distinguishes a different failure:
+  - every entrypoint log line carries the `[claude-code]` prefix — `authenticated via
+    CLAUDE_CODE_OAUTH_TOKEN` and `trusting krayt's ephemeral MITM CA`. A `[krayt-dev]` line would
+    mean the old image is still pinned. There is deliberately no gh line at all now;
+  - `claude` runs with `--model claude-sonnet-5 --effort high` (the image's ENV defaults reaching
+    the base entrypoint's optional selection branch), or whatever `krayt.yaml`'s `env:` says;
+  - `go test -race ./...` links and runs — the check for `gcc`/`libc6-dev` actually being present
+    on the slim base;
+  - `/run/secrets` contains **neither** credential (the run's `report.md`/`meta.json` list both as
+    injected, names only);
+  - `proxy.log` shows `inject=true` on `api.anthropic.com` and `api.github.com`, and only the
+    `CONNECT` line for each `passthrough` host;
+  - the `gh api` call returns real PR JSON — a 401 means the `Bearer ` prefix or the header name is
+    wrong for a fine-grained PAT, which is the one thing here observed only from GitHub's docs and
+    not from a live krayt run;
+  - `go test ./...` passes **inside** the container. This is the check that would catch the
+    concatenated CA bundle being wrong: the Go toolchain talks to `passthrough` hosts, whose real
+    upstream chain must still verify while `SSL_CERT_FILE` points at krayt's rewritten bundle.
+- **Blocking:** yes for anyone dogfooding through `krayt.yaml` — that path cannot work until the
+  image is rebuilt. Not blocking any other work; runs that pass `--image`/`--allow` by flag are
+  unaffected.
 
 ---
 

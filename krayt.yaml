@@ -1,11 +1,26 @@
-# krayt.yaml — tracked, shared dev config for dogfooding krayt on its own repo, auto-loaded from
-# <repo>/krayt.yaml (§8.1/§8.3) so `krayt run --task <file>` picks these up without the long flag
-# list. Any flag overrides the matching value here. Every krayt contributor gets the same starting
-# point: the known-good krayt-dev image, model/effort, and this repo's own network allowlist.
+# krayt.yaml — tracked, shared dev config for dogfooding krayt on its own repo. Every krayt
+# contributor gets the same starting point: the known-good krayt-dev image, model/effort, this
+# repo's own network allowlist, and host-side credential injection for both credentials the repo's
+# tasks use (§6.6.1).
+#
+# **Pass this file explicitly — it is no longer auto-loadable.** §8.3 refuses `network.mitm`,
+# `network.inject`, and `network.passthrough` from a `<repo>/krayt.yaml` a run picked up on its
+# own, because that file ships inside the repo the agent is about to edit and so may not write the
+# run's security policy:
+#
+#   krayt run --config krayt.yaml --task <file>
+#
+# A bare `krayt run --task <file>` now stops with an error naming `network.mitm`. That error is the
+# opt-in working as designed, not a bug. Any flag still overrides the matching value here.
+#
+# Run it from the repo root: an explicit --config is honored in full, which includes leaving
+# `secrets: secrets.env` relative to the working directory rather than anchoring it to the repo
+# root the way an auto-loaded config's containment check does (§8.3).
 #
 # `secrets:` below only names a path — the file it points at (secrets.env) is gitignored and this
-# file carries no secret value. Never inline a real credential into this file's `env:` block;
-# per-task secrets belong only in that gitignored secrets.env (§6.8).
+# file carries no secret value. Never inline a real credential into the `env:` block; the one
+# credential-shaped value there is a non-secret placeholder the host proxy replaces. Per-task
+# secrets belong only in that gitignored secrets.env (§6.8).
 # `task:` is intentionally omitted so you always pass --task per run.
 
 image: ghcr.io/418-cloud/krayt-dev:sha-376210a
@@ -13,6 +28,11 @@ secrets: secrets.env
 env:
   CLAUDE_MODEL: claude-sonnet-5
   CLAUDE_EFFORT: high
+  # Non-secret stand-in, so `gh` considers itself authenticated and sends an Authorization header
+  # for the proxy to replace. The real GH_TOKEN is withheld from SecretsBundle entirely because
+  # network.inject names it, so /run/secrets/GH_TOKEN never exists in the container (§6.6.1).
+  # Deliberately self-describing: anyone who finds this value in a log knows it is not a token.
+  GH_TOKEN: krayt-injected-at-host-proxy
 
 bundle_depth: 0 # full-history bundle
 
@@ -24,12 +44,44 @@ questions:
 
 network:
   mode: allowlist
+  mitm: true # terminate TLS at the host proxy for the two injected hosts below (§6.6.1)
   allow:
-    - api.anthropic.com # Claude Code
+    - api.anthropic.com # Claude Code — credential injected (adapter-supplied rule, see below)
+    - api.github.com # gh CLI — credential injected (network.inject below)
     - proxy.golang.org # Go module proxy
     - sum.golang.org # Go checksum db
     - storage.googleapis.com # Go module blob downloads
     - cache.nixos.org # Nix binary cache (vendorHash regen)
     - github.com # Nix flake inputs
     - codeload.github.com # Nix flake input tarballs
-    - api.github.com
+
+  # Everything krayt does not inject into stays tunneled rather than intercepted, so go, nix, and
+  # git/libcurl keep verifying the real upstream chain against their own trust store instead of
+  # depending on the container having wired krayt's ephemeral CA into each of theirs. The cost is
+  # the one §6.6 names: a passthrough host is opaque from `200 Connection established` onward —
+  # allowlisted by name, but absent from the per-request observation log.
+  passthrough:
+    - proxy.golang.org
+    - sum.golang.org
+    - storage.googleapis.com
+    - cache.nixos.org
+    - github.com
+    - codeload.github.com
+
+  # api.anthropic.com deliberately has NO rule here. With `agent.adapter: claude-code` and
+  # `mitm: true` the adapter emits one itself, from the observed wire shape of whichever credential
+  # secrets.env actually holds (internal/adapter/anthropic_wire.go), and configures the container
+  # with a placeholder of that same shape. Hand-writing a rule for that host would override it —
+  # user config always wins over an adapter's (§8.1) — and pin the wire shape here, away from the
+  # provenance notes that justify it.
+  #
+  # GH_TOKEN, by contrast, is a plain bearer credential with no adapter, so its rule is written out.
+  # Note that this makes GH_TOKEN **required** in secrets.env: pre-flight refuses a `set` naming a
+  # key the secrets file lacks, rather than starting a run that fails 30s in, unauthenticated.
+  inject:
+    - host: api.github.com
+      strip: [authorization] # drop whatever the container's placeholder produced
+      set:
+        authorization: GH_TOKEN # secrets-file key name, resolved host-side
+      set_prefix:
+        authorization: "Bearer " # GitHub's documented PAT scheme

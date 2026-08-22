@@ -28,6 +28,33 @@ claude -p "$(cat /task/prompt.md)" --dangerously-skip-permissions | tee /output/
 - Runs as **non-root** — Claude Code refuses uid 0, and krayt enforces non-root for every
   container regardless (§8.2).
 
+### Extending: wrap the entrypoint, don't fork it
+
+An image built `FROM` this one inherits `krayt-agent-entrypoint`. If it needs setup of its own, the
+pattern is a wrapper that does that work and then hands off:
+
+```sh
+#!/usr/bin/env bash
+set -euo pipefail
+… your setup …
+exec /usr/local/bin/krayt-agent-entrypoint "$@"
+```
+
+Copying this script and editing it instead is what the arrangement exists to prevent: `hack/krayt-dev`
+used to carry a near-identical second copy, and the drift between them is what let a `network.mitm`
+shape-translated run exit `78` before Claude started. `hack/test-entrypoint-credentials.sh` (run by
+`ci.yml`'s build+test job) exercises this script offline — no Docker, no VM, no network.
+
+Often no wrapper is needed at all. `hack/krayt-dev` adds the whole krayt toolchain — including the
+`gh` CLI — and still ships no entrypoint: its GitHub token is injected at the host proxy, so `gh`
+reads it from the environment with no setup step. A credential the proxy attaches needs no script.
+
+**Only behavior belonging to the tools this image ships lives here.** GitHub auth does not — there
+is no `gh` in this image. The one downstream-facing knob that *is* here is **model/effort
+selection**, because `--model`/`--effort` are `claude` flags and this is the image that ships
+`claude`: set `CLAUDE_MODEL` / `CLAUDE_EFFORT` and they become those flags; unset — as they are
+here — no flag is passed and Claude Code picks its own default.
+
 ## Tags
 
 - `:latest` — the most recent build off `main`.

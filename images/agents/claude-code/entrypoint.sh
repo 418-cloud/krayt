@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# krayt-agent-claude-code entrypoint (§6.14, §8.2). It:
+# krayt-agent-claude-code entrypoint (§6.14, §8.2). Baked in as
+# /usr/local/bin/krayt-agent-entrypoint, and INHERITED by every image built FROM this one —
+# hack/krayt-dev is the one in this repo. There is deliberately no second copy: the two scripts
+# used to be near-identical, and the drift between them is what let a shape-translated run exit 78
+# before Claude started (see hack/test-entrypoint-credentials.sh's own header).
+#
+# A downstream image that needs setup of its own WRAPS this script rather than forking it: do the
+# extra work, then `exec krayt-agent-entrypoint "$@"`. Often none is needed — hack/krayt-dev adds
+# the entire krayt toolchain, `gh` included, and still ships no entrypoint, because its GitHub
+# token is injected at the host proxy and `gh` reads it straight from the environment. Only
+# behavior belonging to the tools THIS image actually ships lives here. It:
 #   1. materializes the model credential from the per-task secrets tmpfs (/run/secrets) into the
 #      environment — the in-container half of agent auth; the host adapter already enforced the
 #      exactly-one rule before boot (§6.14);
@@ -77,6 +87,11 @@ if [ -n "${KRAYT_CA_CERT:-}" ] && [ -f "${KRAYT_CA_CERT}" ]; then
   export SSL_CERT_FILE="$bundle"
   export REQUESTS_CA_BUNDLE="$bundle"
   export NODE_EXTRA_CA_CERTS="$KRAYT_CA_CERT"
+  # git and curl read none of the three above on Debian: libcurl is built with its own CA path
+  # compiled in, and git consults GIT_SSL_CAINFO/http.sslCAInfo. Point both at the same bundle, or
+  # a `git clone` / `curl` to an intercepted host fails where node and Go succeed.
+  export GIT_SSL_CAINFO="$bundle"
+  export CURL_CA_BUNDLE="$bundle"
   echo "[claude-code] trusting krayt's ephemeral MITM CA (network.mitm enabled)"
 fi
 
@@ -114,7 +129,18 @@ EOF
   echo "[claude-code] registered ask_human MCP server (questions enabled)"
 fi
 
-echo "[claude-code] running claude -p in $(pwd) (model: ${ANTHROPIC_MODEL:-default})"
+# Optional model + reasoning-effort selection. Unset, no flag is passed and Claude Code picks its
+# own default (this image's behavior); an image or a run that wants to choose sets CLAUDE_MODEL /
+# CLAUDE_EFFORT — krayt-dev sets both as ENV defaults, and krayt.yaml's `env:` block (§8.1)
+# overrides them per run. Claude also reads ANTHROPIC_MODEL from the environment on its own.
+if [ -n "${CLAUDE_MODEL:-}" ]; then
+  extra+=(--model "$CLAUDE_MODEL")
+fi
+if [ -n "${CLAUDE_EFFORT:-}" ]; then
+  extra+=(--effort "$CLAUDE_EFFORT")
+fi
+
+echo "[claude-code] running claude -p in $(pwd) (model: ${CLAUDE_MODEL:-${ANTHROPIC_MODEL:-default}}${CLAUDE_EFFORT:+, effort: $CLAUDE_EFFORT})"
 # Print/headless mode with autonomous edits — safe because the whole run is already isolated in
 # the krayt micro-VM, so the tool-permission prompts add nothing. Claude reads ANTHROPIC_MODEL
 # from the environment if set. Tee its final summary into /output/report.md so it surfaces in the

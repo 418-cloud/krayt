@@ -26,6 +26,12 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
+      # The agent images' entrypoints are shell, so no Go test reaches them — and the one bug that
+      # gap hid (every shape-translated run exiting 78 before the agent started) was invisible to a
+      # fully green suite. This runs them offline: agent CLIs, git, and the report dir are stubbed,
+      # so it needs no Docker, no VM, and no network. On macOS it doubles as the bash 3.2 check the
+      # entrypoints' array expansions are written for.
+      - run: bash hack/test-entrypoint-credentials.sh
 
   cross-compile-guest:
     name: cross-compile guest (linux/arm64)
