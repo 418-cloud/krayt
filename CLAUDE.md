@@ -9,7 +9,8 @@ working. This file is the standing agreement for how to build it.
 - **Work ONE phase at a time** (`KRAYT_SPEC.md` §14). A phase is done only when its
   **"Done when"** criterion passes — prefer an automated test. Stop at phase boundaries for review.
 - **Plan before coding.** At the start of each phase, give a short plan (files/packages,
-  §9.1 deps, how you'll meet the "Done when") and wait for my OK before writing code.
+  §9.1 deps, how you'll meet the "Done when") and wait for my OK before writing code. **In a
+  sandboxed run there is nobody to give that OK** — state the plan and proceed (see below).
 
 ## Implementation protocol (spec §14)
 - Maintain **`HUMAN_TODO.md`** at the repo root — the single handoff log.
@@ -25,6 +26,32 @@ working. This file is the standing agreement for how to build it.
   remove the entry — deleting before the evidence has a permanent home loses it. See §14.
 - **Never fabricate a result** for a human-only step — no fake signatures, invented image
   digests, or "boot succeeded" without a real boot. An honestly-blocked step is correct.
+
+## Running a task from `docs/ai-tasks/` or `docs/common-tasks/`
+
+Being handed one of these files means **do the work**, in full. It is not a proposal to review, a
+spec to summarize, or a plan to write — the deliverable is the change itself: edited files, passing
+checks, and the report. A run that ends with an analysis of the task, a restated plan, or a list of
+what someone else should do next has failed, however good the analysis is.
+
+- **The "Decisions already made" section is settled.** Implement it. Don't reopen a decision,
+  re-derive it, or ask which option to take — the choices were made deliberately, before the task
+  was written. Where it says "verify", verify the fact; that is not an invitation to change the
+  approach. If you find hard evidence a decision is *wrong* (not merely different from what you'd
+  pick), say so plainly, then implement the task's intent as best you can — don't stall on it.
+- **Finish every part you can.** Being blocked on one deliverable is not permission to skip the
+  others. Do all the rest, then say exactly what you left and why.
+- **Only the §14 categories are genuine blockers** — real hardware, live credentials, a registry or
+  CI run, a Mac. Everything else is yours to do. "I don't have Docker" blocks the image *build*, not
+  writing the Dockerfile.
+- **Need a human answer?** If the `ask_human` MCP tool is available (the run enabled questions), use
+  it — that's what it's for, and it's cheaper than a wrong guess. If it isn't available, the run is
+  autonomous: choose the most reasonable option, state the assumption and its reasoning in
+  `/output/report.md`, log it in `HUMAN_TODO.md`, and keep going. Never idle waiting for input that
+  cannot arrive.
+- **Report honestly at the end**: what landed, what's handed off, what's unverified. An honestly
+  incomplete run is fine; a run that claims completion it can't back is a defect, same as a
+  fabricated result.
 
 ## Dependencies & codegen
 - Use the **pinned dependencies in §9.1** exactly. Do not guess libraries or versions.
