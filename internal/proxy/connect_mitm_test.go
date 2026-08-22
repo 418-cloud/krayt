@@ -245,6 +245,16 @@ func TestMITMInjectRuleNotSelectedForLookalikeHost(t *testing.T) {
 	if err := validateConnectAuthority(lookalikeHost + ":443"); err == nil {
 		t.Error("validateConnectAuthority accepted a non-ASCII authority")
 	}
+	// A port outside 1-65535 is not a port. Both fail closed at dial anyway; refuse them here so
+	// the authority the rest of the path trusts is well-formed.
+	for _, bad := range []string{"api.example.com:-1", "api.example.com:0", "api.example.com:99999"} {
+		if err := validateConnectAuthority(bad); err == nil {
+			t.Errorf("validateConnectAuthority accepted %q", bad)
+		}
+	}
+	if err := validateConnectAuthority("api.example.com:65535"); err != nil {
+		t.Errorf("validateConnectAuthority rejected a valid authority: %v", err)
+	}
 }
 
 func TestMITMSetLiteral(t *testing.T) {

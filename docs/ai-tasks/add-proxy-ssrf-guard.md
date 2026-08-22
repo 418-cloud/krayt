@@ -1,5 +1,21 @@
 # Task: block egress-proxy targets that resolve to internal/link-local/metadata IPs
 
+> **⚠️ Partly superseded by `move-egress-proxy-to-host.md`. Do not read the `mode == full`
+> carve-out below as current behavior.** This is a completed task record, kept as written; two
+> things in it are now stale:
+> - **The private/ULA carve-out is gone.** The "Decision" and "Implement" step 2 below deny
+>   private/ULA ranges *"unless `mode == full`"*. `move-egress-proxy-to-host.md` **deleted that
+>   exception outright**: with the dialer on the host rather than in the VM, the same carve-out
+>   would mean "the sandbox can reach the user's real LAN and loopback services from a trusted
+>   host process". Private/ULA ranges are now refused **unconditionally, in every mode including
+>   `full`** — `checkDialAddr` takes no mode parameter at all
+>   (`internal/proxy/proxy.go`). `KRAYT_SPEC.md` §6.6 is authoritative.
+> - **The code moved.** The guard lives in `internal/proxy` (a host process), not
+>   `internal/guest/proxy` (the file paths and line numbers below are pre-move).
+>
+> Everything else — the finding, the `Dialer.Control` hook, the always-blocked ranges, fail-closed
+> parsing — still describes the shipped guard.
+
 **Read `CLAUDE.md` and `KRAYT_SPEC.md` (§6.6 networking & egress) first. Proceed autonomously. The
 proxy logic is OS-agnostic and unit-testable without a VM.**
 
