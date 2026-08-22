@@ -14,7 +14,7 @@ require (
 	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sys v0.47.0
-	google.golang.org/grpc v1.83.0
+	google.golang.org/grpc v1.83.1
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	oras.land/oras-go/v2 v2.6.2
