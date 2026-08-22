@@ -7,7 +7,10 @@ package orchestrator_test
 // provider, exactly like this package's other end-to-end tests.
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"sync"
@@ -108,7 +111,11 @@ func TestSecretsBundleOmitsInjectedKeys(t *testing.T) {
 }
 
 // TestNetworkPolicyCarriesCACertWhenMITMEnabled proves the guest receives the run's ephemeral
-// MITM CA public certificate over the existing NetworkPolicy path when network.mitm is true.
+// MITM CA public certificate over the existing NetworkPolicy path when network.mitm is true —
+// and that what it receives is exactly ONE PEM CERTIFICATE block and nothing else. "Non-empty"
+// alone would be satisfied by a bundle with the CA's PRIVATE KEY block appended, which is the
+// shape that would matter: the parent validates it (isCACertPEM, egressproxy.go), so this is the
+// property being pinned where it is actually observable on the wire.
 func TestNetworkPolicyCarriesCACertWhenMITMEnabled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -134,7 +141,24 @@ func TestNetworkPolicyCarriesCACertWhenMITMEnabled(t *testing.T) {
 		t.Fatal("guest never received SetNetworkPolicy")
 	}
 	if len(np.GetCaCert()) == 0 {
-		t.Error("NetworkPolicy.ca_cert is empty, want the run's ephemeral MITM CA public cert")
+		t.Fatal("NetworkPolicy.ca_cert is empty, want the run's ephemeral MITM CA public cert")
+	}
+	block, rest := pem.Decode(np.GetCaCert())
+	if block == nil {
+		t.Fatal("NetworkPolicy.ca_cert is not PEM")
+	}
+	if block.Type != "CERTIFICATE" {
+		t.Errorf("ca_cert PEM block type = %q, want CERTIFICATE", block.Type)
+	}
+	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		t.Errorf("ca_cert does not parse as an X.509 certificate: %v", err)
+	}
+	// No second block of ANY type — a trailing PRIVATE KEY is the whole point of checking.
+	if extra, _ := pem.Decode(rest); extra != nil {
+		t.Errorf("ca_cert carries a second PEM block of type %q; want the certificate alone", extra.Type)
+	}
+	if len(bytes.TrimSpace(rest)) != 0 {
+		t.Errorf("ca_cert carries %d trailing bytes after the certificate block", len(bytes.TrimSpace(rest)))
 	}
 }
 

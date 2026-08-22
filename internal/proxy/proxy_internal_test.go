@@ -332,6 +332,14 @@ func TestCheckDialAddr(t *testing.T) {
 		"172.16.0.1",      // RFC 1918
 		"100.64.0.1",      // RFC 6598 CGNAT
 		"fc00::1",         // RFC 4193 ULA
+
+		// IPv4-mapped IPv6 (::ffff:a.b.c.d) — the form checkDialAddr's ip.Unmap() exists for. A
+		// dialer handed one of these reaches the same host as the bare IPv4 address, so it must be
+		// blocked under the same rules. (netip's own predicates already handle Is4In6, so Unmap is
+		// belt-and-braces; these rows fail if BOTH ever stop covering it.)
+		"::ffff:127.0.0.1",
+		"::ffff:10.0.0.1",
+		"::ffff:169.254.169.254",
 	}
 	for _, ip := range blocked {
 		if err := checkDialAddr(addr(ip)); err == nil {
@@ -342,7 +350,20 @@ func TestCheckDialAddr(t *testing.T) {
 	}
 
 	// Public addresses: allowed (still gated by the host allowlist elsewhere).
-	public := []string{"1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"}
+	//
+	// The last four are NOT a claim that reaching a loopback/private target through them is fine —
+	// they are the current predicate set's recorded blind spots, listed so a change to it shows up
+	// as a diff here rather than passing unnoticed. Each needs a specific gateway to be routable at
+	// all (NAT64/6to4 relays are deprecated or absent, ::x.y.z.w was deprecated by RFC 4291, and
+	// 0.0.0.1 is in the 0.0.0.0/8 "this network" block no stack forwards), so none of them is a
+	// path out of the sandbox today; widening the predicate is a production change, not a test's.
+	public := []string{
+		"1.1.1.1", "8.8.8.8", "2606:4700:4700::1111",
+		"64:ff9b::7f00:1", // RFC 6052 NAT64 embedding of 127.0.0.1
+		"2002:7f00:1::1",  // RFC 3056 6to4 embedding of 127.0.0.1
+		"::7f00:1",        // deprecated IPv4-compatible IPv6 form of 127.0.0.1
+		"0.0.0.1",         // 0.0.0.0/8, not the unspecified address itself
+	}
 	for _, ip := range public {
 		if err := checkDialAddr(addr(ip)); err != nil {
 			t.Errorf("checkDialAddr(%q) = %v, want allowed", ip, err)
