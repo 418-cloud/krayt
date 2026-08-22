@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -346,20 +349,29 @@ func TestApplyConfigAutoLoadedTaskResolvesUnderRepo(t *testing.T) {
 	}
 }
 
-// configFieldCase is one entry of the trust-boundary checklist below: a name, and the mutation
-// that puts that field in its interesting state on a fresh task.Config.
+// configFieldCase is one entry of the trust-boundary checklist below: a name, the task.Config
+// yaml paths that entry accounts for, and the mutation that puts them in their interesting state
+// on a fresh task.Config. fields is what makes the checklist mechanical — it is cross-checked
+// against the struct's real fields, so an entry cannot claim coverage it does not have.
 type configFieldCase struct {
-	name string
-	set  func(*task.Config)
+	name   string   // for REFUSED, also the substring the refusal error must name
+	fields []string // yaml paths of task.Config this entry accounts for
+	set    func(*task.Config)
 }
 
 // TestConfigFieldsAccountedFor is the checklist that stops the next field added to task.Config
 // from silently repeating this bug (the way `task:`/`repo:`/`container.*` slipped past the first
 // pass, which enumerated only `network.*` and `secrets:`). Every field of task.Config appears in
-// exactly one of the three buckets below — REFUSED for an auto-loaded config, CONTAINED to the
-// repo root, or deliberately SAFE to auto-load — and the first two buckets are asserted against
-// the real guards rather than trusted from a comment. No reflection: when you add a field to
-// task.Config, add it here and to KRAYT_SPEC.md §8.3's table.
+// one of the three buckets below — REFUSED for an auto-loaded config, CONTAINED to the repo root,
+// or deliberately SAFE to auto-load — and the buckets are asserted against the real guards rather
+// than trusted from a comment. Coverage is mechanical, not a comment you have to remember to
+// update: the buckets' `fields` are cross-checked against task.Config's yaml-tagged fields by
+// reflection, so a field added to the struct and to no bucket fails this test. When it does, put
+// the field in the right bucket here and in KRAYT_SPEC.md §8.3's table.
+//
+// A few fields are claimed by two buckets, which is the point rather than a gap: `network.mode`
+// and `container.seccomp` are refused for one value and safe for the others, and `task`/`secrets`
+// are contained when they escape and safe when they name a file inside the repo.
 //
 // task.Config fields, as of internal/task/config.go:
 //
@@ -382,16 +394,27 @@ type configFieldCase struct {
 //	Container.Seccomp        REFUSED for "unconfined" only
 //	Container.ReadonlyRootfs SAFE — it only tightens
 func TestConfigFieldsAccountedFor(t *testing.T) {
+	claimed := map[string]bool{} // yaml paths the buckets below account for
+
 	refused := []configFieldCase{
-		{"network.mitm", func(c *task.Config) { c.Network.MITM = true }},
-		{"network.inject", func(c *task.Config) { c.Network.Inject = []task.ConfigInjectRule{{Host: "h"}} }},
-		{"network.passthrough", func(c *task.Config) { c.Network.Passthrough = []string{"h"} }},
-		{"network.mode: full", func(c *task.Config) { c.Network.Mode = "full" }},
-		{"repo:", func(c *task.Config) { c.Repo = "../elsewhere" }},
-		{"container.capabilities", func(c *task.Config) { c.Container.Capabilities = []string{"NET_ADMIN"} }},
-		{"container.seccomp: unconfined", func(c *task.Config) { c.Container.Seccomp = "unconfined" }},
+		{"network.mitm", []string{"network.mitm"}, func(c *task.Config) { c.Network.MITM = true }},
+		{"network.inject", []string{"network.inject"}, func(c *task.Config) {
+			c.Network.Inject = []task.ConfigInjectRule{{Host: "h"}}
+		}},
+		{"network.passthrough", []string{"network.passthrough"}, func(c *task.Config) {
+			c.Network.Passthrough = []string{"h"}
+		}},
+		{"network.mode: full", []string{"network.mode"}, func(c *task.Config) { c.Network.Mode = "full" }},
+		{"repo:", []string{"repo"}, func(c *task.Config) { c.Repo = "../elsewhere" }},
+		{"container.capabilities", []string{"container.capabilities"}, func(c *task.Config) {
+			c.Container.Capabilities = []string{"NET_ADMIN"}
+		}},
+		{"container.seccomp: unconfined", []string{"container.seccomp"}, func(c *task.Config) {
+			c.Container.Seccomp = "unconfined"
+		}},
 	}
 	for _, r := range refused {
+		claim(claimed, r.fields)
 		var cfg task.Config
 		r.set(&cfg)
 		err := rejectAutoLoadedPolicy("/repo/krayt.yaml", &cfg)
@@ -405,52 +428,123 @@ func TestConfigFieldsAccountedFor(t *testing.T) {
 	}
 
 	// CONTAINED: not refused outright, but resolved through containedRepoPath, so a path leaving
-	// the repo is an error. The escape cases themselves are covered by the table test above.
-	contained := []configFieldCase{
-		{"task", func(c *task.Config) { c.Task = "../../../etc/hostname" }},
-		{"secrets", func(c *task.Config) { c.Secrets = "../../.env" }},
+	// the repo is an error. Each entry carries its own representative escaping path and writes
+	// that same value into its field, so the containment assertion exercises the input the entry
+	// is about rather than a shared stand-in. The escape cases themselves are covered by the table
+	// test above.
+	contained := []struct {
+		name   string
+		fields []string
+		path   string                     // the escaping value this field is exercised with
+		set    func(*task.Config, string) // writes path into the field this entry is about
+	}{
+		{"task", []string{"task"}, "../../../etc/hostname", func(c *task.Config, p string) { c.Task = p }},
+		{"secrets", []string{"secrets"}, "../../.env", func(c *task.Config, p string) { c.Secrets = p }},
 	}
 	for _, c := range contained {
+		claim(claimed, c.fields)
 		var cfg task.Config
-		c.set(&cfg)
+		c.set(&cfg, c.path)
 		if err := rejectAutoLoadedPolicy("/repo/krayt.yaml", &cfg); err != nil {
 			t.Errorf("%s is contained, not refused, but rejectAutoLoadedPolicy refused it: %v", c.name, err)
 		}
-		if _, err := containedRepoPath("/repo", "../../.env"); err == nil {
-			t.Errorf("containedRepoPath accepted an escaping %s path, want it refused", c.name)
+		if _, err := containedRepoPath("/repo", c.path); err == nil {
+			t.Errorf("containedRepoPath accepted %q, an escaping %s path, want it refused", c.path, c.name)
 		}
 	}
 
 	// SAFE: the guard stays narrow — none of the ordinary configuration surface is refused.
 	safe := []configFieldCase{
-		{"image", func(c *task.Config) { c.Image = "img:1" }},
-		{"task", func(c *task.Config) { c.Task = "./task.md" }},
-		{"secrets", func(c *task.Config) { c.Secrets = "secrets.env" }},
-		{"include_dirty", func(c *task.Config) { b := true; c.IncludeDirty = &b }},
-		{"bundle_depth", func(c *task.Config) { d := 0; c.BundleDepth = &d }},
-		{"env", func(c *task.Config) { c.Env = map[string]string{"K": "v"} }},
-		{"network.mode: allowlist", func(c *task.Config) { c.Network.Mode = "allowlist" }},
-		{"network.mode: none", func(c *task.Config) { c.Network.Mode = "none" }},
-		{"network.allow", func(c *task.Config) { c.Network.Allow = []string{"api.anthropic.com"} }},
-		{"resources", func(c *task.Config) {
+		{"image", []string{"image"}, func(c *task.Config) { c.Image = "img:1" }},
+		{"task", []string{"task"}, func(c *task.Config) { c.Task = "./task.md" }},
+		{"secrets", []string{"secrets"}, func(c *task.Config) { c.Secrets = "secrets.env" }},
+		{"include_dirty", []string{"include_dirty"}, func(c *task.Config) { b := true; c.IncludeDirty = &b }},
+		{"bundle_depth", []string{"bundle_depth"}, func(c *task.Config) { d := 0; c.BundleDepth = &d }},
+		{"env", []string{"env"}, func(c *task.Config) { c.Env = map[string]string{"K": "v"} }},
+		{"network.mode: allowlist", []string{"network.mode"}, func(c *task.Config) { c.Network.Mode = "allowlist" }},
+		{"network.mode: none", []string{"network.mode"}, func(c *task.Config) { c.Network.Mode = "none" }},
+		{"network.allow", []string{"network.allow"}, func(c *task.Config) {
+			c.Network.Allow = []string{"api.anthropic.com"}
+		}},
+		{"resources", []string{"resources.cpus", "resources.memory", "resources.disk", "resources.timeout"}, func(c *task.Config) {
 			n := 4
 			c.Resources.CPUs, c.Resources.Memory = &n, "8GiB"
 			c.Resources.Disk, c.Resources.Timeout = "20GiB", "45m"
 		}},
-		{"questions", func(c *task.Config) {
+		{"questions", []string{"questions.mode", "questions.timeout", "questions.on_timeout"}, func(c *task.Config) {
 			c.Questions.Mode, c.Questions.Timeout, c.Questions.OnTimeout = "wait", "5m", "abort"
 		}},
-		{"agent", func(c *task.Config) { c.Agent.Adapter = "claude-code" }},
-		{"container.seccomp: default", func(c *task.Config) { c.Container.Seccomp = "default" }},
-		{"container.readonly_rootfs", func(c *task.Config) { b := true; c.Container.ReadonlyRootfs = &b }},
+		{"agent", []string{"agent.adapter"}, func(c *task.Config) { c.Agent.Adapter = "claude-code" }},
+		{"container.seccomp: default", []string{"container.seccomp"}, func(c *task.Config) { c.Container.Seccomp = "default" }},
+		{"container.readonly_rootfs", []string{"container.readonly_rootfs"}, func(c *task.Config) {
+			b := true
+			c.Container.ReadonlyRootfs = &b
+		}},
 	}
 	for _, s := range safe {
+		claim(claimed, s.fields)
 		var cfg task.Config
 		s.set(&cfg)
 		if err := rejectAutoLoadedPolicy("/repo/krayt.yaml", &cfg); err != nil {
 			t.Errorf("rejectAutoLoadedPolicy refused %s: %v, want it auto-loadable", s.name, err)
 		}
 	}
+
+	// The buckets above are only a checklist if they are checked against the struct: walk
+	// task.Config's yaml fields and require each to be claimed, in either direction. An
+	// unaccounted-for field is the bug this test exists to catch; a claim on a field that no
+	// longer exists means a rename left a bucket entry testing nothing.
+	fields := configYAMLFields(reflect.TypeOf(task.Config{}), "")
+	inConfig := make(map[string]bool, len(fields))
+	for _, path := range fields {
+		inConfig[path] = true
+		if !claimed[path] {
+			t.Errorf("task.Config field %q is in no bucket: add it to REFUSED, CONTAINED or SAFE "+
+				"above (with its yaml path in `fields`) and to KRAYT_SPEC.md §8.3's table", path)
+		}
+	}
+	for _, path := range slices.Sorted(maps.Keys(claimed)) {
+		if !inConfig[path] {
+			t.Errorf("a bucket above accounts for %q, which task.Config no longer has: "+
+				"the entry is testing a field that was renamed or removed", path)
+		}
+	}
+}
+
+// claim records the yaml paths one checklist entry accounts for, for the coverage cross-check.
+func claim(claimed map[string]bool, fields []string) {
+	for _, f := range fields {
+		claimed[f] = true
+	}
+}
+
+// configYAMLFields returns the yaml path of every leaf field of a task.Config-shaped struct type,
+// descending into the nested blocks (network:, resources:, …) and stopping at scalars, maps and
+// slices — the shape of a `network.inject[]` entry is that one field's surface, not several. An
+// exported field with no yaml tag is reported under yaml.v3's default name (the lowercased Go
+// field name) rather than skipped, since such a field is still settable from the file.
+func configYAMLFields(t reflect.Type, prefix string) []string {
+	var out []string
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		tag, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		switch tag {
+		case "-":
+			continue
+		case "":
+			tag = strings.ToLower(f.Name)
+		}
+		path := prefix + tag
+		if f.Type.Kind() == reflect.Struct {
+			out = append(out, configYAMLFields(f.Type, path+".")...)
+			continue
+		}
+		out = append(out, path)
+	}
+	return out
 }
 
 // TestApplyConfigAutoLoadedSecretsSymlink covers the other half of the secrets containment: the
