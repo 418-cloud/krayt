@@ -79,9 +79,10 @@ RUN set -eu; \
 
 # gh CLI, like protoc, has no `go install` story worth relying on, so it's fetched as a prebuilt
 # release tarball. Unlike protoc, gh's asset arch names ARE Docker's TARGETARCH values
-# (amd64/arm64) verbatim — no x86_64/aarch_64 translation needed. Shipping it is what switches on
-# the inherited entrypoint's optional gh-auth branch (see README's GH_TOKEN secret) and what the
-# fix-pr-review-comments task needs.
+# (amd64/arm64) verbatim — no x86_64/aarch_64 translation needed. Needed by the
+# fix-pr-review-comments task; installing the binary is ALL this image does for it, since gh
+# authenticates from the GH_TOKEN the host proxy injects (§6.6.1) and reads that env var itself.
+# No entrypoint anywhere touches the token — see README's GH_TOKEN secret.
 RUN set -eu; \
     curl -fsSL -o /tmp/gh.tar.gz \
       "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" \
