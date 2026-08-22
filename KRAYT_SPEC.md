@@ -557,7 +557,8 @@ is the simplest correct choice. Enforcement layers:
   and any notion of how much data moved — on **any** port (see the bullet above). Operationally
   this is a one-word cliff: adding a host to `passthrough` silently converts it from "inspected
   and injectable" to "opaque", and the only place that conversion shows up is that one log line,
-  and only when `KRAYT_PROXY_LOG_REQUESTS=1` is set.
+  emitted only when request observation is on — `KRAYT_PROXY_LOG_REQUESTS=1`, or
+  `KRAYT_PROXY_LOG_HEADER_VALUES=<names>` (which implies it).
 - **Resolved-IP guard (SSRF / DNS-rebinding) — now a HARD block on every proxy-mediated dial, no
   carve-out.** The host-string allowlist is not enough on its own: an allowlisted name (or, in
   `full`, any name) could resolve to an internal address. After the proxy resolves an upstream

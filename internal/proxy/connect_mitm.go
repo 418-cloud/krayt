@@ -264,6 +264,11 @@ func validateConnectAuthority(authority string) error {
 	if _, ok := normalizeHost(h); !ok {
 		return fmt.Errorf("invalid CONNECT authority %q: host is not an ASCII hostname", authority)
 	}
+	for _, c := range p {
+		if c < '0' || c > '9' {
+			return fmt.Errorf("invalid CONNECT authority %q: invalid port %q", authority, p)
+		}
+	}
 	if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
 		return fmt.Errorf("invalid CONNECT authority %q: invalid port %q", authority, p)
 	}
