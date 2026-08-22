@@ -538,6 +538,27 @@ is the simplest correct choice. Enforcement layers:
   agent's **auth/refresh** endpoints must be allowlisted alongside the inference endpoint
   (§6.14); an OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key, so
   it can need a wider list.
+- **The allowlist is per-*host*, not per-host:port — one entry authorizes every TCP port on that
+  host.** The policy decision is made on the bare hostname (the CONNECT authority's port is
+  stripped before the allowlist lookup), but the **full authority is what gets dialed**. So
+  `allow: [api.example.com]` permits `CONNECT api.example.com:443` *and* `:22`, `:11434`, `:1` —
+  each dialed at the port the guest named, and under `mitm` each receiving the injected
+  credential at `https://<host>:<that port>`. This is intended: §6.6 speaks of hosts throughout,
+  and `passthrough`'s stated purpose (git+ssh on 443) depends on the port being the guest's
+  choice. But "exact-host allowlist" reads narrower than it is — an allowlisted host is reachable
+  on **any** port, subject only to the resolved-IP guard below. If a host must be reachable on one
+  port only, krayt has no mechanism for that today.
+- **What a `passthrough` host gives up (§6.6.1).** From `200 Connection established` onward the
+  proxy is a **byte pipe**. Still enforced for such a host: the allowlist decision on the CONNECT
+  authority, `checkDialAddr` on every resolved IP, the fact that the CONNECT authority is what
+  gets dialed, and a single `observe CONNECT … via=tunnel` line. Given up **entirely**: the
+  request line, path and query; every request and response header; status codes; bodies; whether
+  the traffic is even HTTP; any injection or stripping (§6.6.1); the per-request observation log;
+  and any notion of how much data moved — on **any** port (see the bullet above). Operationally
+  this is a one-word cliff: adding a host to `passthrough` silently converts it from "inspected
+  and injectable" to "opaque", and the only place that conversion shows up is that one log line,
+  emitted only when request observation is on — `KRAYT_PROXY_LOG_REQUESTS=1`, or
+  `KRAYT_PROXY_LOG_HEADER_VALUES=<names>` (which implies it).
 - **Resolved-IP guard (SSRF / DNS-rebinding) — now a HARD block on every proxy-mediated dial, no
   carve-out.** The host-string allowlist is not enough on its own: an allowlisted name (or, in
   `full`, any name) could resolve to an internal address. After the proxy resolves an upstream
@@ -643,6 +664,16 @@ holds it, so there is nothing in the VM for a compromise to steal.
   a stolen key does not) but not "no risk".
 - **It only covers HTTP-shaped credentials.** An SSH key, a signing key, or anything a tool
   computes over cannot move to the proxy; those still ride `SecretsBundle` unchanged.
+- **It does not stop the credential being *reflected back* to the container.** The injected header
+  goes to an allowlisted host; if that host has any endpoint that echoes request headers — a
+  `/headers` or `/debug` route, an error page that quotes the request, a verbose 4xx — the
+  credential comes back **in the response body, in plaintext**, and the proxy streams that body to
+  the guest untouched. Nothing could catch it without reading response bodies, which the
+  hostile-input rules below forbid outright. So the honest statement is conditional: **if** every
+  host in `network.allow` that also has an `inject` rule is one the operator trusts not to reflect
+  request headers, **then** a compromised agent can *use* the credential for the run's duration but
+  cannot learn its bytes. That conditional is doing all the work here, and **krayt enforces no part
+  of it** — it is an operator assumption about the allowlisted hosts, checked by nothing.
 - **It moves the adversarial parser outside the blast-radius boundary a second time.** §6.6
   already names the proxy "the component most directly exposed to untrusted, adversarial network
   input" post step-1: a proxy compromise there bought unrestricted egress from a VM about to be

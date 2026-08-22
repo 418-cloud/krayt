@@ -247,6 +247,21 @@ func TestMITMInjectRuleNotSelectedForLookalikeHost(t *testing.T) {
 	}
 }
 
+// TestValidateConnectAuthorityPortBounds checks validateConnectAuthority's port validation on its
+// own: a port outside 1-65535 is not a port, and a port that isn't digits-only (e.g. a leading
+// '+', which strconv.Atoi accepts) is not a port either. Both fail closed at dial anyway; refuse
+// them here so the authority the rest of the path trusts is well-formed.
+func TestValidateConnectAuthorityPortBounds(t *testing.T) {
+	for _, bad := range []string{"api.example.com:-1", "api.example.com:0", "api.example.com:99999", "api.example.com:+1"} {
+		if err := validateConnectAuthority(bad); err == nil {
+			t.Errorf("validateConnectAuthority accepted %q", bad)
+		}
+	}
+	if err := validateConnectAuthority("api.example.com:65535"); err != nil {
+		t.Errorf("validateConnectAuthority rejected a valid authority: %v", err)
+	}
+}
+
 func TestMITMSetLiteral(t *testing.T) {
 	upstream := &echoTransport{}
 	rule := InjectRule{Host: "api.example.com", SetLiteral: map[string]string{"x-krayt-mitm": "1"}}
