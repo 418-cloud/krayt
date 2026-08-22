@@ -247,6 +247,21 @@ func TestMITMInjectRuleNotSelectedForLookalikeHost(t *testing.T) {
 	}
 }
 
+// TestValidateConnectAuthorityPortBounds checks validateConnectAuthority's port validation on its
+// own: a port outside 1-65535 is not a port, and a port that isn't digits-only (e.g. a leading
+// '+', which strconv.Atoi accepts) is not a port either. Both fail closed at dial anyway; refuse
+// them here so the authority the rest of the path trusts is well-formed.
+func TestValidateConnectAuthorityPortBounds(t *testing.T) {
+	for _, bad := range []string{"api.example.com:-1", "api.example.com:0", "api.example.com:99999", "api.example.com:+1"} {
+		if err := validateConnectAuthority(bad); err == nil {
+			t.Errorf("validateConnectAuthority accepted %q", bad)
+		}
+	}
+	if err := validateConnectAuthority("api.example.com:65535"); err != nil {
+		t.Errorf("validateConnectAuthority rejected a valid authority: %v", err)
+	}
+}
+
 func TestMITMSetLiteral(t *testing.T) {
 	upstream := &echoTransport{}
 	rule := InjectRule{Host: "api.example.com", SetLiteral: map[string]string{"x-krayt-mitm": "1"}}
@@ -334,9 +349,105 @@ func TestMITMPassthroughTunnelsUnmodified(t *testing.T) {
 	}
 }
 
-// TestMITMSSRFGuardStillApplies proves a MITM'd host whose resolved address the shared
-// checkDialAddr guard would refuse is blocked with 403 and never actually dialed — the
-// ReverseProxy's Transport is the SAME guarded transport the tunnel/forward paths use.
+// TestSSRFGuardIsWiredOnEveryRealPath is the test the two fake-transport ones below and in
+// proxy_internal_test.go cannot be: it builds the handler through the REAL buildHandler — the
+// same constructor the `krayt __egress-proxy` child uses — with nothing faked, and asserts that
+// all three egress paths refuse a loopback target with the guard's own 403.
+//
+// The fakes prove the error→403 mapping; only this proves the Control hook is actually attached
+// to the dialer that backs all three. A refactor that gave the MITM path (or the tunnel, or the
+// forward path) its own unguarded transport would keep every other test in this file green.
+//
+// The target is an IP literal, so no DNS lookup happens and no connection is ever attempted:
+// Control fires before connect and refuses.
+func TestSSRFGuardIsWiredOnEveryRealPath(t *testing.T) {
+	const (
+		loopbackHost = "127.0.0.1"
+		target       = loopbackHost + ":9" // discard port; never actually reached
+	)
+	pol := func(mitm bool) Policy {
+		return Policy{Mode: ModeAllowlist, Allow: []string{loopbackHost}, MITM: mitm}
+	}
+
+	t.Run("plain forward", func(t *testing.T) {
+		h, _, err := buildHandler(pol(false), "", "", nil)
+		if err != nil {
+			t.Fatalf("buildHandler: %v", err)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+target+"/", nil))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "blocked address range") {
+			t.Errorf("body = %q, want the SSRF-guard message", rec.Body.String())
+		}
+	})
+
+	t.Run("CONNECT tunnel", func(t *testing.T) {
+		// The tunnel dials before it hijacks, so a recorder is enough: the guard refuses the dial
+		// and the 403 is written as an ordinary response.
+		h, _, err := buildHandler(pol(false), "", "", nil)
+		if err != nil {
+			t.Fatalf("buildHandler: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodConnect, "//"+target, nil)
+		req.Host = target
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "blocked address range") {
+			t.Errorf("body = %q, want the SSRF-guard message", rec.Body.String())
+		}
+	})
+
+	t.Run("MITM upstream", func(t *testing.T) {
+		// This path needs a real hijack + TLS handshake, so it runs against a real listener with a
+		// real proxy-aware client that trusts the run's ephemeral CA.
+		h, ca, err := buildHandler(pol(true), "", "test-run", nil)
+		if err != nil {
+			t.Fatalf("buildHandler: %v", err)
+		}
+		if ca == nil {
+			t.Fatal("buildHandler returned no CA for a mitm policy")
+		}
+		srv := httptest.NewServer(h)
+		defer srv.Close()
+		pool := x509.NewCertPool()
+		pool.AddCert(ca.cert)
+		proxyURL, err := url.Parse(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client := &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				Proxy:           http.ProxyURL(proxyURL),
+				TLSClientConfig: &tls.Config{RootCAs: pool},
+			},
+		}
+		resp, err := client.Get("https://" + target + "/")
+		if err != nil {
+			t.Fatalf("request through the MITM path: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403", resp.StatusCode)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(b), "blocked address range") {
+			t.Errorf("body = %q, want the SSRF-guard message", b)
+		}
+	})
+}
+
+// TestMITMSSRFGuardStillApplies proves the MITM path maps a transport error carrying
+// errBlockedAddr — what the guard's Control hook produces when it refuses a resolved address —
+// to a 403 with the guard's message, rather than a 502 or a silent tunnel. That the
+// ReverseProxy's Transport really IS the guarded one is a separate claim, and the fake here
+// cannot make it: see TestSSRFGuardIsWiredOnEveryRealPath above, which does.
 func TestMITMSSRFGuardStillApplies(t *testing.T) {
 	dialed := false
 	upstream := &blockedDialTransport{dialed: &dialed}
@@ -435,10 +546,11 @@ func TestMITMChunkedNDJSONStreams(t *testing.T) {
 	}
 }
 
-// TestMITMFalseByteIdenticalToTunnel proves mitm:false never leaves the plain tunnel — a
-// listener with no CA at all behaves identically to before this task (connect() dispatch,
-// verified structurally: connectMITM is simply unreachable when ca==nil).
-func TestMITMFalseByteIdenticalToTunnel(t *testing.T) {
+// TestMITMFalseNeverEntersMITMPath proves connect()'s dispatch: with ca == nil the CONNECT goes
+// to the plain tunnel and connectMITM is simply unreachable. That is narrower than "mitm:false is
+// byte-identical to before this task" — this asserts the dispatch, not the bytes — and the name
+// says so, since the old one promised a comparison the body never made.
+func TestMITMFalseNeverEntersMITMPath(t *testing.T) {
 	pol := Policy{Mode: ModeAllowlist, Allow: []string{"api.example.com"}} // MITM left false
 	dialed := false
 	dial := func(_ context.Context, _, addr string) (net.Conn, error) {
@@ -602,29 +714,66 @@ func TestMITMConnectionHeaderCannotStripInjectedCredential(t *testing.T) {
 	}
 }
 
+// TestMITMOversizedHeaderRejected pins BOTH sides of maxMITMHeaderBytes: over it, the inner
+// server answers 431 and the request never reaches upstream; under it, the same request is served
+// normally with the header intact. Asserting only the rejection would pass for a bound set to
+// zero, and accepting "any 4xx, or a torn-down connection, or a write error" would pass for a
+// bound that had stopped working in a different way.
+//
+// slack is 8 KiB either side of the limit because net/http reads up to MaxHeaderBytes + 4 KiB
+// (its own allowance for the request line); the over case must clear that, and the over case's
+// unread remainder stays small enough that the client's write completes before the server —
+// which has stopped reading — closes the connection.
 func TestMITMOversizedHeaderRejected(t *testing.T) {
-	upstream := &echoTransport{}
-	h := newMITMHarness(t, Policy{Mode: ModeAllowlist, Allow: []string{"api.example.com"}}, upstream, nil)
-	conn := rawMITMConn(t, h, "api.example.com:443", "api.example.com")
+	const slack = 8192
 
-	big := strings.Repeat("a", maxMITMHeaderBytes*3)
-	req := "GET / HTTP/1.1\r\nHost: api.example.com\r\nX-Big: " + big + "\r\nConnection: close\r\n\r\n"
-	if _, err := conn.Write([]byte(req)); err != nil {
-		// A write failure (reset by peer mid-write) is an acceptable way for this to surface too.
-		return
-	}
-	// A connection dropped without a well-formed response is also an acceptable rejection shape
-	// for an oversized header (net/http's server behavior here isn't a clean 4xx in every Go
-	// version); the key property asserted below is that upstream never saw it either way.
-	if resp, err := http.ReadResponse(bufio.NewReader(conn), nil); err == nil {
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge && resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("status = %d, want a 4xx rejection for an oversized header", resp.StatusCode)
+	t.Run("over the limit is rejected and never reaches upstream", func(t *testing.T) {
+		upstream := &echoTransport{}
+		h := newMITMHarness(t, Policy{Mode: ModeAllowlist, Allow: []string{"api.example.com"}}, upstream, nil)
+		conn := rawMITMConn(t, h, "api.example.com:443", "api.example.com")
+
+		big := strings.Repeat("a", maxMITMHeaderBytes+slack)
+		req := "GET / HTTP/1.1\r\nHost: api.example.com\r\nX-Big: " + big + "\r\nConnection: close\r\n\r\n"
+		if _, err := conn.Write([]byte(req)); err != nil {
+			t.Fatalf("write inner request: %v", err)
 		}
-	}
-	if upstream.lastRequest() != nil {
-		t.Error("an oversized-header request must never reach upstream")
-	}
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read inner response: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+			t.Errorf("status = %d, want 431 for a header over maxMITMHeaderBytes", resp.StatusCode)
+		}
+		if upstream.lastRequest() != nil {
+			t.Error("an oversized-header request must never reach upstream")
+		}
+	})
+
+	t.Run("just under the limit is served", func(t *testing.T) {
+		upstream := &echoTransport{}
+		h := newMITMHarness(t, Policy{Mode: ModeAllowlist, Allow: []string{"api.example.com"}}, upstream, nil)
+		conn := rawMITMConn(t, h, "api.example.com:443", "api.example.com")
+
+		big := strings.Repeat("a", maxMITMHeaderBytes-slack)
+		req := "GET / HTTP/1.1\r\nHost: api.example.com\r\nX-Big: " + big + "\r\nConnection: close\r\n\r\n"
+		if _, err := conn.Write([]byte(req)); err != nil {
+			t.Fatalf("write inner request: %v", err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read inner response: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 for a header under maxMITMHeaderBytes", resp.StatusCode)
+		}
+		if got := mustLastRequest(t, upstream).Header.Get("X-Big"); got != big {
+			t.Errorf("upstream X-Big = %d bytes, want the %d-byte header forwarded intact", len(got), len(big))
+		}
+	})
 }
 
 func TestMITMInvalidConnectAuthorityRejected(t *testing.T) {

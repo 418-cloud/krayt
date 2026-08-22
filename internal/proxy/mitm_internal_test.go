@@ -119,23 +119,27 @@ func randomHost(i int) string {
 }
 
 // TestCAPrivateKeyNotExported proves there is no exported API surface that can yield the CA's
-// private key — CACertPEM is the only exported accessor, and it is documented to return the
-// certificate alone. This test exercises that by reflection: every exported method on *CA must
-// not return anything containing a crypto private key type.
+// private key. c.key is unexported, so the only way one could escape is through a method — which
+// makes the exported METHOD SET the thing to pin, and it is pinned exactly: any addition fails
+// this test until whoever adds it says why it cannot leak key material.
+//
+// Matching on the returned type's name instead (the earlier shape of this test) checked nothing
+// useful: a method returning crypto.Signer, []byte or any would have passed it.
 func TestCAPrivateKeyNotExported(t *testing.T) {
+	// CACertPEM is the whole exported surface, and it is documented to return the certificate
+	// alone. Keep this list and the reason for each entry in step.
+	want := []string{"CACertPEM"}
+
 	caType := reflect.TypeOf(&CA{})
+	var got []string
 	for i := 0; i < caType.NumMethod(); i++ {
-		m := caType.Method(i)
-		for j := 0; j < m.Type.NumOut(); j++ {
-			out := m.Type.Out(j)
-			if out.Kind() == reflect.Pointer {
-				out = out.Elem()
-			}
-			if out.Name() == "PrivateKey" || out.String() == "ecdsa.PrivateKey" {
-				t.Errorf("exported method %s returns a private-key-shaped type %s", m.Name, out)
-			}
-		}
+		got = append(got, caType.Method(i).Name)
 	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("exported method set of *CA = %v, want exactly %v — a new exported method must be\n"+
+			"justified here as unable to yield the CA's private key", got, want)
+	}
+
 	// Direct sanity check on the one exported accessor's actual output shape.
 	ca, err := newCA("")
 	if err != nil {
