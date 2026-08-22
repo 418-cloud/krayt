@@ -657,37 +657,63 @@ func TestApplyConfigAutoLoadedHonorsOrdinaryFields(t *testing.T) {
 	}
 }
 
-// TestApplyConfigDogfoodsThisRepo loads krayt's OWN tracked krayt.yaml the way `krayt run` in a
-// checkout does — auto-discovered, no --config — and asserts it is still accepted with the values
-// it had before the auto-load containment existed. If this fails, the containment broke the repo's
-// own dogfooding config.
+// TestApplyConfigDogfoodsThisRepo loads krayt's OWN tracked krayt.yaml and pins both halves of
+// the contract it acquired when it turned on host-side credential injection: auto-discovery must
+// REFUSE it (it sets network.mitm, which an auto-loaded repo config may not, §8.3), and an
+// explicit --config must accept it whole. If the first half fails, the file quietly became
+// auto-loadable again and the trust boundary moved; if the second, the repo's own dogfooding
+// config stopped working.
 func TestApplyConfigDogfoodsThisRepo(t *testing.T) {
 	repo := filepath.Join("..", "..")
-	if _, err := os.Stat(filepath.Join(repo, "krayt.yaml")); err != nil {
+	cfgPath := filepath.Join(repo, "krayt.yaml")
+	if _, err := os.Stat(cfgPath); err != nil {
 		t.Fatalf("this repo's krayt.yaml: %v", err)
 	}
+
+	t.Run("auto-loaded is refused", func(t *testing.T) {
+		var f runFlags
+		cmd := &cobra.Command{Use: "run", RunE: func(*cobra.Command, []string) error { return nil }}
+		bindRunFlags(cmd, &f)
+		if err := cmd.ParseFlags([]string{"--repo", repo}); err != nil {
+			t.Fatal(err)
+		}
+		err := applyConfig(cmd, &f)
+		if err == nil {
+			t.Fatal("auto-loading this repo's krayt.yaml succeeded; it sets network.mitm, which §8.3 refuses")
+		}
+		// The error has to name the field and the opt-in, or the contributor who typed a bare
+		// `krayt run` has no way to know that --config is what they were missing.
+		for _, want := range []string{"network.mitm", "--config"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err, want)
+			}
+		}
+	})
+
 	var f runFlags
 	cmd := &cobra.Command{Use: "run", RunE: func(*cobra.Command, []string) error { return nil }}
 	bindRunFlags(cmd, &f)
-	if err := cmd.ParseFlags([]string{"--repo", repo}); err != nil {
+	if err := cmd.ParseFlags([]string{"--repo", repo, "--config", cfgPath}); err != nil {
 		t.Fatal(err)
 	}
 	if err := applyConfig(cmd, &f); err != nil {
-		t.Fatalf("this repo's own krayt.yaml is no longer accepted as an auto-loaded config: %v", err)
+		t.Fatalf("this repo's own krayt.yaml is no longer accepted as an explicit --config: %v", err)
 	}
 	if !strings.HasPrefix(f.image, "ghcr.io/418-cloud/krayt-dev:") {
 		t.Errorf("image = %q, want the krayt-dev image from krayt.yaml", f.image)
 	}
-	// secrets.env is named relative to the repo root, so it resolves under it — the same file the
-	// pre-containment cwd-relative resolution found when running from the repo root.
-	if want := filepath.Join(repo, "secrets.env"); f.secretsFile != want {
-		t.Errorf("secrets = %q, want %q", f.secretsFile, want)
+	// An explicit --config is honored in full, which includes leaving its relative paths relative
+	// to the CWD rather than anchoring them to the repo root the way the auto-load containment
+	// does. `secrets: secrets.env` therefore resolves only when the run is launched FROM the repo
+	// root — which is how krayt.yaml's own documented command line reads.
+	if f.secretsFile != "secrets.env" {
+		t.Errorf("secrets = %q, want the file's own relative path", f.secretsFile)
 	}
 	if f.netMode != "allowlist" {
 		t.Errorf("net = %q, want allowlist", f.netMode)
 	}
-	if !containsHost(f.allow, "api.anthropic.com") {
-		t.Errorf("allow = %v, want it to carry api.anthropic.com", f.allow)
+	if !containsHost(f.allow, "api.anthropic.com") || !containsHost(f.allow, "api.github.com") {
+		t.Errorf("allow = %v, want it to carry both injected hosts", f.allow)
 	}
 	if f.agent != "claude-code" || f.onQuestion != "wait" || f.bundleDepth != 0 {
 		t.Errorf("agent=%q on-question=%q bundle-depth=%d, want claude-code/wait/0", f.agent, f.onQuestion, f.bundleDepth)
@@ -695,9 +721,63 @@ func TestApplyConfigDogfoodsThisRepo(t *testing.T) {
 	if f.env["CLAUDE_MODEL"] == "" {
 		t.Errorf("env = %v, want the file's CLAUDE_MODEL", f.env)
 	}
-	// The dogfooding config touches none of the security-relevant surface.
-	if f.mitm || len(f.passthrough) > 0 || len(f.inject) > 0 {
-		t.Errorf("mitm=%t passthrough=%v inject=%+v, want all unset", f.mitm, f.passthrough, f.inject)
+	// The GH_TOKEN the container is configured with must be a placeholder, never the real token —
+	// this file is tracked, so anything here is public by construction.
+	if f.env["GH_TOKEN"] == "" || !strings.Contains(f.env["GH_TOKEN"], "krayt") {
+		t.Errorf("env GH_TOKEN = %q, want a self-describing krayt placeholder", f.env["GH_TOKEN"])
+	}
+
+	if !f.mitm {
+		t.Error("mitm = false, want the file's opt-in")
+	}
+	// Every allowlisted host is either injected into or tunneled — a host that is neither gets
+	// intercepted for no gain, and then needs the container's trust store rewired to keep working.
+	// api.anthropic.com is the one host injected into WITHOUT a rule in this file: the claude-code
+	// adapter merges its rule in later (applyAdapter), so it is legitimately absent here.
+	injected := map[string]bool{"api.anthropic.com": true}
+	for _, r := range f.inject {
+		injected[r.Host] = true
+	}
+	for _, h := range f.allow {
+		if !injected[h] && !containsHost(f.passthrough, h) {
+			t.Errorf("allow host %q is neither injected into nor in passthrough", h)
+		}
+	}
+
+	var gh *task.InjectRule
+	for i := range f.inject {
+		if f.inject[i].Host == "api.github.com" {
+			gh = &f.inject[i]
+		}
+		if f.inject[i].Host == "api.anthropic.com" {
+			// The claude-code adapter emits this rule from the observed wire shape of whichever
+			// credential secrets.env holds (internal/adapter/anthropic_wire.go). A hand-written one
+			// here would win over it (MergeInjectRules) and pin the shape in the wrong file.
+			t.Error("krayt.yaml hand-writes an api.anthropic.com inject rule; the claude-code adapter supplies it")
+		}
+	}
+	if gh == nil {
+		t.Fatalf("inject = %+v, want a rule for api.github.com", f.inject)
+	}
+	if got := gh.Set["authorization"]; got != "GH_TOKEN" {
+		t.Errorf("inject[api.github.com].set[authorization] = %q, want GH_TOKEN", got)
+	}
+	if got := gh.SetPrefix["authorization"]; got != "Bearer " {
+		t.Errorf("inject[api.github.com].set_prefix[authorization] = %q, want %q", got, "Bearer ")
+	}
+
+	policy := task.NetworkPolicy{
+		Mode: task.NetworkAllowlist, Allow: f.allow,
+		MITM: f.mitm, Passthrough: f.passthrough, Inject: f.inject,
+	}
+	if err := task.ValidateNetworkPolicy(policy, map[string]bool{"GH_TOKEN": true}); err != nil {
+		t.Errorf("this repo's krayt.yaml fails network pre-flight: %v", err)
+	}
+	// GH_TOKEN stopped being optional the moment an inject rule named it: pre-flight refuses a
+	// `set` naming a key the secrets file lacks, rather than starting a run that reaches GitHub
+	// unauthenticated and fails opaquely. Contributors need that failure to be the loud one.
+	if err := task.ValidateNetworkPolicy(policy, map[string]bool{}); err == nil {
+		t.Error("pre-flight accepted a secrets file with no GH_TOKEN; the inject rule requires it")
 	}
 }
 

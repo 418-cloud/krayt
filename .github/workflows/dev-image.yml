@@ -13,6 +13,15 @@ name: dev-image
 on:
   push:
     branches: [main]
+    # Deliberately NOT triggered by images/agents/claude-code/**, even though this image is built
+    # FROM krayt-agent-claude-code and inherits its entrypoint. The `FROM` line names a specific
+    # tag, and Renovate pins it to a digest (`pinDigests: true`), so a rebuild triggered by a
+    # change over there would resolve the SAME base and produce the same image — the trigger would
+    # burn two matrix runners to change nothing. The only thing that moves this image to a new
+    # base is editing that `FROM`, which is a change to hack/krayt-dev/** and already triggers
+    # below. In practice the chain is: base changes -> agent-images.yml republishes -> Renovate
+    # opens a digest-bump PR against hack/krayt-dev/Dockerfile -> merging it rebuilds here, with
+    # the base change recorded in git rather than absorbed silently.
     paths:
       - "hack/krayt-dev/**"
       - "go.mod"
@@ -56,8 +65,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
+      # Unconditional, unlike the agent-image workflows: this build PULLS its own base
+      # (krayt-agent-claude-code) from GHCR, which a PR build needs just as much as a pushing one.
+      # On a fork PR the token is read-only, which is all a pull requires.
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io

@@ -18,6 +18,12 @@ already checked out (that's what `--repo .` from a local checkout of the branch 
 - `api.github.com` must be in the run's `--allow` egress list for any `gh` call to work. If `gh`
   calls fail with a network/egress error, stop and report that `api.github.com` is missing from
   `--allow` (and, if auth also fails, that `GH_TOKEN` wasn't supplied) — don't guess around it.
+- The token is normally **injected at the host proxy**, so `$GH_TOKEN` holds an obvious placeholder
+  and `/run/secrets/GH_TOKEN` does not exist. That is **not** a misconfiguration and needs no
+  working around: the real token is attached to your requests on the way out and `gh` works
+  normally. Judge auth by whether a `gh` call actually succeeds, never by reading the token — and
+  never try to "fix" it by running `gh auth login`, which would replace a working credential with
+  the placeholder you can see.
 
 ## Hard constraints — the token is read-only
 

@@ -1,17 +1,37 @@
 # syntax=docker/dockerfile:1 # renovate: ignore
-# krayt-dev — the dogfooding agent image: a non-root Claude Code agent (§6.14) plus krayt's
-# own dev toolchain, so an agent running `krayt run --image krayt-dev --agent claude-code`
-# against krayt's own repo can build, test, lint, and regenerate protocol code inside the
-# sandbox before returning its patch (§6.14, §8.2).
+# krayt-dev — the dogfooding agent image: krayt's own dev toolchain layered on the published
+# Claude Code agent image, so an agent running `krayt run --image krayt-dev --agent claude-code`
+# against krayt's own repo can build, test, lint, and regenerate protocol code inside the sandbox
+# before returning its patch (§6.14, §8.2).
 #
-# Debian bookworm (glibc, not Nix) so the official native `claude` binary runs; non-root
-# throughout, per the §8.2 container contract.
-FROM golang:1.26-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36
+# It inherits FROM krayt-agent-claude-code rather than re-deriving that image: the non-root `agent`
+# user (uid 1000, §8.2 — Claude Code refuses uid 0), the version-pinned Claude Code CLI, the
+# DISABLE_* egress env, and the ENTRYPOINT — including the §8.2 credential and KRAYT_CA_CERT
+# contracts. Keeping a second near-identical copy of that logic here is what previously let the
+# two drift until a shape-translated run exited 78 before Claude started.
+#
+# This image adds NO entrypoint of its own. It ships `gh`, but gh needs no setup step: krayt.yaml
+# injects GH_TOKEN at the host proxy (§6.6.1), which means the container is configured with a
+# GH_TOKEN env var holding a placeholder — and reading GH_TOKEN from the environment is gh's own
+# first-choice auth path. The proxy swaps the placeholder for the real token on the way out. No
+# script has to move a credential anywhere.
+#
+# One FROM, everything else additive: the base is the whole agent image, and each block below adds
+# one tool on top of it.
+#
+# KEEP THIS DIGEST-PINNED. agent-images.yml re-points the `:<cli-version>` tag on every build off
+# main, so the tag alone floats: this image would silently absorb base changes on any unrelated
+# rebuild, and Renovate would never open the digest-bump PR that is how a base change is meant to
+# arrive here (see dev-image.yml's `paths` comment). Renovate's dockerfile manager appends and
+# maintains the digest (`pinDigests: true`, renovate.json) — the line is tag-only until its first
+# PR lands, which is tracked in HUMAN_TODO.md.
+FROM ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226
 
 # Tool versions, pinned so Renovate's custom regex manager (renovate.json) can bump them
 # independently of the base image tag. `make proto` (Nix) stays the source of truth for the
 # *committed* generated code; this toolchain is only for an agent regenerating it mid-run
 # (see proto-direct.sh) when it edits internal/protocol/krayt.proto.
+ARG GO_VERSION=1.26.3
 ARG PROTOC_VERSION=35.1
 ARG PROTOC_GEN_GO_VERSION=v1.36.11
 ARG PROTOC_GEN_GO_GRPC_VERSION=v1.6.2
@@ -21,16 +41,30 @@ ARG GOLANGCI_LINT_VERSION=v2.12.2
 ARG GH_CLI_VERSION=2.96.0
 ARG HADOLINT_VERSION=2.15.1
 
-# git: repo ops + module fetches; curl + ca-certificates: installers/HTTPS; bash: entrypoint +
-# proto-direct.sh; unzip: protoc's release archive is a zip; xz-utils: the Nix installer's tarball
-# is .tar.xz.
+# The base image is debian:bookworm-slim + `ca-certificates curl git bash`; these are what krayt's
+# toolchain needs on top. gcc + libc6-dev are not optional: `go test -race` requires cgo, so
+# without a C toolchain the race detector — which CI and every dogfooding task run — fails to
+# link. unzip: protoc's release archive is a zip. xz-utils: the Nix installer's tarball is .tar.xz.
+USER root
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git bash unzip xz-utils \
+ && apt-get install -y --no-install-recommends gcc libc6-dev unzip xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
-# protoc itself has no Go module (it's the C++ compiler), so it's the one tool fetched as a
-# prebuilt release archive; TARGETARCH is set per-platform by buildx during the multi-arch build.
+# The Go toolchain, fetched as the official prebuilt tarball like protoc/gh/hadolint below — the
+# base image is an agent image, not a language image, so Go is just another tool this one adds.
+# Go's asset arch names ARE Docker's TARGETARCH values verbatim (amd64/arm64), like gh's.
+# GO_VERSION must stay >= go.mod's `go` directive: with GOTOOLCHAIN=local (below) a lower one
+# fails the build outright rather than silently downloading a second toolchain. Renovate's
+# `go version` group bumps this ARG and that directive together (renovate.json).
 ARG TARGETARCH
+RUN curl -fsSL -o /tmp/go.tar.gz \
+      "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" \
+ && tar -C /usr/local -xzf /tmp/go.tar.gz \
+ && rm /tmp/go.tar.gz
+
+# protoc itself has no Go module (it's the C++ compiler), so it's the one tool fetched as a
+# prebuilt release archive; TARGETARCH (declared above) is set per-platform by buildx during the
+# multi-arch build.
 RUN set -eu; \
     case "${TARGETARCH}" in \
       amd64) protoc_arch=x86_64 ;; \
@@ -45,8 +79,9 @@ RUN set -eu; \
 
 # gh CLI, like protoc, has no `go install` story worth relying on, so it's fetched as a prebuilt
 # release tarball. Unlike protoc, gh's asset arch names ARE Docker's TARGETARCH values
-# (amd64/arm64) verbatim — no x86_64/aarch_64 translation needed. Used by the optional GH_TOKEN
-# path in the entrypoint (see README's GH_TOKEN secret) and the fix-pr-review-comments task.
+# (amd64/arm64) verbatim — no x86_64/aarch_64 translation needed. Shipping it is what switches on
+# the inherited entrypoint's optional gh-auth branch (see README's GH_TOKEN secret) and what the
+# fix-pr-review-comments task needs.
 RUN set -eu; \
     curl -fsSL -o /tmp/gh.tar.gz \
       "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" \
@@ -67,34 +102,22 @@ RUN set -eu; \
       "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-linux-${hadolint_arch}" \
  && chmod 0755 /usr/local/bin/hadolint
 
-# Non-root agent user (uid 1000) — Claude Code refuses uid 0 (§6.14/§8.2). Everything below
-# runs as this user so it owns its own Go/lint caches (see ENV block).
-RUN useradd --create-home --uid 1000 --shell /bin/bash agent
-
-COPY --chmod=0755 hack/krayt-dev/entrypoint.sh /usr/local/bin/krayt-dev-entrypoint
-
+# Back to the base image's non-root `agent` user for everything below, so it owns its own Go/lint
+# caches (see ENV block). The user, its home, and the Claude Code CLI all come from the base.
 USER agent
 WORKDIR /home/agent
 
 # Agent-owned, writable caches so `go build`, `go test -race`, and `golangci-lint run` work
-# under a non-root uid with no permission errors.
+# under a non-root uid with no permission errors. GOTOOLCHAIN=local matches what the official Go
+# image sets: without it, a go.mod naming a newer patch release than GO_VERSION makes `go` fetch a
+# whole second toolchain at run time — an egress destination the run's allowlist does not have.
 ENV GOPATH=/home/agent/go \
     GOCACHE=/home/agent/.cache/go-build \
     GOMODCACHE=/home/agent/go/pkg/mod \
     GOLANGCI_LINT_CACHE=/home/agent/.cache/golangci-lint \
     GOFLAGS=-mod=mod \
-    PATH="/home/agent/go/bin:/home/agent/.local/bin:${PATH}"
-
-# Official installer (native binary; the npm package is deprecated).
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
-# Keep egress tight for the krayt allowlist (§6.6): no autoupdater, telemetry, or error
-# reporting, so the container's steady-state destinations are the model API plus, only for new
-# deps, the Go module proxy (see README).
-ENV DISABLE_AUTOUPDATER=1 \
-    DISABLE_TELEMETRY=1 \
-    DISABLE_ERROR_REPORTING=1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+    GOTOOLCHAIN=local \
+    PATH="/usr/local/go/bin:/home/agent/go/bin:/home/agent/.local/bin:${PATH}"
 
 # krayt's dev toolchain, pinned by the ARGs above. All installable via `go install`, so one
 # command works for both target architectures with no per-arch binary URLs. An agent-owned BuildKit
@@ -141,4 +164,12 @@ RUN cd krayt-src && go mod download \
  && cd hack/ask-probe && go mod download \
  && cd /home/agent && rm -rf krayt-src
 
-ENTRYPOINT ["krayt-dev-entrypoint"]
+# Model + reasoning-effort defaults for this image, read by the base entrypoint's optional
+# selection branch (those are `claude` flags, and the base is the image that ships `claude`).
+# krayt.yaml's `env:` block (§8.1) overrides them per run; the base leaves both unset and lets
+# Claude Code pick its own default.
+ENV CLAUDE_MODEL=claude-sonnet-5 \
+    CLAUDE_EFFORT=high
+
+# No ENTRYPOINT and no USER: both come from the base (krayt-agent-entrypoint, running as `agent`).
+# See the header for why this image needs no entrypoint of its own.

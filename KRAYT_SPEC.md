@@ -1489,11 +1489,33 @@ container:
 **Two tracked files, two purposes.** `configs/krayt.yaml` is the generic, fully-annotated
 template above — copy it as a starting point for any task. The repo-root `krayt.yaml` is a
 second, deliberately tracked file: krayt's own shared dev config for dogfooding krayt on this
-repo (pins the `krayt-dev` image, Claude model/effort, and this repo's network allowlist); with
-no explicit `--config`, a run auto-loads `<repo>/krayt.yaml` if present (§8.3), so every
-contributor gets the same starting point. It carries no secret material — `secrets:` only names a
-path, and the file it points at is itself gitignored — so tracking it is safe; a real credential
-must never be inlined into its `env:` block.
+repo (pins the `krayt-dev` image, Claude model/effort, this repo's network allowlist, and
+host-side injection of both credentials its tasks use), so every contributor gets the same
+starting point. It carries no secret material — `secrets:` only names a path, the file it points
+at is itself gitignored, and the one credential-shaped value in its `env:` block is the non-secret
+`GH_TOKEN` placeholder the proxy replaces — so tracking it is safe; a real credential must never
+be inlined there.
+
+**That file is not auto-loadable, by its own construction.** It sets `network.mitm`,
+`network.passthrough`, and `network.inject`, which the §8.3 table refuses from an auto-loaded
+`<repo>/krayt.yaml`; the repo's own config is held to that boundary exactly like any other repo's
+would be. Runs pass it explicitly, from the repo root:
+
+```sh
+krayt run --config krayt.yaml --task <file>
+```
+
+A bare `krayt run --task <file>` stops with an error naming `network.mitm` — the opt-in, working
+as designed. `TestApplyConfigDogfoodsThisRepo` (`internal/cli`) pins both halves: refused when
+auto-discovered, accepted whole under `--config`.
+
+Only `api.github.com` carries a hand-written `inject` rule there (`authorization: Bearer ` +
+`GH_TOKEN`, `gh`'s documented env-var auth path supplying the placeholder the proxy replaces).
+`api.anthropic.com` deliberately carries none: `agent.adapter: claude-code` plus `mitm: true`
+makes the adapter emit one from the observed wire shape of whichever credential the secrets file
+holds (§6.14), and a hand-written rule would win over it (§8.1's merge precedence) and pin that
+shape away from the provenance notes that justify it. Every other allowlisted host is in
+`passthrough`, so the go/nix/git toolchains keep verifying real upstream chains.
 
 **`container.capabilities` denylist.** These are **never** grantable, even if named, and the
 config is rejected at load if one appears: `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`,

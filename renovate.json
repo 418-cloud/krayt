@@ -16,6 +16,14 @@
   "customManagers": [
     {
       "customType": "regex",
+      "description": "hack/krayt-dev/Dockerfile: the Go toolchain, fetched as the official release tarball rather than inherited from a golang base image, so the native Dockerfile manager can't see it. Grouped with the gomod `go` directive below so the ARG and go.mod move together — GOTOOLCHAIN=local makes a mismatch a build failure.",
+      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "matchStrings": ["ARG GO_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "golang-version",
+      "packageNameTemplate": "go"
+    },
+    {
+      "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: protoc has no native Dockerfile-manager datasource (fetched as a release zip, not a base image)",
       "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
       "matchStrings": ["ARG PROTOC_VERSION=(?<currentValue>.*?)\\n"],
@@ -119,7 +127,7 @@
       "pinDigests": true
     },
     {
-      "matchManagers": ["dockerfile", "gomod"],
+      "matchManagers": ["dockerfile", "gomod", "custom.regex"],
       "matchPackageNames": ["golang", "go"],
       "groupName": "go version",
       "groupSlug": "go-version"
