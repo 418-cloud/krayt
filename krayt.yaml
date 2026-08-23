@@ -23,11 +23,14 @@
 # secrets belong only in that gitignored secrets.env (§6.8).
 # `task:` is intentionally omitted so you always pass --task per run.
 
-image: ghcr.io/418-cloud/krayt-dev:sha-d645be2
+image: ghcr.io/418-cloud/krayt-dev:sha-cbca700
 secrets: secrets.env
 env:
   CLAUDE_MODEL: claude-sonnet-5
   CLAUDE_EFFORT: high
+  # Uncomment for a task that needs verbatim command output — a vendorHash `got: sha256-…`, a full
+  # test failure, a filesystem check the agent will branch on (hack/krayt-dev/README.md).
+  # KRAYT_RTK: off
   # Non-secret stand-in, so `gh` considers itself authenticated and sends an Authorization header
   # for the proxy to replace. The real GH_TOKEN is withheld from SecretsBundle entirely because
   # network.inject names it, so /run/secrets/GH_TOKEN never exists in the container (§6.6.1).

@@ -25,17 +25,16 @@ record of what was verified, and how, lives in `git log` (this file's history th
    somewhere else.
 4. **One live-run security check** — that the egress-proxy child's real environment on macOS carries
    no operator credentials (`[security]` below, report §6 item 4).
-5. **A `krayt-dev` rebuild + repin** — the image was rebased onto the published
-   `krayt-agent-claude-code` and now inherits its entrypoint, and the repo's own `krayt.yaml`
-   injects both credentials at the host proxy. Neither change is in the pinned image yet
-   (`[tooling]` below). Until that lands, `krayt run --config krayt.yaml` exits 78. **Now also
-   waiting on**: the trixie base bump + rtk install (this file's new `[tooling]` entry below) —
-   the same rebuild picks both up.
-6. **The trixie base bump + rtk install** — landed, and the decisive check is done: `rtk 0.45.0`
-   runs in the published arm64 `krayt-agent-claude-code`, so the glibc ≥ 2.39 premise behind the
-   base bump holds on real hardware. What remains needs live agent credentials — proof that
-   rewriting (and `KRAYT_RTK=off`) actually takes effect in a run, for each of the three agents —
-   plus the amd64/other-image manifest check. See the `[tooling]` entry below.
+5. **`krayt-dev`'s floating base pin** — the rebuild, the repin, and the injected-run verification
+   are all done (`krayt.yaml` runs `sha-cbca700`, built from `main`'s tip). What's left is that
+   `hack/krayt-dev/Dockerfile`'s `FROM` is still tag-only, so the base floats, plus two
+   CA-sensitive checks nothing has exercised yet (`[tooling]` below).
+6. **The trixie base bump + rtk install** — landed and verified end-to-end **for Claude Code on
+   arm64**: `rtk 0.45.0` runs in the published image, and two real `krayt-dev` runs
+   (`run_9e0a56de` on, `run_378dac2d` with `KRAYT_RTK=off`) prove the hook intercepts live tool
+   calls and that the opt-out is honoured rather than silently absent. What remains needs live
+   Gemini/OpenCode credentials — the same proof for those two agents — plus the amd64/other-image
+   manifest check. See the `[tooling]` entry below.
 
 (The two `hadolint`-the-{gemini-cli,opencode}-Dockerfile entries formerly here are resolved: this
 task's own Verify step ran `hadolint` against both — clean, same pre-existing warnings as
@@ -50,79 +49,47 @@ corroborating the negative control independently of the agent's own report).
 
 ---
 
-## [tooling] rebuild `krayt-dev` on its new base, repin `krayt.yaml`, and verify the injected run
+## [tooling] pin `krayt-dev`'s `FROM` to a base digest, and close two CA-sensitive checks
 
-Two changes land together here, and neither is in a published image yet:
-
-1. **`krayt-dev` was rebased** onto `ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226` and now
-   **has no entrypoint of its own** — `hack/krayt-dev/entrypoint.sh` is deleted, and the base's
-   `krayt-agent-entrypoint` is inherited. Nothing replaced it: `gh` authenticates from the injected
-   `GH_TOKEN` env var with no setup step. One `FROM`, everything else additive: Go arrives as the
-   official release tarball (`ARG GO_VERSION`, new Renovate manager), and `gcc`/`libc6-dev` are
-   added because the slim base has no C toolchain and `go test -race` needs cgo.
-2. **`krayt.yaml` runs with `network.mitm: true`**: the Anthropic credential is injected by the
-   claude-code adapter's own rule, `GH_TOKEN` by a hand-written `api.github.com` rule, so neither
-   reaches the VM. The §8.2 contracts that requires now live in the shared entrypoint.
-
-`krayt.yaml` still pins `ghcr.io/418-cloud/krayt-dev:sha-376210a`, which predates all of it. Run
-the current config against the current pin and it exits 78 before Claude starts.
+The rebuild and repin this entry was opened for are **done**: `krayt-dev` is rebased onto
+`ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226` with no entrypoint of its own, it builds and
+publishes from `main`, and `krayt.yaml` pins `ghcr.io/418-cloud/krayt-dev:sha-cbca700` — built from
+`cbca700`, `main`'s tip (#138). Real runs through the injected `network.mitm: true` path succeed
+(`run_9e0a56de`, `run_378dac2d`), and their `console.log` carries the discriminating evidence:
+every line `[claude-code]`-prefixed with no `[krayt-dev]` line (so the new image is what ran) and
+no gh line at all, plus `authenticated via CLAUDE_CODE_OAUTH_TOKEN`, `trusting krayt's ephemeral
+MITM CA (network.mitm enabled)`, and `running claude -p in /workspace (model: claude-sonnet-5,
+effort: high)`. Neither credential reaches the container. The `gh api` half is confirmed too — the
+`fix-pr-review-comments` task has run several times against a live fine-grained PAT through the
+`api.github.com` inject rule, so the `Bearer ` prefix and header name are right in practice, not
+just per GitHub's docs. `KRAYT_RTK=off` inside a real krayt-dev container is likewise confirmed
+(`run_378dac2d`).
 
 - **Needed:**
-  1. **Confirm the base tag exists and is anonymously pullable** —
-     `docker buildx imagetools inspect ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226` shows
-     `linux/amd64,linux/arm64`. This is a new hard dependency: `dev-image.yml` cannot build at all
-     without it, on PRs included. If that tag is missing, the `FROM` needs a tag that does exist.
-  2. Build and push `krayt-dev` from `main` (CI does this on merge; confirm the digest actually
-     moved rather than assuming it). Check the build log shows the base being pulled, not built.
-  3. **Get the base digest onto the `FROM` line** — Renovate should do it (`pinDigests: true`
-     covers the dockerfile manager); confirm its first PR actually lands, or add the digest by
-     hand. The line is tag-only today, deliberately: an invented digest is worse than an absent
-     one. **Do not leave it that way.** `agent-images.yml` re-points `:2.1.226` on every build off
-     `main`, so an unpinned `FROM` floats — krayt-dev would absorb base changes silently on any
-     unrelated rebuild, and the Renovate digest PR that is the intended delivery path for a base
-     change (see `dev-image.yml`'s `paths` comment) would never be opened.
-  4. Repin `image:` in `krayt.yaml` to the new `sha-<short>` tag.
-  5. One real run through the injected path, from the repo root:
-     ```sh
-     KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config krayt.yaml --task ./some-krayt-task.md
-     ```
-     with a task that runs `go build ./... && go test ./...` (exercises the `passthrough` hosts
-     under a CA-rewritten trust store) **and** one `gh api repos/418-cloud/krayt/pulls` call
-     (exercises the injected `api.github.com` rule).
+  1. **Get the base digest onto the `FROM` line.** `hack/krayt-dev/Dockerfile:28` is still
+     `ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226` — tag-only. That was deliberate at first
+     (an invented digest is worse than an absent one), but **it must not stay that way**:
+     `agent-images.yml` re-points `:2.1.226` on every build off `main`, so an unpinned `FROM`
+     floats — krayt-dev absorbs base changes silently on any unrelated rebuild, and the Renovate
+     digest PR that is the intended delivery path for a base change (see `dev-image.yml`'s `paths`
+     comment) never gets opened. Renovate should do it (`pinDigests: true` covers the dockerfile
+     manager); confirm its PR lands, or add the digest by hand.
+  2. **The two CA-bundle-sensitive checks, in one run.** No run so far has exercised the Go
+     toolchain inside the container, which is what would catch a wrong concatenated CA bundle:
+     the toolchain talks to `passthrough` hosts whose real upstream chain must still verify while
+     `SSL_CERT_FILE` points at krayt's rewritten bundle. One run with a task that does
+     `go build ./... && go test ./...` **and** `go test -race ./...` (the latter also being the
+     check that `gcc`/`libc6-dev` are actually present on the slim base) closes both. Run it as
+     `KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config krayt.yaml --task <file>` so `proxy.log`
+     records `inject=true` on `api.anthropic.com`/`api.github.com` and only a `CONNECT` line per
+     `passthrough` host — the one remaining observation from the original checklist.
 - **Why the agent can't:** no `docker build`/push access, no live subscription token or PAT, and no
   Apple-Silicon Mac to boot a VM on. The offline half is done and passing:
-  `hack/test-entrypoint-credentials.sh` (now run by `ci.yml`) covers the shared entrypoint's
+  `hack/test-entrypoint-credentials.sh` (run by `ci.yml`) covers the shared entrypoint's
   credential paths plus the branches krayt-dev relies on — model/effort, and that no entrypoint
   touches GH_TOKEN at all (tests 12–15) — and `TestApplyConfigDogfoodsThisRepo` pins the config.
-  With no entrypoint left in the gh path, that Go test is the ONLY thing wiring GitHub auth: it
-  asserts both the `env.GH_TOKEN` placeholder and the `api.github.com` inject rule.
-- **Verify success by**, in order — each one distinguishes a different failure:
-  - every entrypoint log line carries the `[claude-code]` prefix — `authenticated via
-    CLAUDE_CODE_OAUTH_TOKEN` and `trusting krayt's ephemeral MITM CA`. A `[krayt-dev]` line would
-    mean the old image is still pinned. There is deliberately no gh line at all now;
-  - `claude` runs with `--model claude-sonnet-5 --effort high` (the image's ENV defaults reaching
-    the base entrypoint's optional selection branch), or whatever `krayt.yaml`'s `env:` says;
-  - `go test -race ./...` links and runs — the check for `gcc`/`libc6-dev` actually being present
-    on the slim base;
-  - `/run/secrets` contains **neither** credential (the run's `report.md`/`meta.json` list both as
-    injected, names only);
-  - `proxy.log` shows `inject=true` on `api.anthropic.com` and `api.github.com`, and only the
-    `CONNECT` line for each `passthrough` host;
-  - the `gh api` call returns real PR JSON — a 401 means the `Bearer ` prefix or the header name is
-    wrong for a fine-grained PAT, which is the one thing here observed only from GitHub's docs and
-    not from a live krayt run;
-  - `go test ./...` passes **inside** the container. This is the check that would catch the
-    concatenated CA bundle being wrong: the Go toolchain talks to `passthrough` hosts, whose real
-    upstream chain must still verify while `SSL_CERT_FILE` points at krayt's rewritten bundle.
-- **Blocking:** yes for anyone dogfooding through `krayt.yaml` — that path cannot work until the
-  image is rebuilt. Not blocking any other work; runs that pass `--image`/`--allow` by flag are
-  unaffected.
-- **Extended by the trixie+rtk work (`docs/ai-tasks/add-rtk-to-agent-images.md`):** the base this
-  entry is waiting to repin onto now also carries `debian:trixie-slim` and rtk (§ new entry
-  below) — one rebuild picks up all of it, not a separate one. When you do the run in step 5
-  above, also run one command with `KRAYT_RTK=off` (krayt-dev's own README's **Output fidelity
-  with rtk** section) to confirm the opt-out actually disables rewriting inside a real
-  `krayt-dev` container, not just the base image directly.
+- **Blocking:** no longer — dogfooding through `krayt.yaml` works today. The floating `FROM` is a
+  reproducibility risk, not an outage.
 
 ---
 
@@ -153,12 +120,10 @@ shells-out-to-`rtk rewrite` shape. A wrapper that only intercepted `rtk rewrite`
 resolving `rtk hook <agent>` straight through to the real binary. The `images/agents/*/rtk`
 wrapper in this change intercepts all three registered shapes (`rewrite`, `hook claude`, `hook
 gemini`), each mimicking rtk's own "no rewrite" output for that integration (confirmed against
-`hook_cmd.rs`) — this is implemented and offline-tested (a fake binary + all three
-`KRAYT_RTK=off`/`on` combinations). The real `rtk` binary has since been exercised (`rtk 0.45.0`
-runs in the published arm64 image — see the trixie note in
-`images/agents/claude-code/Dockerfile`), but the *wrapper's* behavior still hasn't: every
-`KRAYT_RTK=off` assertion so far was against the fake stand-in, and item 3's negative control is
-what closes that gap. The same source read also settled two things the task asked to verify rather
+`hook_cmd.rs`) — this is implemented, offline-tested (a fake binary + all three
+`KRAYT_RTK=off`/`on` combinations), and **since verified against the real binary in a real run**
+for the Claude Code shape (see "Already verified" below). The same source read also settled two
+things the task asked to verify rather
 than assume: `rtk init --auto-patch`'s default Claude path does **not** write a
 `~/.claude/hooks/rtk-rewrite.sh` script (so no `jq` dependency is needed in any image), and
 Gemini's settings.json patch needs `--auto-patch` too, not just Claude's (its default `Ask` mode
@@ -171,28 +136,41 @@ reads stdin, which a non-interactive `docker build` can't answer — confirmed i
   Claude Code's native installer ran on trixie. It also supersedes the `objdump -p` check this
   entry used to carry: that was only ever a *predictor* of whether the binary would start on this
   glibc, and it demonstrably starts. Renovate pinned the four trixie `FROM` digests in #137.
+- **Also verified — the whole Claude Code path, on arm64, in real runs.** Two `krayt-dev` runs of
+  `docs/common-tasks/verify-rtk-integration.md` against `krayt-dev:sha-cbca700`, positive and
+  negative control, both `exit 0`:
+  - `run_9e0a56de` (rewriting on): the `PreToolUse` entry is a bare `rtk hook claude`, so it
+    resolves through the `/usr/local/bin/rtk` wrapper rather than around it; all five wrapper
+    contract rows matched against the **real** binary, including the two over-broad-wrapper traps;
+    and three plain, unprefixed Bash calls moved `rtk gain`'s independent counters by exactly +3
+    total / +1 on each matching row. That is the hook demonstrably intercepting live tool calls.
+  - `run_378dac2d` (`KRAYT_RTK=off` for the run): the hook still fired on every Bash call
+    (`rtk session`'s Cmds counter grew 40→52) while contributing **zero** rewrites (`rtk gain`
+    flat at 9, `history.db` mtime unchanged), and plain commands came back raw. The discriminator
+    matters: bare "output looks unrewritten" cannot tell an honoured opt-out apart from a hook
+    that never ran.
+  - These also settle "Claude Code still *runs* on trixie" — a 5m47s and a 3m50s session,
+    `claude 2.1.226`, on the trixie chain. Only arm64; amd64 rolls into item 1.
 - **Needed:**
-  1. **The other two images, and the amd64 side.** Only arm64 `krayt-agent-claude-code` has been
-     pulled and run. Confirm the rest actually moved rather than assuming a green
-     `agent-images.yml` run means it happened: `docker buildx imagetools inspect
+  1. **The other two images, and the amd64 side.** Only arm64 has been pulled and run, and only
+     `krayt-agent-claude-code` (via `krayt-dev`). Confirm the rest actually moved rather than
+     assuming a green `agent-images.yml` run means it happened: `docker buildx imagetools inspect
      ghcr.io/418-cloud/krayt-agent-{gemini-cli,opencode}:latest` (or `podman manifest inspect`)
-     showing `linux/amd64,linux/arm64`.
-  2. **Claude Code still *runs* on trixie**, not just installs. The native installer is the whole
-     reason this image is glibc Debian rather than Alpine
-     (`images/agents/claude-code/Dockerfile`'s own header); the image building proves the install,
-     so what's left is `claude --version` or a real run, on both arches.
-  3. **Rewriting actually happens in a real run**, for each of the three agents: a `report.md` or
-     run log showing an `rtk`-prefixed command actually executing, plus the negative control — the
-     same task with `KRAYT_RTK=off` in `krayt.yaml`'s `env:` showing the original, un-rewritten
-     command. Gemini and OpenCode need live Gemini/OpenCode credentials; their rtk integrations
-     have never been exercised against a live binary here, only reasoned about from source.
-  4. **The gemini-cli `--on-question=wait` round-trip AND the settings.json merge, together.**
+     showing `linux/amd64,linux/arm64`, plus one `claude --version` on an amd64 pull.
+  2. **Rewriting actually happens in a real run — for gemini-cli and opencode.** Claude Code is
+     done (above); these two have never been exercised against a live binary, only reasoned about
+     from source, and both need live Gemini/OpenCode credentials. Same shape as the Claude runs: a
+     run log showing an `rtk`-prefixed command executing, plus the `KRAYT_RTK=off` negative
+     control. `docs/common-tasks/verify-rtk-integration.md` is Claude-specific as written (it
+     reads `~/.claude/settings.json` and `rtk hook claude`) — adapt it per agent rather than
+     running it as-is.
+  3. **The gemini-cli `--on-question=wait` round-trip AND the settings.json merge, together.**
      This task's fix means a questions-enabled run should now keep BOTH the `ask_human`
      `mcpServers` entry and rtk's `BeforeTool` hook — confirm the real, built image's
      `~/.gemini/settings.json` has both after a `--on-question=wait` run (this doubles as the
      still-outstanding gemini-cli question-channel check from this file's other `[tooling]`
      entry — do them together rather than as two separate runs).
-  5. **The OpenCode plugin loads without network access.**
+  4. **The OpenCode plugin loads without network access.**
      `~/.config/opencode/plugins/rtk.ts` type-imports `@opencode-ai/plugin` (erased at parse time
      by a TS-aware runtime, confirmed by reading the file — it's a genuine `import type`, not a
      value import) and otherwise uses only the plugin host's injected `$` — so it *should* need no
@@ -207,7 +185,7 @@ reads stdin, which a non-interactive `docker build` can't answer — confirmed i
   `403` on the CONNECT tunnel. `rtk`'s *source* was reachable (via `codeload.github.com`, a GitHub
   source-archive host, not a release-asset host) and is what grounded the corrections above; the
   compiled binary itself was not.
-- **Verify success by:** all five items above, with real command output / a real build log / a
+- **Verify success by:** all four items above, with real command output / a real build log / a
   real `krayt ls` → `done` as the evidence — not the agent's prose.
 - **Blocking:** no — the offline half (hadolint, `go build`/`go test`, the entrypoint-credential
   suite, the gemini merge simulation) already guards the code paths that can be guarded without
