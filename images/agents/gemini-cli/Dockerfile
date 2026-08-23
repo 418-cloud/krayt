@@ -14,7 +14,7 @@
 # this build environment didn't have (see HUMAN_TODO.md). Renovate (pinDigests: true for the
 # dockerfile manager, renovate.json) will open the bootstrap pin PR on its next run — merge that
 # instead of hand-pinning.
-FROM node:24-trixie-slim
+FROM node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d
 
 # ca-certificates: HTTPS to the model API and npm registry; curl: install-time fetches; git:
 # Gemini CLI shells out to it for repo ops; bash: the entrypoint. Nothing else — extend via
