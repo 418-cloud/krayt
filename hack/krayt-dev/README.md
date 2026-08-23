@@ -266,12 +266,23 @@ misleading, not just less convenient:
 - **A full `go test -race` failure list**: rtk's `cargo test`-style compression is built for the
   common "which tests failed" case, not for preserving every line of a race detector's
   interleaved stack trace.
+- **Inspecting the filesystem — `ls`, `stat`, and friends.** This one is worse than lossy, because
+  the failure mode is a *plausible wrong answer* rather than a visibly truncated one. rtk rewrites
+  `ls` too, and its listing drops entries you explicitly asked for (`.`/`..` vanish from an
+  `ls -la`) and rounds sizes (`8742032` → `8.3M`). Two real runs of
+  `docs/common-tasks/verify-rtk-integration.md` against the same image caught it: with rewriting
+  on (`run_9e0a56de`) the agent concluded `~/.local/share/rtk` "does not exist" and that rtk's
+  history DB lived somewhere else; with `KRAYT_RTK=off` (`run_378dac2d`) the same commands showed
+  the directory and a 24576-byte `history.db` exactly where it always was. The first agent then
+  spent real effort inventing an unlink-race theory to explain a directory that was never missing.
+  **If a task's conclusion depends on whether a path exists, run that check with the opt-out.**
 
-Run those two specifically with `KRAYT_RTK=off` (either in the task prompt as a literal env
-prefix, or via `krayt.yaml`'s `env:` block, §8.1) so the commands that produce this evidence
-reach Claude unrewritten. Everything else in a dogfooding run is fine with rtk on — that's the
-default, and it's what saves tokens on the routine `git`/`go build`/`grep` traffic every task
-generates.
+Run those specifically with `KRAYT_RTK=off` (either in the task prompt as a literal env prefix, or
+via `krayt.yaml`'s `env:` block, §8.1) so the commands that produce this evidence reach Claude
+unrewritten. Everything else in a dogfooding run is fine with rtk on — that's the default, and it's
+what saves tokens on the routine `git`/`go build`/`grep` traffic every task generates. How much it
+saves is workload-dependent and can be modest: the positive run above measured ~16% overall on a
+clean repo (74% on `ls -la`, ~22–34% on `git status`, 0% on `git log`/`git diff`).
 
 That lag is why the shared entrypoint is guarded by `hack/test-entrypoint-credentials.sh` in CI
 (`ci.yml`'s build+test job) rather than only by an image build: the script runs the real entrypoint
