@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 # renovate: ignore
+# syntax=docker/dockerfile:1 # renovate: ignore
 # krayt-agent-claude-code — the published, ready-to-run Claude Code onboarding image. Pulls,
 # `krayt run --agent claude-code`, no image building required. Mirrors hack/claude-code/ (an
 # integration/demo fixture that stays as-is) but pins the CLI version and ships under the shared

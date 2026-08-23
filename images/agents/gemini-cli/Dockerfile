@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 # renovate: ignore
+# syntax=docker/dockerfile:1 # renovate: ignore
 # krayt-agent-gemini-cli — the published, ready-to-run Gemini CLI onboarding image. Pulls,
 # `krayt run --agent gemini-cli`, no image building required. Sibling of
 # images/agents/claude-code/ (see that image's README for the shared pattern) under the shared

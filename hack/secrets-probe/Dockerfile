@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 # renovate: ignore
+# syntax=docker/dockerfile:1 # renovate: ignore
 # Exercises the §6.8/§10 secret-confinement fix on hardware (TestSecretConfinementInArtifacts):
 # a NON-ROOT image whose entrypoint reads its mounted credential from /run/secrets and then
 # (carelessly) sprays it into three artifacts — /output/report.md, a tracked /workspace file, and

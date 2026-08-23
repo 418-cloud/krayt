@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 # renovate: ignore
+# syntax=docker/dockerfile:1 # renovate: ignore
 # Throwaway agent image that proves the least-privilege container OCI spec (§6.10, §10,
 # security-review findings #1/#3) on real hardware. Static binary on scratch, run as a numeric
 # non-root uid -> no libc/base-image variables, fewest unknowns (same shape as ../ask-probe).
