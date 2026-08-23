@@ -31,10 +31,11 @@ record of what was verified, and how, lives in `git log` (this file's history th
    (`[tooling]` below). Until that lands, `krayt run --config krayt.yaml` exits 78. **Now also
    waiting on**: the trixie base bump + rtk install (this file's new `[tooling]` entry below) —
    the same rebuild picks both up.
-6. **The trixie base bump + rtk install** — done and offline-verified (hadolint, `go build`/`go
-   test`, the offline entrypoint-credential suite, an offline simulation of the gemini
-   settings.json merge), but every claim that needs a real image build, a real arm64 boot, or a
-   real agent run is unverified — see the new `[tooling]` entry below.
+6. **The trixie base bump + rtk install** — landed, and the decisive check is done: `rtk 0.45.0`
+   runs in the published arm64 `krayt-agent-claude-code`, so the glibc ≥ 2.39 premise behind the
+   base bump holds on real hardware. What remains needs live agent credentials — proof that
+   rewriting (and `KRAYT_RTK=off`) actually takes effect in a run, for each of the three agents —
+   plus the amd64/other-image manifest check. See the `[tooling]` entry below.
 
 (The two `hadolint`-the-{gemini-cli,opencode}-Dockerfile entries formerly here are resolved: this
 task's own Verify step ran `hadolint` against both — clean, same pre-existing warnings as
@@ -153,49 +154,45 @@ resolving `rtk hook <agent>` straight through to the real binary. The `images/ag
 wrapper in this change intercepts all three registered shapes (`rewrite`, `hook claude`, `hook
 gemini`), each mimicking rtk's own "no rewrite" output for that integration (confirmed against
 `hook_cmd.rs`) — this is implemented and offline-tested (a fake binary + all three
-`KRAYT_RTK=off`/`on` combinations), but never against the *real* `rtk` binary, since it could not
-be downloaded here. The same source read also settled two things the task asked to verify rather
+`KRAYT_RTK=off`/`on` combinations). The real `rtk` binary has since been exercised (`rtk 0.45.0`
+runs in the published arm64 image — see the trixie note in
+`images/agents/claude-code/Dockerfile`), but the *wrapper's* behavior still hasn't: every
+`KRAYT_RTK=off` assertion so far was against the fake stand-in, and item 3's negative control is
+what closes that gap. The same source read also settled two things the task asked to verify rather
 than assume: `rtk init --auto-patch`'s default Claude path does **not** write a
 `~/.claude/hooks/rtk-rewrite.sh` script (so no `jq` dependency is needed in any image), and
 Gemini's settings.json patch needs `--auto-patch` too, not just Claude's (its default `Ask` mode
 reads stdin, which a non-interactive `docker build` can't answer — confirmed in
 `src/hooks/init.rs`).
+- **Already verified — do not redo:** `rtk 0.45.0` runs inside the published arm64
+  `krayt-agent-claude-code` (`podman run --rm --platform linux/arm64 --entrypoint rtk
+  ghcr.io/418-cloud/krayt-agent-claude-code:latest --version`), which settles the glibc ≥ 2.39
+  premise the whole trixie bump exists for, proves that image published on arm64, and proves
+  Claude Code's native installer ran on trixie. It also supersedes the `objdump -p` check this
+  entry used to carry: that was only ever a *predictor* of whether the binary would start on this
+  glibc, and it demonstrably starts. Renovate pinned the four trixie `FROM` digests in #137.
 - **Needed:**
-  1. **Build and push all three images on both arches** — `agent-images.yml` does this on merge;
-     confirm the digests actually moved (`docker buildx imagetools inspect
-     ghcr.io/418-cloud/krayt-agent-{claude-code,gemini-cli,opencode}:latest` shows
-     `linux/amd64,linux/arm64`) rather than assuming a green workflow run means it happened.
-  2. **`rtk --version` inside the arm64 image.** This is the single decisive check for the whole
-     premise of the trixie bump: `docker run --rm --platform linux/arm64
-     ghcr.io/418-cloud/krayt-agent-claude-code:latest rtk --version` (or equivalent for the other
-     two) must succeed, not fail with `version 'GLIBC_2.39' not found`. Only fails on arm64 —
-     amd64 (musl) is unaffected either way, so an amd64-only smoke test would miss a real
-     regression here.
-  3. **Claude Code still installs and runs on trixie.** The native installer is the whole reason
-     this image is glibc Debian rather than Alpine (`images/agents/claude-code/Dockerfile`'s own
-     header) — needs a real build plus `claude --version` (or a real run) on both arches.
-  4. **Confirm the objdump premise directly, if you have a machine that can reach
-     `release-assets.githubusercontent.com`:**
-     ```sh
-     curl -fsSL -o rtk-arm64.tar.gz \
-       https://github.com/rtk-ai/rtk/releases/download/v0.45.0/rtk-aarch64-unknown-linux-gnu.tar.gz
-     tar -xzf rtk-arm64.tar.gz rtk && objdump -p rtk | sed -n '/Version References/,/^$/p'
-     ```
-     expect a `GLIBC_2.39` line under `libc.so.6`. Not done in this sandbox — that host is
-     blocked here (confirmed via a `403` on the CONNECT tunnel), which is also why the rtk
-     wrapper below was verified only against a fake stand-in binary, never the real one.
-  5. **Rewriting actually happens in a real run**, for each of the three agents: a `report.md` or
+  1. **The other two images, and the amd64 side.** Only arm64 `krayt-agent-claude-code` has been
+     pulled and run. Confirm the rest actually moved rather than assuming a green
+     `agent-images.yml` run means it happened: `docker buildx imagetools inspect
+     ghcr.io/418-cloud/krayt-agent-{gemini-cli,opencode}:latest` (or `podman manifest inspect`)
+     showing `linux/amd64,linux/arm64`.
+  2. **Claude Code still *runs* on trixie**, not just installs. The native installer is the whole
+     reason this image is glibc Debian rather than Alpine
+     (`images/agents/claude-code/Dockerfile`'s own header); the image building proves the install,
+     so what's left is `claude --version` or a real run, on both arches.
+  3. **Rewriting actually happens in a real run**, for each of the three agents: a `report.md` or
      run log showing an `rtk`-prefixed command actually executing, plus the negative control — the
      same task with `KRAYT_RTK=off` in `krayt.yaml`'s `env:` showing the original, un-rewritten
      command. Gemini and OpenCode need live Gemini/OpenCode credentials; their rtk integrations
      have never been exercised against a live binary here, only reasoned about from source.
-  6. **The gemini-cli `--on-question=wait` round-trip AND the settings.json merge, together.**
+  4. **The gemini-cli `--on-question=wait` round-trip AND the settings.json merge, together.**
      This task's fix means a questions-enabled run should now keep BOTH the `ask_human`
      `mcpServers` entry and rtk's `BeforeTool` hook — confirm the real, built image's
      `~/.gemini/settings.json` has both after a `--on-question=wait` run (this doubles as the
      still-outstanding gemini-cli question-channel check from this file's other `[tooling]`
      entry — do them together rather than as two separate runs).
-  7. **The OpenCode plugin loads without network access.**
+  5. **The OpenCode plugin loads without network access.**
      `~/.config/opencode/plugins/rtk.ts` type-imports `@opencode-ai/plugin` (erased at parse time
      by a TS-aware runtime, confirmed by reading the file — it's a genuine `import type`, not a
      value import) and otherwise uses only the plugin host's injected `$` — so it *should* need no
@@ -203,13 +200,6 @@ reads stdin, which a non-interactive `docker build` can't answer — confirmed i
      run's allowlist blocks the npm registry and this would need to be pre-baked into the image.
      Unproven either way — this is the same open question opencode's own outstanding
      `[tooling]` entry below already carries; resolve both together.
-  8. **Trixie digest pins.** All four `FROM` lines that moved to trixie
-     (`images/agents/{claude-code,opencode}/Dockerfile`, `hack/claude-code/Dockerfile` →
-     `debian:trixie-slim`; `images/agents/gemini-cli/Dockerfile` → `node:24-trixie-slim`) are
-     tag-only, deliberately — this sandbox's egress proxy blocks `registry-1.docker.io` and
-     `ghcr.io` (confirmed via `403`s), so no digest could be resolved without inventing one. The
-     Renovate bootstrap pin PR (`pinDigests: true`, `renovate.json`) is the handoff, same pattern
-     as gemini-cli's pre-existing `node:24-bookworm-slim` pin before it.
 - **Why the agent can't:** no `docker build`/push access; no live Anthropic/Gemini/OpenCode
   credential; and this sandbox's own egress proxy allowlists only `github.com`/`api.github.com`/
   `codeload.github.com`/`api.anthropic.com` — `registry-1.docker.io`, `ghcr.io`, and
@@ -217,7 +207,7 @@ reads stdin, which a non-interactive `docker build` can't answer — confirmed i
   `403` on the CONNECT tunnel. `rtk`'s *source* was reachable (via `codeload.github.com`, a GitHub
   source-archive host, not a release-asset host) and is what grounded the corrections above; the
   compiled binary itself was not.
-- **Verify success by:** all eight items above, with real command output / a real build log / a
+- **Verify success by:** all five items above, with real command output / a real build log / a
   real `krayt ls` → `done` as the evidence — not the agent's prose.
 - **Blocking:** no — the offline half (hadolint, `go build`/`go test`, the entrypoint-credential
   suite, the gemini merge simulation) already guards the code paths that can be guarded without

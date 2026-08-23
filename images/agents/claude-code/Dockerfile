@@ -11,11 +11,9 @@
 # GLIBC_2.39 in its libc.so.6 version requirements. bookworm ships glibc 2.36 — the binary would
 # install and then fail to start with "version 'GLIBC_2.39' not found", on the exact arch
 # (arm64) Apple-Silicon dogfooding runs on. trixie ships glibc 2.41, comfortably over that floor.
-#
-# NOT digest-pinned: resolving the current debian:trixie-slim digest needs registry access this
-# build environment didn't have (see HUMAN_TODO.md). Renovate (pinDigests: true for the
-# dockerfile manager, renovate.json) will open the bootstrap pin PR on its next run — merge that
-# instead of hand-pinning.
+# Confirmed against the real binary in the published image, not just the version tables:
+# `podman run --rm --platform linux/arm64 --entrypoint rtk <this image>:latest --version` prints
+# `rtk 0.45.0`. That check only fails on arm64 — amd64 pulls a musl build and clears any floor.
 FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 # git: Claude Code shells out to it for repo ops; curl + ca-certificates: install + HTTPS to the
@@ -39,6 +37,7 @@ COPY --chmod=0755 entrypoint.sh /usr/local/bin/krayt-agent-entrypoint
 # above). Bumped by Renovate's custom regex manager (renovate.json). The binary lands at
 # /usr/local/lib/rtk/rtk, deliberately NOT on PATH — the `rtk` wrapper below is what's actually on
 # PATH, so KRAYT_RTK=off (see ./rtk) can't be bypassed by anything resolving `rtk` normally.
+ARG CLAUDE_CODE_VERSION=2.1.226
 ARG RTK_VERSION=0.45.0
 ARG TARGETARCH
 RUN set -eu; \
@@ -64,7 +63,6 @@ WORKDIR /home/agent
 # <version>` pins the exact release instead of tracking `latest`. Downloaded to a file and run
 # explicitly (rather than piped straight into bash) so a failed/truncated fetch is caught by
 # curl's own exit code instead of silently executing a partial script.
-ARG CLAUDE_CODE_VERSION=2.1.226
 RUN curl -fsSL -o /tmp/claude-install.sh https://claude.ai/install.sh \
  && bash /tmp/claude-install.sh "${CLAUDE_CODE_VERSION}" \
  && rm -f /tmp/claude-install.sh
