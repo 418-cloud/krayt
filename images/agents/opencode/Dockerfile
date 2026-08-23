@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 # renovate: ignore
 # krayt-agent-opencode — the published, ready-to-run opencode onboarding image. Pulls,
 # `krayt run --agent opencode`, no image building required. Sibling of
 # images/agents/claude-code/ and images/agents/gemini-cli/ (see those images' READMEs for the
@@ -14,7 +14,7 @@
 # build environment didn't have (see HUMAN_TODO.md). Renovate (pinDigests: true for the
 # dockerfile manager, renovate.json) will open the bootstrap pin PR on its next run — merge that
 # instead of hand-pinning.
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 # git: opencode shells out to it for repo ops; curl + ca-certificates: install-time fetches +
 # HTTPS to the model API; bash: the entrypoint. Nothing else — extend via `FROM` + `apt-get`

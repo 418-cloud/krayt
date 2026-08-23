@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 # renovate: ignore
 # krayt-agent-claude-code — the published, ready-to-run Claude Code onboarding image. Pulls,
 # `krayt run --agent claude-code`, no image building required. Mirrors hack/claude-code/ (an
 # integration/demo fixture that stays as-is) but pins the CLI version and ships under the shared
@@ -16,7 +16,7 @@
 # build environment didn't have (see HUMAN_TODO.md). Renovate (pinDigests: true for the
 # dockerfile manager, renovate.json) will open the bootstrap pin PR on its next run — merge that
 # instead of hand-pinning.
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 # git: Claude Code shells out to it for repo ops; curl + ca-certificates: install + HTTPS to the
 # model API; bash: the entrypoint. Nothing else — extend via `FROM` + `apt-get` (see README).

@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 # renovate: ignore
 # Positive-control agent image for TestEndToEndRealVM / TestConcurrentRealVMs (§14 Phase 2): a
 # trivial, credential-free user image whose entrypoint edits one file in /workspace and exits 0.
 # This is the KRAYT_IMAGE the end-to-end suite needs — "a trivial user image that edits a file in
