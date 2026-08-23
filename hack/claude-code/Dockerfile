@@ -5,7 +5,16 @@
 #
 # Debian slim (glibc) so the official native `claude` binary runs; a dedicated non-root user
 # because Claude Code refuses to run as uid 0 (§8.2 container contract).
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+#
+# trixie, matching images/agents/claude-code/Dockerfile (see that file for why: rtk's arm64
+# release needs glibc >= 2.39, which bookworm's 2.36 doesn't clear but trixie's 2.41 does — this
+# fixture stays on the same base generation as the published image it mirrors).
+#
+# NOT digest-pinned: resolving the current debian:trixie-slim digest needs registry access this
+# build environment didn't have (see HUMAN_TODO.md). Renovate (pinDigests: true for the
+# dockerfile manager, renovate.json) will open the bootstrap pin PR on its next run — merge that
+# instead of hand-pinning.
+FROM debian:trixie-slim
 
 # git: Claude Code shells out to it for repo ops; curl + ca-certificates: install + HTTPS to the
 # model API; bash: the entrypoint.

@@ -8,11 +8,28 @@ The published, ready-to-run Gemini CLI onboarding image:
 
 ## What's inside
 
-Minimal, on purpose: `node:24-bookworm-slim` (Node's current LTS, "krypton") +
+Minimal, on purpose: `node:24-trixie-slim` (Node's current LTS, "krypton") +
 `ca-certificates curl git bash`, the non-root `node` user the base image already ships (uid
-1000 — reused rather than creating a second one), and a version-pinned Gemini CLI
-(`@google/gemini-cli`, installed globally via npm). Nothing else — extend it (see below) rather
-than asking upstream to add tools.
+1000 — reused rather than creating a second one), a version-pinned Gemini CLI
+(`@google/gemini-cli`, installed globally via npm), and [`rtk`](https://github.com/rtk-ai/rtk)
+(below). Nothing else — extend it (see below) rather than asking upstream to add tools.
+
+## rtk (automatic command-output compression)
+
+[`rtk`](https://github.com/rtk-ai/rtk) ("Rust Token Killer", Apache-2.0) sits in front of common
+dev commands and compresses their output before Gemini reads it (`rtk git status`, `rtk grep`,
+…) — every byte of command output in a headless run becomes model context, so this can be a
+large token saving on chatty commands. It's wired into Gemini CLI's own `BeforeTool` hook
+(`rtk init --global --gemini --auto-patch`, run at build time as the `node` user, which merges
+into `~/.gemini/settings.json` alongside the auto-update/usage-stats keys baked in above), so
+**rewriting is automatic** — no task-side change needed.
+
+**Opt out per run** with `KRAYT_RTK=off` (a `krayt.yaml` `env:` entry, §8.1, or `krayt run --env
+KRAYT_RTK=off`): the hook falls back to the original, unrewritten command for that run. `rtk`
+itself stays on `PATH` either way — a task can still invoke `rtk <cmd>` directly even with
+rewriting off. rtk needs **no egress** (it never makes a network call at runtime;
+`RTK_TELEMETRY_DISABLED=1` is set as belt-and-braces on top of the run's egress allowlist
+already denying it, §6.6) and **no secret**.
 
 The entrypoint (`entrypoint.sh`, baked in as `/usr/local/bin/krayt-agent-entrypoint`) exports
 the credential from `/run/secrets` into the environment, registers the `ask_human` MCP server

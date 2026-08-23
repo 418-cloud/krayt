@@ -6,10 +6,15 @@
 # images/agents/opencode/README.md).
 #
 # opencode ships a self-contained binary (no npm/native-installer story), so the base is plain
-# debian:bookworm-slim (glibc) — same tag+digest already pinned in images/agents/claude-code/
-# (reused rather than re-resolved, since it's the identical upstream reference) — keeping the
-# `apt-get` extension story uniform across every agent image.
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+# debian:trixie-slim (glibc) — same tag already used in images/agents/claude-code/ (reused rather
+# than re-resolved, since it's the identical upstream reference — see that Dockerfile for why
+# trixie specifically) — keeping the `apt-get` extension story uniform across every agent image.
+#
+# NOT digest-pinned: resolving the current debian:trixie-slim digest needs registry access this
+# build environment didn't have (see HUMAN_TODO.md). Renovate (pinDigests: true for the
+# dockerfile manager, renovate.json) will open the bootstrap pin PR on its next run — merge that
+# instead of hand-pinning.
+FROM debian:trixie-slim
 
 # git: opencode shells out to it for repo ops; curl + ca-certificates: install-time fetches +
 # HTTPS to the model API; bash: the entrypoint. Nothing else — extend via `FROM` + `apt-get`
@@ -54,6 +59,33 @@ RUN mkdir -p /home/agent/.cache/opencode \
  && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o /home/agent/.cache/opencode/models.json https://models.opencode.ai/api.json \
  && chown -R agent:agent /home/agent/.cache
 
+# rtk (Rust Token Killer, Apache-2.0, https://github.com/rtk-ai/rtk): sits in front of common dev
+# commands and compresses their output before this headless agent reads it — every byte of
+# command output here becomes model context. Installed as a pinned prebuilt release tarball, the
+# same exception pattern as opencode's own install above and hack/krayt-dev's protoc/gh/hadolint
+# layers: no Rust toolchain, no `cargo install` (the crates.io `rtk` crate is an unrelated
+# project, "Rust Type Kit — query Rust types and produce FFI types"). Asset names are per-arch and
+# NOT symmetric — amd64 is musl, arm64 is gnu, and the gnu build's glibc floor is why this image
+# is trixie (see the FROM comment above). Bumped by Renovate's custom regex manager
+# (renovate.json). The binary lands at /usr/local/lib/rtk/rtk, deliberately NOT on PATH — the
+# `rtk` wrapper below is what's actually on PATH, so KRAYT_RTK=off (see ./rtk) can't be bypassed
+# by anything resolving `rtk` normally.
+ARG RTK_VERSION=0.45.0
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) rtk_target=x86_64-unknown-linux-musl ;; \
+      arm64) rtk_target=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o /tmp/rtk.tar.gz \
+      "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-${rtk_target}.tar.gz" \
+ && tar -xzf /tmp/rtk.tar.gz -C /tmp \
+ && install -d -m 0755 /usr/local/lib/rtk \
+ && install -m 0755 /tmp/rtk /usr/local/lib/rtk/rtk \
+ && rm -f /tmp/rtk.tar.gz /tmp/rtk
+
+COPY --chmod=0755 rtk /usr/local/bin/rtk
+
 USER agent
 WORKDIR /home/agent
 
@@ -64,5 +96,22 @@ WORKDIR /home/agent
 # network/disk behaviors worth turning off here).
 ENV OPENCODE_DISABLE_AUTOUPDATE=true \
     OPENCODE_DISABLE_MODELS_FETCH=true
+
+# rtk's own telemetry is opt-in and off by default, and the run's egress allowlist denies unknown
+# destinations anyway (§6.6) — belt-and-braces. Also load-bearing for the RUN below: `rtk init`
+# prompts for telemetry consent unless this is set (verified against src/hooks/init.rs's
+# prompt_telemetry_consent, which checks this var before its TTY heuristic — some non-interactive
+# builders hand a process a pseudo-TTY, which would otherwise hang here).
+ENV RTK_TELEMETRY_DISABLED=1
+
+# Wire rtk's native OpenCode integration, as the image's own non-root user (rtk's --global writes
+# into $HOME). This writes ~/.config/opencode/plugins/rtk.ts — a thin plugin that shells out to
+# `rtk rewrite` (confirmed against rtk's own source, hooks/opencode/rtk.ts) — and nothing under
+# ~/.claude: --opencode makes `rtk init` install ONLY the OpenCode plugin, not Claude Code's hook
+# too (confirmed against src/hooks/init.rs's dispatch: `--opencode` sets install_claude = false).
+# `rtk init --show` only ever reports Claude/Codex status (src/hooks/init.rs's show_config), so it
+# would misleadingly print "not registered" here; cat the actual plugin file into the build log
+# instead as evidence it was written.
+RUN rtk init --global --opencode && cat "$HOME/.config/opencode/plugins/rtk.ts"
 
 ENTRYPOINT ["krayt-agent-entrypoint"]

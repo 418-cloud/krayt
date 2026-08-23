@@ -1,0 +1,31 @@
+#!/bin/sh
+# krayt: per-run opt-out for rtk's automatic command rewriting (KRAYT_RTK=off, settable per run
+# via krayt.yaml's `env:` block, §8.1).
+#
+# rtk ships no disable switch of its own. Verified against its real v0.45.0 source
+# (src/hooks/hook_cmd.rs, src/hooks/init.rs): OpenCode's plugin (hooks/opencode/rtk.ts) is a thin
+# delegate that shells out to `rtk rewrite`, but Claude Code's and Gemini CLI's hooks are NOT —
+# both register `rtk hook claude` / `rtk hook gemini` as native in-process handlers (this
+# replaced an older shape where a shell script itself called `rtk rewrite`). So the opt-out has
+# to cover all three registered shapes, each mimicking rtk's own "no rewrite" output for that
+# integration:
+#   - `rtk rewrite ...` -> exit 1, rtk's own "no rtk equivalent" code (OpenCode's plugin already
+#     treats a failed/empty `rtk rewrite` as pass-through)
+#   - `rtk hook claude`  -> exit 0, no stdout (identical to rtk's own Ignore/Skip branches;
+#     Claude Code treats an empty PreToolUse response as "proceed unchanged")
+#   - `rtk hook gemini`  -> exit 0, rtk's own allow-with-no-rewrite JSON
+# Direct `rtk <cmd>` invocations (anything else, including `rtk hook claude`/`rtk hook gemini`
+# when rewriting is ON) are unaffected — only these three shapes are gated, so a task can still
+# opt individual commands in by hand.
+if [ "${KRAYT_RTK:-on}" = "off" ]; then
+  case "$1" in
+    rewrite) exit 1 ;;
+    hook)
+      case "$2" in
+        claude) exit 0 ;;
+        gemini) echo '{"decision":"allow"}'; exit 0 ;;
+      esac
+      ;;
+  esac
+fi
+exec /usr/local/lib/rtk/rtk "$@"

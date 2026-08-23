@@ -107,27 +107,47 @@ git config --global --add safe.directory '*' 2>/dev/null || true
 # MCP server so Gemini can ask the human. Gemini CLI configures MCP servers via the top-level
 # `mcpServers` key in settings.json (packages/cli/src/config/settingsSchema.ts,
 # schemas/settings.schema.json) — there is no per-invocation --mcp-config flag like Claude Code's,
-# so rewrite the settings file baked at build time, repeating its two static keys (auto-update and
-# usage-stats off) so they stay in effect. `krayt-ask --mcp` bridges to the question-channel
-# socket. krayt-ask itself is bind-mounted by the guest onto /usr/local/bin/krayt-ask — never
-# baked into the image. In fail mode the var is unset and settings.json keeps its build-time
-# contents (no mcpServers) — the run stays autonomous.
+# so this patches the settings file rather than replacing it wholesale.
+#
+# MERGE, don't overwrite. This used to `cat > "$SETTINGS_FILE"` the whole file, hand-repeating the
+# two build-time keys (auto-update/usage-stats off) so they'd survive. That silently destroyed any
+# OTHER key already in the file — concretely, the rtk hook's own `hooks.BeforeTool` entry
+# (images/agents/gemini-cli/Dockerfile's `rtk init --global --gemini` merges that in at build
+# time), so every questions-enabled run (`--on-question=wait`) lost automatic command rewriting
+# with no error, while `fail`-mode runs kept it — a divergence that would have been easy to miss
+# since nothing about it looks broken. `node` is guaranteed on PATH in this image (it's the base
+# runtime gemini-cli itself needs), so use it to parse-merge-write JSON properly instead of
+# hand-building JSON in a shell heredoc: read what's there, add/overwrite only `general`,
+# `privacy`, and `mcpServers.ask-human`, leave every other key (rtk's `hooks`, anything else)
+# untouched. `krayt-ask --mcp` bridges to the question-channel socket; krayt-ask itself is
+# bind-mounted by the guest onto /usr/local/bin/krayt-ask — never baked into the image. In fail
+# mode the var is unset and settings.json keeps its build-time contents untouched — the run stays
+# autonomous.
 if [ -n "${KRAYT_ASK_SOCKET:-}" ] && command -v krayt-ask >/dev/null 2>&1; then
   mkdir -p "$(dirname "$SETTINGS_FILE")"
-  cat > "$SETTINGS_FILE" <<EOF
-{
-  "general": { "enableAutoUpdate": false },
-  "privacy": { "usageStatisticsEnabled": false },
-  "mcpServers": {
-    "ask-human": {
-      "command": "krayt-ask",
-      "args": ["--mcp"],
-      "env": { "KRAYT_ASK_SOCKET": "${KRAYT_ASK_SOCKET}" }
+  SETTINGS_FILE="$SETTINGS_FILE" KRAYT_ASK_SOCKET="$KRAYT_ASK_SOCKET" node -e '
+    const fs = require("fs");
+    const path = process.env.SETTINGS_FILE;
+    let settings = {};
+    if (fs.existsSync(path)) {
+      try {
+        settings = JSON.parse(fs.readFileSync(path, "utf8"));
+      } catch (e) {
+        settings = {};
+      }
     }
-  }
-}
-EOF
-  echo "[gemini-cli] registered ask_human MCP server (questions enabled)"
+    settings.general = Object.assign({ enableAutoUpdate: false }, settings.general);
+    settings.privacy = Object.assign({ usageStatisticsEnabled: false }, settings.privacy);
+    settings.mcpServers = Object.assign({}, settings.mcpServers, {
+      "ask-human": {
+        command: "krayt-ask",
+        args: ["--mcp"],
+        env: { KRAYT_ASK_SOCKET: process.env.KRAYT_ASK_SOCKET },
+      },
+    });
+    fs.writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+  '
+  echo "[gemini-cli] registered ask_human MCP server (questions enabled), merged into existing settings.json"
 fi
 
 # Gemini CLI gates tool use on whether it considers the working folder "trusted". In a headless

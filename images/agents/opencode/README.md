@@ -9,10 +9,26 @@ The published, ready-to-run opencode onboarding image:
 
 ## What's inside
 
-Minimal, on purpose: `debian:bookworm-slim` (digest-pinned) + `ca-certificates curl git bash`,
-the non-root `agent` user (uid 1000), and a version-pinned opencode binary (opencode ships a
-self-contained release binary, not an npm package or native installer). Nothing else — extend it
-(see below) rather than asking upstream to add tools.
+Minimal, on purpose: `debian:trixie-slim` + `ca-certificates curl git bash`, the non-root `agent`
+user (uid 1000), a version-pinned opencode binary (opencode ships a self-contained release
+binary, not an npm package or native installer), and [`rtk`](https://github.com/rtk-ai/rtk)
+(below). Nothing else — extend it (see below) rather than asking upstream to add tools.
+
+## rtk (automatic command-output compression)
+
+[`rtk`](https://github.com/rtk-ai/rtk) ("Rust Token Killer", Apache-2.0) sits in front of common
+dev commands and compresses their output before opencode reads it (`rtk git status`, `rtk grep`,
+…) — every byte of command output in a headless run becomes model context, so this can be a
+large token saving on chatty commands. It's wired into opencode's own plugin hook
+(`rtk init --global --opencode`, run at build time as the `agent` user, which writes
+`~/.config/opencode/plugins/rtk.ts`), so **rewriting is automatic** — no task-side change needed.
+
+**Opt out per run** with `KRAYT_RTK=off` (a `krayt.yaml` `env:` entry, §8.1, or `krayt run --env
+KRAYT_RTK=off`): the plugin falls back to the original, unrewritten command for that run. `rtk`
+itself stays on `PATH` either way — a task can still invoke `rtk <cmd>` directly even with
+rewriting off. rtk needs **no egress** (it never makes a network call at runtime;
+`RTK_TELEMETRY_DISABLED=1` is set as belt-and-braces on top of the run's egress allowlist
+already denying it, §6.6) and **no secret**.
 
 The entrypoint (`entrypoint.sh`, baked in as `/usr/local/bin/krayt-agent-entrypoint`) exports the
 credential from `/run/secrets` into the environment, registers the `ask_human` MCP server when
