@@ -156,7 +156,7 @@ if [ -n "${KRAYT_ASK_SOCKET:-}" ] && command -v krayt-ask >/dev/null 2>&1; then
   '; then
     echo "[gemini-cli] registered ask_human MCP server (questions enabled), merged into existing settings.json"
   else
-    echo "[gemini-cli] WARNING: could not merge $SETTINGS_FILE (invalid JSON) — skipping ask_human MCP registration, existing file left untouched" >&2
+    echo "[gemini-cli] WARNING: could not merge $SETTINGS_FILE (see error above) — skipping ask_human MCP registration, existing file left untouched" >&2
   fi
 fi
 
