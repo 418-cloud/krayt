@@ -9,11 +9,6 @@
 # trixie, matching images/agents/claude-code/Dockerfile (see that file for why: rtk's arm64
 # release needs glibc >= 2.39, which bookworm's 2.36 doesn't clear but trixie's 2.41 does — this
 # fixture stays on the same base generation as the published image it mirrors).
-#
-# NOT digest-pinned: resolving the current debian:trixie-slim digest needs registry access this
-# build environment didn't have (see HUMAN_TODO.md). Renovate (pinDigests: true for the
-# dockerfile manager, renovate.json) will open the bootstrap pin PR on its next run — merge that
-# instead of hand-pinning.
 FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 # git: Claude Code shells out to it for repo ops; curl + ca-certificates: install + HTTPS to the
