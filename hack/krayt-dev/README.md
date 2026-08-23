@@ -10,7 +10,12 @@ claude-code`, with the krayt repo injected at `/workspace`.
 
 `FROM ghcr.io/418-cloud/krayt-agent-claude-code:<cli-version>` — this image is that one **plus**
 krayt's dev toolchain, not a parallel re-derivation of it. Inherited: the non-root `agent` user
-(uid 1000), the version-pinned Claude Code CLI, and the `DISABLE_*` egress env.
+(uid 1000), the version-pinned Claude Code CLI, the `DISABLE_*` egress env, and
+[`rtk`](https://github.com/rtk-ai/rtk) (automatic command-output compression, wired into Claude
+Code's `PreToolUse` hook, opt-out per run via `KRAYT_RTK=off` — see the base image's README and
+**Output fidelity with rtk** below). This image adds no rtk install of its own — installing it a
+second time here would drift from the base exactly the way a second entrypoint copy once did
+(see below).
 
 **There is no entrypoint here at all** — the base's `krayt-agent-entrypoint` is inherited as-is. It
 owns the §6.14 credential resolution, the §8.2 `KRAYT_CA_CERT` trust setup, the `ask_human` MCP
@@ -242,6 +247,31 @@ The base change therefore lands in git as a reviewable commit rather than being 
 on the next unrelated rebuild — which is also why the `FROM` **must** stay digest-pinned. The
 `:<cli-version>` tag is re-pointed by `agent-images.yml` on every build off `main`, so an unpinned
 `FROM` would float, and step 2 would never happen.
+
+`rtk` reaches this image through exactly this chain — it was added to
+`krayt-agent-claude-code`'s own Dockerfile, not this one, so it shows up here only once that
+image is republished and this image's digest pin is bumped to follow it. See `HUMAN_TODO.md` for
+the outstanding rebuild/repin this image is already waiting on.
+
+## Output fidelity with rtk
+
+rtk (inherited from the base image, above) compresses and truncates command output by design —
+that's the whole point for a normal dogfooding task. But two things this image is specifically
+for depend on **verbatim** output, and a truncated or rewritten version of either is actively
+misleading, not just less convenient:
+
+- **Regenerating `vendorHash`** (below): the real fix is pasting the exact `got: sha256-…` value
+  from a `nix build` hash-mismatch error. A compressed or reformatted copy of that line risks a
+  subtly wrong hash landing in `images/flake.nix` — worse than not regenerating it at all.
+- **A full `go test -race` failure list**: rtk's `cargo test`-style compression is built for the
+  common "which tests failed" case, not for preserving every line of a race detector's
+  interleaved stack trace.
+
+Run those two specifically with `KRAYT_RTK=off` (either in the task prompt as a literal env
+prefix, or via `krayt.yaml`'s `env:` block, §8.1) so the commands that produce this evidence
+reach Claude unrewritten. Everything else in a dogfooding run is fine with rtk on — that's the
+default, and it's what saves tokens on the routine `git`/`go build`/`grep` traffic every task
+generates.
 
 That lag is why the shared entrypoint is guarded by `hack/test-entrypoint-credentials.sh` in CI
 (`ci.yml`'s build+test job) rather than only by an image build: the script runs the real entrypoint

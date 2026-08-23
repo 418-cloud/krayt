@@ -41,7 +41,7 @@ ARG GOLANGCI_LINT_VERSION=v2.12.2
 ARG GH_CLI_VERSION=2.96.0
 ARG HADOLINT_VERSION=2.15.1
 
-# The base image is debian:bookworm-slim + `ca-certificates curl git bash`; these are what krayt's
+# The base image is debian:trixie-slim + `ca-certificates curl git bash`; these are what krayt's
 # toolchain needs on top. gcc + libc6-dev are not optional: `go test -race` requires cgo, so
 # without a C toolchain the race detector — which CI and every dogfooding task run — fails to
 # link. unzip: protoc's release archive is a zip. xz-utils: the Nix installer's tarball is .tar.xz.

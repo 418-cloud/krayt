@@ -339,11 +339,13 @@ design.
 ### Agent images
 
 krayt publishes official, minimal, version-pinned container images with an agent already
-installed — no `docker build` required to try krayt. Each is `debian:bookworm-slim` (or the
-agent's required base, e.g. `node:24-bookworm-slim` for gemini-cli) plus a non-root user, the
-CLI, and nothing else; extend one with `FROM` + `apt-get` for your own tools (see each image's
-README). Built by [`agent-images.yml`](./.github/workflows/agent-images.yml), tagged `:latest`,
-`:sha-<short>`, and `:<cli-version>`.
+installed — no `docker build` required to try krayt. Each is `debian:trixie-slim` (or the
+agent's required base, e.g. `node:24-trixie-slim` for gemini-cli) plus a non-root user, the
+CLI, [`rtk`](https://github.com/rtk-ai/rtk) (wired into the agent's own pre-tool hook so common
+command output is compressed automatically — opt out per run with `KRAYT_RTK=off`, needs no
+egress and no secret), and nothing else; extend one with `FROM` + `apt-get` for your own tools
+(see each image's README). Built by [`agent-images.yml`](./.github/workflows/agent-images.yml),
+tagged `:latest`, `:sha-<short>`, and `:<cli-version>`.
 
 | Image | `--agent` | Credential (exactly one) | Required `--allow` |
 |---|---|---|---|

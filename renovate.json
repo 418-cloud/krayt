@@ -113,6 +113,15 @@
       "datasourceTemplate": "github-releases",
       "packageNameTemplate": "anomalyco/opencode",
       "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "images/agents/*/Dockerfile: rtk (Rust Token Killer), fetched as a release tarball (Rust binary, no Dockerfile-manager datasource; the crates.io `rtk` crate is an unrelated project)",
+      "managerFilePatterns": ["^images/agents/[^/]+/Dockerfile$"],
+      "matchStrings": ["ARG RTK_VERSION=(?<currentValue>.*?)\\n"],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "rtk-ai/rtk",
+      "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ],
   "packageRules": [

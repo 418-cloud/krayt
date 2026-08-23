@@ -30,7 +30,7 @@ files and add to it; never revert the sibling adapter.
 ## Decisions (already made — don't re-litigate)
 
 - Home: `images/agents/codex/`; registry `ghcr.io/418-cloud/krayt-agent-codex`.
-- Base: `debian:bookworm-slim`, digest-pinned. Upstream ships a **static musl** binary, so no
+- Base: `debian:trixie-slim`, digest-pinned. Upstream ships a **static musl** binary, so no
   Node runtime is needed and the `apt-get` extension story stays uniform with the others.
 - Contents: **minimal** — `ca-certificates curl git bash`, the non-root uid-1000 `agent` user,
   the entrypoint, and the pinned `codex` binary. Nothing else.
