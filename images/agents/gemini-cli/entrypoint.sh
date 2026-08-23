@@ -125,19 +125,26 @@ git config --global --add safe.directory '*' 2>/dev/null || true
 # autonomous.
 if [ -n "${KRAYT_ASK_SOCKET:-}" ] && command -v krayt-ask >/dev/null 2>&1; then
   mkdir -p "$(dirname "$SETTINGS_FILE")"
-  SETTINGS_FILE="$SETTINGS_FILE" KRAYT_ASK_SOCKET="$KRAYT_ASK_SOCKET" node -e '
+  if SETTINGS_FILE="$SETTINGS_FILE" KRAYT_ASK_SOCKET="$KRAYT_ASK_SOCKET" node -e '
     const fs = require("fs");
     const path = process.env.SETTINGS_FILE;
     let settings = {};
     if (fs.existsSync(path)) {
+      const raw = fs.readFileSync(path, "utf8");
       try {
-        settings = JSON.parse(fs.readFileSync(path, "utf8"));
+        settings = JSON.parse(raw);
       } catch (e) {
-        settings = {};
+        // Malformed existing file: do NOT overwrite it with a fresh {} — that would silently
+        // destroy whatever is already there (e.g. rtk hooks.BeforeTool), the exact clobbering
+        // this merge rewrite exists to avoid. Bail out and leave the file untouched.
+        console.error("settings.json contains invalid JSON, leaving it untouched: " + e.message);
+        process.exit(1);
       }
     }
-    settings.general = Object.assign({ enableAutoUpdate: false }, settings.general);
-    settings.privacy = Object.assign({ usageStatisticsEnabled: false }, settings.privacy);
+    // Force these two keys off last so they win over whatever is already on disk — the point
+    // of this block is a hard-disable, not a default that existing settings can re-enable.
+    settings.general = Object.assign({}, settings.general, { enableAutoUpdate: false });
+    settings.privacy = Object.assign({}, settings.privacy, { usageStatisticsEnabled: false });
     settings.mcpServers = Object.assign({}, settings.mcpServers, {
       "ask-human": {
         command: "krayt-ask",
@@ -146,8 +153,11 @@ if [ -n "${KRAYT_ASK_SOCKET:-}" ] && command -v krayt-ask >/dev/null 2>&1; then
       },
     });
     fs.writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
-  '
-  echo "[gemini-cli] registered ask_human MCP server (questions enabled), merged into existing settings.json"
+  '; then
+    echo "[gemini-cli] registered ask_human MCP server (questions enabled), merged into existing settings.json"
+  else
+    echo "[gemini-cli] WARNING: could not merge $SETTINGS_FILE (invalid JSON) — skipping ask_human MCP registration, existing file left untouched" >&2
+  fi
 fi
 
 # Gemini CLI gates tool use on whether it considers the working folder "trusted". In a headless
