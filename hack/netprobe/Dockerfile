@@ -3,7 +3,7 @@
 # on real hardware — the probe behind TestEgressEnforcement (KRAYT_NETPROBE_IMAGE), and the
 # on-hardware regression for security-review finding #1. Static binary on scratch, run as a
 # numeric non-root uid -> no libc/base-image variables (same shape as ../hardening-probe).
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
 WORKDIR /src
 COPY go.mod .
 COPY main.go .
