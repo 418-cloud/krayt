@@ -1,8 +1,12 @@
 # ADR: Replacing krayt's sandbox layer with microsandbox
 
-- **Status:** Proposed. **B1 is the working direction, with no blocking technical gate remaining.**
-  What is left to decide is strategic, not technical — see "The two questions that are not
-  technical". Nothing in this document has been implemented.
+- **Status: Accepted — B1.** The strategic questions below were put to the repo owner and answered:
+  krayt rents the trust boundary rather than owning it, and builds on microsandbox. The
+  implementation is split into eleven tasks under
+  [`ai-tasks/`](./ai-tasks/README.md#microsandbox-migration-adr-option-b1), which also carry the
+  decisions taken at split time (same-arc deletion, `make`-built uncommitted guest binaries, msb's
+  default placeholder, `krayt image` kept as a thin front-end) and four corrections to this
+  document — see "Corrections" at the end. Nothing is implemented yet.
 - **Decided so far:** the secret-handling contract — values never on argv, never persisted;
   owner-readable environ accepted as the residual. See "The secret-handling contract".
 - **Date:** 2026-08-29
@@ -726,13 +730,73 @@ The last row is the one real security regression, and it is bounded by the allow
 only send it somewhere already permitted. Everything else that looked like a blocker resolved —
 question 2 into a design choice, question 5 into a residual (see "The interception CA").
 
-**What is left to decide is not technical.** Own the trust boundary or rent it, and whether to build
-on a vendor adjacent to this space. Those are the two questions above, and this ADR deliberately
-does not answer them.
+**What was left to decide was not technical** — own the trust boundary or rent it, and whether to
+build on a vendor adjacent to this space. Those two questions were put to the repo owner on
+2026-08-29 and answered in favour of renting: **B1 is accepted.** A, B2 and C are closed on that
+basis, not on a technical one, and the reasoning above is left standing so a future reader can see
+what the choice cost rather than only what it bought.
 
-A and B2 remain live on those grounds, not on technical ones. C remains the hedge if the strategic
-answer is genuinely unclear, and only with a delete-the-loser date attached.
+The decision belongs in `KRAYT_SPEC.md` — B1 contradicts §3.1, §6.3–§6.6, §6.10–§6.12 and §11
+outright, and additionally overturns §6.6.1's stdin rule. Per `CLAUDE.md` the spec wins until it is
+amended, not quietly diverged from; those amendments are distributed across the task set, with the
+wholesale rewrites in `ai-tasks/run-tasks-on-microsandbox.md` and
+`ai-tasks/retire-vm-image-pipeline.md`.
 
-Whatever is chosen, the decision belongs in `KRAYT_SPEC.md` — B1 and B2 both contradict §3.1,
-§6.3–§6.6, §6.10–§6.12 and §11 outright, and B1 additionally overturns §6.6.1's stdin rule. Per
-`CLAUDE.md` the spec wins until it is amended, not quietly diverged from.
+## Corrections (2026-08-29, from splitting this ADR into tasks)
+
+Four claims above were checked against microsandbox **0.6.16** source while writing the task set and
+did not survive. They are recorded here so this document is not read as authoritative on them; each
+is carried in full by the task that depends on it.
+
+1. **"`network.mitm: true` — gone — declaring any secret enables TLS interception automatically" is
+   wrong for the CLI path.** `TlsConfig.enabled` is `#[serde(default)] pub enabled: bool` —
+   false (`packages/microsandbox-types/rust/lib/domain.rs:2408-2411`) — and the `has_tls` predicate
+   that is the only thing setting it lists every `--tls-*` flag and omits `opts.secret`
+   (`crates/cli/lib/commands/common.rs:2198-2208`). msb's own
+   `docs/cli/configuration.mdx:320` makes the same claim and is equally unsupported. Since
+   `require_tls_identity` defaults true and the handler skips such secrets on non-intercepted
+   connections (`crates/network/lib/secrets/handler.rs:876`), a secret declared without
+   `--tls-intercept` is **silently never substituted**. krayt must emit `--tls-intercept` itself
+   whenever any secret is declared.
+
+2. **The implicit `allow@public` is wider than "only when no other rules are present".** The CLI
+   branches on `replaces_configured_policy`, true only when one of `--net`, `--no-net`,
+   `--net-default`, `--net-default-egress` or `--net-default-ingress` is present
+   (`common.rs:2088-2104`). `--net-rule` alone takes the `prepend_network_policy_rules` branch and
+   layers krayt's rules **on top of** `NetworkPolicy::default()`, which is
+   `from_profiles([Public])` — the whole public internet
+   (`crates/network/lib/policy/types.rs:724-728`). Conversely, once a `--net-default*` flag *is*
+   present the resulting policy contains only krayt's rules and **no implicit DNS rule**
+   (`common.rs:2494-2512`; only the profile path calls `Rule::allow_dns()`), so a deny-default
+   allowlist without an explicit `allow@dns` resolves nothing. Both failures are silent, in opposite
+   directions. The design rule stands but must be stated more strongly: krayt always emits a
+   complete explicit policy — a default action, the allow rules, an explicit DNS decision, and
+   explicit denies for the private groups in **every** mode, including `full`.
+
+3. **"exec in pipe mode with stdout/stderr separated end to end" needs `--stream`.** `msb exec`'s
+   default non-interactive mode buffers the whole output and writes it only after the command exits
+   (`crates/cli/lib/commands/exec.rs:213-223`). Live streaming is `--stream`
+   (`exec.rs:266-311`), which requires piped — not terminal — stdin. Its exit code is also
+   ambiguous: the guest's code is propagated with `std::process::exit`, while msb's own failures
+   also exit non-zero, so `1` alone cannot distinguish them.
+
+4. **The guest helper does not need to assemble the matched-secret-key-names list.** That job was
+   assigned to it under "What it does", but under B1 secret values never *enter* the guest, so the
+   **host** scans the patch it copied out — strictly more trustworthy, since the agent cannot reach
+   the scanner, and one less responsibility inside the sandbox.
+
+Two further findings shaped the tasks without contradicting anything here. msb's `agentd` installs
+its interception CA into the guest trust store *and* sets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and
+`NODE_EXTRA_CA_CERTS` (`crates/agentd/lib/tls.rs:56-89`); and msb writes each secret's placeholder
+into the guest environment itself (`crates/network/lib/network.rs:454-464`), which the agent images'
+existing "accept an already-set credential variable" branch already handles. Together with the fact
+that `krayt-ask` is copied in rather than baked in
+(`images/agents/claude-code/entrypoint.sh:113`), **no agent image needs rebuilding for this
+migration.**
+
+One capability loss is not named anywhere above and should be: **under B1 every secret must be
+network-scoped.** Today a `secrets.env` key is materialized at `/run/secrets/<KEY>` and can be used
+*inside* the guest. msb has no equivalent channel — `--secret` never puts a value in the guest,
+`--env` puts it on argv, and `msb copy` into a tmpfs requires a host temp file first. The task set
+makes an unscoped secret a pre-flight error rather than delivering something weaker than the name
+promises.

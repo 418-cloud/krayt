@@ -62,3 +62,74 @@ Apple-Silicon Mac to fully verify write the exact test and hand it off via `HUMA
 | [`add-proxy-ssrf-guard.md`](./add-proxy-ssrf-guard.md) | Low | Refuse proxy targets that resolve to link-local/metadata (always) or private ranges (unless `full`). | ✅ Done — post-resolution `Control` guard (`checkDialAddr`) on every upstream dial; `TestCheckDialAddr` + `TestGuardBlocksResolvedIP` cover all range/mode combinations |
 | [`harden-vfkit-socket-dir.md`](./harden-vfkit-socket-dir.md) | Low | Verify the `/tmp/krayt` socket root is a private, self-owned `0700` dir; fail closed otherwise. | ✅ Done — verified on hardware: `TestBootHello` + `TestEndToEndRealVM` pass over the new per-user root, and a pre-created hostile `0777` root is refused before boot |
 | [`fix-krayt-yaml-tracking.md`](./fix-krayt-yaml-tracking.md) | Low | The tracked `krayt.yaml` falsely claims to be gitignored; make it truly local (or a labeled example). | ✅ Done — kept tracked as the shared dev config (task's Option B): fixed the misleading comment, documented it in §8.1 |
+
+## Microsandbox migration (ADR option B1)
+
+Replacing krayt's own sandbox layer — the `Provider` seam, the Nix VM image, the guest agent, the
+gRPC-on-vsock control protocol and the TLS-intercepting egress proxy — with
+[microsandbox](https://github.com/superradcompany/microsandbox) (`msb`), driven as a subprocess.
+Roughly **12,500 lines deleted** against a few hundred added. The decision, its accounting and its
+residuals are in [`../adr-microsandbox-sandbox-layer.md`](../adr-microsandbox-sandbox-layer.md);
+**option B1 was chosen** — msb owns credential substitution too, so `internal/proxy` and
+`internal/adapter/anthropic_wire.go` go with the rest.
+
+**Ordering is real.** Tasks 2–6 are deliberately *additive*: they build every piece and wire none of
+it, so the vfkit/Firecracker path keeps working byte-for-byte until task 7 flips the switch and
+deletes it in the same change. An agent that deletes early will not compile. Task 1 is a gate: its
+P1 probe decides whether task 6's design works at all and P2 decides a hardening choice in task 5;
+both must be answered on hardware before task 7 lands.
+
+| # | Task | What it does | Status |
+|---|---|---|---|
+| 1 | [`probe-microsandbox-feasibility.md`](./probe-microsandbox-feasibility.md) | **Gate.** Five probe scripts under `hack/msb-probes/` + the `HUMAN_TODO.md` handoff. Two are blocking: can a *non-root* guest process open `AF_VSOCK`, and does `msb exec --user root` still work under `--security restricted`. Three size accepted residuals: does `--secret` alone enable interception, how long a real value sits in an environ, does Claude Code accept msb's default placeholder. | ⬜ Not started |
+| 2 | [`add-msb-sandbox-driver.md`](./add-msb-sandbox-driver.md) | New `internal/sandbox` — the `msb` CLI driver (typed argv rendering, closed child-env allowlist, `--stream` exec, JSON parsing, version floor) plus `krayt doctor` checks that delegate to `msb doctor`. Pins `MSB_BACKEND=local` so an operator's cloud profile can never reroute a run. | ⬜ Not started |
+| 3 | [`translate-network-policy-to-msb.md`](./translate-network-policy-to-msb.md) | Pure-function translation of `krayt.yaml`'s network vocabulary into a **fully explicit** msb policy — never an empty one. Encodes the two traps found in msb's source: `--net-rule` alone silently grants the whole public internet, and a `--net-default*` policy has no implicit DNS rule. | ⬜ Not started |
+| 4 | [`hand-secrets-to-msb.md`](./hand-secrets-to-msb.md) | The secret hand-off: `--secret NAME@HOST` on argv (names only), values in the msb child's `cmd.Env`, msb's default `$MSB_<NAME>` placeholder. Reduces `network.inject`'s schema, moves the patch secret-scan host-side, and adds the adapter opt-in that makes `anthropic_wire.go` deletable. | ⬜ Not started |
+| 5 | [`add-krayt-guest-helper.md`](./add-krayt-guest-helper.md) | `cmd/krayt-helper` — stateless, argv-in/JSON-out, run as root via `msb exec --user`, a thin wrapper over the `internal/patch` functions krayt keeps. Built by `make`, embedded from a gitignored dir, `msb copy`'d in per run. Explicitly never a daemon. | ⬜ Not started |
+| 6 | [`dial-ask-channel-over-vsock.md`](./dial-ask-channel-over-vsock.md) | `krayt-ask` dials `AF_VSOCK` to host CID 2 directly over msb's `--vsock` route; the `ask.Bridge` moves host-side to `internal/askbridge`. No guest daemon, and it retires `cmd/krayt-vsock-forward`. No agent image rebuild — `krayt-ask` was never baked in. | ⬜ Not started |
+| 7 | [`run-tasks-on-microsandbox.md`](./run-tasks-on-microsandbox.md) | **The cut-over.** `orchestrator.Run` drives the msb lifecycle; `internal/{provider,guest,protocol,proxy,controlclient,imagestore}` + `cmd/krayt-{agent,vsock-forward}` + `anthropic_wire.go` are deleted in the same change, the test seam moves from `fakeProvider` to a fake `msb`, and §3/§5/§6/§7/§9/§12/§14/§15 are rewritten. | ⬜ Not started |
+| 8 | [`retire-vm-image-pipeline.md`](./retire-vm-image-pipeline.md) | Deletes `internal/vmimage`, `images/`, the three image workflows and the Linux-builder requirement; `krayt image ls/rm/prune/pull` become a thin front-end over msb's store, keeping the age retention by using run records instead of a cache sentinel. | ⬜ Not started |
+| 9 | [`add-msb-extra-conf-escape-hatch.md`](./add-msb-extra-conf-escape-hatch.md) | Opt-in `sandbox.extra_conf: <path>` passed as a root `--conf` before krayt's own flags — explicitly unvalidated, refused from an auto-loaded repo-local config (§8.3), recorded with a digest in `meta.json`. | ⬜ Not started |
+| 10 | [`expand-platforms-under-msb.md`](./expand-platforms-under-msb.md) | The two platforms B1 opens. **Part A** (small): linux/arm64 in the release matrix, now that there is no backend-tagged VM image to resolve wrongly. **Part B** (a real port): Windows — `flock` → `LockFileEx`, the ask socket → a named pipe, `resources_windows.go`. | ⬜ Not started |
+| 11 | [`warm-start-msb-sandboxes.md`](./warm-start-msb-sandboxes.md) | Flat OCI rootfs (`--root-disk flat:…,clone=auto`) and `--materialize` pre-pull, opt-in and defaulting off until measured. Hard guardrail: artifacts are reused, **sandboxes never are** — no pooling, no cross-run snapshots. | ⬜ Not started |
+
+### Corrections to the ADR, found while writing these tasks
+
+Verified against microsandbox **0.6.16** source, not its documentation. Each is carried in the task
+that depends on it; they are collected here so the ADR is not read as authoritative on these four
+points.
+
+- **`--secret` does not enable TLS interception.** The ADR (and msb's own
+  `docs/cli/configuration.mdx:320`) say declaring a secret turns interception on. `TlsConfig.enabled`
+  is `#[serde(default)] bool` and the `has_tls` predicate that is the only thing setting it omits
+  `opts.secret` entirely. With `require_tls_identity` defaulting true, a secret declared without
+  `--tls-intercept` is **silently never substituted**. krayt must always emit `--tls-intercept`
+  itself. → task 3.
+- **The implicit `allow@public` is broader than described.** Not "when no other rules are present"
+  but *whenever no `--net`/`--no-net`/`--net-default*` flag is present* — so `--net-rule "allow@X"`
+  alone grants X **plus the entire public internet**. And once a `--net-default*` flag *is* present,
+  no implicit DNS rule is added either, so a deny-default allowlist with no `allow@dns` cannot
+  resolve anything. Both directions fail silently. → task 3.
+- **`msb exec` buffers output by default.** Live, stream-separated logs need `--stream`, which
+  requires piped stdin. The default non-interactive mode writes everything only after the command
+  exits. → task 2.
+- **The helper needs no secret handling.** The ADR assigns it the matched-secret-key-names scan;
+  under B1 secrets never enter the guest, so the host scans the patch it copied out — more
+  trustworthy and one less thing in the guest. → tasks 4 and 5.
+
+Two smaller findings that shaped the tasks rather than correcting the ADR: msb's `agentd` installs
+its interception CA into the guest trust store *and* sets `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
+`NODE_EXTRA_CA_CERTS` itself (`crates/agentd/lib/tls.rs`), so the agent images' `KRAYT_CA_CERT` block
+becomes inert rather than needing a rewrite; and msb sets each secret's placeholder into the guest
+environment itself (`guest_secret_env`), which the Claude Code entrypoint's existing
+"accept an already-set credential var" branch already handles — so **no agent image needs
+rebuilding for this arc**.
+
+### The capability B1 removes, which the ADR does not name
+
+Every secret must be **network-scoped** under B1. Today a `secrets.env` key is materialized at
+`/run/secrets/<KEY>` and can be *used inside* the guest — an SSH key, a signing key, a local test
+password. msb has no equivalent channel: `--secret` never puts a value in the guest, `--env` puts it
+on argv, and `msb copy` into a tmpfs would require writing it to a host temp file first. krayt
+therefore fails pre-flight on a secret with no `network.inject` entry naming it, rather than
+delivering something weaker than the name promises. → task 4.

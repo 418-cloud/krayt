@@ -57,6 +57,10 @@ network:
     - cache.nixos.org # Nix binary cache (vendorHash regen)
     - github.com # Nix flake inputs
     - codeload.github.com # Nix flake input tarballs
+    - raw.githubusercontent.com
+    - registry.hub.docker.com
+    - registry-1.docker.io
+    - index.docker.io
 
   # Everything krayt does not inject into stays tunneled rather than intercepted, so go, nix, and
   # git/libcurl keep verifying the real upstream chain against their own trust store instead of
@@ -70,6 +74,10 @@ network:
     - cache.nixos.org
     - github.com
     - codeload.github.com
+    - raw.githubusercontent.com
+    - registry.hub.docker.com
+    - registry-1.docker.io
+    - index.docker.io
 
   # api.anthropic.com deliberately has NO rule here. With `agent.adapter: claude-code` and
   # `mitm: true` the adapter emits one itself, from the observed wire shape of whichever credential
