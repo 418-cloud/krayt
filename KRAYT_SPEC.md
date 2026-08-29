@@ -2656,6 +2656,45 @@ the shape the provider wants (§6.14, shape mirroring).
   tap+masquerade setup from `krayt doctor`. Not done: Firecracker's `allocSlot` currently bundles
   tap + `/30` + CID into one allocation, and `full` mode still needs the NIC, so making it
   conditional is its own task.
+- **A `microsandbox` / libkrun provider** — *evaluated and rejected (2026-08-29, against
+  microsandbox SDK 0.6.16 / libkrunfw 5.6.1):*
+  [microsandbox](https://github.com/superradcompany/microsandbox) is a peer of krayt's whole
+  VM + guest-agent + protocol + proxy stack, not a hypervisor backend beneath it, and it does not
+  fit the §6.3 seam. Four blockers, any one of which is disqualifying on its own:
+  1. **cgo.** Its Go SDK is a cgo `dlopen` bridge to a Rust library (`#cgo linux LDFLAGS: -ldl`).
+     krayt's release workflow cross-builds all three targets from a single Linux runner with
+     `CGO_ENABLED=0`; cgo costs that, requiring a macOS runner or a second binary flavour. Driving
+     the `msb` CLI as a subprocess (krayt's vfkit/firecracker idiom) sidesteps it, but couples
+     krayt to the CLI surface of self-described beta software.
+  2. **No `DialControl` equivalent.** microsandbox exposes vsock **guest→host only** (`WithVsock`,
+     via host CID 2); its own control channel is CBOR over virtio-console to an `agentd` running as
+     guest PID 1, and is deliberately host-driven. `VM.ListenEgress` maps onto it cleanly;
+     `VM.DialControl` has no counterpart. Publishing a guest TCP port instead would put the control
+     plane on the guest network that §6.6's default-deny policy exists to close, and a
+     reverse-connect gRPC transport would need a second, provider-selected listen mode inside
+     `krayt-agent` — contradicting §3.1, "the Provider interface is the only OS-specific seam".
+  3. **`VMSpec` largely doesn't apply, and it forces a third base image.** libkrunfw supplies the
+     kernel and there is no cmdline knob, so `Kernel`, `Initrd`, `Cmdline` and `CID` all become
+     ignored fields (the Firecracker provider configures guest networking via `ip=`/`ifname=` on the
+     cmdline). The base image is already backend-tagged, not merely arch-tagged (§11.1: a PE `Image`
+     for vfkit vs. an uncompressed ELF `vmlinux` for Firecracker), so this would be a third flavour —
+     krayt's NixOS userland handed PID 1 through microsandbox's `WithInit`, booting on libkrunfw's
+     kernel, with containerd/overlayfs/nf_tables support plausible but unverified and only checkable
+     on an Apple-Silicon Mac.
+  4. **Duplicated security model and host state.** A provider would use roughly a tenth of
+     microsandbox and ignore its image pull, exec, filesystem API, secrets, network policy, TLS MITM
+     and snapshots — all of which krayt implements itself and treats as core (§6.6, §6.8, §6.11) —
+     while adding a second stateful host store (`MSB_HOME`, SQLite + migrations) beside `~/.krayt`,
+     from a beta project that has already retracted a patch release for shipping breaking wire
+     changes.
+
+  What it would have bought is real and worth restating: userspace networking on Linux (no tap, no
+  `/30` allocation, no `setcap cap_net_admin+ep`, no `hack/linux-net-setup.sh`) and a Windows path
+  via WHP, which krayt has no other route to. On macOS it offers nothing over vfkit, which works and
+  keeps the entitlement off krayt's own binary (§12). The Linux half of that win is available far
+  more cheaply through the preceding bullet — dropping the guest NIC in `allowlist`/`none` — with no
+  new dependency, no cgo, no third image variant and no second security model. Windows, if ever
+  wanted, deserves its own decision rather than arriving as a side effect of a backend swap.
 - **Unifying `full` mode onto the host proxy path** — today `full` still opens the guest NIC
   directly (nftables table deleted outright) rather than routing through the host proxy at HTTP
   granularity. Doing so would change `full`'s meaning from "any protocol, unfiltered" to "HTTP(S)
