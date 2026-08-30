@@ -6,11 +6,13 @@ bridge moves, the dial-address form, how `krayt-ask` ships) and proceed. Depends
 `add-msb-sandbox-driver.md` and `add-krayt-guest-helper.md` (it extends that task's `guestbin`
 package).
 
-**Blocked on `probe-microsandbox-feasibility.md` P1**: whether a *non-root* guest process can open
-`AF_VSOCK` under msb. The agent runs as `agent` (uid 1000). If P1 fails, this design does not work
-and the alternative — a root-owned in-guest forwarder — is the guest daemon B1 exists to delete, so
-it needs a fresh decision rather than an improvised workaround. Build everything that does not
-depend on the answer; stop and ask before implementing a fallback.
+**Unblocked 2026-08-29 — `probe-microsandbox-feasibility.md` P1 passed on msb 0.6.16.** A guest
+process running as `agent` (uid 1000) opened `AF_VSOCK` to host CID 2 and completed a
+write-then-read-back round trip, in the real `ghcr.io/418-cloud/krayt-agent-claude-code` image,
+unmodified (`hack/msb-probes/p1-vsock-nonroot.sh`). **This design works: `krayt-ask` dials the host
+directly.** The fallback the task was told to stop and ask about — a root-owned in-guest forwarder,
+which is the guest daemon B1 exists to delete — is now dead. Do not build it, and do not add a
+privilege-dropping wrapper "just in case": a direct dial as `agent` is the verified path.
 
 ## Sequencing — additive only
 

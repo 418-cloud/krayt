@@ -77,11 +77,15 @@ residuals are in [`../adr-microsandbox-sandbox-layer.md`](../adr-microsandbox-sa
 it, so the vfkit/Firecracker path keeps working byte-for-byte until task 7 flips the switch and
 deletes it in the same change. An agent that deletes early will not compile. Task 1 is a gate: its
 P1 probe decides whether task 6's design works at all and P2 decides a hardening choice in task 5;
-both must be answered on hardware before task 7 lands.
+both must be answered on hardware before task 7 lands. **Both passed on msb 0.6.16** — P1 on
+2026-08-29 (non-root `AF_VSOCK` round trip), P2 on 2026-08-30 (`msb exec --user root` under
+`--security restricted`, with root-only paths still unreadable to the agent) — so task 6's direct
+dial stands and task 5 takes the restricted profile *and* privilege separation. Neither task is
+gated any more.
 
 | # | Task | What it does | Status |
 |---|---|---|---|
-| 1 | [`probe-microsandbox-feasibility.md`](./probe-microsandbox-feasibility.md) | **Gate.** Five probe scripts under `hack/msb-probes/` + the `HUMAN_TODO.md` handoff. Two are blocking: can a *non-root* guest process open `AF_VSOCK`, and does `msb exec --user root` still work under `--security restricted`. Three size accepted residuals: does `--secret` alone enable interception, how long a real value sits in an environ, does Claude Code accept msb's default placeholder. | ⬜ Not started |
+| 1 | [`probe-microsandbox-feasibility.md`](./probe-microsandbox-feasibility.md) | **Gate.** Five probe scripts under `hack/msb-probes/` + the `HUMAN_TODO.md` handoff. Two are blocking: can a *non-root* guest process open `AF_VSOCK`, and does `msb exec --user root` still work under `--security restricted`. Three size accepted residuals: does `--secret` alone enable interception, how long a real value sits in an environ, does Claude Code accept msb's default placeholder. | ✅ **Done — all five run on msb 0.6.16, 2026-08-29/30** (`KRAYT_SPEC.md` §14 Phase 11 carries the full outcomes). P1 ✅ non-root `AF_VSOCK` round trip → task 6's direct dial stands. P2 ✅ `msb exec --user root` under `--security restricted` with root-only paths still unreadable to the agent → task 5 takes both. P3 ✅ **against expectation**: `--secret` alone *does* enable interception (see the withdrawn correction below) → task 3's `--tls-intercept` is explicit-over-implicit, and a secret cannot be declared without MITM. P4 ⚪ inconclusive on darwin *by construction* (a control shows `ps -Eww` reads no same-uid child's environment on macOS); msb's source says the value never enters the runtime's environ — a Linux/KVM re-run would confirm it, blocks nothing. P5 ✅ Claude Code accepts the default placeholder → task 4's `--secret-conf` contingency is dead, and the B1 credential path is proven end to end on hardware |
 | 2 | [`add-msb-sandbox-driver.md`](./add-msb-sandbox-driver.md) | New `internal/sandbox` — the `msb` CLI driver (typed argv rendering, closed child-env allowlist, `--stream` exec, JSON parsing, version floor) plus `krayt doctor` checks that delegate to `msb doctor`. Pins `MSB_BACKEND=local` so an operator's cloud profile can never reroute a run. | ⬜ Not started |
 | 3 | [`translate-network-policy-to-msb.md`](./translate-network-policy-to-msb.md) | Pure-function translation of `krayt.yaml`'s network vocabulary into a **fully explicit** msb policy — never an empty one. Encodes the two traps found in msb's source: `--net-rule` alone silently grants the whole public internet, and a `--net-default*` policy has no implicit DNS rule. | ⬜ Not started |
 | 4 | [`hand-secrets-to-msb.md`](./hand-secrets-to-msb.md) | The secret hand-off: `--secret NAME@HOST` on argv (names only), values in the msb child's `cmd.Env`, msb's default `$MSB_<NAME>` placeholder. Reduces `network.inject`'s schema, moves the patch secret-scan host-side, and adds the adapter opt-in that makes `anthropic_wire.go` deletable. | ⬜ Not started |
@@ -97,14 +101,17 @@ both must be answered on hardware before task 7 lands.
 
 Verified against microsandbox **0.6.16** source, not its documentation. Each is carried in the task
 that depends on it; they are collected here so the ADR is not read as authoritative on these four
-points.
+points. **The first has since been withdrawn** — source reading alone got it wrong, and the probe
+that was meant to merely confirm it disproved it instead.
 
-- **`--secret` does not enable TLS interception.** The ADR (and msb's own
-  `docs/cli/configuration.mdx:320`) say declaring a secret turns interception on. `TlsConfig.enabled`
-  is `#[serde(default)] bool` and the `has_tls` predicate that is the only thing setting it omits
-  `opts.secret` entirely. With `require_tls_identity` defaulting true, a secret declared without
-  `--tls-intercept` is **silently never substituted**. krayt must always emit `--tls-intercept`
-  itself. → task 3.
+- ~~**`--secret` does not enable TLS interception.**~~ **Withdrawn 2026-08-29 — it does, and this
+  correction was wrong.** `hack/msb-probes/p3-secret-tls-intercept.sh` on 0.6.16: substitution
+  happened with *and without* `--tls-intercept`, the guest holding only the placeholder in both.
+  `SandboxBuilder::secret_entry` sets `network.tls.enabled = true` for every secret added
+  (`sdk/rust/lib/sandbox/builder.rs:834-843`); the `has_tls` predicate this correction rested on
+  governs only the network overlay. The ADR and msb's docs were right. Emitting `--tls-intercept`
+  stays in task 3 as explicit-over-implicit, not as a requirement — and the consequence that *is*
+  new: under msb a secret cannot be declared without MITM. → task 3, ADR withdrawn correction 1.
 - **The implicit `allow@public` is broader than described.** Not "when no other rules are present"
   but *whenever no `--net`/`--no-net`/`--net-default*` flag is present* — so `--net-rule "allow@X"`
   alone grants X **plus the entire public internet**. And once a `--net-default*` flag *is* present,

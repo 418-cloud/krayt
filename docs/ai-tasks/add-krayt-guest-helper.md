@@ -5,10 +5,13 @@
 Critical fix whose property this helper exists to preserve. Give a short plan (the two subcommands,
 the embed mechanism, the Makefile/CI wiring) and proceed. Depends on `add-msb-sandbox-driver.md`.
 
-**Blocked on `probe-microsandbox-feasibility.md` P2** for one decision only: whether `msb exec
---user root` works under `--security restricted`. Build everything else; if P2 has not been answered
-when you reach the `--security` choice, implement the privilege separation (it is the property that
-matters) and leave a `HUMAN_TODO.md` entry saying the profile choice is pending.
+**Unblocked 2026-08-30 — `probe-microsandbox-feasibility.md` P2 passed on msb 0.6.16.** `msb exec
+--user root` works under `--security restricted`: it lands as uid 0, and — the property that
+actually matters — a root-created 0700 directory stays unreadable to an `--user agent` exec
+(`hack/msb-probes/p2-exec-root-restricted.sh`). **Take both.** `--security restricted` and the
+helper's privilege separation are not a trade-off, so there is no profile choice to defer and no
+`HUMAN_TODO.md` entry to leave: emit `--security restricted`, and run the helper as root against a
+git dir the agent cannot write (`fix-guest-git-config-rce.md`'s property).
 
 ## Sequencing — additive only
 

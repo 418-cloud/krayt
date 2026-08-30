@@ -62,16 +62,25 @@ material at rest (`common.rs:2016-2018`).
 2. **Take msb's default placeholder, `$MSB_<ENV_VAR>`.** Do not supply a custom one. krayt therefore
    needs **no secret config file at all** — the repeatable `--secret NAME@HOST` flag covers the
    whole surface, and `placeholder`, `require_tls_identity` and `inject:` all keep defaults that are
-   already what krayt wants (`require_tls_identity` true, `inject` = headers).
-   **The contingency, if `probe-microsandbox-feasibility.md` P5 shows Claude Code rejects the default
-   placeholder client-side:** msb exposes `placeholder` only through a config file, never argv, so
+   already what krayt wants (`require_tls_identity` true; `inject` = **headers *and* basic_auth**,
+   with `query_params` and `body` off — `packages/microsandbox-types/rust/lib/domain.rs:2158-2179`,
+   confirmed in a live sandbox config by `hack/msb-probes/p3-secret-tls-intercept.sh` on 2026-08-29).
+   `basic_auth` being on by default is wider than "headers" and is stated here so it is not
+   discovered later: a placeholder the agent puts in userinfo or a `Basic` credential is substituted
+   too, for an allowed host. That is still inside the allowlist, so it changes nothing krayt wants —
+   but it is the default being accepted, not merely tolerated.
+   **P5 has run — 2026-08-30, msb 0.6.16: Claude Code accepts the default placeholder.** `claude -p`
+   replied normally from a sandbox holding only `$MSB_ANTHROPIC_API_KEY`, against the real API under
+   a deny-default policy. **The contingency below is dead weight and must not be built**; it stays
+   as a comment-worthy note only, for a future agent CLI that does reject the default. The
+   contingency, if that ever happens: msb exposes `placeholder` only through a config file, never argv, so
    krayt would need `--secret-conf PATH`. `--secret` carries no `conflicts_with` against
    `--secret-conf` (unlike `--net-rule` vs `--net-conf`), so the two combine. stdin is not an option
    — `sandbox_config.rs`'s `parse_yaml_value` is a plain `fs::read_to_string(path)` with no `-`
    handling — but `/dev/fd/N` backed by a pipe or memfd via `cmd.ExtraFiles` is, and is safe for
    `--secret-conf` specifically because `load_typed` does not call `absolutize_input` the way a root
-   `--conf` does. **Write that down in the code comment; do not build it.** It is dead weight unless
-   the probe fails.
+   `--conf` does. **Write that down in the code comment; do not build it.** The probe did not fail,
+   so this is dead weight — the comment is the whole deliverable.
 3. **msb sets the guest's placeholder env var itself** — `guest_secret_env()` maps each secret's
    `env_var` to its `placeholder` and the runtime extends the guest bootstrap environment with it
    (`crates/network/lib/network.rs:454-464`, `crates/runtime/lib/vm.rs:1871`). So krayt does **not**

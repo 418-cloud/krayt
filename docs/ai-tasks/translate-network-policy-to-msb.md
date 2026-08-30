@@ -61,16 +61,23 @@ msb default.** "No network policy computed" is a pre-flight error, not a valid s
    something much worse. msb's destination groups (`private`, `loopback`, `link-local`, `meta`,
    `multicast`, `host`) express this directly; emit explicit `deny@` rules for them, ordered before
    the allow rules, in **every** mode.
-5. **`--tls-intercept` is emitted whenever any secret is declared, and only then.** msb's own docs
-   claim declaring a secret enables interception (`docs/cli/configuration.mdx:320`); **the CLI flag
-   path does not do this.** `TlsConfig.enabled` is `#[serde(default)] bool` — false
-   (`packages/microsandbox-types/rust/lib/domain.rs:2408-2411`) — and the `has_tls` predicate that is
-   the only thing setting it lists every `--tls-*` flag and omits `opts.secret` entirely
-   (`crates/cli/lib/commands/common.rs:2198-2208`). Since `require_tls_identity` defaults true and
-   the handler skips such secrets on non-intercepted connections
-   (`crates/network/lib/secrets/handler.rs:876`), a secret declared without `--tls-intercept` is
-   **never substituted, silently** — the API just sees a garbage credential. `probe-microsandbox-feasibility.md`
-   P3 confirms this on hardware; the translator must not depend on the probe's outcome to be correct.
+5. **`--tls-intercept` is emitted whenever any secret is declared, and only then.** The rule stands;
+   its original justification did not. It was written as "msb's own docs claim declaring a secret
+   enables interception (`docs/cli/configuration.mdx:320`); the CLI flag path does not do this" —
+   msb's docs were right. `hack/msb-probes/p3-secret-tls-intercept.sh` on msb 0.6.16 (2026-08-29):
+   substitution happened **with and without** `--tls-intercept`, the guest holding only the
+   placeholder in both. `SandboxBuilder::secret_entry` sets `network.tls.enabled = true` for every
+   secret added (`sdk/rust/lib/sandbox/builder.rs:834-843`), and `--secret` goes through that
+   builder (`crates/cli/lib/commands/common.rs:2028-2039`). The `has_tls` predicate the earlier
+   reading cited (`common.rs:2198-2208`) governs only the network *overlay* — intercepted ports,
+   bypass list, CA paths, QUIC — not whether interception is on.
+
+   So the flag is **redundant, not load-bearing**. Emit it anyway: it costs one argv entry, it makes
+   the interception explicit to anyone reading a real command line, and it pins behaviour that msb
+   currently provides as an undocumented side effect of a builder method — in a beta tool that has
+   shipped a breaking wire change as a patch release. Do not build anything that *depends* on the
+   flag being what enables interception, and do not treat its absence as a way to get a secret
+   without MITM: there is no such configuration under msb (see the ADR's withdrawn correction 1).
 6. **Ingress is denied explicitly.** msb's ingress default is `allow`, to preserve unfiltered
    published-port behaviour. krayt publishes no ports, so the setting is inert today and wrong the
    moment anything does. Set it now, while it costs one flag.
