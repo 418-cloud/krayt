@@ -11,8 +11,12 @@ mostly deletion — roughly 12,000 lines removed against a few hundred added, be
 left it unwired. **Do those five first.** If any is missing, stop and say so rather than
 re-implementing it here.
 
-**Blocked on `probe-microsandbox-feasibility.md` P1 and P2.** P1 decides whether the ask channel
-works at all; P2 decides `--security restricted` versus the helper's privilege separation.
+**Unblocked — both gating probes passed on msb 0.6.16.** P1 (2026-08-29): a non-root `agent`
+(uid 1000) completed an `AF_VSOCK` round trip to host CID 2, so the direct dial in
+`dial-ask-channel-over-vsock.md` stands and no in-guest forwarder is needed. P2 (2026-08-30):
+`msb exec --user root` works under `--security restricted` — uid 0, with a root-only 0700 path
+still unreadable to an `--user agent` exec — so `add-krayt-guest-helper.md` keeps the restricted
+profile *and* its privilege separation. Nothing in this task is waiting on a probe any more.
 
 ## What changes
 

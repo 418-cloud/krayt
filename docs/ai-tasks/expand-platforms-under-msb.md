@@ -66,7 +66,18 @@ Two of B1's headline wins are platforms krayt could not reach:
 3. **`krayt doctor` must cover the Windows prerequisites** by delegating to `msb doctor`, which
    already reports WHP availability and offers `--fix` (it opens an elevated PowerShell prompt to
    enable Windows Hypervisor Platform). Do not reimplement that check.
-4. **Published ports are the one behaviour to call out.** msb's docs note that opening a published
+4. **Secret handling is weaker on Windows than on unix, and the plan must say so.** On unix the
+   resolved secret value reaches the `msb sandbox` process over an **anonymous** temp file handed
+   over as `--config-fd` — no filesystem path, nothing on argv (`sdk/rust/lib/runtime/spawn.rs`,
+   `write_launch_config_fd`). Windows has no such handoff: `write_launch_config_file` writes the
+   same launch config, resolved secret included, to a `NamedTempFile` **under the sandbox's runtime
+   directory** and passes its **path on argv**. It is short-lived — dropped once the child reports
+   startup — but it is a real on-disk write of secret material with a process-listing-visible path,
+   on a platform where krayt cannot rely on `0700` unix modes to protect it. Found while reading
+   msb 0.6.16 for `probe-microsandbox-feasibility.md` P4 (2026-08-30). Do not discover this during
+   the port: state it in the plan, decide whether Windows support ships with it as a documented
+   residual or waits for msb to close it, and put the answer in §10's threat table either way.
+5. **Published ports are the one behaviour to call out.** msb's docs note that opening a published
    port on Windows can trigger a Windows Defender Firewall prompt for `msb.exe`. krayt publishes no
    ports, so this is inert — record it in §12 so the first person who adds a port does not discover
    it in a support thread.

@@ -2630,6 +2630,67 @@ the shape the provider wants (§6.14, shape mirroring).
   **scrubs its credential from child-process environments** — `env` inside the agent cannot show it,
   which is why the entrypoint's own line and the proxy log are the evidence.
 
+### Phase 11 — Microsandbox migration (ADR option B1)
+
+Replaces krayt's own sandbox layer — `internal/{provider,guest,protocol,proxy,vmimage,
+controlclient}` and the Nix VM image — with [microsandbox](https://github.com/superradcompany/microsandbox)
+(`msb`), driven as a subprocess. Decided in `docs/adr-microsandbox-sandbox-layer.md`; split into
+eleven tasks under `docs/ai-tasks/README.md`'s "Microsandbox migration (ADR option B1)" section.
+Tasks 2–6 are additive (the vfkit/Firecracker path keeps working byte-for-byte until task 7 flips
+the switch and deletes it in the same change), so this phase's checkboxes below track real,
+independently-landed progress rather than a single big-bang "Done when".
+
+- [x] **Feasibility gate** (`probe-microsandbox-feasibility.md`) — five hardware-probe scripts
+  under `hack/msb-probes/`, **all run on msb 0.6.16, 2026-08-29/30, on an Apple-Silicon Mac**. The
+  two design-shaping questions are answered and nothing below is gated on them any more:
+  - **P1** — a non-root guest process (`agent`, uid 1000) opened `AF_VSOCK` to host CID 2 and
+    completed a round trip, in the real agent image unmodified. `krayt-ask` dials the host
+    directly; the root-owned in-guest forwarder is dead (`dial-ask-channel-over-vsock.md`).
+  - **P2** — `msb exec --user root` works under `--security restricted`: uid 0, and a root-created
+    0700 path stays unreadable to an `--user agent` exec. The guest helper takes the restricted
+    profile *and* its privilege separation (`add-krayt-guest-helper.md`); it is not a trade-off.
+  - **P3** — **answered against expectation**: `--secret` alone *does* enable TLS interception
+    (`SandboxBuilder::secret_entry` sets `network.tls.enabled = true`), so the ADR's correction 1
+    is withdrawn and `--tls-intercept` emission is explicit-over-implicit rather than required.
+    The consequence that follows: **under msb a secret cannot be declared without MITM**, so
+    §6.6.1's opt-in `network.mitm: false` has no B1 equivalent once any secret exists.
+  - **P4** — inconclusive on darwin *by construction*: a positive control shows `ps -Eww` cannot
+    read any same-uid child's environment on macOS, so the reading is uninformative rather than
+    negative. msb's source says the value reaches the long-lived runtime on an anonymous
+    `--config-fd`, never its environ, making the environ window only krayt's own `msb create`
+    call — **a Linux/KVM re-run would confirm that and is the one loose thread here**, though it
+    sizes an already-accepted residual and blocks nothing.
+  - **P5** — Claude Code accepts msb's default `$MSB_ANTHROPIC_API_KEY` placeholder: `claude -p`
+    reached the real API from a deny-default sandbox holding only the placeholder. This is also
+    the first end-to-end proof of the B1 credential path on hardware. `hand-secrets-to-msb.md`'s
+    `--secret-conf` contingency is dead and must not be built.
+- [ ] `add-msb-sandbox-driver.md` — new `internal/sandbox`, the `msb` CLI driver, plus `krayt
+  doctor` checks that delegate to `msb doctor`.
+- [ ] `translate-network-policy-to-msb.md` — pure-function translation of `krayt.yaml`'s network
+  vocabulary into a fully explicit msb policy, never an empty one.
+- [ ] `hand-secrets-to-msb.md` — the secret hand-off: `--secret NAME@HOST` on argv (names only),
+  values in the msb child's `cmd.Env`, msb's default placeholder.
+- [ ] `add-krayt-guest-helper.md` — `cmd/krayt-helper`, stateless, argv-in/JSON-out, run as root
+  via `msb exec --user`, a thin wrapper over the `internal/patch` functions krayt keeps.
+- [ ] `dial-ask-channel-over-vsock.md` — `krayt-ask` dials `AF_VSOCK` to host CID 2 directly over
+  msb's `--vsock` route; retires `cmd/krayt-vsock-forward`.
+- [ ] `run-tasks-on-microsandbox.md` — **the cut-over.** `orchestrator.Run` drives the msb
+  lifecycle; `internal/{provider,guest,protocol,proxy,controlclient,imagestore}` +
+  `cmd/krayt-{agent,vsock-forward}` + `anthropic_wire.go` are deleted in the same change.
+- [ ] `retire-vm-image-pipeline.md` — deletes `internal/vmimage`, `images/`, the three image
+  workflows, and the Linux-builder requirement.
+- [ ] `add-msb-extra-conf-escape-hatch.md` — opt-in `sandbox.extra_conf: <path>`, explicitly
+  unvalidated, subject to §8.3 containment.
+- [ ] `expand-platforms-under-msb.md` — linux/arm64 in the release matrix, plus a real Windows
+  port.
+- [ ] `warm-start-msb-sandboxes.md` — flat OCI rootfs + `--materialize` pre-pull, opt-in and
+  defaulting off until measured.
+- **Done when:** the gate's two blocking probes (P1, P2) have a real-hardware finding recorded in
+  `HUMAN_TODO.md` and folded back into this checklist; each subsequent task's own "Done when" is
+  met in turn as it lands; and task 7 (`run-tasks-on-microsandbox.md`) — the one that deletes the
+  code Phases 0–10 verified — has its own hardware re-verification pass, the same discipline
+  Phase 8 applied when it superseded Phase 3's egress evidence.
+
 ---
 
 ## 15. Open Questions / Future Work

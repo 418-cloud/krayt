@@ -746,18 +746,42 @@ wholesale rewrites in `ai-tasks/run-tasks-on-microsandbox.md` and
 
 Four claims above were checked against microsandbox **0.6.16** source while writing the task set and
 did not survive. They are recorded here so this document is not read as authoritative on them; each
-is carried in full by the task that depends on it.
+is carried in full by the task that depends on it. **Correction 1 was itself overturned on hardware**
+(2026-08-29, `hack/msb-probes/p3-secret-tls-intercept.sh`); it is kept below, marked withdrawn,
+because the reading that produced it is worth not repeating.
 
-1. **"`network.mitm: true` — gone — declaring any secret enables TLS interception automatically" is
-   wrong for the CLI path.** `TlsConfig.enabled` is `#[serde(default)] pub enabled: bool` —
-   false (`packages/microsandbox-types/rust/lib/domain.rs:2408-2411`) — and the `has_tls` predicate
-   that is the only thing setting it lists every `--tls-*` flag and omits `opts.secret`
-   (`crates/cli/lib/commands/common.rs:2198-2208`). msb's own
-   `docs/cli/configuration.mdx:320` makes the same claim and is equally unsupported. Since
-   `require_tls_identity` defaults true and the handler skips such secrets on non-intercepted
-   connections (`crates/network/lib/secrets/handler.rs:876`), a secret declared without
-   `--tls-intercept` is **silently never substituted**. krayt must emit `--tls-intercept` itself
-   whenever any secret is declared.
+1. **WITHDRAWN 2026-08-29 — the original claim was right and this correction was wrong.** The
+   correction read: *"`network.mitm: true` — gone — declaring any secret enables TLS interception
+   automatically" is wrong for the CLI path.* It is not wrong. `p3-secret-tls-intercept.sh` on msb
+   0.6.16: the guest held only the `$MSB_<ENV_VAR>` placeholder in both sandboxes, and the real
+   value arrived at a header-echoing endpoint **with and without `--tls-intercept`** — with the
+   non-intercepting sandbox created and exercised first, so leaked interception state cannot
+   explain it. Declaring a secret does enable interception: `SandboxBuilder::secret_entry` sets
+   `network.tls.enabled = true` for every secret added (`sdk/rust/lib/sandbox/builder.rs:834-843`,
+   documented there as "Automatically enables TLS interception if not already enabled"), and the
+   CLI's `--secret` goes through that builder (`crates/cli/lib/commands/common.rs:2028-2039`).
+
+   Where the reading went wrong, since the cited facts were all true: `TlsConfig.enabled` is indeed
+   `#[serde(default)]` false (`packages/microsandbox-types/rust/lib/domain.rs:2408-2411`) and
+   `has_tls` does indeed omit `opts.secret` (`crates/cli/lib/commands/common.rs:2198-2208`) — but
+   `has_tls` governs only the network **overlay**: intercepted ports, bypass list, CA paths, QUIC
+   blocking. It was never what turns interception on. msb's own `docs/cli/configuration.mdx:320`
+   was accurate. The lesson is narrower than "read the source": a flag's absence from one predicate
+   is not proof of a behaviour, and a claim about behaviour needs a run.
+
+   **The consequence that is genuinely new: under msb there is no such thing as a secret without
+   MITM.** `--secret` alone intercepts every intercepted port — 443 by default — for that sandbox,
+   and msb's `agentd` installs the intercept CA into the guest trust store. krayt wants
+   interception wherever it injects, so this is not a regression on the injection path — §6.6.1
+   already requires `mitm: true` for `inject[]`. What disappears is the **opt-out**: today
+   `network.mitm: false` (the default) plus a `secrets.env` key is a valid configuration in which
+   nothing is intercepted; under B1 it has no equivalent, because declaring the secret is what
+   turns interception on. Read this together with "every secret must be network-scoped" below —
+   they are two halves of the same loss of the non-network secret path.
+
+   Emitting `--tls-intercept` explicitly whenever a secret is declared
+   (`translate-network-policy-to-msb.md` rule 5) stays correct as defence against an undocumented
+   builder side effect in a beta tool, but it is no longer load-bearing.
 
 2. **The implicit `allow@public` is wider than "only when no other rules are present".** The CLI
    branches on `replaces_configured_policy`, true only when one of `--net`, `--no-net`,
