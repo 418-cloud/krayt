@@ -59,6 +59,12 @@ func runFinish(ctx context.Context, workspace, patchGitDir, baseline, outDir str
 	if err := os.MkdirAll(outDir, 0o777); err != nil {
 		return finishResult{}, fmt.Errorf("create output dir: %w", err)
 	}
+	// MkdirAll's mode is subject to umask, so chmod explicitly — mirrors
+	// internal/guest/service.go's outputDir handling, since --out is shared with a non-root
+	// process the same way.
+	if err := os.Chmod(outDir, 0o777); err != nil {
+		return finishResult{}, fmt.Errorf("chmod output dir: %w", err)
+	}
 	diff, err := patch.Diff(ctx, patchGitDir, workspace, baseline)
 	if err != nil {
 		return finishResult{}, err
