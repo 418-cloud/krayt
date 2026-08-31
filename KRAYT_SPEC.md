@@ -1401,6 +1401,85 @@ quota and rate budget, for the run's duration regardless of how the credential g
 a scoped API key for untrusted code either way; translation narrows the cost of a subscription
 token's exposure, it doesn't remove the reason to be careful with one.
 
+### 6.15 microsandbox driver (`internal/sandbox`)
+
+Under ADR option B1 (`docs/adr-microsandbox-sandbox-layer.md`), krayt is migrating its sandbox
+layer onto [microsandbox](https://github.com/superradcompany/microsandbox) (`msb`), a
+libkrun-based microVM runtime, driven the same way the vfkit and Firecracker providers are: as a
+subprocess, over argv, stdio and its `--format json` / `--json` output (§6.3, §12) — not the Go
+SDK, which is a cgo `dlopen` bridge that would cost `CGO_ENABLED=0` without buying independence
+from the `msb` binary (the SDK downloads it too).
+
+`internal/sandbox` is the first landed piece of that migration and is currently **additive only**:
+nothing in krayt calls it yet, `krayt run` is unchanged, and the providers, guest agent, protocol
+and egress proxy it will eventually replace are all untouched. It is, like `internal/provider`, the
+*only* place in krayt that knows `msb` exists — nothing above it may construct an `msb` argv
+directly. It is OS-agnostic (no build tags), has no cgo, and imports none of
+`internal/{provider,guest,protocol,proxy,vmimage,controlclient}`.
+
+**`Client`** wraps one resolved `msb` binary path and is stateless — every method spawns its own
+process, killed with the caller's `context.Context` like every other orchestrator-driven
+subprocess (§6.2). `KRAYT_MSB_BIN`, mirroring `EgressProxyBinEnv` (`internal/orchestrator/
+egressproxy.go`), overrides the resolved path — the test seam, and the escape hatch for a
+non-`PATH` install. Methods: `Version` (parses `msb --version` against `MinVersion`, currently
+`0.6.16` — the version the ADR was verified against), `Context` (`msb context --format json`, the
+backend assertion below), `Create` (`msb create`, argv rendered by `CreateSpec.Args()`, a pure
+function so the whole surface is unit-testable without spawning anything), `Exec` (`msb exec
+--stream`, see below), `Copy` (`msb copy`, docker-cp syntax), `Logs` (`msb logs --json`, JSON
+Lines tagged by stream), `Stop`/`Remove` (`msb stop` / `msb rm --force`), and `Pull` (`msb pull`).
+`CreateSpec` and friends carry no `krayt.yaml` vocabulary and no lifecycle policy — which flags a
+run deserves is decided above this package (network-policy translation, secret handling, and the
+run's own order of operations each belong to the code that wires this driver up, not to the driver
+itself).
+
+**The child environment is a closed allowlist, never `os.Environ()`** — the same discipline
+`egressProxyChildEnvKeys` uses, and for the same reason: an unset `cmd.Env` would hand the `msb`
+child whatever the operator happened to have exported (an API key, a stray `MSB_PROFILE=prod`)
+when they ran `krayt run`. The allowlist forwards `PATH` and `HOME` unconditionally (msb resolves
+its own runtime under `$HOME/.microsandbox`), and `MSB_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR` only
+when the operator already has them set.
+
+**`MSB_BACKEND=local` is pinned on every invocation — always set, never forwarded from this
+process's own environment.** This is a security requirement, not tidiness. msb resolves its
+backend as *programmatic → `MSB_BACKEND` → `MSB_PROFILE` → `active_profile` in
+`~/.microsandbox/config.json` → local*, so an operator who has ever `export MSB_BACKEND=cloud`, or
+who has a cloud `active_profile` saved from an unrelated session, would otherwise have `krayt run`
+silently execute the task — and hand it credentials — on microsandbox's hosted service. Pinning
+`MSB_BACKEND=local` defeats both the environment and the saved profile, since `MSB_BACKEND`
+outranks both. The pin is asserted, not just set: `Client.Context` runs `msb context --format
+json` and callers must refuse to proceed unless it reports the local backend — a pin that is never
+checked is a comment.
+
+**Streaming.** `msb exec`'s default non-interactive mode buffers the entire command's output and
+writes it only after the process exits, which is unusable for krayt's live log streaming (§6.9),
+so `Exec` always passes `--stream`. Its one constraint is that stdin must be a real pipe, never a
+terminal; `Exec` gives it an explicit pipe deliberately (defaulting to an empty reader when the
+caller supplies none) rather than leaving it to inherit. `msb exec` propagates the guest command's
+own exit code via `std::process::exit`, while msb's *own* failures also exit `1` via an `anyhow`
+error — so exit `1` alone cannot distinguish "the agent returned 1" from "msb could not start the
+command". `Exec` resolves this structurally: a non-zero exit with **no** output observed on either
+stream is reported as `ErrMsbFailed`, a distinct error the orchestrator can branch on, rather than
+guessed at as the agent's own exit code.
+
+**Version floor.** `MinVersion` (`0.6.16`) is enforced by `krayt doctor` (below) — msb is beta and
+has shipped a breaking wire change in a patch release, so a silent version drift below the
+verified floor must be surfaced, not discovered as an outage.
+
+**`krayt doctor` checks.** `commonChecks()` (`internal/cli/doctor.go`) gains four checks, delegated
+to `internal/sandbox.DoctorChecks`: msb found on `PATH` (or via `KRAYT_MSB_BIN`), its version
+against `MinVersion`, `msb context --format json` resolving to the local backend under krayt's own
+pinned child env (reporting the resolved backend either way, so an operator with a cloud profile
+sees krayt overriding it rather than silently benefiting from it), and an `msb doctor` passthrough
+— msb ships its own host-readiness command (hypervisor availability, KVM interrupt acceleration on
+Linux, a clone probe inside `MSB_HOME`), and krayt surfaces its exit status as one check rather
+than reimplementing any of it. All four are currently **optional** (reported as `[warn]`, not
+`[FAIL]`): nothing in krayt uses msb yet, so on the near-totality of hosts that don't have it
+installed today, a hard failure here would newly break `krayt doctor` — and with it
+`hack/run-integration-tests.sh`'s preflight — for a dependency nothing yet needs. The existing
+vfkit/firecracker checks are unchanged. `run-tasks-on-microsandbox.md`, which wires `krayt run`
+through msb and removes the vfkit/firecracker providers and their checks, is the point these stop
+being optional.
+
 ---
 
 ## 7. Run Lifecycle (Step by Step)

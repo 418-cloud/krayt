@@ -18,7 +18,7 @@ type checkResult struct {
 
 // commonChecks are the platform-agnostic prerequisite checks, appended to hostChecks.
 func commonChecks() []checkResult {
-	return []checkResult{baseImageCheck()}
+	return append([]checkResult{baseImageCheck()}, msbChecks()...)
 }
 
 // hostChecks returns the platform-specific prerequisite checks; it is implemented per
