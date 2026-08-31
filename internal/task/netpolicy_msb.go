@@ -133,6 +133,11 @@ func ValidateNetworkPolicyForMsb(np NetworkPolicy, secretKeys map[string]bool, i
 	if err != nil {
 		return err
 	}
+	if secretKeys == nil && len(specs) > 0 {
+		return fmt.Errorf("network: inject declares %d key(s) but there is no secrets file — "+
+			"inject scopes secrets-file keys to hosts, so it is meaningless without one; remove "+
+			"network.inject or add a secrets file", len(specs))
+	}
 
 	allow := lowerSet(np.Allow)
 	specKeys := make(map[string]bool, len(specs))

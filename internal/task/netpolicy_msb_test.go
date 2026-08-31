@@ -425,6 +425,17 @@ func TestValidateNetworkPolicyForMsbRejectsUnknownInjectKey(t *testing.T) {
 	}
 }
 
+func TestValidateNetworkPolicyForMsbRejectsInjectWithNoSecretsFile(t *testing.T) {
+	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{"api.github.com"}}
+	err := ValidateNetworkPolicyForMsb(np, nil, []ConfigInjectRule{{Key: "GH_TOKEN", Host: "api.github.com"}})
+	if err == nil {
+		t.Fatal("expected an error for network.inject entries with no secrets file (secretKeys nil)")
+	}
+	if !strings.Contains(err.Error(), "secrets file") {
+		t.Errorf("error %q does not mention the missing secrets file", err)
+	}
+}
+
 func TestValidateNetworkPolicyForMsbRejectsInjectHostOutsideAllow(t *testing.T) {
 	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{"api.github.com"}}
 	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true},

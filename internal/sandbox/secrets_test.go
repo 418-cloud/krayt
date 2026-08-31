@@ -68,6 +68,35 @@ func TestSecretEnvErrorsOnUndeclaredKeyMissingFromSecretsFile(t *testing.T) {
 	}
 }
 
+func TestSecretEnvRejectsReservedKey(t *testing.T) {
+	for _, key := range []string{"PATH", "HOME", "MSB_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "MSB_BACKEND"} {
+		t.Run(key, func(t *testing.T) {
+			specs := []task.SecretSpec{{Key: key, Hosts: []string{"h.example"}}}
+			_, err := SecretEnv(specs, map[string]string{key: "sk-real-value"})
+			if err == nil {
+				t.Fatalf("expected an error: %q collides with a reserved msb child-env variable", key)
+			}
+			if strings.Contains(err.Error(), "sk-real-value") {
+				t.Errorf("error %q echoes the secret value", err)
+			}
+		})
+	}
+}
+
+func TestSecretEnvRejectsDuplicateKey(t *testing.T) {
+	specs := []task.SecretSpec{
+		{Key: "GH_TOKEN", Hosts: []string{"a.example"}},
+		{Key: "GH_TOKEN", Hosts: []string{"b.example"}},
+	}
+	_, err := SecretEnv(specs, map[string]string{"GH_TOKEN": "ghp-real-value"})
+	if err == nil {
+		t.Fatal("expected an error: GH_TOKEN is declared twice")
+	}
+	if strings.Contains(err.Error(), "ghp-real-value") {
+		t.Errorf("error %q echoes the secret value", err)
+	}
+}
+
 func TestSecretEnvEmpty(t *testing.T) {
 	env, err := SecretEnv(nil, map[string]string{"UNUSED": "value"})
 	if err != nil {

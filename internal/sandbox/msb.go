@@ -73,6 +73,21 @@ var childEnvKeys = []string{
 	"SSL_CERT_DIR",
 }
 
+// reservedChildEnvKeys is childEnvKeys plus backendEnvKey — the complete set of variable names
+// childEnv() itself may set on the msb child. A secret sharing one of these names would append a
+// second entry for the same name onto cmd.Env (commandWithEnv appends secretEnv after childEnv()),
+// and which of the two duplicate entries an arbitrary msb build honors is not something this
+// package controls — at worst silently overriding the MSB_BACKEND=local pin (decision 5). SecretEnv
+// rejects the collision at construction time instead.
+var reservedChildEnvKeys = func() map[string]bool {
+	m := make(map[string]bool, len(childEnvKeys)+1)
+	for _, k := range childEnvKeys {
+		m[k] = true
+	}
+	m[backendEnvKey] = true
+	return m
+}()
+
 // childEnv materializes childEnvKeys against this process's environment, dropping unset ones,
 // then pins backendEnvKey to BackendLocal unconditionally — NOT forwarded from this process's own
 // MSB_BACKEND, if it happens to have one. That is the point (add-msb-sandbox-driver.md decision
@@ -262,7 +277,15 @@ func SecretArgs(specs []task.SecretSpec) []string {
 // states for the pre-msb shape.
 func SecretEnv(specs []task.SecretSpec, vals map[string]string) ([]string, error) {
 	env := make([]string, 0, len(specs))
+	seen := make(map[string]bool, len(specs))
 	for _, s := range specs {
+		if reservedChildEnvKeys[s.Key] {
+			return nil, fmt.Errorf("sandbox: secret key %q collides with a reserved msb child-env variable", s.Key)
+		}
+		if seen[s.Key] {
+			return nil, fmt.Errorf("sandbox: secret key %q is declared more than once", s.Key)
+		}
+		seen[s.Key] = true
 		v, ok := vals[s.Key]
 		if !ok {
 			return nil, fmt.Errorf("sandbox: secrets file has no value for declared key %q", s.Key)
