@@ -23,6 +23,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # Cross-builds the embedded guest binaries (add-krayt-guest-helper.md) BEFORE build/test so
+      # internal/sandbox/guestbin's embed is non-empty here — guestbin_test.go's
+      # TestEmbeddedBinariesPresentInCI is gated on the CI env var GitHub Actions sets, so it hard
+      # fails if this step is ever skipped rather than silently passing on an empty embed.
+      - run: make guest-bins
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
