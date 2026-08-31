@@ -48,6 +48,9 @@ func TestNetworkArgsAllowlistEmptyIsDenyAll(t *testing.T) {
 			t.Errorf("empty allow list produced an unexpected allow rule: %q in %v", tok, got)
 		}
 	}
+	if !contains(got, "allow@dns") {
+		t.Errorf("empty allow list did not resolve DNS: %v", got)
+	}
 	assertNetDefaultOrNoNet(t, got)
 }
 
@@ -299,7 +302,7 @@ func TestNetworkArgsThisRepoConfig(t *testing.T) {
 		t.Fatal("this repo's krayt.yaml has an empty network.allow — test would be vacuous")
 	}
 
-	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: cfg.Network.Allow}
+	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: cfg.Network.Allow, Passthrough: cfg.Network.Passthrough}
 	got, err := NetworkArgs(np, true) // this repo's config injects a credential (§6.6.1)
 	if err != nil {
 		t.Fatalf("NetworkArgs: %v", err)
@@ -312,6 +315,9 @@ func TestNetworkArgsThisRepoConfig(t *testing.T) {
 	want = append(want, "--net-rule", "allow@dns")
 	for _, h := range cfg.Network.Allow {
 		want = append(want, "--net-rule", "allow@"+h)
+	}
+	for _, h := range cfg.Network.Passthrough {
+		want = append(want, "--tls-bypass", h)
 	}
 	want = append(want, "--tls-intercept", "--on-secret-violation", "block-and-log")
 
