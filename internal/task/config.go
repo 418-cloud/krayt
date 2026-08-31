@@ -53,8 +53,18 @@ type Config struct {
 // the container sends is not necessarily the header that goes upstream. Set values are
 // secrets-file key names, resolved host-side; SetLiteral values are fixed, non-secret strings —
 // kept syntactically distinct so a literal can never be mistaken for a resolved secret.
+//
+// Key and Hosts are additive (hand-secrets-to-msb.md): the msb-era shape reuses the same
+// `network.inject` YAML key but a different per-entry schema — a secrets-file key name and the
+// hosts it may be substituted to, nothing else (Strip/Set/SetPrefix/SetLiteral/Refresh have no
+// msb equivalent and are hard-errored by SecretSpecsFromConfig if present alongside Key). Host
+// is shared with the pre-msb shape and doubles as the msb shape's singular form; Hosts is the
+// plural form. Which shape a given entry uses is decided entirely by which fields are set — this
+// struct itself stays a plain, unvalidated parse of both.
 type ConfigInjectRule struct {
 	Host       string            `yaml:"host"`
+	Hosts      []string          `yaml:"hosts"`
+	Key        string            `yaml:"key"`
 	Strip      []string          `yaml:"strip"`
 	Set        map[string]string `yaml:"set"`
 	SetPrefix  map[string]string `yaml:"set_prefix"`

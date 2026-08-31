@@ -1,10 +1,12 @@
 package adapter_test
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/418-cloud/krayt/internal/adapter"
+	"github.com/418-cloud/krayt/internal/task"
 )
 
 const askSocket = "/run/krayt/ask.sock"
@@ -234,6 +236,78 @@ func TestMITMShapeTranslationRequiresMITM(t *testing.T) {
 	}
 	if len(plan.Inject) != 0 || len(plan.Placeholders) != 0 {
 		t.Errorf("mitm:false must not translate; plan = %+v", plan)
+	}
+}
+
+// TestSandboxModeReturnsSecretsNotInjectOrPlaceholders is the msb-era counterpart to
+// TestMITMShapeTranslationPlaceholderMirrorsTheCredential (hand-secrets-to-msb.md): when
+// Input.Sandbox is set, the claude-code adapter must return exactly one Plan.Secrets entry naming
+// the selected credential scoped to api.anthropic.com, and must NOT populate Inject or
+// Placeholders — msb needs neither a header table nor a krayt-emitted placeholder (it sets the
+// guest's own credential env var to its default placeholder itself).
+func TestSandboxModeReturnsSecretsNotInjectOrPlaceholders(t *testing.T) {
+	ad, err := adapter.Get("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cred := range []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"} {
+		plan, err := ad.Prepare(adapter.Input{SecretKeys: []string{cred}, Sandbox: true})
+		if err != nil {
+			t.Fatalf("%s: %v", cred, err)
+		}
+		if plan.Credential != cred {
+			t.Errorf("%s: Credential = %q, want %q", cred, plan.Credential, cred)
+		}
+		if len(plan.Inject) != 0 {
+			t.Errorf("%s: Sandbox mode must not populate Inject: %v", cred, plan.Inject)
+		}
+		if len(plan.Placeholders) != 0 {
+			t.Errorf("%s: Sandbox mode must not populate Placeholders: %v", cred, plan.Placeholders)
+		}
+		want := []task.SecretSpec{{Key: cred, Hosts: []string{"api.anthropic.com"}}}
+		if !reflect.DeepEqual(plan.Secrets, want) {
+			t.Errorf("%s: Secrets = %+v, want %+v", cred, plan.Secrets, want)
+		}
+	}
+}
+
+// TestSandboxModeStillEnforcesExactlyOne proves Sandbox mode doesn't bypass the §6.14
+// exactly-one-credential rule — ambiguous or missing auth must fail before Prepare ever builds a
+// SecretSpec.
+func TestSandboxModeStillEnforcesExactlyOne(t *testing.T) {
+	ad, err := adapter.Get("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ad.Prepare(adapter.Input{SecretKeys: []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}, Sandbox: true}); err == nil {
+		t.Fatal("Sandbox mode with two credentials should be rejected")
+	}
+	if _, err := ad.Prepare(adapter.Input{SecretKeys: nil, Sandbox: true}); err == nil {
+		t.Fatal("Sandbox mode with no credential should be rejected")
+	}
+}
+
+// TestSandboxModeFalseIsByteIdenticalToToday proves Input.Sandbox follows Input.MITM's own
+// precedent (adapter.go): unset (the zero value) on every existing caller/test, so Sandbox=false
+// changes nothing about Prepare's return value versus before this field existed.
+func TestSandboxModeFalseIsByteIdenticalToToday(t *testing.T) {
+	ad, err := adapter.Get("claude-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutField, err := ad.Prepare(adapter.Input{SecretKeys: []string{"ANTHROPIC_API_KEY"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitFalse, err := ad.Prepare(adapter.Input{SecretKeys: []string{"ANTHROPIC_API_KEY"}, Sandbox: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(withoutField, explicitFalse) {
+		t.Errorf("Sandbox=false diverges from the zero value: %+v vs %+v", explicitFalse, withoutField)
+	}
+	if len(withoutField.Secrets) != 0 {
+		t.Errorf("Sandbox=false must not populate Secrets: %+v", withoutField)
 	}
 }
 

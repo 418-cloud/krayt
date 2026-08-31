@@ -30,6 +30,15 @@ type Input struct {
 	// adapter may respond by translating its selected credential's shape instead of shipping it
 	// via SecretsBundle at all. False for every existing caller/test unless set explicitly, so an
 	// adapter that doesn't check it keeps today's behavior byte for byte.
+
+	// Sandbox is true for an msb-driven run (hand-secrets-to-msb.md), following MITM's own
+	// precedent: false for every existing caller/test unless set explicitly, so an adapter that
+	// doesn't check it keeps today's behavior byte for byte. When set, an adapter returns
+	// Plan.Secrets instead of Plan.Inject/Plan.Placeholders — msb substitutes a placeholder
+	// STRING wherever it appears, so there is no header shape to translate and no placeholder for
+	// krayt to emit (msb sets the guest's own credential env var to it, KRAYT_SPEC.md §6.14
+	// decision 3). Nothing sets this yet; run-tasks-on-microsandbox.md is the cut-over.
+	Sandbox bool
 }
 
 // Plan is an adapter's host-side contribution to a run: non-secret env additions for the
@@ -42,6 +51,13 @@ type Plan struct {
 	Credential   string
 	Inject       []task.InjectRule // host-side injection the orchestrator applies; requires MITM
 	Placeholders map[string]string // container env standing in for a host-only secret; never a real value
+
+	// Secrets is the msb-era counterpart to Inject/Placeholders (hand-secrets-to-msb.md), returned
+	// instead of them when Input.Sandbox is set: one task.SecretSpec per credential the adapter
+	// selected, naming the secrets-file key and the hosts msb may substitute it into. Never
+	// populated alongside Inject/Placeholders — an adapter picks one delivery shape per run,
+	// matching which field the caller (vfkit/Firecracker vs. msb) actually consumes.
+	Secrets []task.SecretSpec
 }
 
 // Adapter is one agent integration. Name is the config/flag value (§8.1 `agent.adapter`).

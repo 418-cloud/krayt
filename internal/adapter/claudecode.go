@@ -2,6 +2,12 @@ package adapter
 
 import "github.com/418-cloud/krayt/internal/task"
 
+// claudeCodeAPIHost is the one host Claude Code's model-provider credential ever needs under
+// msb (hand-secrets-to-msb.md): unlike anthropic_wire.go's table, there is no header shape to
+// pick, since msb substitutes a placeholder STRING wherever it appears rather than a named
+// header — so this adapter needs to know only the host, not which header carries the credential.
+const claudeCodeAPIHost = "api.anthropic.com"
+
 // claudeCodeAuthKeys are the auth credentials Claude Code accepts, in the §6.14 precedence
 // order krayt surfaces in errors. Exactly one must be set: with both ANTHROPIC_API_KEY and
 // CLAUDE_CODE_OAUTH_TOKEN present the API key silently wins and the subscription is bypassed
@@ -26,6 +32,19 @@ func (claudeCode) Prepare(in Input) (Plan, error) {
 	cred, err := exactlyOne("claude-code", in.SecretKeys, claudeCodeAuthKeys)
 	if err != nil {
 		return Plan{}, err
+	}
+	if in.Sandbox {
+		// msb owns credential substitution end to end (KRAYT_SPEC.md §6.14 decision 3): it sets
+		// the guest's OWN credential env var to its default $MSB_<name> placeholder itself, so
+		// there is nothing here for Env/Placeholders to do, and no header table to consult for
+		// which header the value belongs on — the CLI emits its own auth header unprompted and
+		// msb matches the placeholder string wherever it lands. The exactly-one rule above still
+		// applies: Prepare only ever has one selected credential to scope.
+		return Plan{
+			Env:        askEnv(in),
+			Credential: cred,
+			Secrets:    []task.SecretSpec{{Key: cred, Hosts: []string{claudeCodeAPIHost}}},
+		}, nil
 	}
 	if in.MITM {
 		if rule, placeholders, ok := anthropicInjectRuleFor(cred); ok {

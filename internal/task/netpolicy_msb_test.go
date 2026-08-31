@@ -336,7 +336,7 @@ func TestValidateNetworkPolicyForMsbRejectsMitm(t *testing.T) {
 	if err := ValidateNetworkPolicy(np, nil); err != nil {
 		t.Fatalf("ValidateNetworkPolicy unexpectedly rejected mitm: %v", err)
 	}
-	err := ValidateNetworkPolicyForMsb(np, nil)
+	err := ValidateNetworkPolicyForMsb(np, nil, nil)
 	if err == nil {
 		t.Fatal("ValidateNetworkPolicyForMsb accepted network.mitm")
 	}
@@ -347,22 +347,90 @@ func TestValidateNetworkPolicyForMsbRejectsMitm(t *testing.T) {
 
 func TestValidateNetworkPolicyForMsbAcceptsOtherwiseValidPolicy(t *testing.T) {
 	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{"api.anthropic.com"}}
-	if err := ValidateNetworkPolicyForMsb(np, nil); err != nil {
+	if err := ValidateNetworkPolicyForMsb(np, nil, nil); err != nil {
 		t.Fatalf("ValidateNetworkPolicyForMsb: %v", err)
 	}
 }
 
-func TestValidateNetworkPolicyForMsbStillEnforcesInjectRequiresMitm(t *testing.T) {
-	// mitm is now unconditionally rejected, so a leftover inject rule (out of scope for this task
-	// to remove — hand-secrets-to-msb.md's job) still fails, just via the same "inject requires
-	// mitm: true" path ValidateNetworkPolicy already enforces, since mitm can never be true here.
+func TestValidateNetworkPolicyForMsbAcceptsAMatchingSecretAndInjectEntry(t *testing.T) {
+	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{"api.github.com"}}
+	inject := []ConfigInjectRule{{Key: "GH_TOKEN", Host: "api.github.com"}}
+	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true}, inject)
+	if err != nil {
+		t.Fatalf("ValidateNetworkPolicyForMsb: %v", err)
+	}
+}
+
+func TestValidateNetworkPolicyForMsbRejectsLegacyInjectShape(t *testing.T) {
+	// mitm is now unconditionally rejected first, but a leftover legacy-shape rule (out of scope
+	// for translate-network-policy-to-msb.md to remove — this task's job) must ALSO be refused on
+	// its own terms once mitm can never be true: NetworkPolicy.Inject has no meaning under msb at
+	// all, so populating it is a caller bug, not something that should silently fall through.
 	np := NetworkPolicy{
 		Mode: NetworkAllowlist, Allow: []string{"api.github.com"},
 		Inject: []InjectRule{{Host: "api.github.com", Set: map[string]string{"authorization": "GH_TOKEN"}}},
 	}
-	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true})
+	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true}, nil)
 	if err == nil {
-		t.Fatal("expected an error for an inject rule with no mitm")
+		t.Fatal("expected an error for a populated legacy NetworkPolicy.Inject under msb")
+	}
+}
+
+func TestValidateNetworkPolicyForMsbRejectsRemovedInjectKeys(t *testing.T) {
+	cases := []struct {
+		name    string
+		rule    ConfigInjectRule
+		wantErr string
+	}{
+		{"strip", ConfigInjectRule{Key: "GH_TOKEN", Host: "api.github.com", Strip: []string{"authorization"}}, "strip"},
+		{"set", ConfigInjectRule{Key: "GH_TOKEN", Host: "api.github.com", Set: map[string]string{"authorization": "GH_TOKEN"}}, "set"},
+		{"set_prefix", ConfigInjectRule{Key: "GH_TOKEN", Host: "api.github.com", SetPrefix: map[string]string{"authorization": "Bearer "}}, "set_prefix"},
+		{"set_literal", ConfigInjectRule{Key: "GH_TOKEN", Host: "api.github.com", SetLiteral: map[string]string{"x-krayt": "1"}}, "set_literal"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			np := NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{"api.github.com"}}
+			err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true}, []ConfigInjectRule{tc.rule})
+			if err == nil {
+				t.Fatalf("expected an error for a %s key under msb", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not name %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateNetworkPolicyForMsbRejectsUnscopedSecret(t *testing.T) {
+	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{"api.github.com"}}
+	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true, "DB_PASSWORD": true},
+		[]ConfigInjectRule{{Key: "GH_TOKEN", Host: "api.github.com"}})
+	if err == nil {
+		t.Fatal("expected an error for a secrets-file key with no network.inject entry")
+	}
+	if !strings.Contains(err.Error(), "DB_PASSWORD") {
+		t.Errorf("error %q does not name the unscoped key DB_PASSWORD", err)
+	}
+}
+
+func TestValidateNetworkPolicyForMsbRejectsUnknownInjectKey(t *testing.T) {
+	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{"api.github.com"}}
+	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true},
+		[]ConfigInjectRule{{Key: "GH_TOKEN", Host: "api.github.com"}, {Key: "TYPO_KEY", Host: "api.github.com"}})
+	if err == nil {
+		t.Fatal("expected an error for an inject entry naming a key absent from the secrets file")
+	}
+	if !strings.Contains(err.Error(), "TYPO_KEY") {
+		t.Errorf("error %q does not name TYPO_KEY", err)
+	}
+}
+
+func TestValidateNetworkPolicyForMsbRejectsInjectHostOutsideAllow(t *testing.T) {
+	np := NetworkPolicy{Mode: NetworkAllowlist, Allow: []string{"api.github.com"}}
+	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true},
+		[]ConfigInjectRule{{Key: "GH_TOKEN", Host: "not-allowed.example"}})
+	if err == nil {
+		t.Fatal("expected an error for an inject host outside network.allow in mode: allowlist")
 	}
 }
 

@@ -749,6 +749,14 @@ holds it, so there is nothing in the VM for a compromise to steal.
   process table; env is readable from `/proc/<pid>/environ`. The run supervisor writes one JSON
   document — the passthrough list and every inject rule, with `set`'s secrets-file key names
   already resolved to values — to the child's stdin at startup, then closes it.
+  **`hand-secrets-to-msb.md` deliberately overturns this rule for the msb path** (§6.8, §6.15):
+  msb offers no stdin channel for a secret at all — the complete set of host-side sources is
+  `SecretSource::{Env, Store}`, `Store` has zero usages anywhere in msb's repository, and its CLI
+  only ever builds `Env` — so the msb child's environment is the value channel there, narrowing
+  the requirement from "never in argv or env" to "never on argv, never persisted" (§6.8). This is
+  a decision made once, in full, in §6.8 — not a second, silently-diverging rule; a reader who
+  needs the reasoning should read it there rather than assume this bullet still governs the msb
+  path unchanged.
 - **`http/1.1` only in ALPN.** A hijacked `CONNECT` does not get `net/http`'s automatic h2
   upgrade; advertising `h2` and then serving 1.1 breaks clients. The *upstream* leg (the shared,
   SSRF-guarded transport) keeps `ForceAttemptHTTP2` as before.
@@ -1037,6 +1045,56 @@ proxy attaches can still appear in `proxy.log` the same way any other secret can
 `report.md` record **which keys were injected** (names only) so the human reviewing a run can see
 the container ran without them — the user-visible payoff of this whole mechanism. Everything else
 in this section is unchanged: a non-injected secret still rides `SecretsBundle` exactly as before.
+
+**Under msb — the env-reference channel (additive, not yet wired, `hand-secrets-to-msb.md`).**
+Everything above this paragraph describes the vfkit/Firecracker path, which is still the only one
+`krayt run` executes. msb replaces the whole mechanism, not just the injection variant of it:
+`internal/sandbox` (§6.15) is the *only* place that knows how, and `internal/task.SecretSpec{Key,
+Hosts}` plus `ValidateNetworkPolicyForMsb` (§8.1) are the *only* additive pieces so far — nothing
+below is called from `krayt run` yet.
+
+- **Three channels, one carries a value.** `network.inject[]` becomes `--secret NAME@HOST[,HOST...]`
+  argv (a name and an allow list, never a value); `network.allow`/`passthrough` become
+  `--net-rule`/`--tls-bypass` argv (§6.15's `NetworkArgs`); the secrets-file **value** travels only
+  in `cmd.Env` on the spawned `msb` child (`internal/sandbox.SecretEnv`), never on disk, never on
+  argv, never on any other invocation. msb itself enforces the argv half: `--secret` accepts only
+  `NAME@HOST[,HOST...]`, and rejects an inline `NAME=VALUE@HOST` on both `create` and `modify`.
+- **The narrowed requirement.** `/proc/<pid>/environ` is mode `0400` — same-uid only, unlike the
+  world-readable `/proc/<pid>/cmdline` that makes argv unacceptable. The adversary the env channel
+  admits is one who can already read `secrets.env` (0600), ptrace krayt, and read msb's own heap,
+  where the value lives for the sandbox's lifetime regardless of how it arrived, un-zeroized, by
+  msb's own documentation. Host compromise is out of scope in both threat models, so the
+  requirement narrows to **never on argv, never persisted** — a deliberate decision, not a
+  weakening nobody noticed.
+- **Every secret must be network-scoped — a capability loss, stated plainly.** Today every
+  `secrets.env` key is materialized in the guest at `/run/secrets/<KEY>` (above), so a secret can
+  be *used inside the guest* — an SSH key, a signing key, a local database password — not only
+  sent to a host. Under msb there is no such channel: `--secret` never puts a value in the guest
+  (the guest gets msb's own placeholder instead, §6.14), `--env KEY=VALUE` puts the value on argv
+  (disqualified), and `msb copy` into a tmpfs mount requires writing the value to a host temp file
+  first — rejected, since it trades away "never persisted" for a weaker property, and if that
+  trade is ever reconsidered it needs its own decision, not a quiet implementation. So a
+  `secrets.env` key with no `network.inject` entry naming it is a **pre-flight error**
+  (`ValidateNetworkPolicyForMsb`, §8.1), not a silently-dropped capability: a value that genuinely
+  must be readable inside the guest belongs in `env:` with the user's eyes open, where the name no
+  longer promises something krayt can't deliver.
+- **Timing.** msb reads a secret's value "at start time", not at config-load time, so the
+  environment must be set on whichever invocation actually starts the sandbox — `msb create` — in
+  krayt's lifecycle. A later `msb exec` against an already-running sandbox needs none, because the
+  per-sandbox host runtime holds the value for the sandbox's lifetime; `internal/sandbox.Client`
+  enforces this structurally, not by convention — `Exec` has no parameter through which a secret
+  could reach it at all, and only `Create` accepts one.
+- **The host-side secret-key scanner.** The bullet above ("`changes.patch` is scanned, NOT
+  redacted") assumed the guest does the scanning because only the guest ever held the values.
+  Under msb no value enters the guest at all, so the **host** scans the patch it already copied
+  out (`internal/orchestrator.PatchSecretKeys`) — strictly more trustworthy, since the agent inside
+  the sandbox cannot tamper with a scanner it never runs. It reuses `secrets.ScanKeys`, the same
+  substring-over-the-whole-buffer matcher the pre-msb guest scan and the artifact redactor already
+  use, rather than a second definition of "this looks like the value". Host-side artifact
+  redaction (live logs, `report.md`, `ask_human` prompt/choices) is otherwise unchanged and stays
+  load-bearing — the *host* still holds every value; only the guest-side half of the redaction
+  story stops applying, because a guest that never holds a value cannot leak one into a log in the
+  first place.
 
 ### 6.9 Logging & streaming (`internal/orchestrator` + guest)
 - Container stdout/stderr → guest → vsock `Logs` stream → host.
@@ -1450,6 +1508,22 @@ quota and rate budget, for the run's duration regardless of how the credential g
 a scoped API key for untrusted code either way; translation narrows the cost of a subscription
 token's exposure, it doesn't remove the reason to be careful with one.
 
+**Under msb — adapters return secret specs, not inject rules (additive, not yet wired,
+`hand-secrets-to-msb.md`).** `adapter.Input` gains a `Sandbox bool` field alongside `MITM`,
+following that field's own precedent: false for every existing caller/test unless set explicitly,
+so an adapter that doesn't check it keeps today's behavior byte for byte. When set, an adapter
+returns `Plan.Secrets []task.SecretSpec` instead of `Plan.Inject`/`Plan.Placeholders` — for
+`claude-code` that is one spec naming whichever credential key `secrets.env` holds, scoped to
+`api.anthropic.com`. The exactly-one-credential rule above is unchanged and still enforced before
+a `SecretSpec` is ever built. Two things fall out of decision 3 (§6.15): the adapter emits no
+placeholder (`Plan.Placeholders` has no job here — msb sets the guest's credential env var to its
+own default placeholder itself), and it needs no header table (`anthropic_wire.go` is not called
+on this path) — the CLI emits `x-api-key: $MSB_…` or `authorization: Bearer $MSB_…` unprompted and
+msb substitutes the placeholder wherever it lands, without krayt needing to know which header it
+was in. That shape mirroring (already built for the MITM path above) is what makes deleting
+`anthropic_wire.go` realistic at the msb cut-over, though it is not deleted by this task —
+the live MITM path still calls it.
+
 ### 6.15 microsandbox driver (`internal/sandbox`)
 
 Under ADR option B1 (`docs/adr-microsandbox-sandbox-layer.md`), krayt is migrating its sandbox
@@ -1509,6 +1583,17 @@ error — so exit `1` alone cannot distinguish "the agent returned 1" from "msb 
 command". `Exec` resolves this structurally: a non-zero exit with **no** output observed on either
 stream is reported as `ErrMsbFailed`, a distinct error the orchestrator can branch on, rather than
 guessed at as the agent's own exit code.
+
+**Secret handling (`hand-secrets-to-msb.md`, additive, not yet wired — see §6.8).**
+`Client.Create` is the only method that accepts a `secretEnv []string` parameter, appended to the
+child's environment on top of the closed allowlist above; every other method (`Exec` included)
+has no such parameter at all, so the Timing rule (§6.8: a secret's value is set once, on whichever
+invocation starts the sandbox) is structural, not conventional. Two pure functions, next to
+`CreateSpec.Args()`, render the two channels a secret actually travels: `SecretArgs([]task.SecretSpec)
+[]string` renders one `--secret NAME@HOST[,HOST...]` flag per spec, deterministically ordered by
+key; `SecretEnv([]task.SecretSpec, map[string]string) ([]string, error)` returns the `KEY=VALUE`
+entries for `secretEnv`, for exactly the declared keys — erroring on a declared key the secrets
+file lacks, so a misconfigured run refuses pre-flight rather than reaching msb unauthenticated.
 
 **Version floor.** `MinVersion` (`0.6.16`) is enforced by `krayt doctor` (below) — msb is beta and
 has shipped a breaking wire change in a patch release, so a silent version drift below the
@@ -1671,16 +1756,48 @@ fails opaquely 30s into the agent); `passthrough ⊆ allow` in `mode: allowlist`
 intercepts **every** TLS connection the agent makes except those listed in `passthrough` — that
 is the point of `full`, stated plainly here so it isn't a surprise.
 
-**Under msb — the target model, additive and not yet wired (§6.6, `translate-network-policy-to-msb.md`).**
-`task.ValidateNetworkPolicyForMsb` exists beside `ValidateNetworkPolicy` above but is not yet
-called from anywhere — the vfkit/Firecracker path this section describes is still the one that
-executes, and it still requires `mitm: true` to inject anything, including for this repo's own
-`krayt.yaml`. When `run-tasks-on-microsandbox.md` swaps the call site, `network.mitm` becomes a
-hard pre-flight error naming itself and its replacement: under msb, declaring any secret enables
-TLS interception automatically, so the key has nothing left to opt into. `inject[].set`,
-`inject[].set_prefix`, and `inject[].strip` lose their meaning the same way, on the same schedule
-— msb substitutes a placeholder string wherever it appears rather than naming a header
-(`hand-secrets-to-msb.md`). Until that cut-over, this file's documented behavior is unchanged.
+**Under msb — the target model, additive and not yet wired (§6.6, `translate-network-policy-to-msb.md`,
+`hand-secrets-to-msb.md`).** `task.ValidateNetworkPolicyForMsb` exists beside `ValidateNetworkPolicy`
+above but is not yet called from anywhere — the vfkit/Firecracker path this section describes is
+still the one that executes, and it still requires `mitm: true` to inject anything, including for
+this repo's own `krayt.yaml`. When `run-tasks-on-microsandbox.md` swaps the call site,
+`network.mitm` becomes a hard pre-flight error naming itself and its replacement: under msb,
+declaring any secret enables TLS interception automatically, so the key has nothing left to opt
+into.
+
+`network.inject` keeps its name — §8.3's containment table already refuses it from an
+auto-loaded repo-local config by key name, and that protection carries over without re-deriving it
+— but loses most of its schema. `host`/`strip`/`set`/`set_prefix`/`set_literal`/`refresh` are the
+pre-msb, header-shaped vocabulary above; under msb an entry instead names a secrets-file **key**
+and the **hosts** it may be substituted to, nothing else, because msb substitutes a placeholder
+*string* wherever it appears rather than replacing a named header:
+
+```yaml
+network:
+  inject:
+    - key: GH_TOKEN              # secrets-file key name; never a value
+      hosts: [api.github.com]    # hosts allowed to receive it
+    - key: ANTHROPIC_API_KEY
+      host: api.anthropic.com    # singular form accepted; `host` xor `hosts`
+```
+
+`task.ConfigInjectRule` carries both shapes' fields at once (a plain, unvalidated parse); which
+shape a given entry uses is decided by which fields it sets. `task.SecretSpecsFromConfig` converts
+the msb shape into `task.SecretSpec{Key, Hosts}` and hard-errors, naming itself, on `strip`, `set`,
+`set_prefix`, `set_literal` or `refresh` appearing on an entry — silently ignoring one of these,
+`strip` above all, would weaken the posture (an un-stripped pre-existing auth header reaching an
+allowed host untouched, §10) without telling anyone. `task.ValidateNetworkPolicyForMsb` calls it,
+then additionally enforces: every `network.inject` entry's key must exist in the task's secrets
+file (the same typo protection the pre-msb shape already has) and, the new rule msb's model
+requires (§6.8), every key that *does* exist in the secrets file must have a `network.inject`
+entry — a secret with nowhere to be scoped can never be delivered under msb at all, so leaving one
+unscoped is refused pre-flight rather than silently dropped.
+
+`internal/sandbox.SecretArgs`/`SecretEnv` (§6.15) render the resulting specs into the two channels
+a secret actually travels — argv (names and hosts only) and the msb child's env (the one channel
+that carries a value, §6.8) — and `adapter.Plan.Secrets` (§6.14) is how an adapter contributes its
+own selected credential to the same list. Until the `run-tasks-on-microsandbox.md` cut-over, none
+of this is called from `krayt run`, and this file's documented pre-msb behavior is unchanged.
 
 **Adapter-supplied injection and merge precedence (`inject-claude-oauth-token-at-proxy.md` §2/§4).**
 An adapter's `Prepare` can return `Inject` rules of its own (§6.14's credential shape translation
@@ -2039,6 +2156,7 @@ exposed.
 | Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
 | Secrets | tmpfs only, never on disk, destroyed with VM; **redacted in the guest** from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted** (redacting hunks would break `git apply`); a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
 | TLS MITM / credential injection | **Opt-in, default off** (`network.mitm`, §6.6.1). An injected secrets-file key is **withheld from `SecretsBundle` entirely** — the container never holds it, closing "Auth-credential blast radius" (below) for that credential. Ephemeral per-run CA, in memory only, private key never exported. Trades a HOST-process compromise for a *stronger* claim than plain egress enforcement: the proxy process now also holds real user credentials, not just a policy decision (residual below) |
+| TLS MITM / credential injection — **under msb** (not yet wired, `hand-secrets-to-msb.md`) | Same credential-boundary property (real value never enters the VM) plus msb's DNS-pin and authority-alignment gates, **but msb never strips a pre-existing auth header before substituting its own placeholder's real value in** — krayt today strips `authorization`/`x-api-key` first. **The one real regression against krayt-today**, stated plainly rather than discovered: a credential the agent obtained elsewhere and placed in that header, addressed to an allowed host, goes out **untouched**. Bounded by the allowlist — the agent can only send it somewhere already permitted — not eliminated |
 | Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3, whose table is the full field-by-field boundary): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy, redirect what krayt reads or writes on the host, or relax the container's confinement**. Refused with an error: `network.mitm`, `network.inject`, `network.passthrough`, `network.mode: full`, `repo:`, `container.capabilities`, `container.seccomp: unconfined`. Contained to the repo root (no absolute path, no `..` escape, no symlink resolving out): `secrets:`, `task:`. Without this split a poisoned repo could turn on MITM and name the operator's own secrets-file key as the credential injected into an attacker-controlled host, bundle a *different*, private repo into the VM for the agent to read, read an arbitrary host file in as the run's prompt, or hand the container back the capabilities and seccomp profile §8.1 takes away — with every consistency check passing, because the file is only ever compared against itself |
 | Persistence | CoW disk destroyed on teardown; fresh VM per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
