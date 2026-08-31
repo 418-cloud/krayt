@@ -992,6 +992,35 @@ can tell whether that equality is expected.
 - **Submodules:** a superproject bundle includes the gitlink but **not** submodule contents,
   so repos with submodules won't have submodule working trees in the guest. Out of scope for v1.
 
+**Under B1 (microsandbox, `docs/adr-microsandbox-sandbox-layer.md`), a second implementation
+performs this same sequence: `cmd/krayt-helper`, a small stateless binary embedded in krayt
+(`internal/sandbox/guestbin`) and copied into the sandbox with `msb copy`, run with
+`msb exec --user root` against a workspace a non-root agent user has already edited
+(`add-krayt-guest-helper.md`).** It is additive — the guest-agent description above remains the
+description of the code actually running until `run-tasks-on-microsandbox.md` cuts over and
+deletes it. The helper is **stateless, exec'd, argv in and JSON on stdout, exits**: no gRPC, no
+control protocol, no long-running process, no listener of any kind — growing one would re-create
+the guest agent inside someone else's sandbox. It takes no secrets argument and performs no
+secret scan; that scan moved host-side under B1 (§6.8, §8.4) because secret values never enter
+the guest, narrowing the ADR's original description of this helper's job. It exposes exactly two
+subcommands:
+
+- `krayt-helper setup --bundle <path> --workspace <path> --patch-git <path> --agent-user <name>`
+  runs `Ingest`, then `SetupPatchGit` **before** relaxing the tree, then
+  `MakeContainerWritable` — in that order, non-negotiably: the pristine root-only patchgit
+  snapshot must be taken before the tree becomes agent-writable, or the container→guest-root
+  isolation `fix-guest-git-config-rce.md` bought is void (the same rule the guest-agent's `Start`
+  handler follows above). Prints `{"baseline", "workspace", "patch_git", "agent_user"}` on stdout.
+- `krayt-helper finish --workspace <path> --patch-git <path> --baseline <ref> --out <dir>` runs
+  `Diff` into `<out>/changes.patch` and `BundleCommits` into `<out>/commits.bundle` when the agent
+  committed, against the same root-only `patchgit` and force-cleared git knobs described above.
+  Prints `{"baseline", "commits_bundle", "diff_bytes"}` on stdout.
+
+Both print human-readable errors on stderr and exit non-zero on failure. Distribution is
+`go:embed` per architecture (`runtime.GOARCH`; the guest OS under msb is always Linux, so there
+is no second dimension to select on) — no registry, no OCI artifact, no Nix, no boot test, since
+the helper is neither a kernel nor a rootfs.
+
 ### 6.8 Secrets (`internal/secrets`)
 - Read from a **per-task secrets file** (e.g. `secrets.env` or `secrets.yaml`).
 - Transferred over the encrypted-by-isolation vsock channel.
