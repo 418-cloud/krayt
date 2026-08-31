@@ -115,13 +115,15 @@ Two facts make this much cheaper than it looks:
     the agent fetched from an allowed host each put one back in the sandbox. The host holds the
     values anyway, so applying the `Redactor` in `Serve` before `push` costs nothing.
 12. **`ensureSockRoot` is extracted, not copied.** Decision 4's "reuse that check" is right and, as
-    written, impossible: the check lives at `internal/provider/vfkit/vfkit.go:185` behind
-    `//go:build darwin`, and `internal/sandbox` is OS-agnostic and runs on Linux. Move it to a
-    shared unix-tagged package, preserving the two properties that make it work — `os.Mkdir` (not
+    written, impossible: the check is duplicated in each OS-specific provider package —
+    `internal/provider/vfkit/vfkit.go:185` behind `//go:build darwin` and
+    `internal/provider/firecracker/firecracker.go:203` behind `//go:build linux` — and
+    `internal/sandbox` is OS-agnostic and runs on both. Move it to a shared unix-tagged package,
+    preserving the two properties that make it work — `os.Mkdir` (not
     `MkdirAll`, so an existing path is an error) and `os.Lstat` (so a pre-placed symlink is never
-    followed into an attacker's target). Do not inherit vfkit's `/tmp/krayt` root: the run's own
-    private state dir is correct here. vfkit's fixed `/tmp` path exists only for macOS's 104-byte
-    `sun_path` limit (`vfkit.go:145`) — a limit this socket still has to fit under, so keep the
+    followed into an attacker's target). Do not inherit vfkit's `/tmp/krayt-<uid>` root: the run's
+    own private state dir is correct here. vfkit's fixed `/tmp` path exists only for macOS's
+    104-byte `sun_path` limit (`vfkit.go:145`) — a limit this socket still has to fit under, so keep the
     path short by construction rather than "fixing" an overflow later by moving to a shared
     world-writable dir. A socket already present in a freshly created per-run dir means something
     is wrong: fail closed, never unlink-then-bind.
