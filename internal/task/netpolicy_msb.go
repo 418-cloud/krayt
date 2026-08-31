@@ -91,11 +91,17 @@ func denyGroupArgs() []string {
 }
 
 // ValidateNetworkPolicyForMsb is the msb-era pre-flight check (translate-network-policy-to-msb.md
-// decision 2): it rejects network.mitm outright, naming the key and what replaces it, instead of
-// silently dropping a field whose presence means its author was reasoning about interception.
-// Under msb there is no such thing as a secret without MITM — declaring any secret enables TLS
-// interception automatically (NetworkArgs, decision 5) — so the key has no meaning to translate
-// and must not be quietly ignored.
+// decision 2, extended by hand-secrets-to-msb.md decision 4 and the "every secret must be
+// network-scoped" rule): it rejects network.mitm outright, naming the key and what replaces it,
+// instead of silently dropping a field whose presence means its author was reasoning about
+// interception. Under msb there is no such thing as a secret without MITM — declaring any secret
+// enables TLS interception automatically (NetworkArgs, decision 5) — so the key has no meaning to
+// translate and must not be quietly ignored.
+//
+// inject is network.inject's RAW config entries (task.Config.Network.Inject), not
+// NetworkPolicy.Inject — under msb the per-entry schema is key+hosts (SecretSpecsFromConfig), not
+// host/strip/set/set_prefix/set_literal, so np.Inject (the pre-msb domain shape) must be empty;
+// populating it under msb is itself a caller bug this function refuses rather than misinterprets.
 //
 // This deliberately does NOT replace ValidateNetworkPolicy, and must not be called in its place
 // yet: the vfkit/Firecracker path is still the only path that executes a run, and it requires
@@ -103,15 +109,61 @@ func denyGroupArgs() []string {
 // mitm there would break every run on that path. run-tasks-on-microsandbox.md is the task that
 // swaps the call site, in the same change that deletes the vfkit/Firecracker path.
 //
-// Every other check is unchanged by msb, so this delegates to ValidateNetworkPolicy for the rest
-// (host shapes, passthrough/allow subset rules, and — until hand-secrets-to-msb.md narrows it —
-// the existing inject/mitm-pairing check, which still fires correctly here: mitm is always false
-// by the time that check runs, since a true value already returned above).
-func ValidateNetworkPolicyForMsb(np NetworkPolicy, secretKeys map[string]bool) error {
+// secretKeys is the set of key NAMES present in the task's secrets file (never values), exactly
+// as ValidateNetworkPolicy takes it; pass nil when there is no secrets file. Every key in
+// secretKeys must have a matching inject entry (hand-secrets-to-msb.md, "The gap the ADR does not
+// name: non-network secrets") — under msb a secret with nowhere to be scoped can never be
+// delivered at all, so leaving one unscoped is a pre-flight error, not a silently-dropped
+// capability. Every inject entry must in turn name a key that actually exists in secretKeys, the
+// same typo protection ValidateNetworkPolicy already gives the pre-msb shape.
+func ValidateNetworkPolicyForMsb(np NetworkPolicy, secretKeys map[string]bool, inject []ConfigInjectRule) error {
 	if np.MITM {
 		return fmt.Errorf("network: mitm is not a valid key under msb — TLS interception is " +
 			"enabled automatically the moment any secret is declared, so there is nothing left " +
 			"for this key to opt into; remove network.mitm")
 	}
+	if len(np.Inject) > 0 {
+		return fmt.Errorf("network: NetworkPolicy.Inject (the pre-msb host/strip/set shape) must " +
+			"not be populated for an msb run — msb secret scoping is SecretSpecsFromConfig's job, " +
+			"not InjectRulesFromConfig's; pass network.inject's raw config entries as this " +
+			"function's inject parameter instead")
+	}
+
+	specs, err := SecretSpecsFromConfig(inject)
+	if err != nil {
+		return err
+	}
+	if secretKeys == nil && len(specs) > 0 {
+		return fmt.Errorf("network: inject declares %d key(s) but there is no secrets file — "+
+			"inject scopes secrets-file keys to hosts, so it is meaningless without one; remove "+
+			"network.inject or add a secrets file", len(specs))
+	}
+
+	allow := lowerSet(np.Allow)
+	specKeys := make(map[string]bool, len(specs))
+	for _, s := range specs {
+		specKeys[s.Key] = true
+		for _, h := range s.Hosts {
+			if err := validateHostEntry(h); err != nil {
+				return fmt.Errorf("network: inject (%s): %w", s.Key, err)
+			}
+			if np.Mode == NetworkAllowlist && !allow[lower(h)] {
+				return fmt.Errorf("network: inject (%s): host %q must also be in allow (mode: allowlist)", s.Key, h)
+			}
+		}
+		if secretKeys != nil && !secretKeys[s.Key] {
+			return fmt.Errorf("network: inject names secrets-file key %q, which does not exist", s.Key)
+		}
+	}
+	for k := range secretKeys {
+		if !specKeys[k] {
+			return fmt.Errorf("network: secrets-file key %q has no network.inject entry — under msb "+
+				"every secret must be network-scoped: krayt delivers a secret only as a host-side "+
+				"substitution to allowed hosts, never materialized inside the guest; add an inject "+
+				"entry naming %q and its allowed hosts, or move the value to env: if it genuinely must "+
+				"be readable inside the guest", k, k)
+		}
+	}
+
 	return ValidateNetworkPolicy(np, secretKeys)
 }

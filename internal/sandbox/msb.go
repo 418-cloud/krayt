@@ -8,6 +8,14 @@
 // This package is OS-agnostic (no build tags), has no cgo, and builds argv from typed structs —
 // it takes no krayt.yaml vocabulary and carries no lifecycle policy. Which flags a run deserves
 // is decided above this package; this package only knows how to ask msb to do what it's told.
+//
+// The one deliberate exception is task.SecretSpec (hand-secrets-to-msb.md's "What to build"): it
+// is not krayt.yaml vocabulary in the sense above (no YAML shape, no policy) but a bare (key,
+// hosts) pair — SecretArgs and SecretEnv render it into the two channels a secret actually
+// travels, argv and env, and keeping both pure functions here next to CreateSpec.Args() is what
+// makes their "never a value on argv" / "only the declared keys in env" properties testable
+// without spawning anything, the same reason CreateSpec.Args() lives here rather than above this
+// package.
 package sandbox
 
 import (
@@ -20,10 +28,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/418-cloud/krayt/internal/task"
 )
 
 // BinEnv is the swap/test seam (add-msb-sandbox-driver.md decision 3), mirroring
@@ -61,6 +72,21 @@ var childEnvKeys = []string{
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
 }
+
+// reservedChildEnvKeys is childEnvKeys plus backendEnvKey — the complete set of variable names
+// childEnv() itself may set on the msb child. A secret sharing one of these names would append a
+// second entry for the same name onto cmd.Env (commandWithEnv appends secretEnv after childEnv()),
+// and which of the two duplicate entries an arbitrary msb build honors is not something this
+// package controls — at worst silently overriding the MSB_BACKEND=local pin (decision 5). SecretEnv
+// rejects the collision at construction time instead.
+var reservedChildEnvKeys = func() map[string]bool {
+	m := make(map[string]bool, len(childEnvKeys)+1)
+	for _, k := range childEnvKeys {
+		m[k] = true
+	}
+	m[backendEnvKey] = true
+	return m
+}()
 
 // childEnv materializes childEnvKeys against this process's environment, dropping unset ones,
 // then pins backendEnvKey to BackendLocal unconditionally — NOT forwarded from this process's own
@@ -111,14 +137,27 @@ func NewClient() (*Client, error) {
 // command builds an *exec.Cmd for one msb invocation: the run's context.Context (killed with it,
 // add-msb-sandbox-driver.md decision 6) and the closed child-env allowlist, never os.Environ().
 func (c *Client) command(ctx context.Context, args ...string) *exec.Cmd {
+	return c.commandWithEnv(ctx, nil, args...)
+}
+
+// commandWithEnv is command plus extraEnv appended on top of the closed allowlist — the ONLY seam
+// a secret value ever travels through (Create, via secretEnv; hand-secrets-to-msb.md's Timing
+// rule). Every other Client method goes through command, which passes nil here, so nothing but
+// Create can ever hand the msb child anything beyond childEnv()'s fixed allowlist.
+func (c *Client) commandWithEnv(ctx context.Context, extraEnv []string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, c.Bin, args...)
-	cmd.Env = childEnv()
+	cmd.Env = append(childEnv(), extraEnv...)
 	return cmd
 }
 
 // runCaptured runs an msb subcommand to completion, capturing stdout/stderr separately.
 func (c *Client) runCaptured(ctx context.Context, args []string) (stdout, stderr []byte, err error) {
-	cmd := c.command(ctx, args...)
+	return c.runCapturedWithEnv(ctx, nil, args)
+}
+
+// runCapturedWithEnv is runCaptured plus extraEnv — see commandWithEnv.
+func (c *Client) runCapturedWithEnv(ctx context.Context, extraEnv []string, args []string) (stdout, stderr []byte, err error) {
+	cmd := c.commandWithEnv(ctx, extraEnv, args...)
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
@@ -213,6 +252,47 @@ type VsockRoute struct {
 type SecretRef struct {
 	Name  string
 	Hosts []string
+}
+
+// SecretArgs renders one `--secret NAME@HOST[,HOST...]` flag per spec, deterministically ordered
+// by key regardless of input order — so the same set of secrets always produces byte-identical
+// argv, matching CreateSpec.Args()'s own determinism guarantee. It carries no value, by
+// construction: task.SecretSpec has no field to hold one (hand-secrets-to-msb.md's "What to
+// build") — see SecretEnv for the one channel that does.
+func SecretArgs(specs []task.SecretSpec) []string {
+	sorted := append([]task.SecretSpec(nil), specs...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
+	args := make([]string, 0, len(sorted)*2)
+	for _, s := range sorted {
+		args = append(args, "--secret", s.Key+"@"+strings.Join(s.Hosts, ","))
+	}
+	return args
+}
+
+// SecretEnv returns the KEY=VALUE entries to append to the msb child's environment (Create's
+// secretEnv parameter), for EXACTLY the keys specs declare — never every key in the secrets file,
+// so a secret nobody scoped to a host never leaves the host process at all. It errors on a
+// declared key vals lacks: pre-flight refusal beats a run that fails thirty seconds in,
+// unauthenticated, against an allowed host — the same rule krayt.yaml's own comment already
+// states for the pre-msb shape.
+func SecretEnv(specs []task.SecretSpec, vals map[string]string) ([]string, error) {
+	env := make([]string, 0, len(specs))
+	seen := make(map[string]bool, len(specs))
+	for _, s := range specs {
+		if reservedChildEnvKeys[s.Key] {
+			return nil, fmt.Errorf("sandbox: secret key %q collides with a reserved msb child-env variable", s.Key)
+		}
+		if seen[s.Key] {
+			return nil, fmt.Errorf("sandbox: secret key %q is declared more than once", s.Key)
+		}
+		seen[s.Key] = true
+		v, ok := vals[s.Key]
+		if !ok {
+			return nil, fmt.Errorf("sandbox: secrets file has no value for declared key %q", s.Key)
+		}
+		env = append(env, s.Key+"="+v)
+	}
+	return env, nil
 }
 
 // CreateSpec carries every `msb create` argument as typed fields. Render argv with Args(), a pure
@@ -317,11 +397,17 @@ func (s CreateSpec) Args() []string {
 	return args
 }
 
-// Create runs `msb create` and returns its output combined (msb create's own stdout is not
-// documented as structured; callers needing the sandbox name already supplied it via
-// CreateSpec.Name).
-func (c *Client) Create(ctx context.Context, spec CreateSpec) error {
-	_, stderr, err := c.runCaptured(ctx, spec.Args())
+// Create runs `msb create`, with secretEnv appended to the child's environment on top of the
+// usual closed allowlist. secretEnv is the ONE place a secret value is ever handed to an msb
+// child (hand-secrets-to-msb.md's Timing rule): msb reads a --secret's value "at start time", and
+// `msb create` is the invocation that starts the sandbox, so this is the only Client method that
+// accepts it at all — Exec, Copy, Logs and every other method call command/runCaptured, which
+// always pass nil extra env, structurally rather than by convention (msb_test.go asserts this on
+// Exec directly). Build secretEnv with SecretEnv; CreateSpec.Secrets ([]SecretRef, names + hosts,
+// never values) is rendered into argv by CreateSpec.Args() itself, same as SecretArgs renders a
+// []task.SecretSpec.
+func (c *Client) Create(ctx context.Context, spec CreateSpec, secretEnv []string) error {
+	_, stderr, err := c.runCapturedWithEnv(ctx, secretEnv, spec.Args())
 	if err != nil {
 		return fmt.Errorf("sandbox: msb create: %w (%s)", err, firstNonEmpty(stderr))
 	}
@@ -359,6 +445,22 @@ type ExecResult struct {
 	ExitCode int
 }
 
+// Args renders ExecSpec into `msb exec --stream` argv, in the exact order Exec issues it — a
+// pure function, mirroring CreateSpec.Args(), so the exec argv surface is unit-testable without
+// spawning anything. It has no way to carry a secret value structurally: ExecSpec carries no env
+// field at all (hand-secrets-to-msb.md's Timing rule — a secret's value is set once, on whichever
+// invocation starts the sandbox, never on a later exec against it) and Stdin/Stdout/Stderr are
+// I/O plumbing this function never touches.
+func (s ExecSpec) Args() []string {
+	args := []string{"exec"}
+	if s.User != "" {
+		args = append(args, "--user", s.User)
+	}
+	args = append(args, "--stream", s.Name, "--")
+	args = append(args, s.Command...)
+	return args
+}
+
 // Exec runs `msb exec --stream` (add-msb-sandbox-driver.md, "Streaming"): the default
 // non-interactive mode buffers the entire output until the command exits, which is unusable for
 // krayt's live log streaming, so --stream is always passed. Stdin is always an explicit pipe (see
@@ -372,14 +474,7 @@ type ExecResult struct {
 // agent execs additionally write their real exit status somewhere krayt can read unambiguously;
 // this heuristic is what the driver layer alone can do without that.
 func (c *Client) Exec(ctx context.Context, spec ExecSpec) (ExecResult, error) {
-	args := []string{"exec"}
-	if spec.User != "" {
-		args = append(args, "--user", spec.User)
-	}
-	args = append(args, "--stream", spec.Name, "--")
-	args = append(args, spec.Command...)
-
-	cmd := c.command(ctx, args...)
+	cmd := c.command(ctx, spec.Args()...)
 
 	stdin := spec.Stdin
 	if stdin == nil {
