@@ -282,6 +282,45 @@ func SetupPatchGit(workspaceDir, patchGitDir string) error {
 	return nil
 }
 
+// MakeContainerWritable relaxes a directory tree so a NON-ROOT agent uid (§8.2) can read,
+// traverse, and write it. The caller (guest-agent or krayt-helper) ingests the workspace as
+// root, but the agent that edits it runs non-root (Claude Code and others refuse uid 0), so the
+// tree must be relaxed before the agent runs. Exposure is bounded to the ephemeral
+// single-workload sandbox, and the caller does not know which uid the agent will actually run
+// as (it varies per image), so this relaxes group+other rather than chown-ing to a specific uid.
+//
+// This relaxes `.git` too, on purpose: the agent commits inside the workspace, so its `.git`
+// must be writable. That makes the workspace `.git` (config, hooks, attributes) attacker-writable
+// and therefore UNtrusted — a root process running git there could be tricked into executing
+// container-written config (fsmonitor/hooks/textconv), the container→guest-root escape of §10
+// finding #2. The fix is not to lock `.git` down (that breaks commits) but to isolate patch
+// generation: SetupPatchGit must be called BEFORE this function, copying the pristine `.git` to
+// a root-only patchgit dir, and Diff/BundleCommits run git against THAT dir with the dangerous
+// knobs force-cleared, never trusting the writable workspace `.git` (§6.7). The agent's own git
+// in the container needs `safe.directory`, set by the adapter/entrypoint.
+func MakeContainerWritable(root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// os.Chmod follows symlinks, and the repo is untrusted (§10) — a symlink could point
+		// outside the workspace, so (running as root) never chmod through one. WalkDir doesn't
+		// descend symlinks either; a symlink's in-workspace target is relaxed on its own visit.
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		mode := info.Mode().Perm() | 0o066 // group + other read/write
+		if d.IsDir() {
+			mode |= 0o111 // …and traversable
+		}
+		return os.Chmod(p, mode)
+	})
+}
+
 // Diff produces changes.patch: everything in the workspace working tree since the baseline,
 // whether the agent committed or only edited the working tree. It runs entirely against the
 // root-only patchGitDir (§6.7, §10 finding #2) — the container-writable `workspace/.git` is

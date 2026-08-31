@@ -49,6 +49,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Embed the guest binaries (add-krayt-guest-helper.md) before the cross-build loop below,
+      # so the released krayt binary embeds real krayt-helper binaries rather than an empty
+      # bin/ (.gitkeep only). This runner is already Linux with Go installed, so it's one line
+      # and no new runner; CGO stays off for this too (guest-bins itself sets CGO_ENABLED=0).
+      - run: make guest-bins
+
       # Pure-Go (CGO off): one Linux runner cross-builds every target. darwin/arm64 is the
       # supported macOS target; darwin/amd64 builds but is untested (see README). linux/amd64 is
       # the supported Linux target — the only host arch the Firecracker backend has been verified

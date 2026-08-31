@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -282,7 +281,7 @@ func (s *Service) Start(req *pb.StartRequest, stream pb.GuestAgent_StartServer) 
 	// (§8.2). This intentionally leaves `.git` writable too, so the agent can `git commit` inside
 	// the container; that writable `.git` is deliberately UNtrusted — patch generation is isolated
 	// in the root-only patchgit above, so no container-written git config runs as root.
-	if err := makeContainerWritable(workspace); err != nil {
+	if err := patch.MakeContainerWritable(workspace); err != nil {
 		return fmt.Errorf("guest: make workspace writable: %w", err)
 	}
 	s.mu.Lock()
@@ -463,43 +462,6 @@ func (s *Service) writeSecrets(vals map[string]string) (string, error) {
 		}
 	}
 	return dir, nil
-}
-
-// makeContainerWritable relaxes a directory tree so the NON-ROOT container uid (§8.2) can read,
-// traverse, and write it. The guest runs as root and ingests /workspace root-owned, but the
-// agent runs non-root (Claude Code and others refuse uid 0) and must edit the tree. Exposure is
-// bounded to the ephemeral single-container VM.
-//
-// This relaxes `.git` too, on purpose: the agent commits inside the container, so its `.git`
-// must be writable. That makes the workspace `.git` (config, hooks, attributes) attacker-writable
-// and therefore UNtrusted — a root guest-agent running git there could be tricked into executing
-// container-written config (fsmonitor/hooks/textconv), the container→guest-root escape of §10
-// finding #2. The fix is not to lock `.git` down (that breaks commits) but to isolate patch
-// generation: patch.SetupPatchGit copied the pristine `.git` to a root-only patchgit dir before
-// this call, and patch.Diff/BundleCommits run git against THAT dir with the dangerous knobs
-// force-cleared, never trusting the writable workspace `.git` (§6.7). The agent's own git in the
-// container needs `safe.directory`, set by the adapter/entrypoint.
-func makeContainerWritable(root string) error {
-	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		// os.Chmod follows symlinks, and the repo is untrusted (§10) — a symlink could point
-		// outside the workspace, so (running as root) never chmod through one. WalkDir doesn't
-		// descend symlinks either; a symlink's in-workspace target is relaxed on its own visit.
-		if d.Type()&fs.ModeSymlink != 0 {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		mode := info.Mode().Perm() | 0o066 // group + other read/write
-		if d.IsDir() {
-			mode |= 0o111 // …and traversable
-		}
-		return os.Chmod(p, mode)
-	})
 }
 
 // askBinaryPath returns the krayt-ask binary shipped next to the guest-agent (both built into
