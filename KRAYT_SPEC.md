@@ -641,6 +641,55 @@ is the simplest correct choice. Enforcement layers:
   the artifact. Disclosing a high-entropy token's *length* into an already-redacted, per-run,
   explicitly-opted-into log is the deliberate trade being made here.
 
+**Under msb — the target model, additive and not yet wired
+(`translate-network-policy-to-msb.md`).** `docs/adr-microsandbox-sandbox-layer.md` ("Default
+posture: what a bare sandbox gets") is the strategic decision; `internal/task/netpolicy_msb.go`
+(`task.NetworkArgs`, `task.ValidateNetworkPolicyForMsb`) is the pure translator implementing it.
+Nothing above is called from `krayt run` yet — the proxy/nftables design described in the rest of
+this section is what an actual run executes today, byte-for-byte, until
+`run-tasks-on-microsandbox.md` cuts over and deletes it in the same change. Recorded here so the
+target model is not discoverable only by reading a task file:
+
+- **Every mode maps to a fully explicit msb policy — never an implicit one.** msb's own default
+  (`NetworkPolicy::default()`, i.e. no network flags at all) is `from_profiles([Public])`: an
+  implicit `allow@public` rule — the whole public internet — the instant no
+  `--net`/`--no-net`/`--net-default*` flag is present. Critically, `--net-rule` alone does **not**
+  suppress that default; it *layers krayt's rules on top of it*. So krayt always emits one of
+  `--no-net`, `--net-default deny`, or the `--net-default-egress`/`--net-default-ingress` pair —
+  computing "no policy" is a pre-flight error, never a state a real run can reach.
+- **`allowlist` (default)** → `--net-default deny`, explicit `deny@<group>` rules for every private
+  destination group (below), `allow@dns`, then one `allow@<host>` per `network.allow` entry, in
+  the order given — deterministic, so the same config always renders byte-identical argv.
+- **`full`** → `--net-default-egress allow --net-default-ingress deny`, plus the *same* explicit
+  `deny@<group>` rules first: `full`'s allow must not mean "and also the host's LAN", the identical
+  design rule the resolved-IP guard above already enforces for the pre-msb dialer.
+- **`none`** → `--no-net` and **zero** `--net-rule` flags. `--net none` is deliberately avoided:
+  msb still attaches any supplied `--net-rule` on top of `NetworkPolicy::none()`, so even one
+  stray rule would silently punch a hole through the mode that is supposed to mean no network at
+  all.
+- **Private/loopback/link-local/metadata stay denied in every mode, including `full`** — an
+  existing krayt property carried forward, not a new one. msb exposes this as destination groups
+  (`private`, `loopback`, `link-local`, `meta`, `multicast`, `host`), denied explicitly and
+  ordered before any allow rule, rather than as krayt's own resolved-IP dialer guard, which has no
+  equivalent once msb — not krayt — is doing the dialing.
+- **The guest regains DNS, a deliberate change.** Since `move-egress-proxy-to-host.md` the guest
+  has had no usable network at all in `allowlist`/`none` — everything rides vsock to the host
+  proxy (above). Under msb the guest has a real, policed network interface, so `allowlist` mode
+  must emit `allow@dns` or nothing resolves; it is policed by msb's own gateway with DNS-rebind
+  protection on by default.
+- **Ingress is denied explicitly, in every mode.** krayt publishes no ports today, so this is
+  inert — but msb's own ingress default is `allow`, and closing it costs one flag now rather than
+  becoming a live gap the moment krayt publishes anything.
+- **`--tls-intercept` is emitted whenever any secret is declared, and only then** — redundant with
+  msb's own behavior (`SandboxBuilder::secret_entry` turns on interception unconditionally the
+  moment any `--secret` is declared), emitted anyway to pin that behavior explicitly rather than
+  depend on an undocumented builder side effect in a beta tool.
+- **`network.mitm` has no msb equivalent and becomes a hard pre-flight error** once
+  `run-tasks-on-microsandbox.md` swaps the active validator to
+  `task.ValidateNetworkPolicyForMsb` (built, not yet called anywhere): under msb there is no
+  configuration in which a secret is declared without TLS interception, so the opt-in the key
+  represented has nothing left to opt into.
+
 #### 6.6.1 TLS MITM & credential injection (`internal/proxy`, `add-tls-mitm-credential-injection.md`)
 > **Amended by `add-tls-mitm-credential-injection.md` (step 2 of the three-step host-side-proxy
 > arc, §14; depends on `move-egress-proxy-to-host.md`, step 1, above).** Everything below is
@@ -1621,6 +1670,17 @@ fails opaquely 30s into the agent); `passthrough ⊆ allow` in `mode: allowlist`
 `mode: full`; header names must be valid HTTP tokens and not hop-by-hop. `full` + `mitm`
 intercepts **every** TLS connection the agent makes except those listed in `passthrough` — that
 is the point of `full`, stated plainly here so it isn't a surprise.
+
+**Under msb — the target model, additive and not yet wired (§6.6, `translate-network-policy-to-msb.md`).**
+`task.ValidateNetworkPolicyForMsb` exists beside `ValidateNetworkPolicy` above but is not yet
+called from anywhere — the vfkit/Firecracker path this section describes is still the one that
+executes, and it still requires `mitm: true` to inject anything, including for this repo's own
+`krayt.yaml`. When `run-tasks-on-microsandbox.md` swaps the call site, `network.mitm` becomes a
+hard pre-flight error naming itself and its replacement: under msb, declaring any secret enables
+TLS interception automatically, so the key has nothing left to opt into. `inject[].set`,
+`inject[].set_prefix`, and `inject[].strip` lose their meaning the same way, on the same schedule
+— msb substitutes a placeholder string wherever it appears rather than naming a header
+(`hand-secrets-to-msb.md`). Until that cut-over, this file's documented behavior is unchanged.
 
 **Adapter-supplied injection and merge precedence (`inject-claude-oauth-token-at-proxy.md` §2/§4).**
 An adapter's `Prepare` can return `Inject` rules of its own (§6.14's credential shape translation
