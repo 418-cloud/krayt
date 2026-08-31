@@ -3,7 +3,6 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
 // CheckResult is one host-prerequisite check, shaped for internal/cli's `krayt doctor` (§13) to
@@ -22,9 +21,9 @@ const installHint = "install from https://github.com/superradcompany/microsandbo
 	"(or point " + BinEnv + " at an existing install)"
 
 // DoctorChecks returns the msb prerequisite checks for `krayt doctor` (add-msb-sandbox-driver.md):
-// msb found on PATH, its version against MinVersion, MSB_BACKEND=local resolution, and msb's own
-// `msb doctor` passthrough — in that order, since each of the first three short-circuits the
-// rest once msb can't be found at all.
+// msb resolved (via PATH or BinEnv), its version against MinVersion, MSB_BACKEND=local
+// resolution, and msb's own `msb doctor` passthrough — in that order, since each of the first
+// three short-circuits the rest once msb can't be found at all.
 //
 // Every check here is Optional: krayt does not use msb for anything yet (nothing calls this
 // package outside internal/cli/doctor_msb.go), so on the near-totality of hosts that don't have
@@ -38,7 +37,7 @@ func DoctorChecks(ctx context.Context) []CheckResult {
 	if err != nil {
 		skip := "skipped — msb not found"
 		return []CheckResult{
-			{Name: "msb found on PATH", Optional: true, Detail: "msb not found — " + installHint},
+			{Name: "msb found (PATH or " + BinEnv + ")", Optional: true, Detail: "msb not found — " + installHint},
 			{Name: fmt.Sprintf("msb --version >= %s", MinVersion), Optional: true, Detail: skip},
 			{Name: "msb context reports local backend", Optional: true, Detail: skip},
 			{Name: "msb doctor", Optional: true, Detail: skip},
@@ -47,7 +46,7 @@ func DoctorChecks(ctx context.Context) []CheckResult {
 
 	c := &Client{Bin: bin}
 	return []CheckResult{
-		{Name: "msb found on PATH", OK: true, Optional: true, Detail: bin},
+		{Name: "msb found (PATH or " + BinEnv + ")", OK: true, Optional: true, Detail: bin},
 		versionCheck(ctx, c),
 		contextCheck(ctx, c),
 		passthroughDoctorCheck(ctx, c),
@@ -89,10 +88,7 @@ func contextCheck(ctx context.Context, c *Client) CheckResult {
 func passthroughDoctorCheck(ctx context.Context, c *Client) CheckResult {
 	const name = "msb doctor"
 	out, stderr, err := c.runCaptured(ctx, []string{"doctor"})
-	detail := strings.TrimSpace(string(out))
-	if detail == "" {
-		detail = strings.TrimSpace(string(stderr))
-	}
+	detail := firstNonEmpty(out, stderr)
 	if err != nil {
 		return CheckResult{Name: name, Optional: true, Detail: "msb doctor reported problems: " + detail}
 	}

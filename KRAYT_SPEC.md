@@ -1435,9 +1435,9 @@ itself).
 **The child environment is a closed allowlist, never `os.Environ()`** — the same discipline
 `egressProxyChildEnvKeys` uses, and for the same reason: an unset `cmd.Env` would hand the `msb`
 child whatever the operator happened to have exported (an API key, a stray `MSB_PROFILE=prod`)
-when they ran `krayt run`. The allowlist forwards `PATH` and `HOME` unconditionally (msb resolves
-its own runtime under `$HOME/.microsandbox`), and `MSB_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR` only
-when the operator already has them set.
+when they ran `krayt run`. The allowlist forwards `PATH`, `HOME` (msb resolves its own runtime
+under `$HOME/.microsandbox`), `MSB_HOME`, `SSL_CERT_FILE`, and `SSL_CERT_DIR` only when the
+operator already has them set — none is fabricated.
 
 **`MSB_BACKEND=local` is pinned on every invocation — always set, never forwarded from this
 process's own environment.** This is a security requirement, not tidiness. msb resolves its

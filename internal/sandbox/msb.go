@@ -484,11 +484,21 @@ func (c *Client) Logs(ctx context.Context, name string, follow bool) (<-chan Log
 			case entries <- LogEntry{Stream: tagged.Stream, Raw: raw}:
 			case <-ctx.Done():
 				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
 				return
 			}
 		}
-		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
-			errs <- fmt.Errorf("sandbox: msb logs: %w", err)
+		scanErr := scanner.Err()
+		waitErr := cmd.Wait()
+		if ctx.Err() != nil {
+			return
+		}
+		if scanErr != nil {
+			errs <- fmt.Errorf("sandbox: msb logs: scan: %w", scanErr)
+			return
+		}
+		if waitErr != nil {
+			errs <- fmt.Errorf("sandbox: msb logs: %w", waitErr)
 		}
 	}()
 

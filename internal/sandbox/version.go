@@ -7,9 +7,11 @@ import (
 )
 
 // MinVersion is the msb version the ADR (docs/adr-microsandbox-sandbox-layer.md) was verified
-// against. msb is beta and has shipped a breaking wire change in a patch release, so krayt
-// refuses to trust anything older: krayt doctor reports a hard failure and the run pre-flight
-// refuses (add-msb-sandbox-driver.md decision 7).
+// against. msb is beta and has shipped a breaking wire change in a patch release, so krayt is
+// meant to refuse anything older (add-msb-sandbox-driver.md decision 7). In this package's
+// current, additive-only state, DoctorChecks only warns on a below-MinVersion msb — nothing
+// calls this driver yet, so there is no run pre-flight to refuse. The hard failure lands when
+// run-tasks-on-microsandbox.md wires krayt run through msb.
 var MinVersion = Version{Major: 0, Minor: 6, Patch: 16}
 
 // Version is a parsed `msb --version`. Raw keeps the exact trimmed output for diagnostics —
