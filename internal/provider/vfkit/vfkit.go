@@ -17,12 +17,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/crc-org/vfkit/pkg/config"
 
 	"github.com/418-cloud/krayt/internal/provider"
+	"github.com/418-cloud/krayt/internal/sockroot"
 )
 
 // DefaultBinary is the vfkit executable name resolved on PATH when no path is set.
@@ -178,39 +178,14 @@ func newSockDirAt(root string) (string, error) {
 	return d, nil
 }
 
-// ensureSockRoot makes root a private directory owned by the current user, or fails. It
-// uses Lstat (no symlink following) + os.Mkdir (fails if the path already exists), so a
-// symlink or a foreign-owned/loose-mode directory pre-placed at root is refused rather
-// than trusted.
+// ensureSockRoot makes root a private directory owned by the current user, or fails — a thin
+// delegate to the shared check (dial-ask-channel-over-vsock.md decision 12) so this provider and
+// internal/askbridge's host-side ask-bridge socket directory can never drift apart. See
+// sockroot.Ensure for the property it implements: Lstat (no symlink following) + os.Mkdir (fails
+// if the path already exists), so a symlink or a foreign-owned/loose-mode directory pre-placed at
+// root is refused rather than trusted.
 func ensureSockRoot(root string) error {
-	fi, err := os.Lstat(root)
-	if errors.Is(err, os.ErrNotExist) {
-		// Mkdir (not MkdirAll) fails if root exists, incl. as a symlink, so we never
-		// follow a pre-placed link into an attacker-controlled target.
-		if err := os.Mkdir(root, 0o700); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				// Lost a race with a concurrent creator (root is shared across every VM this
-				// user boots, §6.12) — re-validate whatever now exists rather than failing a
-				// legitimate concurrent `krayt run` on a spurious EEXIST.
-				return ensureSockRoot(root)
-			}
-			return fmt.Errorf("vfkit: create socket root: %w", err)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("vfkit: stat socket root: %w", err)
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("vfkit: socket root %s: cannot read owner/mode", root)
-	}
-	if !fi.IsDir() || int(st.Uid) != os.Getuid() || fi.Mode().Perm() != 0o700 {
-		return fmt.Errorf("vfkit: socket root %s is not a private directory owned by this user "+
-			"(mode %o, uid %d); refusing to place VM control sockets there — remove or fix it",
-			root, fi.Mode().Perm(), st.Uid)
-	}
-	return nil
+	return sockroot.Ensure(root)
 }
 
 // buildConfig assembles the vfkit VirtualMachine: Linux bootloader (kernel+initrd+

@@ -24,6 +24,8 @@ guest-bins:
 	mkdir -p $(GUESTBIN_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o $(GUESTBIN_DIR)/krayt-helper-linux-amd64 ./cmd/krayt-helper
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o $(GUESTBIN_DIR)/krayt-helper-linux-arm64 ./cmd/krayt-helper
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o $(GUESTBIN_DIR)/krayt-ask-linux-amd64 ./cmd/krayt-ask
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o $(GUESTBIN_DIR)/krayt-ask-linux-arm64 ./cmd/krayt-ask
 
 build: guest-bins
 	go build ./...

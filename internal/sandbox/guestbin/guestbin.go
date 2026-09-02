@@ -26,6 +26,12 @@ var binFS embed.FS
 // HelperName is the embedded name of the krayt-helper binary (add-krayt-guest-helper.md).
 const HelperName = "krayt-helper"
 
+// AskName is the embedded name of the krayt-ask binary (dial-ask-channel-over-vsock.md decision
+// 6): built by the same `make guest-bins` target, `msb copy`'d in per run alongside krayt-helper,
+// never baked into an agent image (images/agents/claude-code/entrypoint.sh already says so of
+// today's bind-mounted krayt-ask).
+const AskName = "krayt-ask"
+
 // GuestRoot is where guestbin binaries are copied to inside a sandbox — deliberately outside
 // both /workspace and /output (§8.2), so a copied-in helper binary can never land in the
 // agent's changes.patch or be mistaken for a collected artifact.

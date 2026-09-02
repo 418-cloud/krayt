@@ -179,6 +179,12 @@ Two facts make this much cheaper than it looks:
   `wait` run (decision 9).
 - The host socket is created `0600` inside the `0700` directory, asserted by a test that stats it
   (decision 10).
+- **The host does not close the connection after answering** — it waits for the sandbox to close,
+  asserted by a test that reads after the response and requires a timeout rather than EOF. Added
+  after P1 measured msb 0.6.16 dropping the reply when the host closes first (21 of 75 round trips
+  completed, against 25 of 25 when it waits; `KRAYT_SPEC.md` §6.13 and §14 Phase 11's P1 bullet).
+  The loss is silent from inside the sandbox — EOF with nothing read, indistinguishable from a host
+  that never answered — so nothing downstream of this could have caught it.
 - A prompt carrying a secret value comes back redacted from the host-side `Serve` path — the
   guest-side test covering this today has a host-side equivalent (decision 11).
 - The port constant is distinct from `provider.ControlPort`/`EgressPort` (1024/1025), not merely

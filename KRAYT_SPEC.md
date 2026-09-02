@@ -1039,9 +1039,15 @@ it to everything the agent controls that the host will keep:
   accepted miss (see §10 residuals); it only affects live logs.
 - **`report.md`** — the agent-written `/output/report.md` is redacted in place after the run,
   before it is collected, so the notes the host folds into the final report carry no value.
-- **`ask_human` prompt + choices** — redacted at the bridge boundary before the question leaves
-  the VM, covering both the live display and the persisted `questions/<id>.json`. Answers come
-  from the human (host side), not the agent, so they are not a leak path.
+- **`ask_human` prompt + choices** — redacted at the bridge boundary, covering both the live
+  display and the persisted `questions/<id>.json`. Answers come from the human (host side), not
+  the agent, so they are not a leak path. **Under msb** (`dial-ask-channel-over-vsock.md`) this
+  boundary moves host-side along with the bridge itself: the guest no longer redacts before the
+  question "leaves the VM" because there is no in-guest redaction step left to run — the host
+  already holds every secret value, so whatever constructs the production `internal/askbridge.Bridge`
+  applies the same `Redactor` in its `push` callback before a question is persisted. The property
+  (never an unredacted secret value on disk or on screen) is unchanged; only which process enforces
+  it moves.
 - **`changes.patch` is scanned, NOT redacted.** Rewriting hunk bytes would corrupt the diff and
   break `git apply`, so the patch is left byte-exact. Instead the guest scans it for secret
   values and, on a hit, writes a `secret-scan.json` marker naming the matched **keys only**
@@ -1337,6 +1343,54 @@ agent-specific part in the adapter.
   optional adapter — **not** the agnostic core. The adapter wires the CLI **only when
   `--on-question=wait`** (Phase 5); MCP-server registration lands with the MCP server itself
   (Phase 6).
+
+**Transport under msb — no guest listener (`dial-ask-channel-over-vsock.md`, additive to the vfkit/
+Firecracker description above until `run-tasks-on-microsandbox.md` cuts over).** Under msb there is
+no guest-agent to bridge through, and B1's guest helper is explicitly scoped to never grow one (the
+ADR's "`ask_human` must not go through it"). Instead `krayt-ask` (and its `--mcp` front-end) inside
+the sandbox dials `AF_VSOCK` **straight to the host** — no listener inside the guest, ever, not in
+the helper, not as a separate process. msb's `--vsock HOST_PATH:PORT` exposes a host unix socket at
+guest CID 2 on a krayt-chosen `PORT` (`provider.AskPort`, distinct from `ControlPort`/`EgressPort`
+and never msb's reserved `123`); `internal/askbridge` — the moved, hardened continuation of
+`internal/guest/ask` — listens on that host socket and answers each connection with one
+question/answer exchange against a `Bridge`, the same newline-delimited JSON wire protocol
+unchanged. `KRAYT_ASK_SOCKET` keeps its name and gains a URL form: a bare filesystem path still
+means a unix socket (nothing existing breaks), and `vsock://cid:port` is the new form
+`internal/guest/ask`'s dialer parses and dials (confined to a linux-tagged file, since the vsock
+transport is only ever exercised inside the linux guest). The `--vsock` route is created only under
+`--on-question=wait`, matching the CLI/MCP wiring's own existing "only when wait" rule — a `fail`
+run gets no guest→host channel at all, the same as today.
+
+Because the host process is now reading bytes an arbitrary sandbox process wrote directly (no
+gRPC, no generated protobuf, no 4 MiB `grpc.NewClient` cap standing between the sandbox and krayt),
+`internal/askbridge.Serve` carries three bounds `internal/guest/ask` never needed under §10's
+per-VM resource limits: a byte cap on one request (`maxAskRequestBytes`, 64 KiB), a read deadline
+around decoding the request only — never around `Bridge.Ask`, which legitimately blocks for the
+whole `--question-timeout` — and a cap on in-flight questions, past which a new question gets the
+no-answer sentinel immediately rather than a queue slot. The host socket lives in the run's own
+private state directory (not vfkit's shared `/tmp/krayt-<uid>` root, which exists only for macOS's
+`sockaddr_un` length limit), created `0700` and owned by the invoking user — reusing the same
+hostile-pre-existing-directory check `harden-vfkit-socket-dir.md` established for vfkit/Firecracker
+(extracted to `internal/sockroot` so there is one check, not three) — and the socket itself is
+`0600` inside it: narrower than the in-guest bridge's `0777`, which existed only so a non-root
+container could reach a root-owned directory; here there is no non-root party on the host side to
+widen it for. The secret redaction `internal/guest/service.go` applies to the prompt/choices before
+they leave the VM moves with the boundary: the host already holds every secret value, so whatever
+constructs the production `Bridge` redacts in its own `push` closure before a question is persisted,
+at no extra cost. `cmd/krayt-vsock-forward` and `internal/guest/ask`'s in-guest half stay live
+until the cut-over deletes both — this is purely additive.
+
+**The host writes its answer and then waits for the sandbox to close** — it never closes first.
+This is a property of the channel, not an implementation detail: msb 0.6.16's vsock relay discards
+a reply that is still in flight when the host end of the bridged unix socket closes, and it does so
+most of the time. `hack/msb-probes/p1-vsock-nonroot.sh` measures 21 of 75 round trips completing
+with the host closing immediately after writing, against 25 of 25 with the host waiting (2026-09-02,
+Apple-Silicon Mac; §14 Phase 11's P1 bullet carries the per-shape rates, and the loss is
+indistinguishable from the guest — EOF with zero bytes read — so nothing downstream could detect
+it). `internal/askbridge.lingerUntilPeerCloses` therefore drains the connection until the sandbox
+closes it, bounded by its own deadline and byte cap so a sandbox that goes silent, or talks instead
+of closing, delays only itself. `krayt-ask` closes as soon as it has decoded its answer, which is
+what makes that wait cost microseconds; a future guest-side client must keep doing so.
 
 **Modes — `--on-question`, default `fail`:**
 - `fail` (default): neither front-end is wired → `ask_human` is absent and `krayt-ask`
@@ -1859,11 +1913,19 @@ Injected by the tool, regardless of adapter:
   environment from there (§6.14).
 - `/output/` — agent/guest writes `changes.patch` + `report.md` here (or guest generates the patch).
 - `/usr/local/bin/krayt-ask` — the `krayt-ask` CLI front-end (§6.13), bind-mounted on the PATH so
-  any agent can shell out to it; `/run/krayt/ask.sock` is the bridge it connects to.
+  any agent can shell out to it; `KRAYT_ASK_SOCKET` names the bridge it connects to — a bare path
+  (default `/run/krayt/ask.sock`) on vfkit/Firecracker, or a `vsock://cid:port` URL under msb
+  (`dial-ask-channel-over-vsock.md`), where `krayt-ask` dials the host directly and no guest
+  process listens at all. Same binary, same env var name, same wire protocol either way — only
+  the transport underneath differs, and the adapter that sets `KRAYT_ASK_SOCKET` does not need to
+  know which one it is.
 
 Because the container runs **non-root** (below), the tool makes these usable by any non-root uid:
 `/run/secrets` is world-readable, `/workspace` and `/output` are writable, and the ask socket is
-connectable (§8.2 was root-only before Phase 5 — fixed in the guest).
+connectable (§8.2 was root-only before Phase 5 — fixed in the guest). Under msb the host-side
+socket `internal/askbridge.Listen` binds is private instead — `0600` inside a `0700` directory,
+since there the peer is a sandbox process reaching *out* to the host rather than a host-owned
+resource a non-root container must reach *into*.
 
 The container **must** run as a **non-root** uid — this is now **enforced, not just a
 convention** (§6.10, §10): an image whose `USER` is root (uid 0) or unset **fails the run**
@@ -2182,6 +2244,7 @@ exposed.
 | Host filesystem | No live mount; input via git bundle, output via reviewed patch |
 | Repo ingest | git bundle cloned in-guest — source `.git/hooks` are never executed or imported, and the guest commits under a throwaway krayt bot identity. The workspace `.git` is left container-writable (so the agent can commit) but is **never trusted by the root guest-agent's git**: patch generation runs against a root-only `patchgit` snapshot with `core.fsmonitor`/`core.hooksPath` force-cleared and `--no-textconv`, so container-written `.git/config`/hooks/attributes cannot execute as root (§6.7, finding #2) |
 | Network egress | Default-deny + allowlist proxy, per-task opt-in to widen — **enforced host-side** since `move-egress-proxy-to-host.md`. The L7 allowlist proxy is a separate HOST process reached over a guest-initiated vsock channel; the guest's L3 lock is loopback-only and keys on **no uid at all**, so there is no container-hardening dependency left for it to bypass (§6.6) |
+| `ask_human` bridge — **under msb** (`dial-ask-channel-over-vsock.md`) | A second host-side process reading sandbox-authored input: `krayt-ask` dials the host directly over vsock (no guest listener, ever); `internal/askbridge.Serve` decodes the question with a byte cap, a decode-only read deadline, and a cap on in-flight questions (§6.13). Unauthenticated by construction — any sandbox process can dial it, same as today's in-guest socket — but bounded to one question/answer exchange per connection and never reaching the host beyond that (residual below) |
 | Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
 | Secrets | tmpfs only, never on disk, destroyed with VM; **redacted in the guest** from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted** (redacting hunks would break `git apply`); a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
 | TLS MITM / credential injection | **Opt-in, default off** (`network.mitm`, §6.6.1). An injected secrets-file key is **withheld from `SecretsBundle` entirely** — the container never holds it, closing "Auth-credential blast radius" (below) for that credential. Ephemeral per-run CA, in memory only, private key never exported. Trades a HOST-process compromise for a *stronger* claim than plain egress enforcement: the proxy process now also holds real user credentials, not just a policy decision (residual below) |
@@ -2227,8 +2290,16 @@ exposed.
   adversarial-input attack surface concentrates in one host process running the hand-rolled (or
   swapped-in, `KRAYT_EGRESS_PROXY_BIN`) `internal/proxy` package, rather than being spread across
   a guest process *and* a uid-keyed firewall rule whose correctness depended on container
-  capabilities. The vsock channel this process is reached over additionally gives **concurrent-VM
-  isolation by construction**: each VM gets its own host unix socket (vfkit) or `uds_path`
+  capabilities. **`internal/askbridge` (`dial-ask-channel-over-vsock.md`, msb only) is a second
+  such host process**, and by the same reasoning: `krayt-ask` dials the host directly with no
+  guest-side listener or parser in between, so `internal/askbridge.Serve` — not `internal/guest/ask`
+  running inside a disposable VM — is what decodes a sandbox-authored JSON question. It is bounded
+  the way the egress proxy is not required to be (a question is a much smaller, simpler shape than
+  arbitrary HTTP): a 64 KiB request cap, a read deadline scoped to decoding only (never to
+  `Bridge.Ask`, which legitimately blocks for the question timeout), and a cap on in-flight
+  questions past which admission itself is refused rather than queued. The vsock channel this
+  process is reached over additionally gives **concurrent-VM isolation by construction**: each VM
+  gets its own host unix socket (vfkit) or `uds_path`
   (Firecracker), so one run's egress channel is not reachable from another run's VM — unlike a
   gateway-bound TCP proxy would be on vfkit/vmnet's shared-segment NAT (§6.6); asserted on
   hardware by `TestConcurrentRealVMs`. The container-hardening controls (dropped
@@ -2254,6 +2325,19 @@ exposed.
   credential is to never give it to the container: `network.mitm` + `network.inject` (§6.6.1),
   whose companion run (`run_c654e575`) had no credential in the VM to leak in any form.
 - Resource exhaustion — bounded by per-VM CPU/mem/disk + wall-clock timeout.
+- **`ask_human` under msb — any sandbox process can dial the bridge** (`dial-ask-channel-over-
+  vsock.md`). The channel is unauthenticated by construction, exactly as today's in-guest unix
+  socket already is: nothing about `krayt-ask` dialing straight to the host adds or removes an
+  identity check. A hostile process in the same sandbox can ask a plausible-looking question and
+  collect the human's answer meant for the agent. It does not reach the host beyond the one
+  bounded question/answer exchange `internal/askbridge.Serve` performs, and the existing controls
+  are unchanged: the prompt is labeled agent-originated on display, and a human is never expected
+  to auto-fill a secret into an answer (§6.13).
+- **`ask_human` under msb — cross-run isolation is per-sandbox by construction**, the same claim
+  §6.12 already makes and proves on hardware (`TestConcurrentRealVMs`) for the vfkit/Firecracker
+  egress channel: vsock maps guest CID 2:port to whichever host path was named on *that* sandbox's
+  `create`, so one fixed `provider.AskPort` is safe to reuse across every concurrent run — there is
+  no shared host CID namespace for two runs to collide in.
 - Auth-credential blast radius — a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) is tied to
   a personal/seat plan and is less granularly revocable than a scoped API key; exposing one
   to untrusted code risks that seat's consumption and rate budget. Prefer a scoped,
@@ -2929,9 +3013,32 @@ independently-landed progress rather than a single big-bang "Done when".
 - [x] **Feasibility gate** (`probe-microsandbox-feasibility.md`) — five hardware-probe scripts
   under `hack/msb-probes/`, **all run on msb 0.6.16, 2026-08-29/30, on an Apple-Silicon Mac**. The
   two design-shaping questions are answered and nothing below is gated on them any more:
-  - **P1** — a non-root guest process (`agent`, uid 1000) opened `AF_VSOCK` to host CID 2 and
-    completed a round trip, in the real agent image unmodified. `krayt-ask` dials the host
-    directly; the root-owned in-guest forwarder is dead (`dial-ask-channel-over-vsock.md`).
+  - **P1 — the dial works; the host must not close first.** A non-root guest process (`agent`,
+    uid 1000) opens `AF_VSOCK` to host CID 2 in the real agent image unmodified, and msb bridges
+    that dial to the host socket **as the invoking user** — `peer uid` is the caller's on every
+    accepted connection, against a `0600` socket inside a `0700` directory. `krayt-ask` dials the
+    host directly, the root-owned in-guest forwarder is dead (`dial-ask-channel-over-vsock.md`),
+    and decision 10's socket hardening stands as written.
+    **The reply, though, is dropped unless the host waits for the guest to close.** Measured
+    2026-09-02 on msb 0.6.16 (Apple-Silicon Mac), 25 round trips per shape against one sandbox:
+
+    | shape | who closes first | completed |
+    |---|---|---|
+    | bare `$TMPDIR` socket, as `agent` | host | 7/25 |
+    | `0600` in a `0700` dir, as `agent` | host | 5/25 |
+    | `0600` in a `0700` dir, as **root** | host | 9/25 |
+    | `0600` in a `0700` dir, as `agent` | **guest** | **25/25** |
+
+    Every loss is identical and silent from inside: the host logs the bytes it read *and* the echo
+    it wrote, and the guest's read returns EOF having received nothing. It is not a privilege
+    problem (root loses too), not the private directory (the bare shape loses at the same rate),
+    and not the peer uid. msb's relay discards the reply still in flight when the host end closes.
+    §6.13's channel therefore requires the host to wait for the sandbox to close
+    (`internal/askbridge.lingerUntilPeerCloses`, covered by
+    `TestServeDoesNotCloseBeforeTheSandboxDoes`). `hack/msb-probes/p1-vsock-nonroot.sh` passes or
+    fails on that shape — the one krayt ships — and reports the close-first rates beside it
+    without failing on them, so a re-run says whether msb still drops replies (expected) or has
+    fixed it (which would make the wait belt-and-braces rather than load-bearing).
   - **P2** — `msb exec --user root` works under `--security restricted`: uid 0, and a root-created
     0700 path stays unreadable to an `--user agent` exec. The guest helper takes the restricted
     profile *and* its privilege separation (`add-krayt-guest-helper.md`); it is not a trade-off.
@@ -2958,8 +3065,11 @@ independently-landed progress rather than a single big-bang "Done when".
   values in the msb child's `cmd.Env`, msb's default placeholder.
 - [ ] `add-krayt-guest-helper.md` — `cmd/krayt-helper`, stateless, argv-in/JSON-out, run as root
   via `msb exec --user`, a thin wrapper over the `internal/patch` functions krayt keeps.
-- [ ] `dial-ask-channel-over-vsock.md` — `krayt-ask` dials `AF_VSOCK` to host CID 2 directly over
-  msb's `--vsock` route; retires `cmd/krayt-vsock-forward`.
+- [x] `dial-ask-channel-over-vsock.md` — `krayt-ask` dials `AF_VSOCK` to host CID 2 directly over
+  msb's `--vsock` route; retires `cmd/krayt-vsock-forward` at the cut-over. Additive:
+  `internal/askbridge` + `internal/sockroot` + the `vsock://cid:port` dialer are built and tested,
+  nothing calls them from `krayt run` yet. P1's measurement is baked into the channel — the host
+  waits for the sandbox to close (§6.13).
 - [ ] `run-tasks-on-microsandbox.md` — **the cut-over.** `orchestrator.Run` drives the msb
   lifecycle; `internal/{provider,guest,protocol,proxy,controlclient,imagestore}` +
   `cmd/krayt-{agent,vsock-forward}` + `anthropic_wire.go` are deleted in the same change.

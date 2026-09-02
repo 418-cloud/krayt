@@ -84,3 +84,13 @@ const ControlPort uint32 = 1024
 // every container-initiated connection (§6.6, §6.12). Guest→host, the opposite direction of
 // ControlPort — see VM.ListenEgress.
 const EgressPort uint32 = 1025
+
+// AskPort is the fixed vsock port `krayt-ask` (and its --mcp front-end) dial to reach the
+// host-side ask_human bridge under msb (dial-ask-channel-over-vsock.md, §6.13): msb's
+// `--vsock HOST_PATH:PORT` exposes a host unix socket at guest CID 2 on this port, so it lives
+// here next to ControlPort/EgressPort so every fixed krayt vsock port stays enumerable in one
+// file, even though msb (unlike vfkit/Firecracker) never implements the Provider interface
+// above. Distinct from both by construction: two channels sharing a port number would invite the
+// wrong one being reasoned about, and msb reserves 123 for itself while 0 and math.MaxUint32 are
+// invalid — none of which AskPort may equal (see provider_test.go).
+const AskPort uint32 = 1026
