@@ -20,6 +20,8 @@
 # `//go:embed all:bin` has something to embed on a fresh clone.
 /internal/sandbox/guestbin/bin/krayt-helper-linux-amd64
 /internal/sandbox/guestbin/bin/krayt-helper-linux-arm64
+/internal/sandbox/guestbin/bin/krayt-ask-linux-amd64
+/internal/sandbox/guestbin/bin/krayt-ask-linux-arm64
 
 # Test binary, built with `go test -c`
 *.test

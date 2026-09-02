@@ -135,11 +135,18 @@ func handleConn(ctx context.Context, conn net.Conn, b *Bridge) {
 	_ = json.NewEncoder(conn).Encode(wireResponse{Response: resp, NoAnswer: noAnswer})
 }
 
-// OverSocket connects to a bridge unix socket, submits one question, and returns the
-// answer. It is the client side of the protocol used by the `krayt-ask` CLI (Phase 5) and by
-// tests to drive a stubbed agent question.
+// OverSocket connects to the bridge named by socket — a bare unix path, or a vsock://cid:port URL
+// (dial-ask-channel-over-vsock.md decision 2) — submits one question, and returns the answer. It
+// is the client side of the protocol used by the `krayt-ask` CLI (Phase 5) and by tests to drive
+// a stubbed agent question. A malformed vsock:// value returns an error wrapping
+// ErrMalformedSocket, distinct from a dial/connection failure, so a caller can tell "the socket
+// value is wrong" apart from "no human is available" (§6.13).
 func OverSocket(socket, prompt string, choices []string) (string, bool, error) {
-	conn, err := net.Dial("unix", socket)
+	addr, err := parseDialAddr(socket)
+	if err != nil {
+		return "", false, err
+	}
+	conn, err := dial(addr)
 	if err != nil {
 		return "", false, err
 	}

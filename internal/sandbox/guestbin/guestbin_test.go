@@ -23,6 +23,9 @@ func TestGuestPath(t *testing.T) {
 	if got, want := GuestPath(HelperName), "/.krayt/krayt-helper"; got != want {
 		t.Errorf("GuestPath(%q) = %q, want %q", HelperName, got, want)
 	}
+	if got, want := GuestPath(AskName), "/.krayt/krayt-ask"; got != want {
+		t.Errorf("GuestPath(%q) = %q, want %q", AskName, got, want)
+	}
 }
 
 // TestEmbeddedBinariesPresentInCI is the Done-when assertion that the embed is non-empty in CI,
@@ -33,14 +36,16 @@ func TestEmbeddedBinariesPresentInCI(t *testing.T) {
 	if os.Getenv("CI") == "" {
 		t.Skip("guest binaries are only guaranteed present after `make guest-bins`; run it locally to exercise this")
 	}
-	for _, arch := range []string{"amd64", "arm64"} {
-		b, err := Binary(HelperName, arch)
-		if err != nil {
-			t.Errorf("Binary(%q, %q): %v", HelperName, arch, err)
-			continue
-		}
-		if len(b) == 0 {
-			t.Errorf("Binary(%q, %q) returned empty bytes", HelperName, arch)
+	for _, name := range []string{HelperName, AskName} {
+		for _, arch := range []string{"amd64", "arm64"} {
+			b, err := Binary(name, arch)
+			if err != nil {
+				t.Errorf("Binary(%q, %q): %v", name, arch, err)
+				continue
+			}
+			if len(b) == 0 {
+				t.Errorf("Binary(%q, %q) returned empty bytes", name, arch)
+			}
 		}
 	}
 }

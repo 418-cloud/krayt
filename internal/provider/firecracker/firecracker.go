@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/418-cloud/krayt/internal/provider"
+	"github.com/418-cloud/krayt/internal/sockroot"
 )
 
 // DefaultBinary is the firecracker executable name resolved on PATH when no path is set.
@@ -195,38 +196,16 @@ func newSockDir() (string, error) {
 	return d, nil
 }
 
-// ensureSockRoot makes root a private directory owned by the current user, or fails. It uses
-// Lstat (no symlink following) + os.Mkdir (fails if the path already exists), so a symlink or
-// a foreign-owned/loose-mode directory pre-placed at root is refused rather than trusted. The
-// sockets it guards are the VM's lifecycle API and its control channel, so we never chmod or
-// chown a directory we do not own — we fail closed and let the human fix it (§6.12).
+// ensureSockRoot makes root a private directory owned by the current user, or fails — a thin
+// delegate to the shared check (dial-ask-channel-over-vsock.md decision 12) so this provider and
+// internal/askbridge's host-side ask-bridge socket directory can never drift apart. See
+// sockroot.Ensure for the property it implements: Lstat (no symlink following) + os.Mkdir (fails
+// if the path already exists), so a symlink or a foreign-owned/loose-mode directory pre-placed at
+// root is refused rather than trusted. The sockets it guards are the VM's lifecycle API and its
+// control channel, so we never chmod or chown a directory we do not own — we fail closed and let
+// the human fix it (§6.12).
 func ensureSockRoot(root string) error {
-	fi, err := os.Lstat(root)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(root, 0o700); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				// Lost a race with a concurrent creator (the root is shared across every VM
-				// this user boots) — re-validate whatever now exists rather than failing a
-				// legitimate concurrent `krayt run` on a spurious EEXIST.
-				return ensureSockRoot(root)
-			}
-			return fmt.Errorf("firecracker: create socket root: %w", err)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("firecracker: stat socket root: %w", err)
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("firecracker: socket root %s: cannot read owner/mode", root)
-	}
-	if !fi.IsDir() || int(st.Uid) != os.Getuid() || fi.Mode().Perm() != 0o700 {
-		return fmt.Errorf("firecracker: socket root %s is not a private directory owned by this user "+
-			"(mode %o, uid %d); refusing to place VM control sockets there — remove or fix it",
-			root, fi.Mode().Perm(), st.Uid)
-	}
-	return nil
+	return sockroot.Ensure(root)
 }
 
 // bootArgs derives the guest kernel command line from the caller's cmdline plus the two things

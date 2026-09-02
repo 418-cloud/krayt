@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/418-cloud/krayt/internal/provider"
 )
 
 // newFakeClient points a Client at this test binary (via testBinPath, set by TestMain) and
@@ -95,6 +97,32 @@ func TestCreateSpecArgsOmitsZeroValues(t *testing.T) {
 	want := []string{"create", "img"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Args() = %q, want %q (every optional field should be omitted)", got, want)
+	}
+}
+
+// TestCreateSpecArgsVsockOnlyWhenPopulated pins dial-ask-channel-over-vsock.md decision 9: the
+// --vsock route is create-time policy decided above this package — CreateSpec.Args() only ever
+// renders what it is given. An --on-question=fail run passes an empty Vsock and must get no
+// flag; a wait run passes one route and must get exactly one — never zero (the channel silently
+// missing) and never more than one (two channels sharing a number inviting the wrong one being
+// reasoned about, decision 3).
+func TestCreateSpecArgsVsockOnlyWhenPopulated(t *testing.T) {
+	fail := CreateSpec{Image: "img"}.Args()
+	for _, tok := range fail {
+		if tok == "--vsock" {
+			t.Fatalf("Args() for an empty Vsock (fail mode) emitted --vsock: %q", fail)
+		}
+	}
+
+	wait := CreateSpec{Image: "img", Vsock: []VsockRoute{{HostPath: "/run/krayt/ask.sock", Port: provider.AskPort}}}.Args()
+	n := 0
+	for _, tok := range wait {
+		if tok == "--vsock" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("Args() for one Vsock route (wait mode) emitted %d --vsock flags, want 1: %q", n, wait)
 	}
 }
 
