@@ -16,6 +16,13 @@ import (
 // quietly never asks", the exact failure mode §6.13 is designed to avoid.
 var ErrMalformedSocket = errors.New("ask: malformed KRAYT_ASK_SOCKET")
 
+// ErrVsockUnsupported is what dialVsock returns on a platform where the vsock:// transport has
+// no meaning (see dial_vsock_other.go) — a well-formed vsock://cid:port value that simply can't
+// be dialed here. Like ErrMalformedSocket, this is a configuration problem, not "bridge
+// unreachable": a caller should treat it as a usage error, not silently fall back to the
+// no-answer sentinel (§6.13).
+var ErrVsockUnsupported = errors.New("ask: vsock transport not supported on this platform")
+
 // vsockScheme is the KRAYT_ASK_SOCKET URL form dial-ask-channel-over-vsock.md decision 2 adds
 // alongside today's bare filesystem path. The env var keeps its name; a bare path still means a
 // unix socket, so nothing that exists today breaks.
