@@ -1,5 +1,7 @@
 package adapter
 
+import "github.com/418-cloud/krayt/internal/task"
+
 // openCodeAuthKeys are the credentials opencode's env-based provider auth accepts (verified
 // against packages/llm/src/providers/{anthropic,openai,openrouter}.ts upstream); exactly one
 // must be set so the run's billing/identity is unambiguous, mirroring claude-code/gemini-cli
@@ -7,8 +9,17 @@ package adapter
 // only the three common setups — extend later if asked.
 var openCodeAuthKeys = []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"}
 
+// openCodeAPIHosts maps each recognized credential to the one host it authenticates against
+// (hand-secrets-to-msb.md) — unlike claude-code/gemini-cli, opencode's three credentials don't
+// share a single host.
+var openCodeAPIHosts = map[string]string{
+	"ANTHROPIC_API_KEY":  "api.anthropic.com",
+	"OPENAI_API_KEY":     "api.openai.com",
+	"OPENROUTER_API_KEY": "openrouter.ai",
+}
+
 // openCode is the opencode adapter: same shape as claude-code/gemini-cli (exactly-one auth +
-// krayt-ask wiring), different credential names.
+// krayt-ask wiring + msb secret scoping), different credential names/hosts.
 type openCode struct{}
 
 func (openCode) Name() string { return "opencode" }
@@ -18,5 +29,9 @@ func (openCode) Prepare(in Input) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	return Plan{Env: credentialEnv(in, cred), Credential: cred}, nil
+	return Plan{
+		Env:        askEnv(in),
+		Credential: cred,
+		Secrets:    []task.SecretSpec{{Key: cred, Hosts: []string{openCodeAPIHosts[cred]}}},
+	}, nil
 }

@@ -31,7 +31,7 @@ const (
 	outFile   = "ask-probe-decision.txt"
 )
 
-// request/response mirror internal/guest/ask.wireRequest / wireResponse exactly.
+// request/response mirror internal/askbridge's wireRequest / wireResponse exactly.
 type request struct {
 	Prompt  string   `json:"prompt"`
 	Choices []string `json:"choices,omitempty"`

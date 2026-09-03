@@ -16,13 +16,11 @@ type checkResult struct {
 	detail   string
 }
 
-// commonChecks are the platform-agnostic prerequisite checks, appended to hostChecks.
+// commonChecks are the (now OS-agnostic — msb is krayt's only sandbox backend,
+// run-tasks-on-microsandbox.md) prerequisite checks for `krayt doctor`.
 func commonChecks() []checkResult {
 	return append([]checkResult{baseImageCheck()}, msbChecks()...)
 }
-
-// hostChecks returns the platform-specific prerequisite checks; it is implemented per
-// OS in doctor_darwin.go / doctor_linux.go / doctor_other.go.
 
 // newDoctorCmd builds the `doctor` command (§13).
 func newDoctorCmd() *cobra.Command {
@@ -37,7 +35,7 @@ func newDoctorCmd() *cobra.Command {
 }
 
 func runDoctor(w io.Writer) error {
-	checks := append(hostChecks(), commonChecks()...)
+	checks := commonChecks()
 	allOK := true
 	for _, c := range checks {
 		mark := "ok"

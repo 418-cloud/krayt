@@ -21,8 +21,8 @@ func TestDoctorChecksNoMsb(t *testing.T) {
 		if c.OK {
 			t.Errorf("check %q: OK = true, want false when msb cannot be found", c.Name)
 		}
-		if !c.Optional {
-			t.Errorf("check %q: Optional = false, want true (see DoctorChecks' doc comment)", c.Name)
+		if c.Optional {
+			t.Errorf("check %q: Optional = true, want false — these are mandatory now (see DoctorChecks' doc comment)", c.Name)
 		}
 		if c.Detail == "" {
 			t.Errorf("check %q: no detail text — must be actionable, not a bare failure", c.Name)

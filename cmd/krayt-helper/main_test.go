@@ -94,9 +94,9 @@ func TestRunSetupOrderingPatchGitUnaffectedByRelax(t *testing.T) {
 	}
 }
 
-// TestRunFinishGoldenMatchesDirectPatchCalls is the golden comparison against
-// internal/guest/service.go's buildArtifacts (still live at this point in the B1 arc): the same
-// Ingest/SetupPatchGit/Diff/BundleCommits sequence, driven once through the CLI and once by
+// TestRunFinishGoldenMatchesDirectPatchCalls is the golden comparison against the pre-msb guest
+// agent's own buildArtifacts (as it stood before run-tasks-on-microsandbox.md deleted it): the
+// same Ingest/SetupPatchGit/Diff/BundleCommits sequence, driven once through the CLI and once by
 // calling internal/patch directly, must produce a byte-identical changes.patch and an
 // equivalent commits.bundle.
 func TestRunFinishGoldenMatchesDirectPatchCalls(t *testing.T) {

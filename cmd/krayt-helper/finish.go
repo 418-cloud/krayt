@@ -13,8 +13,8 @@ import (
 	"github.com/418-cloud/krayt/internal/patch"
 )
 
-// Artifact file names written under --out, matching internal/guest's fileChangesPatch /
-// fileCommitsBundle (§6.7) — the same names both the running guest-agent and this helper produce.
+// Artifact file names written under --out (§6.7) — the same names the pre-msb guest agent used
+// to produce, before run-tasks-on-microsandbox.md's cut-over made this helper their only source.
 const (
 	fileChangesPatch  = "changes.patch"
 	fileCommitsBundle = "commits.bundle"
@@ -59,9 +59,8 @@ func runFinish(ctx context.Context, workspace, patchGitDir, baseline, outDir str
 	if err := os.MkdirAll(outDir, 0o777); err != nil {
 		return finishResult{}, fmt.Errorf("create output dir: %w", err)
 	}
-	// MkdirAll's mode is subject to umask, so chmod explicitly — mirrors
-	// internal/guest/service.go's outputDir handling, since --out is shared with a non-root
-	// process the same way.
+	// MkdirAll's mode is subject to umask, so chmod explicitly — mirrors how the pre-msb guest
+	// agent handled its outputDir, since --out is shared with a non-root process the same way.
 	if err := os.Chmod(outDir, 0o777); err != nil {
 		return finishResult{}, fmt.Errorf("chmod output dir: %w", err)
 	}

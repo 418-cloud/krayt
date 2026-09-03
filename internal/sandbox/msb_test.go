@@ -8,8 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/418-cloud/krayt/internal/provider"
 )
 
 // newFakeClient points a Client at this test binary (via testBinPath, set by TestMain) and
@@ -114,7 +112,7 @@ func TestCreateSpecArgsVsockOnlyWhenPopulated(t *testing.T) {
 		}
 	}
 
-	wait := CreateSpec{Image: "img", Vsock: []VsockRoute{{HostPath: "/run/krayt/ask.sock", Port: provider.AskPort}}}.Args()
+	wait := CreateSpec{Image: "img", Vsock: []VsockRoute{{HostPath: "/run/krayt/ask.sock", Port: AskPort}}}.Args()
 	n := 0
 	for _, tok := range wait {
 		if tok == "--vsock" {
@@ -376,6 +374,39 @@ func TestTeardownStillBoundedByATimeout(t *testing.T) {
 	}
 	if teardownTimeout < time.Second {
 		t.Fatalf("teardownTimeout = %v, suspiciously short", teardownTimeout)
+	}
+}
+
+func TestSystemLogsRendersArgsAndReturnsStdout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"logs": {ExitCode: 0, Stdout: `{"source":"system","line":"boot ok"}` + "\n"},
+	}})
+
+	out, err := c.SystemLogs(context.Background(), "krayt-run-1")
+	if err != nil {
+		t.Fatalf("SystemLogs: %v", err)
+	}
+	if !strings.Contains(string(out), "boot ok") {
+		t.Errorf("SystemLogs output = %q, want it to contain the fake's stdout", out)
+	}
+	call := lastFakeCall(t, home)
+	want := []string{"logs", "--source", "system", "--json", "krayt-run-1"}
+	if !reflect.DeepEqual(call.Args, want) {
+		t.Errorf("SystemLogs args = %v, want %v", call.Args, want)
+	}
+}
+
+func TestSystemLogsErrorsIncludeStderr(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"logs": {ExitCode: 1, Stderr: "sandbox not found"},
+	}})
+	_, err := c.SystemLogs(context.Background(), "nope")
+	if err == nil || !strings.Contains(err.Error(), "sandbox not found") {
+		t.Errorf("SystemLogs error = %v, want it to surface stderr", err)
 	}
 }
 

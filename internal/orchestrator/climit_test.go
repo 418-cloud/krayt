@@ -2,19 +2,16 @@ package orchestrator_test
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/418-cloud/krayt/internal/orchestrator"
-	"github.com/418-cloud/krayt/internal/proxy"
 )
 
 // Env vars that turn a re-exec of this test binary into a slot-acquiring helper process, so the
@@ -25,27 +22,15 @@ const (
 	slotHelperHold = "KRAYT_TEST_SLOT_HOLD_MS"
 )
 
-// egressHelperArg is the first argv element spawnEgressProxy gives a KRAYT_EGRESS_PROXY_BIN
-// replacement (`--mode <mode> …`), and so is how a re-exec of this test binary recognizes itself as
-// the egress-proxy child rather than the slot helper or the test suite — see the TestMain doc
-// below. It is argv and not an env var on purpose: spawnEgressProxy hands the child an explicit,
-// minimal environment (egressProxyChildEnvKeys), so no test-only marker can ride along in it.
-const egressHelperArg = "--mode"
+// fakeMsbBinPath is this test binary's own path, captured once before m.Run() so tests can point
+// sandbox.BinEnv at it (fakemsb_test.go) — mirroring internal/sandbox's own fakemsb_test.go.
+var fakeMsbBinPath string
 
 // TestMain triples as: (1) the slot-acquiring helper process used by
-// TestAcquireSlotCrossProcess, (2) the egress-proxy child process EVERY orchestrator.Run call
-// in this package's tests spawns for real (§4/§6 of move-egress-proxy-to-host.md — there is no
-// fake/no-op path in production, so there should not be one in tests either), or (3) the test
-// suite itself.
-//
-// For (2): rather than hand every orchestrator.Run call site a purpose-built stub binary, this
-// test binary points orchestrator.EgressProxyBinEnv at itself before running the suite. Every
-// child spawned that way reruns this same TestMain, which recognizes the proxy contract's leading
-// `--mode` argument (egressHelperArg) and behaves as the child (adopt fd 3, run the real
-// proxy.Serve loop) instead of recursing into the suite. The marker has to be argv: spawnEgressProxy
-// gives the child an explicit, minimal environment (egressProxyChildEnvKeys), so an env-var flag
-// set on this process before m.Run() would NOT reach it. This exercises the genuine fd-passing +
-// allowlist-enforcement path end to end in every orchestrator test, not a mock.
+// TestAcquireSlotCrossProcess, (2) a re-exec'd fake `msb` binary (fakemsb_test.go) — every
+// orchestrator.Run call in this package's tests drives a REAL exec.Cmd against this binary
+// scripted to play msb, per run-tasks-on-microsandbox.md decision 4 (the test seam moved from
+// fakeProvider to a scriptable fake msb) — or (3) the test suite itself.
 func TestMain(m *testing.M) {
 	if dir := os.Getenv(slotHelperDir); dir != "" {
 		hold, _ := strconv.Atoi(os.Getenv(slotHelperHold))
@@ -60,71 +45,13 @@ func TestMain(m *testing.M) {
 		rel()
 		os.Exit(0)
 	}
-	if len(os.Args) > 1 && os.Args[1] == egressHelperArg {
-		os.Exit(runEgressHelper())
+	if len(os.Args) > 1 && fakeMsbVerbs[os.Args[1]] {
+		os.Exit(runFakeMsb())
 	}
 	if self, err := os.Executable(); err == nil {
-		_ = os.Setenv(orchestrator.EgressProxyBinEnv, self)
+		fakeMsbBinPath = self
 	}
 	os.Exit(m.Run())
-}
-
-// runEgressHelper is this test binary re-exec'd as a `krayt __egress-proxy` stand-in: it
-// behaves exactly like the real hidden subcommand (internal/cli/egressproxy.go) — adopt fd 3,
-// read the stdin config, report the CA cert (if any) over fd 4, serve — but lives here so every
-// orchestrator-package test that calls orchestrator.Run gets a REAL child process without
-// repeating this wiring per test.
-func runEgressHelper() int {
-	fs := flag.NewFlagSet("egress-helper", flag.ContinueOnError)
-	mode := fs.String("mode", proxy.ModeAllowlist, "")
-	allowCSV := fs.String("allow", "", "")
-	mitm := fs.Bool("mitm", false, "")
-	runID := fs.String("run-id", "", "")
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "egress-helper: parse flags:", err)
-		return 1
-	}
-	lis, err := proxy.ListenerFromFD(3)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "egress-helper:", err)
-		return 1
-	}
-	var allow []string
-	if *allowCSV != "" {
-		allow = strings.Split(*allowCSV, ",")
-	}
-	stdinCfg, err := proxy.ReadStdinConfig(os.Stdin)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "egress-helper:", err)
-		return 1
-	}
-	policy := proxy.Policy{
-		Mode: *mode, Allow: allow, MITM: *mitm,
-		Passthrough: stdinCfg.Passthrough, Inject: stdinCfg.Inject,
-		// Mirrors internal/cli/egressproxy.go's envEnabled(proxy.LogRequestsEnv): the observation
-		// log is the one feature that reaches the child through its environment, so a stand-in that
-		// ignored it would let spawnEgressProxy quietly stop forwarding the variable without any
-		// test noticing (TestSpawnEgressProxyForwardsLogRequestsEnv). Reading the SAME constant the
-		// real reader and forwarder use is what keeps this helper from passing while the real
-		// contract breaks.
-		LogRequests: os.Getenv(proxy.LogRequestsEnv) == "1",
-	}
-	h, ca, err := proxy.BuildHandler(policy, "", *runID)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "egress-helper:", err)
-		return 1
-	}
-	if caW := os.NewFile(4, "ca-cert"); caW != nil {
-		if ca != nil {
-			_, _ = caW.Write(ca.CACertPEM())
-		}
-		_ = caW.Close()
-	}
-	if err := proxy.ServeHandler(context.Background(), lis, h); err != nil {
-		fmt.Fprintln(os.Stderr, "egress-helper:", err)
-		return 1
-	}
-	return 0
 }
 
 // TestAcquireSlotLimits proves the file-lock semaphore caps concurrency at max and actually

@@ -7,69 +7,52 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	specs "github.com/opencontainers/image-spec/specs-go"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"google.golang.org/grpc"
-	"oras.land/oras-go/v2/content"
-	"oras.land/oras-go/v2/content/memory"
-
-	"github.com/418-cloud/krayt/internal/guest"
-	"github.com/418-cloud/krayt/internal/imagestore"
 	"github.com/418-cloud/krayt/internal/orchestrator"
 	"github.com/418-cloud/krayt/internal/patch"
-	"github.com/418-cloud/krayt/internal/protocol/pb"
-	"github.com/418-cloud/krayt/internal/provider/fake"
-	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
-// TestEndToEndRun is the automated proof of the Phase 2 "Done when" (§14 test strategy):
-// against the in-process fakeProvider, `krayt`'s orchestrator drives the real bundle →
-// clone → baseline → diff → collect path, a stand-in agent (the fake Runner) edits one
-// file, and the resulting changes.patch applies cleanly back onto the host repo. The
-// container runtime is the only simulated piece; everything else is production code. The
-// real trivial-image-on-hardware run is the build-tagged integration test + a HUMAN_TODO.
+// TestEndToEndRun is the automated proof of the run lifecycle (§7): against the fake msb, the
+// orchestrator drives the real bundle → copy-in → helper-setup → agent-exec → helper-finish →
+// copy-out path, a scripted agent edits one file, and the resulting changes.patch applies
+// cleanly back onto the host repo. Every artifact-producing step (patch.CreateBundle,
+// patch.Ingest, patch.Diff, patch.BundleCommits) is the genuine production code; only "the
+// agent" itself is simulated, since there is no real agent image in a unit test.
 func TestEndToEndRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// A host repo to sandbox.
 	src := newRepo(t, map[string]string{
 		"greeting.txt": "hello\n",
 		"keep.txt":     "unchanged\n",
 	})
 
-	// A minimal user image acquired on the host (exercises the PushImage path).
-	img := minimalImage(ctx, t)
-
-	// Stand-in agent: edits one tracked file + adds a new one, without committing.
-	runner := &editingRunner{edits: map[string]string{
-		"greeting.txt": "hello world\n",
-		"new.txt":      "fresh\n",
-	}}
-	guestRoot := t.TempDir()
-	p := &fake.Provider{Register: func(s *grpc.Server) {
-		pb.RegisterGuestAgentServer(s, guest.NewService(
-			guest.WithRunner(runner),
-			guest.WithRoot(guestRoot),
-		))
-	}}
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
+		LogLines: []string{"agent starting", "agent done"},
+		WorkspaceFiles: map[string]string{
+			"greeting.txt": "hello world\n",
+			"new.txt":      "fresh\n",
+		},
+		ExitCode: 0,
+	}})
 
 	var logs bytes.Buffer
 	runDir := filepath.Join(t.TempDir(), "run")
 	spec := task.RunSpec{
 		ID:          "run_e2e",
-		ImageRef:    "latest",
+		ImageRef:    "agent-image:latest",
 		RepoPath:    src,
 		BundleDepth: 1,
 		TaskPrompt:  []byte("edit the greeting"),
+		Network:     allowlistAll,
 		Resources:   task.Resources{CPUs: 2, MemoryMiB: 2048},
 	}
 
-	res, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img, LogOut: &logs}, spec, runDir)
+	res, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb, LogOut: &logs}, spec, runDir)
 	if err != nil {
 		t.Fatalf("orchestrator.Run: %v", err)
 	}
@@ -77,25 +60,6 @@ func TestEndToEndRun(t *testing.T) {
 		t.Errorf("exit code = %d, want 0", res.ExitCode)
 	}
 
-	// The container runs non-root (§8.2), so the guest must leave /workspace and /output writable
-	// by other uids — the root-owned-dirs bug the claude-code image hit.
-	for _, d := range []string{"workspace", "output"} {
-		fi, err := os.Stat(filepath.Join(guestRoot, d))
-		if err != nil {
-			t.Fatalf("stat %s: %v", d, err)
-		}
-		if fi.Mode().Perm()&0o002 == 0 {
-			t.Errorf("%s dir mode %v not world-writable; a non-root container can't write it (§8.2)", d, fi.Mode().Perm())
-		}
-	}
-	// An ingested (root-cloned) file must be writable too, so the non-root agent can edit it.
-	if fi, err := os.Stat(filepath.Join(guestRoot, "workspace", "keep.txt")); err != nil {
-		t.Fatalf("stat keep.txt: %v", err)
-	} else if fi.Mode().Perm()&0o002 == 0 {
-		t.Errorf("ingested file mode %v not world-writable; a non-root agent can't edit it (§8.2)", fi.Mode().Perm())
-	}
-
-	// Artifacts + logs landed in the run dir.
 	patchBytes, err := os.ReadFile(res.PatchPath)
 	if err != nil || len(patchBytes) == 0 {
 		t.Fatalf("changes.patch missing/empty: err=%v len=%d", err, len(patchBytes))
@@ -119,60 +83,26 @@ func TestEndToEndRun(t *testing.T) {
 	}
 }
 
-// interceptingService wraps guest.Service to signal onPushCode synchronously right as the
-// PushCode stream starts arriving — after pushCode has already built the bundle from
-// spec.RepoPath (patch.CreateBundle, orchestrator.go), but before the transfer of that bundle
-// to the guest has completed, so `state: running` must not be externally visible yet.
-type interceptingService struct {
-	*guest.Service
-	onPushCode func()
-}
-
-func (s *interceptingService) PushCode(stream pb.GuestAgent_PushCodeServer) error {
-	if s.onPushCode != nil {
-		s.onPushCode()
-	}
-	return s.Service.PushCode(stream)
-}
-
 // TestStateNotRunningUntilCodeCaptured is the regression proof for §6.2: `state: running` must
-// not be externally visible until pushCode has returned, because that is the point after which
-// the host repo can be safely mutated without affecting this run's code snapshot.
+// not be externally visible until the code snapshot is durably captured inside the sandbox
+// (krayt-helper setup succeeding), because that is the point after which the host repo can be
+// safely mutated without affecting this run's snapshot.
 func TestStateNotRunningUntilCodeCaptured(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
-	img := minimalImage(ctx, t)
-	runner := &editingRunner{edits: map[string]string{"a.txt": "2\n"}}
-	guestRoot := t.TempDir()
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
+		WorkspaceFiles: map[string]string{"a.txt": "2\n"}, ExitCode: 0,
+	}})
 
 	runDir := filepath.Join(t.TempDir(), "run")
-	var stateAtPushCode string
-	svc := &interceptingService{
-		Service: guest.NewService(guest.WithRunner(runner), guest.WithRoot(guestRoot)),
-		onPushCode: func() {
-			rec, err := orchestrator.ReadRecord(runDir)
-			if err != nil {
-				t.Errorf("ReadRecord during PushCode: %v", err)
-				return
-			}
-			stateAtPushCode = rec.State
-		},
-	}
-	p := &fake.Provider{Register: func(s *grpc.Server) { pb.RegisterGuestAgentServer(s, svc) }}
-
 	spec := task.RunSpec{
-		ID: "run_state_order", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
+		ID: "run_state_order", ImageRef: "img", RepoPath: src, BundleDepth: 1, Network: allowlistAll,
 		TaskPrompt: []byte("task"), Resources: task.Resources{CPUs: 2, MemoryMiB: 2048},
 	}
-	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img}, spec, runDir); err != nil {
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb}, spec, runDir); err != nil {
 		t.Fatalf("orchestrator.Run: %v", err)
-	}
-
-	if stateAtPushCode != orchestrator.StateStarting {
-		t.Errorf("state during PushCode = %q, want %q (code must be captured before \"running\" is externally visible)",
-			stateAtPushCode, orchestrator.StateStarting)
 	}
 	final, err := orchestrator.ReadRecord(runDir)
 	if err != nil {
@@ -183,202 +113,181 @@ func TestStateNotRunningUntilCodeCaptured(t *testing.T) {
 	}
 }
 
-// TestContainerPolicyReachesRunner proves the per-task container hardening policy (§6.10, §10)
-// travels host → guest end to end: RunSpec.Container is pushed in the TaskSpec proto and threaded
-// into the guest.RunConfig the Runner receives. The containerd Runner turns these into OCI spec
-// opts (unit-tested separately in the linux runner package); here we assert the plumbing.
-func TestContainerPolicyReachesRunner(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	src := newRepo(t, map[string]string{"a.txt": "1\n"})
-	img := minimalImage(ctx, t)
-
-	var got guest.RunConfig
-	runner := &capturingRunner{onRun: func(cfg guest.RunConfig) { got = cfg }}
-	p := &fake.Provider{Register: func(s *grpc.Server) {
-		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(runner), guest.WithRoot(t.TempDir())))
-	}}
-
-	runDir := filepath.Join(t.TempDir(), "run")
-	spec := task.RunSpec{
-		ID: "run_container", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
-		TaskPrompt: []byte("task"),
-		Container: task.ContainerPolicy{
-			AddCapabilities:   []string{"CAP_NET_BIND_SERVICE"},
-			SeccompUnconfined: true,
-			ReadonlyRootfs:    true,
-		},
+// TestContainerPolicyIsHardErroredForMsb proves run-tasks-on-microsandbox.md decision 5: the
+// pre-msb OCI-spec knobs have no msb equivalent and must be refused before any sandbox work
+// begins, rather than silently ignored — a config setting them is reasoning about hardening, and
+// dropping it quietly would be a posture regression.
+func TestContainerPolicyIsHardErroredForMsb(t *testing.T) {
+	cases := []task.ContainerPolicy{
+		{AddCapabilities: []string{"CAP_NET_BIND_SERVICE"}},
+		{SeccompUnconfined: true},
+		{ReadonlyRootfs: true},
 	}
-	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img}, spec, runDir); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if len(got.AddCapabilities) != 1 || got.AddCapabilities[0] != "CAP_NET_BIND_SERVICE" {
-		t.Errorf("AddCapabilities = %v, want [CAP_NET_BIND_SERVICE]", got.AddCapabilities)
-	}
-	if !got.SeccompUnconfined {
-		t.Error("SeccompUnconfined did not reach the runner")
-	}
-	if !got.ReadonlyRootfs {
-		t.Error("ReadonlyRootfs did not reach the runner")
-	}
-}
-
-// TestContainerPolicyDefaultsAreSecure confirms the zero-value policy stays least-privilege end to
-// end: no opt-in caps (drop all), seccomp on, writable rootfs (§10).
-func TestContainerPolicyDefaultsAreSecure(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	src := newRepo(t, map[string]string{"a.txt": "1\n"})
-	img := minimalImage(ctx, t)
-
-	var got guest.RunConfig
-	runner := &capturingRunner{onRun: func(cfg guest.RunConfig) { got = cfg }}
-	p := &fake.Provider{Register: func(s *grpc.Server) {
-		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(runner), guest.WithRoot(t.TempDir())))
-	}}
-	runDir := filepath.Join(t.TempDir(), "run")
-	spec := task.RunSpec{ID: "run_default", ImageRef: "latest", RepoPath: src, BundleDepth: 1, TaskPrompt: []byte("task")}
-	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img}, spec, runDir); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if len(got.AddCapabilities) != 0 {
-		t.Errorf("default AddCapabilities = %v, want empty (drop all)", got.AddCapabilities)
-	}
-	if got.SeccompUnconfined {
-		t.Error("default must apply the seccomp profile (SeccompUnconfined=false)")
-	}
-	if got.ReadonlyRootfs {
-		t.Error("default rootfs must be writable (ReadonlyRootfs=false)")
-	}
-}
-
-// capturingRunner records the RunConfig it was handed, so a test can assert host→guest plumbing.
-type capturingRunner struct{ onRun func(guest.RunConfig) }
-
-func (r *capturingRunner) Version() string { return "fake" }
-func (r *capturingRunner) Run(_ context.Context, cfg guest.RunConfig, _ guest.LogFunc) (int, error) {
-	if r.onRun != nil {
-		r.onRun(cfg)
-	}
-	return 0, nil
-}
-
-// editingRunner is a stand-in for the containerd runner: it simulates the agent by writing
-// known edits into the workspace and emitting a couple of log lines (§14).
-type editingRunner struct{ edits map[string]string }
-
-func (r *editingRunner) Version() string { return "fake-containerd" }
-
-func (r *editingRunner) Run(_ context.Context, cfg guest.RunConfig, log guest.LogFunc) (int, error) {
-	log(pb.LogLine_STDOUT, []byte("agent starting\n"), time.Now().UnixMilli())
-	for name, contentStr := range r.edits {
-		p := filepath.Join(cfg.WorkspaceDir, name)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			return 1, err
-		}
-		if err := os.WriteFile(p, []byte(contentStr), 0o644); err != nil {
-			return 1, err
+	for _, cp := range cases {
+		if err := task.ValidateContainerPolicyForMsb(cp); err == nil {
+			t.Errorf("ValidateContainerPolicyForMsb(%+v) = nil, want an error naming --security", cp)
 		}
 	}
-	log(pb.LogLine_STDOUT, []byte("agent done\n"), time.Now().UnixMilli())
-	return 0, nil
 }
 
-// TestSecretsRedactedInLogs is the Phase 3 "secrets never appear in logs/artifacts" proof:
-// a secret reaches the container (mounted at /run/secrets), but when the agent prints it the
-// guest redacts it before the line is streamed, so it is absent from the live log, the
-// persisted agent.log, and meta.json (§6.8).
-func TestSecretsRedactedInLogs(t *testing.T) {
+// TestNoSecretValueOnAnyArgvOrNonCreateEnv is the Done-when's headline security proof: across
+// every msb invocation in a full run's lifecycle (create, copy x N, exec x N, logs, stop, rm),
+// a declared secret's real value never appears in any argv, and appears in the child's
+// environment ONLY on the single `create` call — never on a later exec/copy/logs/stop/rm — per
+// hand-secrets-to-msb.md's Timing rule.
+func TestNoSecretValueOnAnyArgvOrNonCreateEnv(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
-	img := minimalImage(ctx, t)
-
-	const secretVal = "sk-ant-supersecret-0123456789"
+	const secretValue = "sk-ant-supersecret-0123456789"
 	secretsFile := filepath.Join(t.TempDir(), "secrets.env")
-	if err := os.WriteFile(secretsFile, []byte("ANTHROPIC_API_KEY="+secretVal+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(secretsFile, []byte("ANTHROPIC_API_KEY="+secretValue+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	var mounted string
-	runner := &secretRunner{secret: secretVal, onRun: func(cfg guest.RunConfig) {
-		if cfg.SecretsDir != "" {
-			b, _ := os.ReadFile(filepath.Join(cfg.SecretsDir, "ANTHROPIC_API_KEY"))
-			mounted = string(b)
-		}
-	}}
-	guestRoot := t.TempDir()
-	p := &fake.Provider{Register: func(s *grpc.Server) {
-		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(runner), guest.WithRoot(guestRoot)))
-	}}
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	home := t.TempDir()
+	sb := newFakeSandbox(t, home, fakeMsbScript{Agent: fakeAgentScript{ExitCode: 0}})
 
-	var logs bytes.Buffer
-	runDir := filepath.Join(t.TempDir(), "run")
 	spec := task.RunSpec{
-		ID: "run_secrets", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
-		TaskPrompt: []byte("task"), SecretsPath: secretsFile,
+		ID: "run_secret_argv", ImageRef: "img", RepoPath: src, BundleDepth: 1,
+		TaskPrompt:  []byte("task"),
+		SecretsPath: secretsFile,
+		Network: task.NetworkPolicy{
+			Mode: task.NetworkAllowlist, Allow: []string{"api.anthropic.com"},
+			Secrets: []task.SecretSpec{{Key: "ANTHROPIC_API_KEY", Hosts: []string{"api.anthropic.com"}}},
+		},
 	}
-	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img, LogOut: &logs}, spec, runDir); err != nil {
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb}, spec, runDir); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// The agent could read the real secret (mounted at /run/secrets)…
-	if mounted != secretVal {
-		t.Errorf("secret not mounted for the agent: got %q", mounted)
+	calls := readFakeMsbCalls(t, home)
+	if len(calls) == 0 {
+		t.Fatal("no msb calls recorded")
 	}
-	// …and, since the container runs as a NON-ROOT uid (§8.2) while the guest writes the tmpfs as
-	// root, the dir must be traversable and the file world-readable or the agent can't read its
-	// credential (the exit-78 bug the claude-code image hit).
-	secDir := filepath.Join(guestRoot, "secrets")
-	if di, err := os.Stat(secDir); err != nil {
-		t.Fatalf("stat secrets dir: %v", err)
-	} else if di.Mode().Perm()&0o001 == 0 {
-		t.Errorf("secrets dir mode %v not traversable by others; a non-root container can't reach /run/secrets (§8.2)", di.Mode().Perm())
-	}
-	if fi, err := os.Stat(filepath.Join(secDir, "ANTHROPIC_API_KEY")); err != nil {
-		t.Fatalf("stat secret file: %v", err)
-	} else if fi.Mode().Perm()&0o004 == 0 {
-		t.Errorf("secret file mode %v not readable by others; a non-root container can't read it (§8.2/§6.14)", fi.Mode().Perm())
-	}
-	// …but it must not survive anywhere krayt records output.
-	if bytes.Contains(logs.Bytes(), []byte(secretVal)) {
-		t.Error("secret value leaked into the live log stream")
-	}
-	if !bytes.Contains(logs.Bytes(), []byte(secrets.RedactionMarker)) {
-		t.Errorf("expected a redaction marker in the logs; got %q", logs.String())
-	}
-	for _, f := range []string{"logs/agent.log", "meta.json"} {
-		b, err := os.ReadFile(filepath.Join(runDir, f))
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
+	createCalls := 0
+	for _, c := range calls {
+		for _, a := range c.Args {
+			if strings.Contains(a, secretValue) {
+				t.Errorf("secret value appeared in argv of a %q call: %v", c.Args[0], c.Args)
+			}
 		}
-		if bytes.Contains(b, []byte(secretVal)) {
-			t.Errorf("secret value leaked into %s", f)
+		leaked := false
+		for _, v := range c.Env {
+			if strings.Contains(v, secretValue) {
+				leaked = true
+			}
 		}
+		if c.Args[0] == "create" {
+			createCalls++
+			if !leaked {
+				t.Error("create call's env should carry the secret value (the one accepted channel)")
+			}
+		} else if leaked {
+			t.Errorf("secret value leaked into a non-create call's env: verb=%q", c.Args[0])
+		}
+	}
+	if createCalls != 1 {
+		t.Fatalf("expected exactly 1 create call, got %d", createCalls)
+	}
+}
+
+// TestTeardownRunsOnEveryPath asserts msb `stop` and `rm` both run regardless of how the run
+// ends: success, agent failure (nonzero exit with real output), a driver failure (ErrMsbFailed),
+// a wall-clock timeout, and ctx cancellation.
+func TestTeardownRunsOnEveryPath(t *testing.T) {
+	cases := []struct {
+		name       string
+		agent      fakeAgentScript
+		timeout    time.Duration
+		cancelSoon bool
+		wantErr    bool
+	}{
+		{name: "success", agent: fakeAgentScript{ExitCode: 0}},
+		{name: "agent_failure", agent: fakeAgentScript{LogLines: []string{"boom"}, ExitCode: 7}},
+		{name: "msb_driver_failure", agent: fakeAgentScript{NoOutput: true}, wantErr: true},
+		{name: "wall_clock_timeout", agent: fakeAgentScript{Block: true}, timeout: 200 * time.Millisecond},
+		{name: "ctx_cancellation", agent: fakeAgentScript{Block: true}, cancelSoon: true, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if tc.cancelSoon {
+				go func() { time.Sleep(200 * time.Millisecond); cancel() }()
+			}
+
+			src := newRepo(t, map[string]string{"a.txt": "1\n"})
+			home := t.TempDir()
+			sb := newFakeSandbox(t, home, fakeMsbScript{Agent: tc.agent})
+
+			spec := task.RunSpec{
+				ID: "run_teardown_" + tc.name, ImageRef: "img", RepoPath: src, BundleDepth: 1,
+				TaskPrompt: []byte("task"), Network: allowlistAll,
+			}
+			if tc.timeout > 0 {
+				spec.Resources.Timeout = tc.timeout
+			}
+			runDir := filepath.Join(t.TempDir(), "run")
+			_, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb}, spec, runDir)
+			if tc.wantErr && err == nil {
+				t.Error("expected an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			var sawStop, sawRm bool
+			for _, c := range readFakeMsbCalls(t, home) {
+				if c.Args[0] == "stop" {
+					sawStop = true
+				}
+				if c.Args[0] == "rm" {
+					sawRm = true
+				}
+			}
+			if !sawStop {
+				t.Error("msb stop was never called")
+			}
+			if !sawRm {
+				t.Error("msb rm was never called")
+			}
+		})
+	}
+}
+
+// TestMsbDriverFailureIsNotMistakenForAgentExitCode pins decision 6: a non-zero exit from `msb
+// exec` with no output observed on either stream must surface as a failed run naming the driver
+// failure, never as "the agent exited N".
+func TestMsbDriverFailureIsNotMistakenForAgentExitCode(t *testing.T) {
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{NoOutput: true}})
+	spec := task.RunSpec{ID: "run_msb_fail", ImageRef: "img", RepoPath: src, BundleDepth: 1, TaskPrompt: []byte("task"), Network: allowlistAll}
+	runDir := filepath.Join(t.TempDir(), "run")
+	_, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "msb failed") {
+		t.Errorf("error = %v, want it to name an msb driver failure, not an agent exit code", err)
 	}
 }
 
 // TestRunTimeout is the wall-clock-timeout proof: a stuck agent is killed and the run is
-// recorded as timed out, with the VM torn down (§6.1).
+// recorded as timed out, with the sandbox stopped and removed (§6.1).
 func TestRunTimeout(t *testing.T) {
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
-	img := minimalImage(context.Background(), t)
-
-	guestRoot := t.TempDir()
-	p := &fake.Provider{Register: func(s *grpc.Server) {
-		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(blockingRunner{}), guest.WithRoot(guestRoot)))
-	}}
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{Block: true}})
 
 	runDir := filepath.Join(t.TempDir(), "run")
 	spec := task.RunSpec{
-		ID: "run_timeout", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
-		TaskPrompt: []byte("task"),
-		Resources:  task.Resources{Timeout: 300 * time.Millisecond},
+		ID: "run_timeout", ImageRef: "img", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"), Network: allowlistAll,
+		Resources: task.Resources{Timeout: 300 * time.Millisecond},
 	}
-	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Provider: p, Image: img}, spec, runDir)
+	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir)
 	if err != nil {
 		t.Fatalf("Run (timeout should not be an error): %v", err)
 	}
@@ -395,100 +304,130 @@ func TestRunTimeout(t *testing.T) {
 }
 
 // TestRunTimeoutDuringSetup covers the same wall-clock timeout, but forced to fire before the
-// container ever starts — during WaitReady/pushImage/pushCode/etc. (§7 step 2-3) — instead of
-// during the container's own run. This used to surface as a raw, confusing error (e.g. a
-// killed `git bundle create` subprocess if pushCode's timing lost the race against a longer
-// timeout) instead of the same clean TimedOut result a run-phase timeout already got. A
-// deadline this tight has elapsed before any step runs, so — unlike racing a real subprocess —
-// this deterministically exercises the setup-phase path rather than depending on machine speed.
+// agent ever runs — during Create/copy-in/helper-setup — instead of during the agent's own exec.
+// A deadline this tight has already elapsed before any step runs, so this deterministically
+// exercises the setup-phase path rather than depending on machine speed.
 func TestRunTimeoutDuringSetup(t *testing.T) {
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
-	img := minimalImage(context.Background(), t)
-
-	guestRoot := t.TempDir()
-	p := &fake.Provider{Register: func(s *grpc.Server) {
-		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(blockingRunner{}), guest.WithRoot(guestRoot)))
-	}}
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{Block: true}})
 
 	runDir := filepath.Join(t.TempDir(), "run")
 	spec := task.RunSpec{
-		ID: "run_setup_timeout", ImageRef: "latest", RepoPath: src, BundleDepth: 1,
-		TaskPrompt: []byte("task"),
-		Resources:  task.Resources{Timeout: 1 * time.Nanosecond},
+		ID: "run_setup_timeout", ImageRef: "img", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"), Network: allowlistAll,
+		Resources: task.Resources{Timeout: 1 * time.Nanosecond},
 	}
-	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Provider: p, Image: img}, spec, runDir)
+	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir)
 	if err != nil {
 		t.Fatalf("Run (setup-phase timeout should not be an error): %v", err)
 	}
 	if !res.TimedOut {
 		t.Error("expected TimedOut = true")
 	}
-	b, err := os.ReadFile(filepath.Join(runDir, "meta.json"))
+}
+
+// TestPatchSecretScanWiredIntoRun proves Run() actually calls the host-side secret scan
+// (PatchSecretKeys) against the collected patch and surfaces a Safety warning naming the key —
+// never the value — in the Result, meta.json, and report.md (§6.8/§8.4). This is defense in
+// depth: under B1 no secret value can legitimately reach the guest at all (msb substitutes only
+// at the host TLS boundary), so this proves the wiring rather than a real leak path.
+func TestPatchSecretScanWiredIntoRun(t *testing.T) {
+	const secretValue = "sk-ant-supersecret-0123456789"
+	secretsFile := filepath.Join(t.TempDir(), "secrets.env")
+	if err := os.WriteFile(secretsFile, []byte("ANTHROPIC_API_KEY="+secretValue+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
+		WorkspaceFiles: map[string]string{"config.txt": "api_key=" + secretValue + "\n"},
+		ExitCode:       0,
+	}})
+
+	spec := task.RunSpec{
+		ID: "run_secret_scan", ImageRef: "img", RepoPath: src, BundleDepth: 1,
+		TaskPrompt:  []byte("task"),
+		SecretsPath: secretsFile,
+		Network: task.NetworkPolicy{
+			Mode: task.NetworkAllowlist, Allow: []string{"api.anthropic.com"},
+			Secrets: []task.SecretSpec{{Key: "ANTHROPIC_API_KEY", Hosts: []string{"api.anthropic.com"}}},
+		},
+	}
+	runDir := filepath.Join(t.TempDir(), "run")
+	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Run: %v", err)
 	}
-	if !bytes.Contains(b, []byte(`"timed_out": true`)) {
-		t.Errorf("meta.json should record timed_out: true; got %s", b)
+
+	hit := func(lines []string) bool {
+		for _, s := range lines {
+			if strings.Contains(s, "ANTHROPIC_API_KEY") && strings.Contains(s, "changes.patch") {
+				return true
+			}
+		}
+		return false
+	}
+	if !hit(res.Safety) {
+		t.Errorf("Result.Safety should flag the secret key found in the patch; got %v", res.Safety)
+	}
+	mb := readFile(t, filepath.Join(runDir, "meta.json"))
+	if strings.Contains(mb, secretValue) {
+		t.Error("secret value leaked into meta.json")
+	}
+	var m orchestrator.RunRecord
+	if err := json.Unmarshal([]byte(mb), &m); err != nil {
+		t.Fatalf("parse meta.json: %v", err)
+	}
+	if !hit(m.Safety) {
+		t.Errorf("meta.json safety should flag the secret key; got %v", m.Safety)
 	}
 }
 
-// secretRunner simulates an agent that reads the mounted secret and (carelessly) logs it.
-type secretRunner struct {
-	secret string
-	onRun  func(guest.RunConfig)
+// TestCreateSpecReflectsRunResources proves resources.{cpus,memory,disk,timeout} reach `msb
+// create`'s argv (run-tasks-on-microsandbox.md decision 5).
+func TestCreateSpecReflectsRunResources(t *testing.T) {
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	home := t.TempDir()
+	sb := newFakeSandbox(t, home, fakeMsbScript{Agent: fakeAgentScript{ExitCode: 0}})
+
+	spec := task.RunSpec{
+		ID: "run_resources", ImageRef: "img", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"), Network: allowlistAll,
+		Resources: task.Resources{CPUs: 4, MemoryMiB: 8192, DiskGiB: 40, Timeout: 20 * time.Minute},
+	}
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	calls := readFakeMsbCalls(t, home)
+	if len(calls) == 0 || calls[0].Args[0] != "create" {
+		t.Fatalf("expected the first call to be create; got %v", calls)
+	}
+	create := calls[0].Args
+	for _, want := range [][2]string{
+		{"--cpus", "4"}, {"--memory", "8192"}, {"--root-disk", "40G"}, {"--max-duration", (20 * time.Minute).String()},
+		{"--security", "restricted"}, {"--user", "agent"},
+	} {
+		if !argPairPresent(create, want[0], want[1]) {
+			t.Errorf("create args %v missing %s %s", create, want[0], want[1])
+		}
+	}
 }
 
-func (r *secretRunner) Version() string { return "fake" }
-func (r *secretRunner) Run(_ context.Context, cfg guest.RunConfig, log guest.LogFunc) (int, error) {
-	if r.onRun != nil {
-		r.onRun(cfg)
+func argPairPresent(args []string, flag, value string) bool {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) && args[i+1] == value {
+			return true
+		}
 	}
-	log(pb.LogLine_STDOUT, []byte("debug: ANTHROPIC_API_KEY="+r.secret+" (oops)\n"), time.Now().UnixMilli())
-	return 0, nil
+	return false
 }
 
-// blockingRunner never finishes on its own; it returns only when the run context is
-// canceled (the wall-clock timeout).
-type blockingRunner struct{}
+// --- shared helpers used across this package's test files ---
 
-func (blockingRunner) Version() string { return "fake" }
-func (blockingRunner) Run(ctx context.Context, _ guest.RunConfig, _ guest.LogFunc) (int, error) {
-	<-ctx.Done()
-	return -1, ctx.Err()
-}
-
-// --- helpers ---
-
-func minimalImage(ctx context.Context, t *testing.T) *imagestore.Image {
-	t.Helper()
-	src := memory.New()
-	cfg := content.NewDescriptorFromBytes(ocispec.MediaTypeImageConfig, []byte(`{"architecture":"arm64","os":"linux"}`))
-	if err := src.Push(ctx, cfg, bytes.NewReader([]byte(`{"architecture":"arm64","os":"linux"}`))); err != nil {
-		t.Fatal(err)
-	}
-	layer := content.NewDescriptorFromBytes(ocispec.MediaTypeImageLayer, []byte("layer"))
-	if err := src.Push(ctx, layer, bytes.NewReader([]byte("layer"))); err != nil {
-		t.Fatal(err)
-	}
-	manifestBlob, _ := json.Marshal(ocispec.Manifest{
-		Versioned: specs.Versioned{SchemaVersion: 2},
-		MediaType: ocispec.MediaTypeImageManifest,
-		Config:    cfg,
-		Layers:    []ocispec.Descriptor{layer},
-	})
-	mdesc := content.NewDescriptorFromBytes(ocispec.MediaTypeImageManifest, manifestBlob)
-	if err := src.Push(ctx, mdesc, bytes.NewReader(manifestBlob)); err != nil {
-		t.Fatal(err)
-	}
-	if err := src.Tag(ctx, mdesc, "latest"); err != nil {
-		t.Fatal(err)
-	}
-	img, err := imagestore.Acquire(ctx, src, "latest", t.TempDir())
-	if err != nil {
-		t.Fatalf("acquire image: %v", err)
-	}
-	return img
-}
+// allowlistAll is the minimal, always-valid network policy for tests that don't care about
+// egress specifics — task.NetworkArgs refuses to translate a zero-value Mode (the ADR's "never
+// emit an empty policy" rule), so every RunSpec needs an explicit one.
+var allowlistAll = task.NetworkPolicy{Mode: task.NetworkAllowlist}
 
 func newRepo(t *testing.T, files map[string]string) string {
 	t.Helper()

@@ -1,19 +1,7 @@
-.PHONY: proto proto-direct build krayt test lint tidy clean guest-bins
+.PHONY: build krayt test lint tidy clean guest-bins
 
 BIN := bin
 GUESTBIN_DIR := internal/sandbox/guestbin/bin
-
-# Regenerate the gRPC control protocol from internal/protocol/krayt.proto into
-# internal/protocol/pb (§9.2). Wraps the pinned Nix codegen target so plugin/version
-# skew never produces noisy diffs. The generated Go is committed; building krayt needs
-# no protoc.
-proto:
-	nix --extra-experimental-features nix-command --extra-experimental-features flakes run .#proto
-
-# Same codegen without Nix (protoc + protoc-gen-go + protoc-gen-go-grpc on PATH), for the
-# krayt-dev agent image (hack/krayt-dev), which has no Nix. See hack/krayt-dev/proto-direct.sh.
-proto-direct:
-	hack/krayt-dev/proto-direct.sh
 
 # Cross-build the static Linux guest binaries krayt embeds (internal/sandbox/guestbin) and
 # `msb copy`s into a sandbox per run (add-krayt-guest-helper.md). Not committed — the bin/ dir is

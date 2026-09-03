@@ -202,13 +202,12 @@ func TestValidateNetworkPolicyInvalid(t *testing.T) {
 }
 
 // TestValidateNetworkPolicyHostEntries pins the pre-flight half of "one definition of the same
-// hostname". internal/proxy's newHandler drops a host entry its normalizeHost refuses, so any
-// entry accepted here that the proxy would refuse means the run silently enforces a policy the
-// user did not write — an allowlist entry, or an inject rule, quietly absent. The good cases are
-// exactly what internal/proxy's normalizeHost accepts and folds to the same bare key; the bad ones
-// are what it refuses, plus the entries this side is deliberately stricter about (brackets, and
-// label shapes that fold fine but can never match a request host). TestHostRulesAgree in
-// internal/proxy holds that one-directional invariant to the two implementations directly.
+// hostname". The pre-msb host proxy's newHandler dropped a host entry its normalizeHost refused,
+// so any entry accepted here that the proxy would have refused meant the run silently enforced a
+// policy the user did not write — an allowlist entry, or an inject rule, quietly absent. The good
+// cases are exactly what that normalizeHost accepted and folded to the same bare key; the bad ones
+// are what it refused, plus the entries this side is deliberately stricter about (brackets, and
+// label shapes that fold fine but can never match a request host).
 func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 	bad := map[string]string{
 		// Written as escapes on purpose: these three are the runes that look like ASCII (or fold

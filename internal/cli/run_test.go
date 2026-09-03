@@ -191,20 +191,26 @@ func TestRunRunResourcePreflightRejectsOversizedRequest(t *testing.T) {
 	}
 }
 
-// TestRunRunNetworkInjectPreflightRejectsMissingSecretKey checks that a network.inject rule
-// naming a secrets-file key that doesn't exist fails fast at pre-flight — before any VM/image
-// work — rather than producing a run that fails opaquely once the agent tries to authenticate
-// (add-tls-mitm-credential-injection.md §1).
+// TestRunRunNetworkInjectPreflightRejectsMissingSecretKey checks that a network.inject entry
+// naming a secrets-file key that doesn't exist fails fast at pre-flight — before any sandbox
+// work — rather than producing a run that fails opaquely once the agent tries to authenticate.
 func TestRunRunNetworkInjectPreflightRejectsMissingSecretKey(t *testing.T) {
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "task.md")
 	if err := os.WriteFile(taskFile, []byte("do the thing"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A real (but key-less) secrets file, so the "no secrets file at all" pre-flight error
+	// doesn't mask the one this test actually checks.
+	secretsPath := filepath.Join(dir, "secrets.env")
+	if err := os.WriteFile(secretsPath, []byte("SOME_OTHER_KEY=x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfgPath := filepath.Join(dir, "krayt.yaml")
 	cfg := "image: img:1\n" +
-		"network:\n  mode: allowlist\n  allow: [api.anthropic.com]\n  mitm: true\n" +
-		"  inject:\n    - host: api.anthropic.com\n      set:\n        x-api-key: TYPO_KEY\n"
+		"secrets: " + secretsPath + "\n" +
+		"network:\n  mode: allowlist\n  allow: [api.anthropic.com]\n" +
+		"  inject:\n    - key: TYPO_KEY\n      host: api.anthropic.com\n"
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +228,7 @@ func TestRunRunNetworkInjectPreflightRejectsMissingSecretKey(t *testing.T) {
 
 // TestRunRunNetworkInjectPreflightPassesWithRealSecretKey is the companion positive case: when
 // the referenced key really is in the secrets file, pre-flight validation does not itself
-// reject the run (it may still fail later for unrelated reasons — no provider on this host,
+// reject the run (it may still fail later for unrelated reasons — no msb on this host,
 // same as TestRunRunResourcePreflightBypassedBySkipFlag — that's fine and untested here).
 func TestRunRunNetworkInjectPreflightPassesWithRealSecretKey(t *testing.T) {
 	dir := t.TempDir()
@@ -237,8 +243,8 @@ func TestRunRunNetworkInjectPreflightPassesWithRealSecretKey(t *testing.T) {
 	cfgPath := filepath.Join(dir, "krayt.yaml")
 	cfg := "image: img:1\n" +
 		"secrets: " + secretsPath + "\n" +
-		"network:\n  mode: allowlist\n  allow: [api.anthropic.com]\n  mitm: true\n" +
-		"  inject:\n    - host: api.anthropic.com\n      set:\n        x-api-key: ANTHROPIC_API_KEY\n"
+		"network:\n  mode: allowlist\n  allow: [api.anthropic.com]\n" +
+		"  inject:\n    - key: ANTHROPIC_API_KEY\n      host: api.anthropic.com\n"
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -277,21 +283,15 @@ func TestRunRunResourcePreflightBypassedBySkipFlag(t *testing.T) {
 	}
 }
 
-// TestPrintNetworkPolicy checks the pre-boot summary shows the operator every host and header
-// name the policy touches — and no secret material: an inject rule's values are secrets-file key
-// names that resolve host-side to real credentials, so only the header names may be printed.
+// TestPrintNetworkPolicy checks the pre-boot summary shows the operator every host and secret
+// scope the policy touches — and no secret material: msb substitutes the value at the host TLS
+// boundary, so only the key name and hosts may be printed.
 func TestPrintNetworkPolicy(t *testing.T) {
 	p := task.NetworkPolicy{
 		Mode:        task.NetworkAllowlist,
 		Allow:       []string{"api.anthropic.com", "proxy.golang.org"},
-		MITM:        true,
 		Passthrough: []string{"proxy.golang.org"},
-		Inject: []task.InjectRule{{
-			Host:       "api.anthropic.com",
-			Strip:      []string{"x-api-key"},
-			Set:        map[string]string{"authorization": "ANTHROPIC_API_KEY"},
-			SetLiteral: map[string]string{"anthropic-beta": "oauth-2025-04-20"},
-		}},
+		Secrets:     []task.SecretSpec{{Key: "ANTHROPIC_API_KEY", Hosts: []string{"api.anthropic.com"}}},
 	}
 	var b strings.Builder
 	if err := printNetworkPolicy(&b, p, "/repo/krayt.yaml"); err != nil {
@@ -300,22 +300,15 @@ func TestPrintNetworkPolicy(t *testing.T) {
 	out := b.String()
 	for _, want := range []string{
 		"/repo/krayt.yaml", "mode=allowlist", "api.anthropic.com", "proxy.golang.org",
-		"mitm=true", "passthrough", "inject api.anthropic.com",
-		"strip=x-api-key", "set=anthropic-beta,authorization",
+		"secrets-scoped=true", "passthrough", "secret ANTHROPIC_API_KEY -> api.anthropic.com",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary missing %q:\n%s", want, out)
 		}
 	}
-	// The mapped values name a secrets-file key and a literal; neither belongs on the terminal.
-	for _, leak := range []string{"ANTHROPIC_API_KEY", "oauth-2025-04-20"} {
-		if strings.Contains(out, leak) {
-			t.Errorf("summary leaks %q:\n%s", leak, out)
-		}
-	}
 }
 
-// TestPrintNetworkPolicyFlagsOnly covers the default run: no config file, no MITM. The summary
+// TestPrintNetworkPolicyFlagsOnly covers the default run: no config file, no secrets. The summary
 // still prints, because a run that never names a policy still has one.
 func TestPrintNetworkPolicyFlagsOnly(t *testing.T) {
 	var b strings.Builder
@@ -324,7 +317,7 @@ func TestPrintNetworkPolicyFlagsOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := strings.TrimSpace(b.String())
-	if want := "network policy (from flags): mode=none mitm=false"; out != want {
+	if want := "network policy (from flags): mode=none secrets-scoped=false"; out != want {
 		t.Errorf("summary = %q, want %q", out, want)
 	}
 }

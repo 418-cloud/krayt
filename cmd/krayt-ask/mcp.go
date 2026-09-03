@@ -6,7 +6,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/418-cloud/krayt/internal/guest/ask"
+	"github.com/418-cloud/krayt/internal/askclient"
 )
 
 // askHumanInput is the ask_human tool's argument schema (§6.13); the field docs become the JSON
@@ -34,7 +34,7 @@ func runMCP(socket string) error {
 			"anything you can decide, infer, or look up. If no human is available you'll get a sentinel " +
 			"telling you to proceed autonomously.",
 	}, askHumanHandler(func(q string, choices []string) (string, bool, error) {
-		return ask.OverSocket(socket, q, choices)
+		return askclient.OverSocket(socket, q, choices)
 	}))
 	return server.Run(context.Background(), &mcp.StdioTransport{})
 }

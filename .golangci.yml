@@ -1,8 +1,9 @@
 version: "2"
 
-# OS-specific files (provider seams, doctor checks) are linted under their native GOOS
-# by running the CI lint job on both macOS and Linux — not via build-tags, which would
-# leave GOOS mismatched and break stdlib typechecking.
+# The few remaining OS-specific files (cmd/krayt-helper, cmd/krayt-ask's vsock dialer,
+# internal/cli/resources_*.go) are linted under their native GOOS by running the CI lint job on
+# both macOS and Linux — not via build-tags, which would leave GOOS mismatched and break stdlib
+# typechecking.
 
 linters:
   enable:
@@ -13,10 +14,3 @@ linters:
     - unused
     - misspell
     - revive
-  exclusions:
-    rules:
-      # Generated protocol code is not linted.
-      - path: internal/protocol/pb/
-        linters:
-          - revive
-          - staticcheck

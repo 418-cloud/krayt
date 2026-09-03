@@ -18,26 +18,24 @@ need on your machine* and *how to get started*. Architecture and rationale live 
 
 ## Platform reality (read first)
 
-krayt runs on **macOS / Apple Silicon** (vfkit) and on **Linux / KVM** (Firecracker), behind one
-`Provider` interface. Everything above that seam — orchestrator, control protocol, guest agent,
-patch generation, secrets, egress policy — is the same code on both.
+krayt no longer builds its own VM. It drives [**msb** (microsandbox)](https://github.com/superradcompany/microsandbox)
+as a subprocess to rent a sandboxed micro-VM per run — the same `msb` binary, the same driver
+(`internal/sandbox`), on **macOS and Linux alike**. There is no more per-OS `Provider` split:
+orchestrator, patch generation, secrets, and egress policy are one code path on both platforms.
+See [`docs/adr-microsandbox-sandbox-layer.md`](./docs/adr-microsandbox-sandbox-layer.md) for why.
 
 What this means in practice:
-- The OS-agnostic core (most of the codebase) builds and unit-tests anywhere via a fake VM provider.
-- **macOS integration tests need real Apple-Silicon hardware.** They cannot run in CI or a cloud
-  agent, because Apple's Virtualization.framework only runs on Apple hardware.
-- **Linux integration tests need any host with `/dev/kvm`** — a bare-metal box, or a cloud VM with
-  nested virtualization enabled. They *can* run in CI.
+- The whole codebase builds and unit-tests anywhere via a scriptable fake `msb` binary — no real
+  sandbox needed.
+- **Hardware verification still needs a real host with `msb` installed** — msb's own sandboxes are
+  libkrun-based micro-VMs, so on macOS that means Apple Silicon and on Linux it means a host with
+  KVM available (msb's prerequisite, not krayt's — see "Prerequisites" below). This can't run in an
+  ordinary CI runner or a cloud agent without nested virtualization.
 
-**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64**
-and **linux/amd64** — the two tested targets (Apple Silicon/vfkit and Linux-KVM/Firecracker,
-matching what's actually verified on hardware) — and **darwin/amd64**, which compiles and
-*should* run on Intel Macs via Virtualization.framework but is **not tested**. There is no
-**linux/arm64** build yet: the base VM image is backend-tagged, not just arch-tagged (vfkit needs
-a PE `Image`, Firecracker an uncompressed ELF `vmlinux`), and only the vfkit-formatted
-`linux/arm64` variant is published today — a `linux/arm64` `krayt` would resolve to it and fail to
-boot under Firecracker, so it's left unshipped rather than shipped broken. Verify a download
-against the release's `checksums.txt`.
+**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64** and
+**linux/amd64** — the two tested targets — and **darwin/amd64**, which compiles and *should* run on
+Intel Macs but is **not tested**. There is no **linux/arm64** build yet (tracked separately from
+this migration). Verify a download against the release's `checksums.txt`.
 
 **Upgrading.** Once krayt is installed, `krayt upgrade` updates it in place: it finds the latest
 GitHub release (or a pinned one), downloads the right platform tarball, verifies it against that
@@ -50,70 +48,51 @@ downgrades, or reinstalls a specific release instead of latest.
 
 ## Prerequisites
 
-There are **three tiers**. Most contributors only need the first. Tiers 2 and 3 are
-provided by a Nix dev shell, so in practice you install **Go, vfkit, and (optionally) Nix**
+There are **two tiers**. Most contributors only need the first. Tier 2 is
+provided by a Nix dev shell, so in practice you install **Go, msb, and (optionally) Nix**
 — everything else comes from `nix develop`.
 
 ### 1. Build & run krayt (everyone)
 
-Common to both platforms:
+Common to both platforms — **no more per-OS split**: krayt needs the same tools on macOS and
+Linux alike.
+
 - **Go** — current stable _(verify current)_
 - **git**
+- **msb** (microsandbox) — the sandbox runtime krayt drives as a subprocess. Install it — see
+  <https://github.com/superradcompany/microsandbox> — then run `krayt doctor` to confirm it's
+  found and healthy. As of writing, the upstream installer is:
+  ```sh
+  curl -fsSL https://install.microsandbox.dev | sh
+  ```
+  _(verify current — check the linked repo for the latest install method)._ msb itself needs
+  **Apple Silicon** on macOS or a **KVM-capable** host on Linux (its own prerequisite, not a
+  separate krayt setup step — there is no more `/dev/kvm` group wrangling, tap device, or NAT
+  script for krayt to own; msb manages its own sandbox networking).
 - **Claude Code** — if you're driving development with the agent (see below)
 
-**On macOS:**
-- **macOS 13+** on Apple Silicon — _(verify current; vfkit needs 12+, some features 13/14+)_
-- **vfkit** — `brew install vfkit` _(verify current formula name)_. Carries the
-  virtualization entitlement, so **krayt itself needs no code-signing**.
+Run **`krayt doctor`** after installing msb; it checks msb is on `PATH` (or `KRAYT_MSB_BIN`),
+its version meets krayt's minimum, it resolves to the local (not a cloud) backend, and passes
+`msb doctor` itself — all **mandatory**: a host without a healthy msb fails `krayt doctor`
+outright, since `krayt run` cannot do anything without one.
 
-**On Linux:**
-- **KVM** — `/dev/kvm` must exist *and be writable by you*. Add yourself to the `kvm` group
-  (`sudo usermod -aG kvm $USER`) and then **start a new login session** — group membership only
-  takes effect at login, so an existing shell keeps getting "permission denied". On a cloud VM,
-  make sure nested virtualization is enabled.
-- **firecracker** — download a release from
-  [firecracker-microvm/firecracker](https://github.com/firecracker-microvm/firecracker/releases)
-  and put it on your `PATH`.
-- **One-time host setup:** `sudo hack/linux-net-setup.sh`. Firecracker, unlike vfkit, has no
-  built-in NAT device or DHCP server, so krayt has to create and address a tap device per VM.
-  The script grants krayt `CAP_NET_ADMIN` as a **file capability** (so krayt does *not* run as
-  root), enables IP forwarding, and installs krayt's NAT/forward rules as `krayt-nat.service` so
-  they survive a reboot. It does not loosen the guest's egress policy — what a container may
-  reach is still enforced by the host-side egress proxy (see "Egress control" below); this NIC
-  only matters for `--net full` and the vsock control channel.
-- **If Docker is also installed:** it sets the netfilter `FORWARD` chain's default policy to
-  `DROP` at `dockerd` startup — a separate rule set from krayt's own, evaluated independently, so
-  krayt's NAT rules above being correctly in place does not save you: guest egress gets silently
-  dropped by Docker's policy regardless. `hack/linux-net-setup.sh` handles this automatically (an
-  explicit accept in Docker's own `DOCKER-USER` chain, the customization point Docker documents
-  for exactly this), but only for the Docker state that exists *when you run it* — if you install
-  or start Docker afterward, **re-run the script**. This isn't a corner case: it's the default
-  outcome any time Docker and krayt's Linux backend share a host.
+> No `protoc`/`buf` here any more — krayt's own gRPC-on-vsock control protocol
+> (`internal/protocol/krayt.proto`) was deleted along with the rest of the sandbox layer it drove;
+> msb is driven as a CLI subprocess instead, so there is nothing left to codegen.
 
-Run **`krayt doctor`** after setup on either platform; it checks each of the above and tells you
-exactly what to do about anything missing.
+> **Guest helper binaries.** `make build`/`make test` cross-compile the embedded `linux/amd64` +
+> `linux/arm64` `krayt-helper`/`krayt-ask` binaries first (`make guest-bins`) and embed them via
+> `go:embed` — pure Go, `CGO_ENABLED=0`, so this needs no toolchain beyond Go itself and works the
+> same on macOS or Linux. A plain `go build ./...` still compiles on a fresh clone (the embed
+> directory ships a `.gitkeep`), it just won't have real guest binaries to copy into a sandbox.
 
-> No `protoc` here — generated protocol code is checked into the repo.
-
-> **Filesystem tip (Linux):** krayt gives each VM a copy-on-write clone of the base rootfs. On
-> **XFS or Btrfs** that is a reflink — instant, and it costs no disk. **ext4 has no reflink
-> support**, so the clone falls back to a full ~2 GiB copy per VM. Everything works either way,
-> but putting `~/.cache/krayt` on XFS/Btrfs makes runs start faster and use far less disk.
-
-### 2. Regenerate protocol code (only when editing `internal/protocol/krayt.proto`)
-Provided by the dev shell — no per-tool installs:
-```bash
-nix develop          # provides protoc, protoc-gen-go, protoc-gen-go-grpc, buf, oras (pinned)
-make proto           # regenerate; commit the result alongside the .proto
-```
-If you'd rather not use Nix, install `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc`
-(or `buf`) yourself — see links below — but the pinned dev shell is recommended so plugin
-versions can't drift.
-
-### 3. Build the VM image (CI / image maintainers only)
-The minimal Linux micro-VM image is a Nix flake under `images/`, built and published as an
-OCI artifact (see `KRAYT_SPEC.md` §11). This is **owned by CI (or a human), not by Claude
-Code** — building/boot-testing needs a Linux builder and real hardware.
+### 2. Build the VM image (legacy — CI / image maintainers only)
+`krayt run` no longer needs this: msb pulls the agent's own OCI image directly, so there is no
+krayt-built base VM image in the loop any more. What's left is legacy, kept only for the
+`krayt image` cache subcommands until it's retired: the minimal Linux micro-VM image is a Nix
+flake under `images/`, built and published as an OCI artifact (see `KRAYT_SPEC.md` §11). This is
+**owned by CI (or a human), not by Claude Code** — building/boot-testing needs a Linux builder and
+real hardware.
 - **arm64 Linux runner** (GitHub Actions)
 - **Nix** (CI uses the Determinate Systems action; see links)
 - **`oras`** — provided by the dev shell
@@ -129,14 +108,10 @@ All marked _(verify current)_ — confirm against the linked page, since names/v
 | Tool | Install | Reference _(verify current)_ |
 |---|---|---|
 | Go | platform installer | https://go.dev/doc/install |
-| vfkit | `brew install vfkit` | https://github.com/crc-org/vfkit |
+| msb (microsandbox) | `curl -fsSL https://install.microsandbox.dev \| sh` | https://github.com/superradcompany/microsandbox |
 | Nix | `curl -fsSL https://install.determinate.systems/nix \| sh -s -- install` | https://determinate.systems/nix-installer/ — or the community installer at https://nixos.org/download |
 | Claude Code | per docs | https://docs.claude.com/en/docs/claude-code/overview |
-| protoc | via `nix develop`, else manual | https://protobuf.dev |
-| buf (alt to protoc) | via `nix develop`, else manual | https://buf.build |
-| protoc-gen-go | `go install google.golang.org/protobuf/cmd/protoc-gen-go@latest` | https://protobuf.dev/reference/go/go-generated/ |
-| protoc-gen-go-grpc | `go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest` | https://grpc.io/docs/languages/go/quickstart/ |
-| oras | via `nix develop`, else manual | https://oras.land |
+| oras (legacy VM image pipeline only) | via `nix develop`, else manual | https://oras.land |
 
 > CI Nix install uses the GitHub Action `DeterminateSystems/determinate-nix-action`
 > (or `nix-installer-action`) — see https://github.com/DeterminateSystems/nix-installer.
@@ -148,24 +123,23 @@ All marked _(verify current)_ — confirm against the linked page, since names/v
 ```bash
 git clone <your-fork> krayt && cd krayt
 # tier-1 prereqs installed? confirm:
-go build ./...        # OS-agnostic core + this host's VM provider (vfkit on macOS, firecracker on Linux)
-go test ./...         # unit tests via the fake VM provider (no real VM needed)
+make build             # cross-builds the embedded guest binaries, then builds krayt — same on macOS and Linux
+make test              # unit tests via a scriptable fake msb binary (no real sandbox needed)
 go run ./cmd/krayt doctor
 
-# only if you need to regenerate protocol code or build the image:
-nix develop           # drops you into a shell with protoc/buf/oras pinned
+# only if you need the legacy VM image pipeline (tier 2, CI/image maintainers only):
+nix develop             # drops you into a shell with oras pinned
 ```
 
-To actually boot a VM you also need a published base image (`krayt image pull`) — see
-`KRAYT_SPEC.md` §11. That artifact comes from the tier-3 CI build.
+That's it — no base VM image to pull. `krayt run` hands your agent image straight to `msb create`,
+which pulls it itself.
 
 ---
 
 ## Running an agent
 
-With a booted base image (`krayt image pull`), no image building is required — pull one of
-krayt's published, ready-to-run [agent images](#agent-images), grab a task file and a
-credential, and run:
+No image building is required — pull one of krayt's published, ready-to-run
+[agent images](#agent-images), grab a task file and a credential, and run:
 
 ```bash
 # the agent works on a copy of the repo, returns a patch you review
@@ -201,12 +175,12 @@ nothing about which AI or tools are inside.
   Pass `--skip-resource-check` to bypass.
 - Flags can live in a `krayt.yaml` instead (see `configs/`); each run leaves a self-contained
   `.krayt/runs/<id>/` with `changes.patch`, `report.md`, `meta.json`, and logs.
-- **Disk cache.** Base VM images and agent images are cached on the host under `<user-cache-dir>/krayt/`
-  (`~/.cache/krayt/` on many Linux distros; `~/Library/Caches/krayt/` on macOS), in `vmimage/` and `imagestore/`, keyed by digest — a multi-GB agent image
-  rebuilt on every commit accumulates there.
-  `krayt image rm <digest>` drops one, and `krayt image prune` bulk-reclaims (keeping the pinned
-  base image and anything a running run still needs). VMs themselves are fully ephemeral, so this
-  host cache is the only thing that grows.
+- **Disk cache.** Agent images are pulled and cached by **msb itself** now — krayt hands `msb
+  create` the image reference and lets it manage that cache, rather than pulling and storing it
+  itself. `krayt image ls/rm/prune` still exist and still see krayt's own legacy `vmimage/` cache
+  under `<user-cache-dir>/krayt/` (a leftover of the pre-msb base VM image, no longer used by
+  `krayt run`); `imagestore/` is no longer populated for the same reason. Sandboxes themselves are
+  fully ephemeral either way.
 
 Reproducible, ready-to-run examples live under `hack/` — most notably `hack/claude-code/`
 (a real Claude Code agent, build-it-yourself version of the published image below) and
@@ -215,100 +189,75 @@ Reproducible, ready-to-run examples live under `hack/` — most notably `hack/cl
 ### Egress control
 
 `--net allowlist` (default) — only hosts in `--allow`/`network.allow` are reachable; `--net full`
-opens the guest's NIC directly (explicit opt-in); `--net none` denies everything. The allowlist
-is enforced by a **host-side proxy process** (`krayt __egress-proxy`, spawned per run, reached
-over a dedicated vsock channel) — the container's own network access is otherwise dropped except
-loopback. Two behavior notes worth knowing:
+opens egress to the whole public internet (explicit opt-in); `--net none` denies all network
+access outright. krayt still enforces default-deny/allowlist egress, but the mechanism is now
+msb's own: krayt translates `krayt.yaml`'s `network:` block into a fully explicit
+`--net-rule`/`--net-default`/`--tls-intercept`/`--tls-bypass` policy handed to `msb create` —
+there is no more krayt-run egress-proxy subprocess or in-guest firewall table. Two behavior notes
+worth knowing:
 
-- **DNS resolves in your host's network context**, not the VM's — it uses your system resolver
-  by default, so VPN/split-horizon/corporate DNS behaves the way it would for any other process
-  on your machine.
-- **Loopback, link-local, and private/LAN ranges (RFC 1918, CGNAT, ULA) are refused on every
-  proxy-mediated dial, in every policy mode, including `full`.** A local Ollama/LM Studio on
-  `127.0.0.1:11434` or a LAN package mirror is **not reachable through the proxy** — this is
-  deliberate: the proxy now runs on your host, so a range unblock would mean giving sandboxed
-  code a path to your real LAN and loopback services, not just the VM's own NAT segment. There is
-  no per-task opt-in for this; a purpose-built named-forward-target mechanism is a possible
-  future addition. **Note:** `--net full` also opens the guest's NIC directly (it deletes the
-  in-guest firewall table), so software that ignores `HTTP_PROXY` — or opens a raw socket — is
-  **not** subject to this guard at all in `full` mode and can reach routable private/LAN
-  addresses directly; only the proxy path is hard-blocked.
+- **DNS resolves through msb's own gateway**, not your host's resolver — msb polices it with
+  DNS-rebind protection. This is a change from krayt's own former proxy, which used your host's
+  system resolver directly.
+- **Loopback, link-local, private/LAN ranges (RFC 1918, CGNAT, ULA), the metadata address, and
+  multicast are explicitly denied in every policy mode, including `full`.** krayt always emits
+  these deny rules itself rather than relying on msb's own defaults (a bare sandbox's implicit
+  default is to *allow* the public internet the moment no explicit policy is given, which is the
+  opposite of what `--net none` needs to mean) — so `krayt run` refuses to create a sandbox at all
+  unless it has computed a complete, explicit network policy. A local Ollama/LM Studio on
+  `127.0.0.1:11434` or a LAN package mirror is still **not reachable** from inside the sandbox.
 
 ### Credential injection
 
-**Opt-in, off by default.** With `network.mitm: true`, the host egress proxy terminates TLS for
-the hosts you name in `network.inject[]` and attaches the credential itself — the container
-never sees it at all, closing the window where a compromised agent (or anything it touches)
-could read `/run/secrets` and walk off with a long-lived key. This is **not** a strict
-improvement over the default: it removes credential *theft*, not *use* (a compromised agent can
-still make authenticated requests for the run's duration), it only covers HTTP-shaped
-credentials, and it concentrates more trust in the host proxy process, which now holds your real
-credential in memory. Read `KRAYT_SPEC.md` §6.6.1/§10 before enabling it for anything sensitive.
+**On the moment you declare a secret — there is no separate opt-in any more.** Substitution is
+now msb's own: krayt passes each `network.inject[]` entry to `msb create` as `--secret
+NAME@HOST[,HOST...]` (the secrets-file key name and the hosts it may be substituted into — never
+the value, which travels only in the environment of the `msb` process krayt spawns). msb sets the
+sandbox's own `NAME` environment variable to a placeholder itself, and swaps in the real value
+only on egress to one of the named hosts. Declaring any secret this way turns on TLS interception
+for the whole sandbox automatically — under msb there is no such thing as a secret without it, so
+`network.mitm` is **gone as a config key** (it's a hard error if set) and there is nothing left to
+opt into by hand.
+
+This is **not** a strict improvement over the default: it removes credential *theft*, not *use* (a
+compromised agent can still make authenticated requests for the run's duration), and it
+concentrates trust in msb's own process, which holds your real credential in memory for the
+sandbox's lifetime. It also does not strip a pre-existing `authorization`/similar header the agent
+may have set itself — msb substitutes a placeholder string wherever it finds it, it does not
+remove headers the workload sent — so a credential the agent obtained elsewhere and placed in that
+header, addressed to an allowed host, goes out untouched. See
+[`docs/adr-microsandbox-sandbox-layer.md`](./docs/adr-microsandbox-sandbox-layer.md) for the full
+reasoning.
 
 ```yaml
 # krayt.yaml
-secrets: ./secrets.env          # still holds ANTHROPIC_API_KEY — the proxy loads it host-side;
-                                 # the container never receives this specific key at all
+secrets: ./secrets.env          # still holds GH_TOKEN — msb substitutes it at the TLS boundary;
+                                 # the container never receives the real value, only a placeholder
 network:
   mode: allowlist
-  allow: [api.anthropic.com]
-  mitm: true                    # terminate TLS at the host proxy for the hosts named below
+  allow: [api.github.com]
   inject:
-    - host: api.anthropic.com
-      strip: [x-api-key, authorization]   # remove any value the container itself sent
-      set:
-        x-api-key: ANTHROPIC_API_KEY      # secrets-file key name, resolved host-side
+    - key: GH_TOKEN              # secrets-file key name
+      host: api.github.com       # or `hosts: [...]` for more than one
 ```
 
-Run it exactly like any other task — `krayt run --config krayt.yaml --task ./task.md`. The run's
-`report.md`/`meta.json` show which keys were injected (names only, never values) so you can
-confirm the container ran without them.
+No header name, no strip list, no literal prefix — the tool inside the sandbox is expected to emit
+its own placeholder-bearing header (`gh` does this itself), and msb matches the placeholder string
+wherever it appears rather than krayt naming a header to rewrite. Run it exactly like any other
+task — `krayt run --config krayt.yaml --task ./task.md`. The run's `report.md`/`meta.json` still
+show which keys were injected (names only, never values) so you can confirm the container ran
+without them.
 
-**Seeing what the agent actually sent.** `.krayt/runs/<id>/proxy.log` records only failures and
-policy denials, so a run where everything worked leaves it **empty**. To watch the traffic itself,
-set `KRAYT_PROXY_LOG_REQUESTS=1` on the run:
-
-```sh
-KRAYT_PROXY_LOG_REQUESTS=1 krayt run --config krayt.yaml --task ./task.md
-```
-
-Each intercepted request then logs its request line, host, header **names**, query-parameter
-**names**, and response status — never a header value, a query value, or a body:
-
-```
-krayt-egress-proxy: observe CONNECT "api.anthropic.com:443" via=mitm
-krayt-egress-proxy: observe mitm POST host="api.anthropic.com:443" path="/v1/messages" headers=[accept,content-type,x-api-key] inject=true
-krayt-egress-proxy: observe mitm response host="api.anthropic.com:443" path="/v1/messages" status=200 headers=[content-type,request-id]
-```
-
-Off by default so ordinary runs don't persist every host and path the agent visited. Hosts you
-listed under `network.passthrough` are tunneled, not intercepted, so they log the `CONNECT` line
-only — their contents stay encrypted end to end.
-
-When a name isn't enough — you need an API's required beta/version header *value*, say — name those
-headers explicitly with `KRAYT_PROXY_LOG_HEADER_VALUES=anthropic-beta,anthropic-version`. Anything
-credential-bearing (`authorization`, `x-api-key`, `cookie`, … or any header your `network.inject[]`
-rules touch) is reduced to its shape instead of its value. The response line additionally reports
-what the proxy actually sent upstream (`sent=[…]`), which is the only place credential injection is
-visible — the request line shows what the container sent, placeholder and all:
-
-```
-values=[anthropic-beta="oauth-2026-01-01" authorization=<scheme="Bearer" credential_len=108>]
-```
-
-**Credential shape translation (`--agent claude-code` + `mitm: true`, zero `network.inject[]`
-needed).** For Claude Code specifically, the adapter can skip hand-writing `network.inject`
-entirely: with `--agent claude-code` and `network.mitm: true`, the adapter emits the injection
-rule itself — the container gets a placeholder that satisfies Claude Code's own "a credential is
-configured" check, and the real value never leaves the host:
+**Claude Code needs no `network.inject[]` at all.** With `--agent claude-code`, the adapter scopes
+whichever credential your secrets file holds (`ANTHROPIC_API_KEY` xor
+`CLAUDE_CODE_OAUTH_TOKEN`) to `api.anthropic.com` itself:
 
 ```yaml
 # krayt.yaml
 secrets: ./secrets.env          # ANTHROPIC_API_KEY OR CLAUDE_CODE_OAUTH_TOKEN — exactly one
 network:
   mode: allowlist
-  allow: [api.anthropic.com]
-  mitm: true                    # that's it — no network.inject[] to write
+  allow: [api.anthropic.com]    # no network.inject[] to write — the adapter scopes it
 agent:
   adapter: claude-code
 ```
@@ -317,24 +266,17 @@ agent:
 krayt run --config krayt.yaml --agent claude-code --task ./task.md --repo .
 ```
 
-Both credential shapes are handled, and **the placeholder mirrors the kind of credential you
-supplied**:
+Claude Code accepts msb's own default placeholder shape (`$MSB_<NAME>`) for either credential —
+confirmed on hardware — so there is no krayt-maintained table of wire-format placeholders to keep
+in sync with Anthropic's API any more; that whole translation layer
+(`internal/adapter/anthropic_wire.go`) went with the old host-side proxy. The container holds no
+real credential either way; it can still tell it is on a subscription, because Anthropic's own
+responses say so in their rate-limit headers.
 
-| Your secrets file has | The container is configured with | The proxy sends upstream |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use` | `x-api-key: <your key>` |
-| `CLAUDE_CODE_OAUTH_TOKEN` | `CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-krayt-placeholder-do-not-use` | `authorization: Bearer <your token>` |
-
-Mirroring the shape means Claude Code runs its own code path for the credential you actually have —
-composing the `anthropic-beta` opt-in flags and everything else itself — so krayt substitutes one
-header value and invents nothing. The container holds no credential either way; it can still tell
-it is on a subscription, because Anthropic's own responses say so in their rate-limit headers.
-
-Both wire shapes come from live MITM observation of Claude Code itself, dated and recorded in
-`internal/adapter/anthropic_wire.go`'s PROVENANCE comment (a golden test pins the table, so the day
-Anthropic changes something that test's diff *is* the changelog). The subscription shape has been
-verified end to end (`run_df97fffa`) — see `HUMAN_TODO.md`; `KRAYT_SPEC.md` §6.14 has the full
-design.
+One capability this loses: krayt's old proxy could log intercepted request/response metadata
+(header **names**, never values) to `.krayt/runs/<id>/proxy.log` for debugging what an agent
+actually sent. There is no krayt-side equivalent under msb today — that observability went with
+`internal/proxy`.
 
 ### Agent images
 
@@ -385,24 +327,24 @@ Repo-scoped completions read the same `.krayt/` state the commands do, so they h
 
 ### Running the integration tests
 
-The `//go:build integration` suite boots a **real micro-VM per test** (vfkit on Apple Silicon,
-firecracker on Linux/KVM), so it can't run in the ordinary `go test ./...`. One command runs the
-whole suite for your host — it builds `krayt`, runs `krayt doctor` as a preflight, pulls the base
-VM image, defaults every probe image to the CI-published `krayt-probe` tags, and runs the right
-`go test -tags integration` invocations:
+There is no more `//go:build integration` Go suite — it drove the now-deleted vfkit/Firecracker
+providers, and msb is a real subprocess with no in-process fake worth booting a sandbox to test
+twice (`internal/sandbox`'s and `internal/orchestrator`'s own unit tests already exercise the
+driver and the run lifecycle against a scriptable fake `msb`). What's left to verify only on real
+hardware is msb itself: does a real sandbox boot, does a real agent image run in it, does
+`ask_human` round-trip over the guest's vsock dial to the host. `hack/run-integration-tests.sh` is
+the runnable form of that recipe — it needs a host with `msb` installed (an Apple-Silicon Mac, or
+any host with KVM) and a real model credential; it does not run in CI:
 
 ```bash
-# macOS (Apple Silicon + vfkit):
+export KRAYT_IMAGE=ghcr.io/418-cloud/krayt-agent-claude-code:latest
+export KRAYT_SECRETS=./secrets.env   # a real model credential
 hack/run-integration-tests.sh
-
-# Linux (host with /dev/kvm + firecracker, after `sudo hack/linux-net-setup.sh` once):
-hack/run-integration-tests.sh          # compiles each package, sudo-setcaps it, runs it
 ```
 
-No live LLM credential is needed: the end-to-end tests use `hack/edit-probe` (a trivial
-`/workspace`-editing image), not a real agent. Override any `KRAYT_*` env var to point at your own
-image; pass `--run <pattern>` to run a single test while iterating. The per-file header comments in
-each `integration_test.go` remain the authoritative manual fallback for running one test by hand.
+It builds `krayt`, runs `krayt doctor` as a preflight (fails fast if msb isn't installed and
+healthy), then launches a plain run and a `--on-question=wait` run against the real image — verify
+the results with `krayt ls`/`attach`/`answer` as the script's own output describes.
 
 ---
 
@@ -415,27 +357,28 @@ each `integration_test.go` remain the authoritative manual fallback for running 
 | `HUMAN_TODO.md` | Handoff log the agent maintains for steps a human must do (created during development). |
 | `SECURITY.md` | Threat model pointer + how to privately report a vulnerability. |
 | `CONTRIBUTING.md` | How to get set up, code/commit conventions, and what a PR should include. |
-| `images/` | Nix flake for the micro-VM image; `images/agents/` holds the published, ready-to-run agent images (CI-built). |
+| `images/` | Legacy Nix flake for krayt's old base micro-VM image (no longer used by `krayt run`, kept only for the `krayt image` cache subcommands until retired); `images/agents/` holds the published, ready-to-run agent images (CI-built) and is very much still live. |
 | `internal/` | The implementation (see §9 of the spec for package layout). |
-| `cmd/` | Binaries: `krayt` (CLI, incl. the hidden `krayt __egress-proxy` host-side allowlist proxy), `krayt-agent` (guest), `krayt-vsock-forward` (guest-side parse-nothing pipe to the host proxy), `krayt-ask` (question front-end + MCP server). |
+| `cmd/` | Binaries: `krayt` (the CLI), `krayt-helper` (stateless, linux-only, root-run guest binary invoked via `msb exec` that builds the patch — clones the bundle, tags a baseline, diffs, bundles commits), `krayt-ask` (question front-end + MCP server; dials `AF_VSOCK` to the host directly). |
 | `configs/` | Example `krayt.yaml` + default allowlist. |
-| `hack/` | Reproducible demo/probe images used to verify features on hardware (`claude-code` agent, `ask-probe`, `krayt-ask-probe`). |
+| `hack/` | Reproducible demo/probe images used to verify features on hardware (`claude-code` agent, `ask-probe`, `krayt-ask-probe`, `msb-probes/`). |
 
 ### Steps a human is expected to own (the `[HUMAN]` handoffs)
 Claude Code does everything it can, then logs these to `HUMAN_TODO.md` and pauses if blocked:
-- **Install vfkit** (`brew install vfkit`) — trivial, scriptable.
-- **Run CI to build/publish the VM image** + provide registry credentials.
-- **Run the boot test** on your Mac (vfkit boots the image → `Hello` round-trips).
+- **Install msb** — see <https://github.com/superradcompany/microsandbox> — trivial, scriptable.
+- **Run a real `krayt run` against real msb** (`hack/run-integration-tests.sh`) on hardware with
+  msb installed.
 - **Provide live API keys** to exercise a real agent image.
 
 ---
 
 ## Driving development with Claude Code
 
-Recommended: develop with **Claude Code in the terminal on your Mac** — the laptop is the
-target platform, so it's the only place the macOS-specific code can be built and tested.
-The OS-agnostic phases can optionally be offloaded to Claude Code on the web (it PRs to
-GitHub), but all VM/integration work comes back to the Mac.
+There is no more macOS-specific code path to build and test — msb is driven the same way on macOS
+and Linux, so the whole codebase builds and unit-tests anywhere. Real-sandbox hardware
+verification (a real `msb`-backed `krayt run`) still needs a host with msb installed — an
+Apple-Silicon Mac, or any Linux host with KVM — and can be offloaded there or run locally; it just
+can't run in an ordinary CI runner or a cloud agent without nested virtualization.
 
 Work **one phase at a time**, using each phase's "Done when" criterion in the spec as the
 gate. A good kickoff prompt:
@@ -453,26 +396,29 @@ See `CLAUDE.md` for the full working agreement.
 
 ## Status
 
-Built phase by phase per `KRAYT_SPEC.md` §14. **Phases 0–7 are complete and verified on real
+Built phase by phase per `KRAYT_SPEC.md` §14. **Phases 0–7 were complete and verified on real
 hardware on both backends**, released as
-[`v0.5.0`](https://github.com/418-cloud/krayt/releases/tag/v0.5.0) — krayt runs a real coding
-agent (Claude Code) in an isolated micro-VM over an untrusted repo and hands back a reviewable
+[`v0.5.0`](https://github.com/418-cloud/krayt/releases/tag/v0.5.0) — krayt ran a real coding
+agent (Claude Code) in an isolated micro-VM over an untrusted repo and handed back a reviewable
 patch, with egress control, secrets, concurrency, park-and-walk-away, and an agent↔human question
-channel, on **both** macOS/vfkit and Linux/firecracker behind the same `Provider` interface. See
-`CHANGELOG.md` for the full release history.
+channel, on **both** macOS/vfkit and Linux/firecracker behind the same `Provider` interface.
+**That sandbox layer has since been replaced** (Phase 11, below): krayt now drives
+[msb](https://github.com/superradcompany/microsandbox) instead of owning vfkit/Firecracker itself.
+See `CHANGELOG.md` for the full release history.
 
 | Phase | What | State |
 |---|---|---|
 | 0 — Foundations | provider/protocol scaffold, `fakeProvider`, `doctor` | ✅ |
-| 1 — Boot a VM on macOS | vfkit provider, vsock guest-agent, image pull; `Hello` round-trips | ✅ hardware |
+| 1 — Boot a VM on macOS | vfkit provider, vsock guest-agent, image pull; `Hello` round-trips | ✅ hardware (superseded, Phase 11) |
 | 2 — End-to-end run | bundle → clone → agent edit → `changes.patch` that applies cleanly | ✅ hardware |
-| 3 — Security & limits | egress allowlist proxy + nftables lock, secrets + redaction, resource/timeout | ✅ hardware |
+| 3 — Security & limits | egress allowlist proxy + nftables lock, secrets + redaction, resource/timeout | ✅ hardware (superseded, Phase 11) |
 | 4 — Concurrency & UX | `Manager`, `ls`/`attach`/`logs`/`stop`/`rm`, config file, question channel | ✅ |
 | 5 — Polish & orchestration | `report.md`/`meta.json`, patch lint, agent adapters + auth, `krayt-ask`, detached "park & walk away" | ✅ hardware |
 | 6 — `ask_human` MCP + precise resume | in-VM MCP server, `waiting`→`running` on answer | ✅ hardware |
-| 7 — Linux backend (parity) | `firecracker` provider behind the same interface | ✅ hardware |
-| 8 — Host-side egress proxy, step 1 | L7 allowlist proxy moved off the guest to a separate host process over a new guest-initiated vsock channel (`move-egress-proxy-to-host.md`) | ✅ offline / ⏳ hardware re-verification, see `HUMAN_TODO.md` |
+| 7 — Linux backend (parity) | `firecracker` provider behind the same interface | ✅ hardware (superseded, Phase 11) |
+| 8 — Host-side egress proxy, step 1 | L7 allowlist proxy moved off the guest to a separate host process over a new guest-initiated vsock channel (`move-egress-proxy-to-host.md`) | ✅ offline (superseded, Phase 11) |
+| 11 — Microsandbox migration (ADR option B1) | Replace krayt's own vfkit/Firecracker/guest-agent/proxy stack with a driver for [msb](https://github.com/superradcompany/microsandbox); msb now owns the sandbox and credential substitution (`run-tasks-on-microsandbox.md`, the cut-over) | ✅ cut-over landed — a real end-to-end `krayt run` against real msb on hardware is still outstanding |
 
 The showcase: a real agent, blocked mid-task on a decision only a human could make, paused,
-asked over MCP, got the answer, and continued with it — all inside the VM with a live
+asked over MCP, got the answer, and continued with it — all inside the sandbox with a live
 credential. See `hack/claude-code/` for the reproducible example.

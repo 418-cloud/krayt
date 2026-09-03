@@ -57,8 +57,6 @@ func TestAskWiring(t *testing.T) {
 			t.Fatal(err)
 		}
 		// A valid single credential so claude-code/gemini/opencode pass the auth gate.
-		// ANTHROPIC_API_KEY alone satisfies opencode too (it's one of its recognized keys), so
-		// this doesn't need a fourth key.
 		keys := []string{"ANTHROPIC_API_KEY", "GEMINI_API_KEY"}
 
 		waiting, err := ad.Prepare(adapter.Input{SecretKeys: keys, QuestionsWait: true, AskSocket: askSocket})
@@ -79,7 +77,8 @@ func TestAskWiring(t *testing.T) {
 	}
 }
 
-// TestGeminiAndNone covers the gemini-cli auth gate and the pass-through none adapter.
+// TestGeminiAndNone covers the gemini-cli auth gate, its msb secret scoping, and the
+// pass-through none adapter.
 func TestGeminiAndNone(t *testing.T) {
 	gem, _ := adapter.Get("gemini-cli")
 	if _, err := gem.Prepare(adapter.Input{SecretKeys: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"}}); err == nil {
@@ -88,6 +87,10 @@ func TestGeminiAndNone(t *testing.T) {
 	p, err := gem.Prepare(adapter.Input{SecretKeys: []string{"GEMINI_API_KEY"}})
 	if err != nil || p.Credential != "GEMINI_API_KEY" {
 		t.Errorf("gemini-cli single cred: plan=%+v err=%v", p, err)
+	}
+	want := []task.SecretSpec{{Key: "GEMINI_API_KEY", Hosts: []string{"generativelanguage.googleapis.com"}}}
+	if !reflect.DeepEqual(p.Secrets, want) {
+		t.Errorf("gemini-cli Secrets = %+v, want %+v", p.Secrets, want)
 	}
 
 	n, _ := adapter.Get("none")
@@ -98,7 +101,8 @@ func TestGeminiAndNone(t *testing.T) {
 }
 
 // TestOpenCodeExactlyOne is the §6.14 proof for the opencode adapter: it accepts exactly one of
-// its three recognized credentials, and fails fast when none or several are set.
+// its three recognized credentials, fails fast when none or several are set, and scopes each
+// credential to its own host (hand-secrets-to-msb.md).
 func TestOpenCodeExactlyOne(t *testing.T) {
 	ad, err := adapter.Get("opencode")
 	if err != nil {
@@ -109,13 +113,14 @@ func TestOpenCodeExactlyOne(t *testing.T) {
 		keys     []string
 		wantErr  string // substring; "" = success
 		wantCred string
+		wantHost string
 	}{
-		{"anthropic only", []string{"ANTHROPIC_API_KEY", "GH_TOKEN"}, "", "ANTHROPIC_API_KEY"},
-		{"openai only", []string{"OPENAI_API_KEY"}, "", "OPENAI_API_KEY"},
-		{"openrouter only", []string{"OPENROUTER_API_KEY"}, "", "OPENROUTER_API_KEY"},
-		{"two set", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}, "exactly one", ""},
-		{"all three set", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"}, "exactly one", ""},
-		{"none set", []string{"GH_TOKEN"}, "no auth credential", ""},
+		{"anthropic only", []string{"ANTHROPIC_API_KEY", "GH_TOKEN"}, "", "ANTHROPIC_API_KEY", "api.anthropic.com"},
+		{"openai only", []string{"OPENAI_API_KEY"}, "", "OPENAI_API_KEY", "api.openai.com"},
+		{"openrouter only", []string{"OPENROUTER_API_KEY"}, "", "OPENROUTER_API_KEY", "openrouter.ai"},
+		{"two set", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}, "exactly one", "", ""},
+		{"all three set", []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"}, "exactly one", "", ""},
+		{"none set", []string{"GH_TOKEN"}, "no auth credential", "", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -127,6 +132,10 @@ func TestOpenCodeExactlyOne(t *testing.T) {
 				if plan.Credential != c.wantCred {
 					t.Errorf("credential = %q, want %q", plan.Credential, c.wantCred)
 				}
+				want := []task.SecretSpec{{Key: c.wantCred, Hosts: []string{c.wantHost}}}
+				if !reflect.DeepEqual(plan.Secrets, want) {
+					t.Errorf("Secrets = %+v, want %+v", plan.Secrets, want)
+				}
 				return
 			}
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
@@ -136,178 +145,30 @@ func TestOpenCodeExactlyOne(t *testing.T) {
 	}
 }
 
-// TestCredentialInjectionSignal proves that when the adapter's selected credential is withheld
-// from SecretsBundle by network.inject (§6.6.1), Prepare wires KRAYT_INJECTED_CREDENTIAL naming
-// it — so the container entrypoint can start without the /run/secrets file that will never
-// arrive — and that it is absent when injection isn't configured for that key.
-func TestCredentialInjectionSignal(t *testing.T) {
+// TestClaudeCodeSecretScoping proves the claude-code adapter returns exactly one Plan.Secrets
+// entry naming the selected credential scoped to api.anthropic.com — the credential value never
+// rides Plan.Env or any other channel (hand-secrets-to-msb.md; msb substitutes it at the host TLS
+// boundary and sets the guest's own credential env var to its default placeholder itself).
+func TestClaudeCodeSecretScoping(t *testing.T) {
 	ad, err := adapter.Get("claude-code")
 	if err != nil {
 		t.Fatal(err)
 	}
-	keys := []string{"ANTHROPIC_API_KEY"}
-
-	injected, err := ad.Prepare(adapter.Input{SecretKeys: keys, InjectedKeys: map[string]bool{"ANTHROPIC_API_KEY": true}})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if injected.Env["KRAYT_INJECTED_CREDENTIAL"] != "ANTHROPIC_API_KEY" {
-		t.Errorf("KRAYT_INJECTED_CREDENTIAL = %q, want ANTHROPIC_API_KEY; env = %v", injected.Env["KRAYT_INJECTED_CREDENTIAL"], injected.Env)
-	}
-
-	notInjected, err := ad.Prepare(adapter.Input{SecretKeys: keys})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, set := notInjected.Env["KRAYT_INJECTED_CREDENTIAL"]; set {
-		t.Errorf("KRAYT_INJECTED_CREDENTIAL should be unset without network.inject; env = %v", notInjected.Env)
-	}
-
-	// A different key injected (not the one actually selected) must not wire the signal.
-	other, err := ad.Prepare(adapter.Input{SecretKeys: keys, InjectedKeys: map[string]bool{"SOME_OTHER_KEY": true}})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, set := other.Env["KRAYT_INJECTED_CREDENTIAL"]; set {
-		t.Errorf("KRAYT_INJECTED_CREDENTIAL should only name the SELECTED credential; env = %v", other.Env)
-	}
-}
-
-// TestMITMShapeTranslationPlaceholderMirrorsTheCredential is the thesis test for SHAPE MIRRORING
-// (internal/adapter/anthropic_wire.go's PROVENANCE, owner decision 2026-08-18): every credential
-// shape produces a placeholder delivered under ITS OWN env var, never translated into another
-// shape's variable. That is what makes the agent run its own code path for the credential the user
-// actually supplied — so krayt never has to reproduce the request that path would have built.
-//
-// It iterates every credential claude-code recognizes rather than hardcoding the observed ones, so
-// a future probe that adds a table entry gets this property asserted for free.
-func TestMITMShapeTranslationPlaceholderMirrorsTheCredential(t *testing.T) {
-	ad, err := adapter.Get("claude-code")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, cred := range []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"} {
-		plan, err := ad.Prepare(adapter.Input{SecretKeys: []string{cred}, MITM: true})
-		if err != nil {
-			t.Fatalf("%s: %v", cred, err)
-		}
-		if len(plan.Inject) == 0 {
-			// No wire rule for this shape yet — correctly falls back to SecretsBundle, and there is
-			// no placeholder to assert anything about.
-			continue
-		}
-		if len(plan.Placeholders) != 1 {
-			t.Errorf("%s: Placeholders = %v, want exactly one entry", cred, plan.Placeholders)
-		}
-		got, ok := plan.Placeholders[cred]
-		if !ok {
-			t.Errorf("%s: Placeholders = %v, want the placeholder under the credential's OWN name", cred, plan.Placeholders)
-			continue
-		}
-		if got == "" {
-			t.Errorf("%s: empty placeholder value", cred)
-		}
-		// A placeholder that looked like the real thing would be indistinguishable from a leak in a
-		// log; a human who finds one must be able to tell immediately (§3).
-		if !strings.Contains(got, "krayt-placeholder-do-not-use") {
-			t.Errorf("%s: placeholder %q is not self-describing", cred, got)
-		}
-		// The container is configured for exactly one credential, so the entrypoint's exactly-one
-		// selection can never see two and pick the wrong one.
-		for other := range plan.Placeholders {
-			if other != cred {
-				t.Errorf("%s: placeholder also configures %q", cred, other)
-			}
-		}
-	}
-}
-
-// TestMITMShapeTranslationRequiresMITM proves the observed-shape injection path only ever
-// activates when network.mitm is actually on — the same credential with in.MITM false must fall
-// back to plain SecretsBundle delivery (mitm:false byte-identical regression).
-func TestMITMShapeTranslationRequiresMITM(t *testing.T) {
-	ad, err := adapter.Get("claude-code")
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := ad.Prepare(adapter.Input{SecretKeys: []string{"ANTHROPIC_API_KEY"}, MITM: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Inject) != 0 || len(plan.Placeholders) != 0 {
-		t.Errorf("mitm:false must not translate; plan = %+v", plan)
-	}
-}
-
-// TestSandboxModeReturnsSecretsNotInjectOrPlaceholders is the msb-era counterpart to
-// TestMITMShapeTranslationPlaceholderMirrorsTheCredential (hand-secrets-to-msb.md): when
-// Input.Sandbox is set, the claude-code adapter must return exactly one Plan.Secrets entry naming
-// the selected credential scoped to api.anthropic.com, and must NOT populate Inject or
-// Placeholders — msb needs neither a header table nor a krayt-emitted placeholder (it sets the
-// guest's own credential env var to its default placeholder itself).
-func TestSandboxModeReturnsSecretsNotInjectOrPlaceholders(t *testing.T) {
-	ad, err := adapter.Get("claude-code")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, cred := range []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"} {
-		plan, err := ad.Prepare(adapter.Input{SecretKeys: []string{cred}, Sandbox: true})
+	for _, cred := range []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"} {
+		plan, err := ad.Prepare(adapter.Input{SecretKeys: []string{cred}})
 		if err != nil {
 			t.Fatalf("%s: %v", cred, err)
 		}
 		if plan.Credential != cred {
 			t.Errorf("%s: Credential = %q, want %q", cred, plan.Credential, cred)
 		}
-		if len(plan.Inject) != 0 {
-			t.Errorf("%s: Sandbox mode must not populate Inject: %v", cred, plan.Inject)
-		}
-		if len(plan.Placeholders) != 0 {
-			t.Errorf("%s: Sandbox mode must not populate Placeholders: %v", cred, plan.Placeholders)
-		}
 		want := []task.SecretSpec{{Key: cred, Hosts: []string{"api.anthropic.com"}}}
 		if !reflect.DeepEqual(plan.Secrets, want) {
 			t.Errorf("%s: Secrets = %+v, want %+v", cred, plan.Secrets, want)
 		}
-	}
-}
-
-// TestSandboxModeStillEnforcesExactlyOne proves Sandbox mode doesn't bypass the §6.14
-// exactly-one-credential rule — ambiguous or missing auth must fail before Prepare ever builds a
-// SecretSpec.
-func TestSandboxModeStillEnforcesExactlyOne(t *testing.T) {
-	ad, err := adapter.Get("claude-code")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ad.Prepare(adapter.Input{SecretKeys: []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}, Sandbox: true}); err == nil {
-		t.Fatal("Sandbox mode with two credentials should be rejected")
-	}
-	if _, err := ad.Prepare(adapter.Input{SecretKeys: nil, Sandbox: true}); err == nil {
-		t.Fatal("Sandbox mode with no credential should be rejected")
-	}
-}
-
-// TestSandboxModeFalseIsByteIdenticalToToday proves Input.Sandbox follows Input.MITM's own
-// precedent (adapter.go): unset (the zero value) on every existing caller/test, so Sandbox=false
-// changes nothing about Prepare's return value versus before this field existed.
-func TestSandboxModeFalseIsByteIdenticalToToday(t *testing.T) {
-	ad, err := adapter.Get("claude-code")
-	if err != nil {
-		t.Fatal(err)
-	}
-	withoutField, err := ad.Prepare(adapter.Input{SecretKeys: []string{"ANTHROPIC_API_KEY"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	explicitFalse, err := ad.Prepare(adapter.Input{SecretKeys: []string{"ANTHROPIC_API_KEY"}, Sandbox: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(withoutField, explicitFalse) {
-		t.Errorf("Sandbox=false diverges from the zero value: %+v vs %+v", explicitFalse, withoutField)
-	}
-	if len(withoutField.Secrets) != 0 {
-		t.Errorf("Sandbox=false must not populate Secrets: %+v", withoutField)
+		if _, set := plan.Env[cred]; set {
+			t.Errorf("%s: the credential value must never ride Plan.Env; env = %v", cred, plan.Env)
+		}
 	}
 }
 

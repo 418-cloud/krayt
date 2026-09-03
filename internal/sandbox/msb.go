@@ -1,5 +1,5 @@
 // Package sandbox is the ONLY place in krayt that knows the `msb` (microsandbox) CLI exists —
-// the same containment rule internal/provider holds for the hypervisor (§6.3). It drives msb as
+// the same containment rule the pre-msb provider package held for the hypervisor (§6.3). It drives msb as
 // a subprocess over argv, stdio and its `--format json` / `--json` output, per ADR option B1
 // (docs/adr-microsandbox-sandbox-layer.md, "Integration path: CLI or SDK"): not the Go SDK, which
 // is a cgo dlopen bridge that would cost CGO_ENABLED=0 and the single-Linux-runner cross-build
@@ -37,10 +37,9 @@ import (
 	"github.com/418-cloud/krayt/internal/task"
 )
 
-// BinEnv is the swap/test seam (add-msb-sandbox-driver.md decision 3), mirroring
-// orchestrator.EgressProxyBinEnv: when set, it replaces the resolved `msb` path. This is how
-// tests point the driver at a fake without mocking it, and it is the documented escape hatch for
-// an operator whose msb install is not on PATH.
+// BinEnv is the swap/test seam (add-msb-sandbox-driver.md decision 3): when set, it replaces the
+// resolved `msb` path. This is how tests point the driver at a fake without mocking it, and it
+// is the documented escape hatch for an operator whose msb install is not on PATH.
 const BinEnv = "KRAYT_MSB_BIN"
 
 // BackendLocal is the only backend value krayt ever allows a run to observe. See childEnv and
@@ -53,8 +52,7 @@ const BackendLocal = "local"
 const backendEnvKey = "MSB_BACKEND"
 
 // childEnvKeys is the COMPLETE set of environment variables forwarded to the msb child, each
-// copied only if this process already has it set, never invented — the exact discipline
-// internal/orchestrator/egressproxy.go's egressProxyChildEnvKeys uses for the same reason: an
+// copied only if this process already has it set, never invented — an
 // unset cmd.Env would run the child with os.Environ(), handing it whatever secrets the operator
 // happened to have exported (an ANTHROPIC_API_KEY, an AWS credential, a stray MSB_PROFILE=prod)
 // when they typed `krayt run`. Anything added here must come with a comment saying why msb
@@ -628,6 +626,27 @@ func (c *Client) Remove(ctx context.Context, name string) error {
 		return fmt.Errorf("sandbox: msb rm --force %s: %w (%s)", name, err, firstNonEmpty(stderr))
 	}
 	return nil
+}
+
+// SystemLogs runs `msb logs --source system --json <name>` and returns its raw stdout — msb's
+// boot/system diagnostics (run-tasks-on-microsandbox.md decision 7), as opposed to Logs' live
+// guest-log stream. This is the msb-era replacement for the old provider.VM.LogPaths' console
+// log: when a sandbox fails to start, `msb logs` prepends a reconstructed error block from
+// boot-error.json, which is exactly the evidence a boot failure's console output used to carry.
+// Captured non-streaming (the whole point is a diagnostics snapshot, not a live tail), and
+// tolerant of a nonexistent/never-started sandbox — the caller persists whatever came back,
+// even on error, since msb's own stderr on a failed lookup is itself diagnostic. Like Stop/
+// Remove, it always runs under context.WithoutCancel(ctx) (bounded by teardownTimeout): it is
+// called from the same deferred teardown path, which must still capture diagnostics when the
+// run's own context is what just expired or was cancelled.
+func (c *Client) SystemLogs(ctx context.Context, name string) ([]byte, error) {
+	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), teardownTimeout)
+	defer cancel()
+	out, stderr, err := c.runCaptured(tctx, []string{"logs", "--source", "system", "--json", name})
+	if err != nil {
+		return out, fmt.Errorf("sandbox: msb logs --source system: %w (%s)", err, firstNonEmpty(stderr))
+	}
+	return out, nil
 }
 
 // Pull runs `msb pull <ref>` (image acquisition, for retire-vm-image-pipeline.md).

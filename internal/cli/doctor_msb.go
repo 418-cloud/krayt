@@ -11,9 +11,9 @@ import (
 // --format json`, `msb doctor`), and doctor must not hang indefinitely if one of them does.
 const msbDoctorTimeout = 15 * time.Second
 
-// msbChecks bridges sandbox.DoctorChecks (add-msb-sandbox-driver.md) into this package's
-// checkResult, appended to commonChecks. See sandbox.DoctorChecks' doc comment for why every one
-// of these is currently optional.
+// msbChecks bridges sandbox.DoctorChecks into this package's checkResult, appended to
+// commonChecks. Every one of these is mandatory: `krayt run` cannot do anything without a
+// healthy msb install (run-tasks-on-microsandbox.md).
 func msbChecks() []checkResult {
 	ctx, cancel := context.WithTimeout(context.Background(), msbDoctorTimeout)
 	defer cancel()

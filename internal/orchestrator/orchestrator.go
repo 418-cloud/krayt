@@ -1,13 +1,14 @@
-// Package orchestrator drives one run's lifecycle end to end (§7): provision the VM, push
-// the image/code/task, start the container and stream logs, collect the artifact bundle,
-// and guarantee teardown. It is OS-agnostic — it talks to the Provider seam and the gRPC
-// control client only — so it is unit-tested against the fakeProvider with no real VM
-// (§14). Secrets, the egress proxy, and wall-clock container-kill are Phase 3; this is the
-// happy path.
+// Package orchestrator drives one run's lifecycle end to end (§7): rent an msb sandbox, copy the
+// code bundle and task in, run the guest helper (root) to set up the patch baseline, run the
+// agent (as the sandbox's non-root user) with its logs streamed, run the helper again to build
+// the patch, copy the artifacts out, and guarantee teardown. It is OS-agnostic — it talks to the
+// internal/sandbox msb driver only — so it is unit-tested against a scriptable fake `msb`
+// binary, not a real sandbox (§14; run-tasks-on-microsandbox.md superseded the fakeProvider seam
+// this package's tests used before the ADR option B1 migration).
 package orchestrator
 
 import (
-	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,45 +16,67 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync/atomic"
 	"time"
 
 	"github.com/opencontainers/go-digest"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
-	"github.com/418-cloud/krayt/internal/controlclient"
-	"github.com/418-cloud/krayt/internal/imagestore"
+	"github.com/418-cloud/krayt/internal/askbridge"
 	"github.com/418-cloud/krayt/internal/patch"
-	"github.com/418-cloud/krayt/internal/protocol/pb"
-	"github.com/418-cloud/krayt/internal/provider"
+	"github.com/418-cloud/krayt/internal/sandbox"
+	"github.com/418-cloud/krayt/internal/sandbox/guestbin"
 	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
-// bootTimeout bounds how long we wait for the guest-agent to answer Hello after Start
-// (§11.6). The real wall-clock run timeout (spec.Resources.Timeout) is separate.
-const bootTimeout = 60 * time.Second
+// sandboxAgentUser is the non-root user krayt's agent images run as (§8.2 — enforced, not just
+// convention) and the `msb create --user`/`msb exec --user` value the agent's own exec uses. The
+// guest helper always execs as root instead (add-krayt-guest-helper.md's privilege separation).
+const sandboxAgentUser = "agent"
 
-// Deps are the host-side collaborators for a run. The Provider and BaseVM are OS-specific
-// (the CLI supplies the vfkit provider + the pulled base image on macOS); Image is the
-// user's agent image already acquired on the host (§6.11).
+// sandboxSecurity is msb's `--security` profile every krayt sandbox is created with. Fixed, not
+// user-configurable: P2 (probe-microsandbox-feasibility.md, 2026-08-30) confirmed `msb exec
+// --user root` still works under `--security restricted` with a root-only path staying unreadable
+// to an `--user agent` exec, so the guest helper keeps BOTH the restricted profile and its own
+// privilege separation rather than trading one for the other (run-tasks-on-microsandbox.md
+// decision, carrying add-krayt-guest-helper.md's finding forward).
+const sandboxSecurity = "restricted"
+
+// Container-contract paths (§8.2) the guest helper and the agent's entrypoint both read/write.
+// containerPatchGit is new under msb: previously a guest-agent-managed temp dir, now a fixed
+// in-sandbox path outside /workspace and /output, matching guestbin.GuestRoot's own reasoning
+// (never mistaken for a collected artifact).
+const (
+	containerWorkspace  = "/workspace"
+	containerTaskFile   = "/task/prompt.md"
+	containerOutput     = "/output"
+	containerBundlePath = "/tmp/repo.bundle"
+	containerPatchGit   = guestbin.GuestRoot + "/patchgit"
+	containerAskBinPath = "/usr/local/bin/krayt-ask" // §8.2's fixed, documented path
+
+	// containerEntrypoint is the one command every agent image exposes (§8.2, add-*-agent-image.md
+	// tasks): "/usr/local/bin/krayt-agent-entrypoint", uniform across every published image so this
+	// package needs no per-adapter command table.
+	containerEntrypoint = "/usr/local/bin/krayt-agent-entrypoint"
+)
+
+// Deps are the host-side collaborators for a run. Sandbox is the msb driver — the one thing this
+// package is not OS-specific about, since internal/sandbox itself has no build tags.
 type Deps struct {
-	Provider provider.Provider
-	BaseVM   provider.VMSpec   // kernel/initrd/cmdline/rootfs base; resources overlaid from spec
-	Image    *imagestore.Image // acquired user image; nil skips the image push (test/simple paths)
-	LogOut   io.Writer         // live log sink when spec.Detach is false; may be nil
+	Sandbox *sandbox.Client
+	LogOut  io.Writer // live log sink when spec.Detach is false; may be nil
 
-	// OnClient, if set, is invoked once the guest control client is connected with an
-	// AnswerFunc that delivers a human answer to this run's guest (§6.13), and again with nil
-	// as the run ends. The Manager uses it so Manager.Answer / `krayt answer` can resolve a
-	// waiting run in-process without reaching for the transport.
+	// OnClient, if set, is invoked once a run's answerer is ready (immediately, since msb has no
+	// boot handshake this package waits on) with an AnswerFunc that delivers a human answer to
+	// this run (§6.13), and again with nil as the run ends. The Manager uses it so
+	// Manager.Answer / `krayt answer` can resolve a waiting run in-process. Named identically to
+	// the pre-msb Deps field it replaces; its meaning ("a way to answer this run") is unchanged.
 	OnClient func(runID string, answer AnswerFunc)
 }
 
-// AnswerFunc delivers a human answer (or no-answer sentinel) to a waiting agent question via
-// the guest Answer RPC (§6.13).
+// AnswerFunc delivers a human answer (or no-answer sentinel) to a waiting agent question (§6.13).
 type AnswerFunc func(questionID, response string, noAnswer bool) error
 
 // Result summarizes a completed run for the caller and `krayt` output.
@@ -63,13 +86,17 @@ type Result struct {
 	TimedOut      bool
 	PatchPath     string   // path to changes.patch in the run dir
 	CommitsBundle string   // path to commits.bundle if the agent committed, else ""
-	Safety        []string // patch-lint findings, if any (§14 Phase 5), for a run-time warning
+	Safety        []string // patch-lint findings, if any, for a run-time warning
 }
 
-// Run executes the full lifecycle and writes artifacts under runDir (§7, §8.4). The VM is
-// always destroyed before Run returns — on success, error, or context cancellation — via
-// deferred teardown; the CLI maps SIGINT/SIGTERM to ctx cancellation so Ctrl-C still tears
-// the VM down.
+// sandboxName derives the msb sandbox name from the run id (run-tasks-on-microsandbox.md decision
+// 8): one sandbox per run, named so an orphaned "krayt-*" sandbox is recognizable as krayt's own.
+func sandboxName(runID string) string { return "krayt-" + runID }
+
+// Run executes the full lifecycle and writes artifacts under runDir (§7, §8.4). The sandbox is
+// always stopped and removed before Run returns — on success, error, or context cancellation —
+// via a deferred teardown that runs regardless of how far setup got; the CLI maps SIGINT/SIGTERM
+// to ctx cancellation so Ctrl-C still tears the sandbox down.
 func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res *Result, err error) {
 	if spec.Resources.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -80,20 +107,40 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return nil, fmt.Errorf("orchestrator: create run dir: %w", err)
 	}
 
-	// Publish run state to disk so `ls`/`attach`/`stop` observe it without any in-process
-	// handle (§6.2). Written best-effort at each transition and finalized on return. The
-	// static facts (task summary, network, resources, questions mode) are the §8.4 review
-	// schema; the dynamic ones (timings, patch stats, questions, safety) are filled below.
+	// Resolve secrets up front: every declared secret must be network-scoped (already enforced
+	// pre-flight by task.ValidateNetworkPolicyForMsb before Run is ever called), so specs and
+	// secretValues below are the complete secret picture for this run.
+	specs := spec.Network.Secrets
+	var secretValues map[string]string
+	if spec.SecretsPath != "" {
+		secretValues, err = secrets.Load(spec.SecretsPath)
+		if err != nil {
+			return nil, fmt.Errorf("orchestrator: load secrets: %w", err)
+		}
+	}
+	secretKeyNames := make([]string, 0, len(specs))
+	for _, s := range specs {
+		secretKeyNames = append(secretKeyNames, s.Key)
+	}
+	sort.Strings(secretKeyNames)
+	hasSecrets := len(specs) > 0
+
+	name := sandboxName(spec.ID)
 	rec := RunRecord{
 		ID: spec.ID, ImageRef: spec.ImageRef, RepoPath: spec.RepoPath,
 		TaskSummary: summarizeTask(spec.TaskPrompt),
 		Network: NetworkMeta{
+			// Under msb, TLS interception turns on automatically the moment any secret is
+			// declared (docs/adr-microsandbox-sandbox-layer.md correction 1) — MITM here reports
+			// exactly that, and InjectedKeys names every secret substituted host-side, which
+			// under B1 is every declared secret (there is no other delivery channel, §6.8).
 			Mode: string(spec.Network.Mode), Allow: spec.Network.Allow,
-			MITM: spec.Network.MITM, InjectedKeys: sortedKeys(spec.Network.InjectedSecretKeys()),
+			MITM: hasSecrets, InjectedKeys: secretKeyNames,
 		},
 		Resources:    ResourceMeta{CPUs: spec.Resources.CPUs, MemoryMiB: spec.Resources.MemoryMiB, DiskGiB: spec.Resources.DiskGiB, TimeoutSecs: int(spec.Resources.Timeout.Seconds())},
 		QuestionMode: string(spec.Questions.Mode),
 		State:        StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
+		SandboxName: name,
 	}
 	_, _ = writeRecord(runDir, rec)
 	defer func() {
@@ -101,9 +148,6 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		rec.DurationSecs = durationSecs(rec.StartedAt, rec.EndedAt)
 		switch {
 		case err != nil:
-			// If the run failed because ctx was canceled by the egress-death watch below
-			// (rather than by the caller or the wall-clock timeout), surface that specific
-			// reason instead of whatever generic "context canceled" the failing step reported.
 			if cause := context.Cause(ctx); cause != nil &&
 				!errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
 				err = cause
@@ -114,412 +158,497 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		case res != nil:
 			rec.State, rec.ExitCode = StateDone, res.ExitCode
 		}
-		rec.Questions = summarizeQuestions(runDir) // §6.13 Q&A summary for the review artifacts
-		// Read any agent-written report.md before overwriting it with the canonical one (§8.4).
+		rec.Questions = summarizeQuestions(runDir)
 		notes := agentNotes(runDir)
 		metaDigest, _ := writeRecord(runDir, rec)
 		_ = writeReport(runDir, rec, notes, metaDigest)
 	}()
 
-	// 1. Provision the VM and guarantee teardown.
-	vmSpec := deps.BaseVM
-	vmSpec.ID = spec.ID
-	if spec.Resources.CPUs > 0 {
-		vmSpec.CPUs = spec.Resources.CPUs
-	}
-	if spec.Resources.MemoryMiB > 0 {
-		vmSpec.MemoryMiB = spec.Resources.MemoryMiB
-	}
-	if spec.Resources.DiskGiB > 0 {
-		vmSpec.DiskGiB = spec.Resources.DiskGiB
-	}
-	vm, err := deps.Provider.Create(ctx, vmSpec)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: create VM: %w", err)
-	}
+	// Teardown + boot/system diagnostics, guaranteed on EVERY path (run-tasks-on-microsandbox.md
+	// decision 8) — registered before Create is even attempted, so a failure at any later step,
+	// including Create itself failing partway through, still stops and removes whatever msb
+	// created. SystemLogs is captured first (ordered before rm, decision 7): it is msb's
+	// replacement for the pre-msb console log, including the reconstructed boot-error block msb
+	// prepends when a sandbox never finished starting.
 	defer func() {
-		// Teardown is guaranteed; surface its error only if the run otherwise succeeded.
-		if derr := vm.Destroy(context.WithoutCancel(ctx)); derr != nil && err == nil {
-			err = fmt.Errorf("orchestrator: destroy VM: %w", derr)
+		if out, lerr := deps.Sandbox.SystemLogs(ctx, name); lerr == nil || len(out) > 0 {
+			writeConsoleLog(out, runDir, secretValues)
 		}
-	}()
-	// Copy the guest's serial console log into the run's own (persistent) logs dir before the
-	// VM is destroyed — registered here (LIFO, so it runs before the Destroy defer above) rather
-	// than only on the happy path below, so a failure on ANY later step (e.g. setNetworkPolicy
-	// failing closed on a bad egress ruleset) still retains this evidence instead of losing it
-	// to the deferred vm.Destroy that removes the VM's directory, console.log included.
-	defer func() {
-		if _, consoleLog := vm.LogPaths(); consoleLog != "" {
-			writeConsoleLog(consoleLog, runDir, spec.SecretsPath)
-		}
+		_ = deps.Sandbox.Stop(ctx, name)
+		_ = deps.Sandbox.Remove(ctx, name)
 	}()
 
-	// 1b. Open the guest→host egress channel and spawn the host-side allowlist proxy child
-	// BEFORE Start (§6, move-egress-proxy-to-host.md): the fd-3 listener must exist before the
-	// backend process launches, so a guest connection racing boot never finds it missing, and
-	// the container must never come up with its only egress path unspawned. Same wall-clock
-	// timeout handling as every other setup step below: a deadline that has already elapsed
-	// (or elapses mid-spawn) is a clean TimedOut result, not a raw exec/context error.
-	lis, err := vm.ListenEgress(ctx, provider.EgressPort)
-	if err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, fmt.Errorf("orchestrator: listen egress: %w", err)
+	netArgs, nerr := task.NetworkArgs(spec.Network, hasSecrets)
+	if nerr != nil {
+		return nil, fmt.Errorf("orchestrator: %w", nerr)
 	}
-	egress, err := spawnEgressProxy(ctx, lis, spec.Network, spec.ID, runDir, spec.SecretsPath)
-	if err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, err
+	secretRefs := make([]sandbox.SecretRef, len(specs))
+	for i, s := range specs {
+		secretRefs[i] = sandbox.SecretRef{Name: s.Key, Hosts: s.Hosts}
 	}
-	defer egress.stop()
-
-	// spawnEgressProxy only catches a child that dies within its startup window; nothing past
-	// that point watches egress.waited until teardown, so a delayed init failure or a crash
-	// during the run would otherwise leave the VM running with its only egress path dead,
-	// contrary to spawnEgressProxy's fail-fast contract. Cancel the run the moment that happens,
-	// so every ctx-aware step below fails instead of silently continuing.
-	ctx, cancelOnEgressDeath := context.WithCancelCause(ctx)
-	defer cancelOnEgressDeath(nil)
-	go func() {
-		select {
-		case <-egress.waited:
-			cancelOnEgressDeath(fmt.Errorf("orchestrator: egress proxy exited mid-run; see %s", ProxyLogPath(runDir)))
-		case <-ctx.Done():
-		}
-	}()
-
-	if err := vm.Start(ctx); err != nil {
-		return nil, fmt.Errorf("orchestrator: start VM: %w", err)
+	secretEnv, serr := sandbox.SecretEnv(specs, secretValues)
+	if serr != nil {
+		return nil, fmt.Errorf("orchestrator: %w", serr)
 	}
 
-	// 2. Connect + boot-readiness handshake (§11.6).
-	client, err := controlclient.Dial(vm, provider.ControlPort)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: dial guest: %w", err)
-	}
-	defer func() { _ = client.Close() }()
-	if _, err := client.WaitReady(ctx, bootTimeout, 200*time.Millisecond); err != nil {
-		// A run wall-clock timeout shorter than bootTimeout can also expire here, before any
-		// push step runs — same class of gap as pushImage/pushCode/etc. below (§6.1).
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, err
-	}
+	// 1b. Wire the ask_human channel (§6.13) BEFORE Create: --vsock is a create-time-only flag
+	// (msb requires a restart to add one to a running sandbox), so the route must exist before
+	// msb ever starts the sandbox. Only for a --on-question=wait run — in `fail` mode no --vsock
+	// route is emitted at all, so krayt-ask inside the container simply fails to dial and its CLI
+	// front-end maps that straight to the no-answer sentinel; there is no separate in-process
+	// "fail mode" branch to maintain here the way the pre-msb Start-stream loop needed one.
+	var vsockRoutes []sandbox.VsockRoute
+	var streamCancel context.CancelFunc // set just before the agent Exec call; referenced by the question-timeout closure below
+	var aborted atomic.Bool
+	var outstandingQuestions atomic.Int32
+	setState := func(st string) { rec.State = st; _, _ = writeRecord(runDir, rec) }
 
-	// Record how to reach this run's guest (for cross-invocation `krayt answer`/`stop`) and
-	// register the in-process answerer for the Manager (§6.13, §6.2).
-	if cs, ok := vm.(controlSocketer); ok {
-		rec.CtrlSocket = cs.ControlSocket()
-	}
-	if deps.OnClient != nil {
-		deps.OnClient(spec.ID, func(qid, response string, noAnswer bool) error {
-			ack, aerr := client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{
-				QuestionId: qid, Response: response, NoAnswer: noAnswer,
-			})
-			if aerr != nil {
-				return aerr
+	if spec.Questions.Mode == task.QuestionWait {
+		askDir := filepath.Join(runDir, "ask")
+		lis, lerr := askbridge.Listen(askDir)
+		if lerr != nil {
+			return nil, fmt.Errorf("orchestrator: listen ask bridge: %w", lerr)
+		}
+		defer func() { _ = lis.Close() }()
+
+		var redactor *secrets.Redactor
+		if len(secretValues) > 0 {
+			redactor = secrets.NewRedactor(secrets.Values(secretValues))
+		}
+		var bridge *askbridge.Bridge
+		bridge = askbridge.NewBridge(func(id, prompt string, choices []string) error {
+			if redactor != nil {
+				prompt = string(redactor.Redact([]byte(prompt)))
+				choices = redactChoices(redactor, choices)
 			}
-			// Ok=false means no such question was waiting — treat it as a failure, matching
-			// the CLI `krayt answer` and the timeout path, so a stale/duplicate answer doesn't
-			// silently report success (§6.13).
-			if !ack.GetOk() {
-				return fmt.Errorf("orchestrator: no pending question %q on run %q (already answered or timed out)", qid, spec.ID)
+			if err := writeQuestionRecord(runDir, QuestionRecord{ID: id, Prompt: prompt, Choices: choices, AskedAt: nowStamp()}); err != nil {
+				return err
 			}
-			_ = RecordAnswer(runDir, qid, response, noAnswer) // complete the on-disk Q&A history (best-effort)
+			outstandingQuestions.Add(1)
+			setState(StateWaiting)
+			notifyWaiting(filepath.Base(runDir), prompt)
+			if to := spec.Questions.Timeout; to > 0 {
+				armQuestionTimeout(bridge, runDir, id, to, spec.Questions.OnTimeout, &aborted, &streamCancel)
+			}
 			return nil
 		})
-		defer deps.OnClient(spec.ID, nil)
+		bridge.OnResolved(func(string) {
+			if outstandingQuestions.Add(-1) <= 0 {
+				setState(StateRunning)
+			}
+		})
+
+		bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+		defer bridgeCancel()
+		go func() { _ = askbridge.Serve(bridgeCtx, lis, bridge) }()
+
+		answerFunc := func(qid, response string, noAnswer bool) error {
+			if !bridge.Answer(qid, response, noAnswer) {
+				return fmt.Errorf("orchestrator: no pending question %q on run %q (already answered or timed out)", qid, spec.ID)
+			}
+			_ = RecordAnswer(runDir, qid, response, noAnswer)
+			return nil
+		}
+		ctlSocket, stopCtl, cerr := serveRunControl(askDir, answerFunc)
+		if cerr != nil {
+			return nil, fmt.Errorf("orchestrator: %w", cerr)
+		}
+		defer stopCtl()
+		rec.CtrlSocket = ctlSocket
+		if deps.OnClient != nil {
+			deps.OnClient(spec.ID, answerFunc)
+			defer deps.OnClient(spec.ID, nil)
+		}
+
+		vsockRoutes = []sandbox.VsockRoute{{HostPath: filepath.Join(askDir, "ask.sock"), Port: sandbox.AskPort}}
+		mergeEnv(&spec, map[string]string{"KRAYT_ASK_SOCKET": sandbox.AskSocketEnv})
 	}
-	// 3. Push inputs: image (incremental), code bundle, task, secrets. A wall-clock timeout
-	// can expire mid-step here just as easily as during the container's run (e.g. a slow
-	// `git bundle create` in pushCode outliving the budget) — isWallClockTimeout catches that
-	// so it is reported the same clean way as a timeout during streamRun, not as a raw
-	// killed-subprocess/context error (§6.1).
-	if err := pushImage(ctx, client, deps.Image); err != nil {
+	_, _ = writeRecord(runDir, rec)
+
+	// 1. Create (rent) the sandbox: image, --secret (names only; values in secretEnv), --vsock
+	// only when wiring above populated it, --security restricted, resources, --max-duration. The
+	// run's own context.WithTimeout (above) is belt-and-braces alongside --max-duration
+	// (run-tasks-on-microsandbox.md decision 5): the ctx is what makes teardown deterministic,
+	// --max-duration is what stops a wedged guest outliving it.
+	createSpec := sandbox.CreateSpec{
+		Image: spec.ImageRef, Name: name, User: sandboxAgentUser,
+		CPUs: spec.Resources.CPUs, MemoryMiB: spec.Resources.MemoryMiB, DiskGiB: spec.Resources.DiskGiB,
+		MaxDuration: spec.Resources.Timeout,
+		Env:         envVarsFromMap(spec.Env),
+		Vsock:       vsockRoutes,
+		Secrets:     secretRefs,
+		Security:    sandboxSecurity,
+		ExtraArgs:   netArgs,
+	}
+	if err := deps.Sandbox.Create(ctx, createSpec, secretEnv); err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("orchestrator: create sandbox: %w", err)
 	}
-	prov, err := pushCode(ctx, client, spec)
+
+	// 2. Copy in: the git bundle, the task prompt, and the two embedded guest binaries.
+	tmp, err := os.MkdirTemp("", "krayt-msb-")
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: temp copy-in dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+
+	bundlePath := filepath.Join(tmp, "repo.bundle")
+	// BundleDepth passes through literally: 0 = full history (§6.1/§8.1); CreateBundle treats
+	// depth<=0 as full history.
+	br, err := patch.CreateBundle(ctx, spec.RepoPath, bundlePath, spec.BundleDepth, spec.IncludeDirty)
 	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
 		return nil, err
 	}
-	// Capture the run's code provenance now that the bundle is built + streamed, before the
-	// StateRunning write, so it survives on disk even if a later step fails and only the deferred
-	// writeReport runs. Left nil (not a zero-value struct) when pushCode never completed, mirroring
-	// how rec.Patch stays nil until a patch is actually collected (§8.4).
-	rec.Provenance = &prov
-	// The code snapshot is now fixed (§6.7) — from this point on it is safe for the host repo
-	// to be mutated (checkout/commit/rebase) without affecting this run, so `running` becomes
-	// externally visible only now, not before pushImage/pushCode (§6.2).
+	bundleDigest, err := digestFile(bundlePath)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: digest bundle: %w", err)
+	}
+	rec.Provenance = &ProvenanceMeta{
+		HeadSHA: br.HeadSHA, BundleSHA: br.BundleSHA,
+		BundleDepth: spec.BundleDepth, IncludeDirty: spec.IncludeDirty,
+		BundleDigest: bundleDigest.String(),
+	}
+	_, _ = writeRecord(runDir, rec)
+
+	promptPath := filepath.Join(tmp, "prompt.md")
+	if err := os.WriteFile(promptPath, spec.TaskPrompt, 0o644); err != nil {
+		return nil, fmt.Errorf("orchestrator: write task prompt: %w", err)
+	}
+	helperLocal, err := writeEmbeddedBinary(tmp, guestbin.HelperName)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: %w", err)
+	}
+	askLocal, err := writeEmbeddedBinary(tmp, guestbin.AskName)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: %w", err)
+	}
+
+	copies := [...][2]string{
+		{bundlePath, name + ":" + containerBundlePath},
+		{promptPath, name + ":" + containerTaskFile},
+		{helperLocal, name + ":" + guestbin.GuestPath(guestbin.HelperName)},
+		{askLocal, name + ":" + containerAskBinPath},
+	}
+	for _, c := range copies {
+		if err := deps.Sandbox.Copy(ctx, c[0], c[1]); err != nil {
+			if isWallClockTimeout(ctx, err) {
+				return earlyTimeoutResult(runDir), nil
+			}
+			return nil, fmt.Errorf("orchestrator: copy %s: %w", c[1], err)
+		}
+	}
+	// Defensive: msb copy's mode-preservation is not a pinned contract, so make sure both
+	// binaries are actually executable before exec-ing either of them.
+	if _, err := execCapture(ctx, deps.Sandbox, name, "root",
+		[]string{"chmod", "+x", guestbin.GuestPath(guestbin.HelperName), containerAskBinPath}); err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
+		return nil, fmt.Errorf("orchestrator: chmod copied binaries: %w", err)
+	}
+
+	// 3. Exec the helper as root: clone the bundle into /workspace, tag krayt-baseline, snapshot
+	// the root-only patch-git, then relax /workspace for the agent user
+	// (add-krayt-guest-helper.md's privilege-separation ordering).
+	setupOut, err := execCapture(ctx, deps.Sandbox, name, "root", []string{
+		guestbin.GuestPath(guestbin.HelperName), "setup",
+		"--bundle", containerBundlePath, "--workspace", containerWorkspace,
+		"--patch-git", containerPatchGit, "--agent-user", sandboxAgentUser,
+	})
+	if err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
+		// decision 6: a driver failure (ErrMsbFailed) must surface as a failed run, never as
+		// "the agent/helper exited 1" — errors.Is sees through execCapture's %w wrapping.
+		return nil, fmt.Errorf("orchestrator: krayt-helper setup: %w", err)
+	}
+	var setupResult struct {
+		Baseline string `json:"baseline"`
+	}
+	if jerr := json.Unmarshal(setupOut, &setupResult); jerr != nil || setupResult.Baseline == "" {
+		return nil, fmt.Errorf("orchestrator: parse krayt-helper setup output %q: %v", setupOut, jerr)
+	}
+
+	// The code snapshot is now durably captured inside the sandbox (cloned from the bundle,
+	// baseline tagged) — only now is it safe for the host repo to be mutated without affecting
+	// this run, so `running` becomes externally visible here, matching the pre-msb rule (§6.2).
 	rec.State = StateRunning
 	_, _ = writeRecord(runDir, rec)
-	if _, err := client.Agent.PushTask(ctx, &pb.TaskSpec{
-		Prompt:            spec.TaskPrompt,
-		Env:               spec.Env,
-		AddCapabilities:   spec.Container.AddCapabilities,
-		SeccompUnconfined: spec.Container.SeccompUnconfined,
-		ReadonlyRootfs:    spec.Container.ReadonlyRootfs,
+
+	// 4. Exec the agent as the sandbox's non-root user, streamed to the run's log sink.
+	logFile, err := os.Create(filepath.Join(runDir, "logs", "agent.log"))
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: open log: %w", err)
+	}
+	defer func() { _ = logFile.Close() }()
+	writers := []io.Writer{logFile}
+	if !spec.Detach && deps.LogOut != nil {
+		writers = append(writers, deps.LogOut)
+	}
+	logWriter := io.MultiWriter(writers...)
+
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	streamCancel = cancelStream
+	defer cancelStream()
+
+	execResult, execErr := deps.Sandbox.Exec(streamCtx, sandbox.ExecSpec{
+		Name: name, User: sandboxAgentUser, Command: []string{containerEntrypoint},
+		Stdout: logWriter, Stderr: logWriter,
+	})
+
+	var exitCode int
+	var timedOut bool
+	switch {
+	case execErr != nil && aborted.Load():
+		return nil, fmt.Errorf("orchestrator: question timed out (abort policy, §6.13)")
+	case execErr != nil && isWallClockTimeout(ctx, execErr):
+		timedOut, exitCode = true, -1
+	case errors.Is(execErr, sandbox.ErrMsbFailed):
+		return nil, fmt.Errorf("orchestrator: %w", execErr)
+	case execErr != nil:
+		return nil, fmt.Errorf("orchestrator: run agent: %w", execErr)
+	default:
+		exitCode = execResult.ExitCode
+	}
+
+	res = &Result{RunDir: runDir, ExitCode: exitCode, TimedOut: timedOut, PatchPath: filepath.Join(runDir, "changes.patch")}
+	if timedOut {
+		// The run context is already dead; skip helper finish/collection, matching the pre-msb
+		// contract for a wall-clock timeout during the container's run.
+		return res, nil
+	}
+
+	// 5. Exec the helper again as root: diff against the baseline, assemble /output.
+	if _, err := execCapture(ctx, deps.Sandbox, name, "root", []string{
+		guestbin.GuestPath(guestbin.HelperName), "finish",
+		"--workspace", containerWorkspace, "--patch-git", containerPatchGit,
+		"--baseline", setupResult.Baseline, "--out", containerOutput,
 	}); err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
-		return nil, fmt.Errorf("orchestrator: push task: %w", err)
+		return nil, fmt.Errorf("orchestrator: krayt-helper finish: %w", err)
 	}
-	knownSecretKeys, err := pushSecrets(ctx, client, spec.SecretsPath, spec.Network.InjectedSecretKeys())
-	if err != nil {
+
+	// 6. Copy out /output/* (§6.7, §8.4).
+	if err := collectOutput(ctx, deps.Sandbox, name, runDir); err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
 		return nil, err
 	}
-	if err := setNetworkPolicy(ctx, client, spec.Network, egress.caCertPEM); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, err
+	if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
+		res.CommitsBundle = cb
 	}
 
-	// 4. Start the container and consume the event stream (logs, questions, terminal status).
-	setState := func(st string) { rec.State = st; _, _ = writeRecord(runDir, rec) }
-	exitCode, timedOut, err := streamRun(ctx, client, spec, deps.LogOut, runDir, setState)
-	if err != nil {
-		return nil, err
+	// 7. Host: diffstat + safety lint + secret-value scan of the collected patch (§8.4, §14) —
+	// none of this is an exec; the host already holds the patch bytes and every secret value.
+	if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
+		rec.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
 	}
-
-	res = &Result{
-		RunDir:    runDir,
-		ExitCode:  exitCode,
-		TimedOut:  timedOut,
-		PatchPath: filepath.Join(runDir, "changes.patch"),
+	if b, rerr := os.ReadFile(res.PatchPath); rerr == nil {
+		for _, f := range patch.Lint(b) {
+			rec.Safety = append(rec.Safety, f.Path+": "+f.Reason)
+		}
 	}
-
-	// 5. Collect artifacts into the run dir (§6.7, §8.4). On a wall-clock timeout the run
-	// context is already dead, so skip collection and just record the timed-out run.
-	if !timedOut {
-		if err := collect(ctx, client, runDir); err != nil {
-			return nil, err
-		}
-		if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
-			res.CommitsBundle = cb
-		}
-		// Diffstat + safety lint of the collected patch → meta.json/report.md (§8.4, §14). The
-		// record is finalized by the deferred writer, which captures rec.Patch/rec.Safety.
-		if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
-			rec.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
-		}
-		if b, rerr := os.ReadFile(res.PatchPath); rerr == nil {
-			for _, f := range patch.Lint(b) {
-				rec.Safety = append(rec.Safety, f.Path+": "+f.Reason)
+	if len(secretValues) > 0 {
+		if keys, kerr := PatchSecretKeys(res.PatchPath, secretValues); kerr == nil {
+			for _, k := range keys {
+				rec.Safety = append(rec.Safety, "changes.patch contains the value of secret "+k+" — review before applying")
 			}
 		}
-		// The guest cannot redact changes.patch (mutating hunks breaks `git apply`), so it
-		// records which secret KEYS it found in the patch (values never leave the VM, §6.8);
-		// surface each as a Safety warning for the human's pre-apply review (§8.4).
-		for _, k := range secretPatchKeys(runDir, knownSecretKeys) {
-			rec.Safety = append(rec.Safety, "changes.patch contains the value of secret "+k+" — review before applying")
-		}
-		res.Safety = rec.Safety
 	}
-	// Best-effort polite shutdown before the deferred Destroy; the terminal run state is
-	// written by the deferred finalizer above.
-	_, _ = client.Agent.Shutdown(context.WithoutCancel(ctx), &pb.ShutdownRequest{})
+	res.Safety = rec.Safety
 	return res, nil
 }
 
-// sortedKeys returns the keys of a set map in sorted order, for a deterministic meta.json
-// field (§8.4).
-func sortedKeys(set map[string]bool) []string {
-	if len(set) == 0 {
+// envVarsFromMap renders a non-secret env map into CreateSpec's []EnvVar, sorted for
+// deterministic argv (matching CreateSpec.Args()' own determinism guarantee).
+func envVarsFromMap(m map[string]string) []sandbox.EnvVar {
+	if len(m) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-	sort.Strings(out)
+	sort.Strings(keys)
+	out := make([]sandbox.EnvVar, len(keys))
+	for i, k := range keys {
+		out[i] = sandbox.EnvVar{Name: k, Value: m[k]}
+	}
 	return out
 }
 
-// pushImage runs the incremental image transfer: ask which blobs the guest lacks, then
-// stream only those (§6.11). For a fresh ephemeral VM the guest is missing everything.
-func pushImage(ctx context.Context, client *controlclient.Client, img *imagestore.Image) error {
-	if img == nil {
-		return nil
+// mergeEnv adds every key in additions to spec.Env that spec.Env doesn't already set — mirrors
+// internal/cli's own mergeEnv (adapter plan env), used here so a run's own explicit env always
+// wins over the ask-socket wiring this package adds.
+func mergeEnv(spec *task.RunSpec, additions map[string]string) {
+	if len(additions) == 0 {
+		return
 	}
-	digests, err := img.BlobDigests()
+	if spec.Env == nil {
+		spec.Env = map[string]string{}
+	}
+	for k, v := range additions {
+		if _, set := spec.Env[k]; !set {
+			spec.Env[k] = v
+		}
+	}
+}
+
+// writeEmbeddedBinary writes the embedded guest binary named name (guestbin.HelperName or
+// guestbin.AskName) for the host's own architecture — under msb the guest architecture always
+// equals the host's (libkrun runs a same-arch VM, guestbin's own doc comment) — to a temp file
+// with the executable bit set, returning its path for Copy.
+func writeEmbeddedBinary(dir, name string) (string, error) {
+	b, err := guestbin.Binary(name, runtime.GOARCH)
 	if err != nil {
-		return err
+		return "", err
 	}
-	presence, err := client.Agent.QueryImageBlobs(ctx, &pb.BlobQuery{Digests: digests})
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, b, 0o755); err != nil {
+		return "", fmt.Errorf("write %s: %w", name, err)
+	}
+	return path, nil
+}
+
+// digestFile computes the canonical digest of a file's bytes without loading it all into memory.
+func digestFile(path string) (digest.Digest, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("orchestrator: query image blobs: %w", err)
+		return "", err
 	}
-	only := map[string]bool{}
-	for _, d := range presence.GetMissingDigests() {
-		only[d] = true
+	defer func() { _ = f.Close() }()
+	return digest.Canonical.FromReader(f)
+}
+
+// execCapture runs one msb exec to completion, capturing stdout/stderr into buffers rather than
+// streaming — used for the short, JSON-in/JSON-out helper invocations and the defensive chmod,
+// as opposed to the long-lived, streamed agent exec. A non-zero exit (including ErrMsbFailed) is
+// returned as an error carrying stderr, with errors.Is-visibility into ErrMsbFailed preserved
+// through the %w wrap.
+func execCapture(ctx context.Context, sb *sandbox.Client, name, user string, cmd []string) ([]byte, error) {
+	var stdout, stderr bytes.Buffer
+	result, err := sb.Exec(ctx, sandbox.ExecSpec{Name: name, User: user, Command: cmd, Stdout: &stdout, Stderr: &stderr})
+	if err != nil {
+		return stdout.Bytes(), fmt.Errorf("%w (stderr: %s)", err, firstNonEmptyTrimmed(stderr.String(), stdout.String()))
 	}
-	pr, pw := io.Pipe()
-	go func() { pw.CloseWithError(img.WriteArchive(pw, only)) }()
-	if err := client.PushImage(ctx, pr); err != nil {
-		return fmt.Errorf("orchestrator: push image: %w", err)
+	if result.ExitCode != 0 {
+		return stdout.Bytes(), fmt.Errorf("exit %d (stderr: %s)", result.ExitCode, firstNonEmptyTrimmed(stderr.String(), stdout.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
+func firstNonEmptyTrimmed(ss ...string) string {
+	for _, s := range ss {
+		if t := bytesTrimSpace(s); t != "" {
+			return t
+		}
+	}
+	return "(no output)"
+}
+
+func bytesTrimSpace(s string) string { return string(bytes.TrimSpace([]byte(s))) }
+
+// collectOutput copies /output/* out of the sandbox into runDir (§6.7, §8.4). msb's Copy uses
+// docker-cp syntax; docker itself is inconsistent about whether copying a directory nests it one
+// level (dest/output/...) or flattens it (dest/...) depending on whether the destination already
+// exists, so this tolerates either shape rather than assuming one.
+func collectOutput(ctx context.Context, sb *sandbox.Client, name, runDir string) error {
+	tmp, err := os.MkdirTemp(runDir, ".output-tmp-")
+	if err != nil {
+		return fmt.Errorf("orchestrator: create output staging dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	if err := sb.Copy(ctx, name+":"+containerOutput, tmp); err != nil {
+		return fmt.Errorf("orchestrator: copy output: %w", err)
+	}
+	src := tmp
+	if nested := filepath.Join(tmp, "output"); dirExists(nested) {
+		src = nested
+	}
+	return moveTreeContents(src, runDir)
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+// moveTreeContents moves every top-level entry of src into dst, overwriting any same-named
+// entry already there. src is expected to be on the same filesystem as dst (collectOutput stages
+// its temp dir under runDir itself for exactly this reason), so this is a plain rename per entry.
+func moveTreeContents(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("orchestrator: read collected output: %w", err)
+	}
+	for _, e := range entries {
+		from := filepath.Join(src, e.Name())
+		to := filepath.Join(dst, e.Name())
+		if err := os.RemoveAll(to); err != nil {
+			return fmt.Errorf("orchestrator: replace %s: %w", to, err)
+		}
+		if err := os.Rename(from, to); err != nil {
+			return fmt.Errorf("orchestrator: move %s: %w", e.Name(), err)
+		}
 	}
 	return nil
 }
 
-// pushCode builds the self-contained bundle on the host and streams it (§6.7), returning the run's
-// code provenance (§8.4): the real + bundled commit SHAs from CreateBundle, the request flags, and a
-// digest of the exact bundle bytes. The digest is computed off the on-disk bundle before PushCode
-// streams it, fulfilling §6.7's Integrity promise with the same go-digest convention as §6.11/§6.8.
-func pushCode(ctx context.Context, client *controlclient.Client, spec task.RunSpec) (ProvenanceMeta, error) {
-	tmp, err := os.MkdirTemp("", "krayt-bundle-")
-	if err != nil {
-		return ProvenanceMeta{}, fmt.Errorf("orchestrator: temp bundle dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmp) }()
-	bundle := filepath.Join(tmp, "repo.bundle")
-	// Pass BundleDepth through literally: 0 = full history is the documented contract
-	// (§6.1/§8.1), and CreateBundle treats depth<=0 as full history. The default of 1 is
-	// applied at the CLI flag (and, in Phase 4, config resolution) — overriding 0 here would
-	// silently defeat an explicit `--bundle-depth 0` request for full history.
-	br, err := patch.CreateBundle(ctx, spec.RepoPath, bundle, spec.BundleDepth, spec.IncludeDirty)
-	if err != nil {
-		return ProvenanceMeta{}, err
-	}
-	f, err := os.Open(bundle)
-	if err != nil {
-		return ProvenanceMeta{}, err
-	}
-	defer func() { _ = f.Close() }()
-	// Digest the bundle bytes now, before streaming — the file is complete on disk at this point.
-	bundleDigest, err := digest.Canonical.FromReader(f)
-	if err != nil {
-		return ProvenanceMeta{}, fmt.Errorf("orchestrator: digest bundle: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return ProvenanceMeta{}, fmt.Errorf("orchestrator: rewind bundle: %w", err)
-	}
-	if err := client.PushCode(ctx, f); err != nil {
-		return ProvenanceMeta{}, fmt.Errorf("orchestrator: push code: %w", err)
-	}
-	return ProvenanceMeta{
-		HeadSHA:      br.HeadSHA,
-		BundleSHA:    br.BundleSHA,
-		BundleDepth:  spec.BundleDepth,
-		IncludeDirty: spec.IncludeDirty,
-		BundleDigest: bundleDigest.String(),
-	}, nil
-}
-
-// pushSecrets loads the per-task secrets file (if any) and pushes it to the guest, which
-// holds it in memory and materializes it on tmpfs at /run/secrets (§6.8). It returns the secret
-// KEY NAMES (never values) the host loaded, so the caller can later cross-check anything the
-// guest reports about them (secretPatchKeys) against a set the host determined independently of
-// the guest/container.
-//
-// injectedKeys — the secrets-file keys named in any network.inject[].set rule
-// (task.NetworkPolicy.InjectedSecretKeys) — are withheld from the bundle actually sent to the
-// guest (add-tls-mitm-credential-injection.md §2, the load-bearing change): those values are
-// attached host-side, at the MITM proxy, so the container never holds them at all. The returned
-// key list still includes them, since it names every secret the TASK has, independent of where
-// each is delivered.
-func pushSecrets(ctx context.Context, client *controlclient.Client, secretsPath string, injectedKeys map[string]bool) ([]string, error) {
-	if secretsPath == "" {
-		return nil, nil
-	}
-	values, err := secrets.Load(secretsPath)
-	if err != nil {
-		return nil, err
-	}
-	bundle := make(map[string]string, len(values))
-	for k, v := range values {
-		if injectedKeys[k] {
-			continue
-		}
-		bundle[k] = v
-	}
-	if _, err := client.Agent.PushSecrets(ctx, &pb.SecretsBundle{Values: bundle}); err != nil {
-		return nil, fmt.Errorf("orchestrator: push secrets: %w", err)
-	}
-	keys := make([]string, 0, len(values))
-	for k := range values {
-		keys = append(keys, k)
-	}
-	return keys, nil
-}
-
-// maxConsoleLog bounds how much of the guest console writeConsoleLog persists per run — the
-// container is untrusted (§6.1), and a run's wall-clock timeout is caller-set with no fixed
-// ceiling, so nothing stops a hostile or merely broken guest from spewing console output for the
-// whole run instead of just at boot. Unbounded, that becomes an unbounded on-disk artifact per
-// run, accumulating across every run a host ever does. Same tail-truncation idiom as
-// firecracker.tailLog (internal/provider/firecracker/firecracker.go) for the same file, just a
-// larger cap: that one folds into a terse boot-failure error string, this one is a persisted
-// diagnostic artifact meant to actually be read.
+// maxConsoleLog bounds how much of msb's system/boot diagnostics writeConsoleLog persists per
+// run — the container is untrusted (§10), and a run's wall-clock timeout has no fixed ceiling,
+// so nothing bounds how much a hostile or merely broken guest could otherwise cause msb to log.
 const maxConsoleLog = 1 << 20 // 1 MiB
 
-// writeConsoleLog copies the guest's serial console log — proxyd's and krayt-agent's own
-// stdout/stderr, everything logs/agent.log's container-only stream doesn't carry — into the
-// run's persistent logs dir, redacted against the task's secrets. Nothing on this path is
-// designed to ever see a secret value (proxyd and krayt-agent never read /run/secrets; only the
-// container does), but it is a new persisted artifact this stream never had before, so it is
-// redacted defensively rather than resting on that design guarantee alone. Same fail-closed
-// rule as redactReportFile (internal/guest/service.go): if the secret values can't be loaded to
-// redact against, the file is dropped rather than risked in the clear.
-func writeConsoleLog(consoleLogSrc, runDir, secretsPath string) {
-	b, err := os.ReadFile(consoleLogSrc)
-	if err != nil {
+// writeConsoleLog persists msb's `logs --source system --json` output — boot/system diagnostics,
+// including the reconstructed error block msb prepends when a sandbox never finished starting
+// (run-tasks-on-microsandbox.md decision 7, replacing the pre-msb guest serial console) — into
+// the run's logs dir, redacted against the task's secrets. Same fail-closed rule as before: if
+// the secret values can't be confirmed, nothing is written rather than risking one in the clear.
+func writeConsoleLog(b []byte, runDir string, secretValues map[string]string) {
+	if len(b) == 0 {
 		return
 	}
 	if len(b) > maxConsoleLog {
-		b = b[len(b)-maxConsoleLog:] // keep the tail: closest to whatever the run ended on
+		b = b[len(b)-maxConsoleLog:]
 	}
-	if secretsPath != "" {
-		values, err := secrets.Load(secretsPath)
-		if err != nil {
-			return // couldn't confirm what to scrub against; fail closed, write nothing
-		}
-		b = secrets.NewRedactor(secrets.Values(values)).Redact(b)
+	if len(secretValues) > 0 {
+		b = secrets.NewRedactor(secrets.Values(secretValues)).Redact(b)
 	}
 	_ = os.WriteFile(ConsoleLogPath(runDir), b, 0o644)
 }
 
-// setNetworkPolicy translates the task's egress policy to the proto and sends it (§6.6).
-// caCertPEM is the run's ephemeral MITM CA's public certificate (empty when network.mitm is
-// false, §5 of add-tls-mitm-credential-injection.md) — the guest writes it to
-// /run/krayt/ca.crt so the container can trust the connections the host proxy terminates; the
-// private key never leaves the proxy child, let alone this process.
-func setNetworkPolicy(ctx context.Context, client *controlclient.Client, np task.NetworkPolicy, caCertPEM []byte) error {
-	mode := pb.NetworkPolicy_ALLOWLIST
-	switch np.Mode {
-	case task.NetworkFull:
-		mode = pb.NetworkPolicy_FULL
-	case task.NetworkNone:
-		mode = pb.NetworkPolicy_NONE
+// redactChoices applies r to each choice string, same as a question's prompt — an agent could in
+// principle put a secret value inside an offered choice, not just the prompt text.
+func redactChoices(r *secrets.Redactor, choices []string) []string {
+	if len(choices) == 0 {
+		return choices
 	}
-	if _, err := client.Agent.SetNetworkPolicy(ctx, &pb.NetworkPolicy{Mode: mode, Allow: np.Allow, CaCert: caCertPEM}); err != nil {
-		return fmt.Errorf("orchestrator: set network policy: %w", err)
+	out := make([]string, len(choices))
+	for i, c := range choices {
+		out[i] = string(r.Redact([]byte(c)))
 	}
-	return nil
+	return out
 }
 
-// isWallClockTimeout reports whether an error from any run-context-bound step — the Start
-// stream, or an earlier push (image/code/task/secrets/network) — is the run's wall-clock
-// timeout rather than a real failure. ctx.Err() can lag under load (the deadline timer may
-// fire just after gRPC observes the expiry and RST_STREAMs the stream, or after a subprocess
-// like `git bundle create` gets SIGKILLed by ctx's cancellation) — so we also accept a
-// DeadlineExceeded RPC status (set atomically by gRPC at failure time) or a deadline that has
-// already elapsed. A plain cancellation (Ctrl-C) is not a timeout and stays an error.
+// isWallClockTimeout reports whether an error from any ctx-bound step (Create, Copy, Exec) is
+// the run's wall-clock timeout rather than a real failure. ctx.Err() can lag under load (the
+// deadline timer may fire just after a subprocess is SIGKILLed by ctx's cancellation) — so a
+// deadline that has already elapsed is accepted too. A plain cancellation (Ctrl-C) is not a
+// timeout and stays an error.
 func isWallClockTimeout(ctx context.Context, err error) bool {
-	if ctx.Err() == context.DeadlineExceeded || status.Code(err) == codes.DeadlineExceeded {
+	if err == nil {
+		return false
+	}
+	if ctx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
@@ -528,246 +657,36 @@ func isWallClockTimeout(ctx context.Context, err error) bool {
 	return false
 }
 
-// earlyTimeoutResult builds the Result for a wall-clock timeout that fired before the
-// container ever started — during the image/code/task/secrets/network push steps (§7 step 3).
-// It mirrors the shape streamRun produces for a timeout during the container's run (§6.1), so
-// both are reported identically: TimedOut, no error, sentinel exit code, nothing to collect.
+// earlyTimeoutResult builds the Result for a wall-clock timeout that fired before the agent ever
+// ran — during Create/copy-in/helper-setup. It mirrors the shape a timeout during the agent's own
+// exec produces, so both are reported identically: TimedOut, no error, sentinel exit code,
+// nothing to collect.
 func earlyTimeoutResult(runDir string) *Result {
-	return &Result{
-		RunDir:    runDir,
-		ExitCode:  -1,
-		TimedOut:  true,
-		PatchPath: filepath.Join(runDir, "changes.patch"),
-	}
+	return &Result{RunDir: runDir, ExitCode: -1, TimedOut: true, PatchPath: filepath.Join(runDir, "changes.patch")}
 }
 
-// controlSocketer is implemented by a VM that exposes its host-side control socket path, so a
-// run can record where a later `krayt answer`/`stop` should dial the guest (§6.2, §6.13). The
-// fakeProvider does not implement it (in-process transport), leaving CtrlSocket empty.
-type controlSocketer interface{ ControlSocket() string }
-
-// streamRun starts the container and consumes RunEvents until the terminal Status. Log lines
-// are appended to logs/agent.log and, when not detached, echoed to LogOut. An agent question
-// (§6.13) drives the run to `waiting` (setState) with the Q&A persisted and a desktop
-// notification; it is answered out of band by the guest Answer RPC (`krayt answer` dialing the
-// guest, Manager.Answer, or the timeout below). In `fail` mode a question is sentinel-answered
-// immediately so the run never blocks.
-//
-// A log line is NOT a resume signal — an agent can (and does) keep logging while blocked in
-// ask_human — so resumption comes only from the guest "question resolved" RunEvent (§6.13),
-// which fires however the question was answered (Answer RPC, a separate `krayt answer` process,
-// or the timeout sentinel). The run is `waiting` while any question is outstanding and flips back
-// to `running` when the last one resolves.
-func streamRun(ctx context.Context, client *controlclient.Client, spec task.RunSpec, logOut io.Writer, runDir string, setState func(string)) (int, bool, error) {
-	var timeoutSecs uint32
-	if spec.Resources.Timeout > 0 {
-		timeoutSecs = uint32(spec.Resources.Timeout.Seconds())
-	}
-	streamCtx, streamCancel := context.WithCancel(ctx)
-	defer streamCancel()
-	stream, err := client.Agent.Start(streamCtx, &pb.StartRequest{ImageRef: spec.ImageRef, TimeoutSecs: timeoutSecs})
-	if err != nil {
-		return 0, false, fmt.Errorf("orchestrator: start: %w", err)
-	}
-
-	logFile, err := os.Create(filepath.Join(runDir, "logs", "agent.log"))
-	if err != nil {
-		return 0, false, fmt.Errorf("orchestrator: open log: %w", err)
-	}
-	defer func() { _ = logFile.Close() }()
-
-	var aborted atomic.Bool
-	var outstanding int // wait-mode questions awaiting an answer; run is `waiting` while > 0
-	for {
-		ev, err := stream.Recv()
-		if err == io.EOF {
-			return 0, false, fmt.Errorf("orchestrator: start stream ended without a terminal status")
-		}
-		if err != nil {
-			if aborted.Load() {
-				return -1, false, fmt.Errorf("orchestrator: question timed out (abort policy, §6.13)")
-			}
-			// Wall-clock timeout: our run context expired, which canceled the stream. The
-			// guest kills the container and the deferred Destroy tears the VM down (§6.1).
-			if isWallClockTimeout(ctx, err) {
-				return -1, true, nil
-			}
-			return 0, false, fmt.Errorf("orchestrator: stream recv: %w", err)
-		}
-		switch k := ev.GetKind().(type) {
-		case *pb.RunEvent_Log:
-			line := k.Log.GetLine()
-			_, _ = logFile.Write(line)
-			if !spec.Detach && logOut != nil {
-				_, _ = logOut.Write(line)
-			}
-		case *pb.RunEvent_Status:
-			st := k.Status
-			if e := st.GetError(); e != "" {
-				return int(st.GetExitCode()), st.GetTimedOut(), fmt.Errorf("orchestrator: run failed: %s", e)
-			}
-			return int(st.GetExitCode()), st.GetTimedOut(), nil
-		case *pb.RunEvent_Question:
-			q := k.Question
-			if spec.Questions.Mode != task.QuestionWait {
-				// fail mode (default): never block — sentinel immediately so the agent
-				// proceeds autonomously (§6.13).
-				_, _ = client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: q.GetId(), NoAnswer: true})
-				continue
-			}
-			outstanding++
-			// Persist the question BEFORE announcing `waiting`, so any observer that sees the
-			// waiting state — a test, or a cross-process `krayt answer` reading the newest
-			// question — is guaranteed to find it on disk (§6.13). Otherwise there's a window
-			// where the state is `waiting` but the question file isn't written yet.
-			if err := writeQuestion(runDir, q); err != nil {
-				return 0, false, err
-			}
-			setState(StateWaiting)
-			notifyWaiting(filepath.Base(runDir), q.GetPrompt())
-			if to := spec.Questions.Timeout; to > 0 {
-				armQuestionTimeout(ctx, client, spec, runDir, q.GetId(), to, &aborted, streamCancel)
-			}
-		case *pb.RunEvent_Resolved:
-			// A question was answered (§6.13). Resume only when the last outstanding one clears; a
-			// Resolved with none outstanding is a fail-mode sentinel echo, so it's a no-op.
-			if outstanding > 0 {
-				if outstanding--; outstanding == 0 {
-					setState(StateRunning)
-				}
-			}
-		}
-	}
-}
-
-// armQuestionTimeout schedules the per-question wait limit (§6.13). On expiry it probes with a
-// no-answer sentinel: Ack.Ok reports whether the question was still pending, so a question the
-// human already answered (possibly from another process) is never wrongly sentinel-echoed or
-// aborted. Only a genuinely-still-pending question triggers the on-timeout action.
-func armQuestionTimeout(ctx context.Context, client *controlclient.Client, spec task.RunSpec, runDir, qid string, to time.Duration, aborted *atomic.Bool, cancel context.CancelFunc) {
+// armQuestionTimeout schedules the per-question wait limit (§6.13). On expiry it delivers the
+// no-answer sentinel directly to the bridge — unblocking the sandbox's still-pending Ask call —
+// and records it; Bridge.Answer is itself idempotent-safe (a no-op if the question was already
+// answered by a human first, since the human's answer already consumed the pending channel). For
+// `abort` it also cancels the agent's exec via *streamCancel (a pointer so it can be armed before
+// the agent's own exec has actually started the real context it will cancel).
+func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Duration, onTimeout task.QuestionTimeoutAction, aborted *atomic.Bool, streamCancel *context.CancelFunc) {
 	time.AfterFunc(to, func() {
-		ack, err := client.Agent.Answer(context.WithoutCancel(ctx), &pb.AnswerRequest{QuestionId: qid, NoAnswer: true})
-		if err != nil || !ack.GetOk() {
-			return // already answered/resolved, or transient failure — do not act
+		if !bridge.Answer(qid, "", true) {
+			return // already answered (by a human, or a previous timeout) — nothing to do
 		}
-		// The question was genuinely still pending at the deadline. The no-answer sentinel was
-		// just delivered; record it in the history and, for `abort`, fail the whole run.
 		_ = RecordAnswer(runDir, qid, "", true)
-		if spec.Questions.OnTimeout == task.OnTimeoutAbort {
+		if onTimeout == task.OnTimeoutAbort {
 			aborted.Store(true)
-			cancel()
+			if cancel := *streamCancel; cancel != nil {
+				cancel()
+			}
 		}
 	})
-}
-
-// collect streams the guest's artifact tar and extracts it into the run dir (§8.4).
-func collect(ctx context.Context, client *controlclient.Client, runDir string) error {
-	pr, pw := io.Pipe()
-	go func() { pw.CloseWithError(client.CollectArtifacts(ctx, pw)) }()
-	if err := untar(pr, runDir); err != nil {
-		return fmt.Errorf("orchestrator: extract artifacts: %w", err)
-	}
-	return nil
-}
-
-// untar extracts a tar stream into dir, creating parent directories as needed. Entry names
-// are cleaned and constrained to dir so a malformed/hostile tar cannot escape it.
-func untar(r io.Reader, dir string) error {
-	tr := tar.NewReader(r)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		target, err := safeJoin(dir, hdr.Name)
-		if err != nil {
-			return err
-		}
-		if hdr.FileInfo().IsDir() {
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		f, err := os.Create(target)
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(f, tr); err != nil { //nolint:gosec // bounded by the guest run
-			_ = f.Close()
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-	}
-}
-
-// safeJoin joins name onto dir, rejecting paths that would escape dir (path traversal).
-func safeJoin(dir, name string) (string, error) {
-	target := filepath.Join(dir, name)
-	rel, err := filepath.Rel(dir, target)
-	if err != nil || rel == ".." || filepath.IsAbs(rel) || hasDotDotPrefix(rel) {
-		return "", fmt.Errorf("orchestrator: unsafe artifact path %q", name)
-	}
-	return target, nil
-}
-
-func hasDotDotPrefix(rel string) bool {
-	return len(rel) >= 3 && rel[0] == '.' && rel[1] == '.' && (rel[2] == filepath.Separator)
 }
 
 func fileExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && !fi.IsDir()
-}
-
-// secretScanFile is the guest's marker (§6.8) naming the secret KEYS whose value appears in
-// changes.patch. The guest never writes the values, so the file is harmless in the run dir; the
-// host turns each key into a Safety warning (§8.4).
-const secretScanFile = "secret-scan.json"
-
-// secretPatchKeys reads the guest's secret-scan.json (collected with the other artifacts) and
-// returns the secret KEYS whose value the guest found in changes.patch. Absent/unreadable →
-// none (a run with no secret in the patch, the common case).
-//
-// secret-scan.json lives in the guest's outputDir, which is rbind-mounted read-write into the
-// (untrusted, §10) container as /output. The guest's own post-run scan is meant to be the
-// authoritative last writer there, but as defense in depth this does not trust the file's
-// contents outright: reported keys are filtered against knownKeys — the secret names the host
-// itself loaded for this run (pushSecrets), independent of anything the guest/container
-// reports — and deduplicated. So a malformed or maliciously planted file can at worst produce a
-// false-positive warning naming a real configured secret, never an arbitrary, huge, or
-// attacker-chosen string.
-func secretPatchKeys(runDir string, knownKeys []string) []string {
-	b, err := os.ReadFile(filepath.Join(runDir, secretScanFile))
-	if err != nil {
-		return nil
-	}
-	var s struct {
-		PatchContainsSecretKeys []string `json:"patch_contains_secret_keys"`
-	}
-	if json.Unmarshal(b, &s) != nil {
-		return nil
-	}
-	known := make(map[string]bool, len(knownKeys))
-	for _, k := range knownKeys {
-		known[k] = true
-	}
-	seen := make(map[string]bool, len(s.PatchContainsSecretKeys))
-	var keys []string
-	for _, k := range s.PatchContainsSecretKeys {
-		if !known[k] || seen[k] {
-			continue
-		}
-		seen[k] = true
-		keys = append(keys, k)
-	}
-	return keys
 }
