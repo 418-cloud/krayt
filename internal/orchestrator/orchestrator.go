@@ -830,17 +830,17 @@ func writeTranscript(stage, runDir string, secretValues map[string]string) error
 // elideMiddle caps b at max bytes by keeping its first head bytes and its last (max-head), with a
 // marker between, cutting on line boundaries so a line-oriented transcript stays parseable by eye
 // and by grep. Returns b unchanged when it already fits.
-func elideMiddle(b []byte, max, head int) []byte {
-	if len(b) <= max {
+func elideMiddle(b []byte, maxLen, head int) []byte {
+	if len(b) <= maxLen {
 		return b
 	}
-	if head >= max {
+	if head >= maxLen {
 		// Nonsensical budget; keeping the head alone is the safe reading and beats slicing past
 		// the end. Unreachable with the package constants, guarded so a later tweak to either
 		// cannot turn a diagnostic into a panic during teardown.
-		return b[:max]
+		return b[:maxLen]
 	}
-	tail := max - head
+	tail := maxLen - head
 	h := b[:head]
 	if i := bytes.LastIndexByte(h, '\n'); i > 0 {
 		h = h[:i+1]

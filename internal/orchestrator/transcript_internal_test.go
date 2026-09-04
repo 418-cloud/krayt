@@ -18,11 +18,11 @@ func TestElideMiddleKeepsBothEnds(t *testing.T) {
 		fmt.Fprintf(&b, `{"line":%d,"filler":"%s"}`+"\n", i, strings.Repeat("x", 200))
 	}
 	orig := b.Bytes()
-	const max, head = 1 << 14, 1 << 12
-	got := elideMiddle(orig, max, head)
+	const maxLen, head = 1 << 14, 1 << 12
+	got := elideMiddle(orig, maxLen, head)
 
-	if len(got) > max+128 { // +marker
-		t.Errorf("elideMiddle returned %d bytes, want <= %d plus the marker", len(got), max)
+	if len(got) > maxLen+128 { // +marker
+		t.Errorf("elideMiddle returned %d bytes, want <= %d plus the marker", len(got), maxLen)
 	}
 	if !bytes.Contains(got, []byte(`{"line":0,`)) {
 		t.Error("the head was dropped; the first event in the transcript is the one being looked for")
