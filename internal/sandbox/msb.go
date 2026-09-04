@@ -725,11 +725,12 @@ func parseImages(raw []byte) ([]ImageInfo, error) {
 	}
 	out := make([]ImageInfo, 0, len(entries))
 	for _, e := range entries {
+		info := ImageInfo{Raw: e}
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(e, &m); err != nil {
+			out = append(out, info)
 			continue
 		}
-		info := ImageInfo{Raw: e}
 		for _, key := range []string{"reference", "ref", "name", "image", "repository"} {
 			v, ok := m[key]
 			if !ok {

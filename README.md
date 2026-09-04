@@ -149,7 +149,7 @@ nothing about which AI or tools are inside.
   `.krayt/runs/<id>/` with `changes.patch`, `report.md`, `meta.json`, and logs.
 - **Disk cache.** Agent images are pulled and cached by **msb itself** — krayt hands `msb create`
   the image reference and lets it manage that cache; krayt keeps no image cache of its own
-  (`retire-vm-image-pipeline.md`). `krayt image ls/rm/prune` are a thin front-end over msb's own
+  (`docs/ai-tasks/retire-vm-image-pipeline.md`). `krayt image ls/rm/prune` are a thin front-end over msb's own
   store (`msb images`/`msb rmi`/`msb image prune`), not a second cache. Sandboxes themselves are
   fully ephemeral either way.
 

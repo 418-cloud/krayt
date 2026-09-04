@@ -38,7 +38,8 @@ func newImagePruneCmd() *cobra.Command {
 			"(terminal or not) used it within --older-than (default 24h) — krayt's own retention " +
 			"policy, layered on top of msb's own `image prune` sweep of dangling artifacts (" +
 			"retire-vm-image-pipeline.md decision 3). --all bypasses both protections. --dry-run " +
-			"reports without deleting anything, and never calls msb at all.",
+			"reports what would happen without removing or pruning anything, though it still lists " +
+			"msb's images to compute the report.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runImagePrune(cmd, repo, olderThan, all, dryRun)
@@ -72,7 +73,7 @@ func runImagePrune(cmd *cobra.Command, repo string, olderThan time.Duration, all
 		decisions = append(decisions, pruneDecision{img: img, keep: keep, reason: reason})
 	}
 
-	return reportPrune(cmd, sb, decisions, dryRun)
+	return reportPrune(cmd, sb, decisions, all, dryRun)
 }
 
 // pruneDecide applies the retention policy (decision 3) to one of msb's images.
@@ -142,7 +143,7 @@ func recordUsedAt(r orchestrator.RunRecord) time.Time {
 // reportPrune prints the decisions and, unless dryRun, removes the entries marked for removal via
 // `msb rmi`, then sweeps whatever msb's own store still considers dangling via `msb image prune`.
 // dryRun calls neither.
-func reportPrune(cmd *cobra.Command, sb *sandbox.Client, decisions []pruneDecision, dryRun bool) error {
+func reportPrune(cmd *cobra.Command, sb *sandbox.Client, decisions []pruneDecision, all, dryRun bool) error {
 	w := cmd.OutOrStdout()
 	var removed, kept []pruneDecision
 	var reclaim int64
@@ -161,7 +162,7 @@ func reportPrune(cmd *cobra.Command, sb *sandbox.Client, decisions []pruneDecisi
 	}
 	for _, d := range removed {
 		if !dryRun {
-			if err := sb.Rmi(cmd.Context(), d.img.Ref, false); err != nil {
+			if err := sb.Rmi(cmd.Context(), d.img.Ref, all); err != nil {
 				return err
 			}
 		}
