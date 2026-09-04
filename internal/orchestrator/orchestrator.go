@@ -146,8 +146,17 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		State:        StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
 		SandboxName: name,
 	}
-	_, _ = writeRecord(runDir, rec)
+	// recMu guards every read/mutation of rec and every writeRecord(runDir, rec) call below: rec is
+	// also touched from the ask-bridge and run-control goroutines (setState, and the connection
+	// handler behind serveRunControl in runctl.go) concurrently with this function's own sequential
+	// progress, and writeRecord's write-temp-then-rename uses a single fixed meta.json.tmp path per
+	// run — two unsynchronized writers can race on both the struct fields and that temp file.
+	var recMu sync.Mutex
+	persistRec := func() { recMu.Lock(); _, _ = writeRecord(runDir, rec); recMu.Unlock() }
+	persistRec()
 	defer func() {
+		recMu.Lock()
+		defer recMu.Unlock()
 		rec.EndedAt = nowStamp()
 		rec.DurationSecs = durationSecs(rec.StartedAt, rec.EndedAt)
 		switch {
@@ -206,7 +215,12 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	var streamCancel context.CancelFunc // set just before the agent Exec call; referenced by the question-timeout closure below
 	var aborted abortLatch
 	var outstandingQuestions atomic.Int32
-	setState := func(st string) { rec.State = st; _, _ = writeRecord(runDir, rec) }
+	setState := func(st string) {
+		recMu.Lock()
+		rec.State = st
+		_, _ = writeRecord(runDir, rec)
+		recMu.Unlock()
+	}
 
 	if spec.Questions.Mode == task.QuestionWait {
 		// Not simply runDir/ask: that path is unbounded on the left (the operator's repo path)
@@ -266,7 +280,9 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 			return nil, fmt.Errorf("orchestrator: %w", cerr)
 		}
 		defer stopCtl()
+		recMu.Lock()
 		rec.CtrlSocket = ctlSocket
+		recMu.Unlock()
 		if deps.OnClient != nil {
 			deps.OnClient(spec.ID, answerFunc)
 			defer deps.OnClient(spec.ID, nil)
@@ -275,7 +291,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		vsockRoutes = []sandbox.VsockRoute{{HostPath: filepath.Join(askDir, "ask.sock"), Port: sandbox.AskPort}}
 		mergeEnv(&spec, map[string]string{"KRAYT_ASK_SOCKET": sandbox.AskSocketEnv})
 	}
-	_, _ = writeRecord(runDir, rec)
+	persistRec()
 
 	// 1. Create (rent) the sandbox: image, --secret (names only; values in secretEnv), --vsock
 	// only when wiring above populated it, --security restricted, resources, --max-duration. The
@@ -320,12 +336,14 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: digest bundle: %w", err)
 	}
+	recMu.Lock()
 	rec.Provenance = &ProvenanceMeta{
 		HeadSHA: br.HeadSHA, BundleSHA: br.BundleSHA,
 		BundleDepth: spec.BundleDepth, IncludeDirty: spec.IncludeDirty,
 		BundleDigest: bundleDigest.String(),
 	}
 	_, _ = writeRecord(runDir, rec)
+	recMu.Unlock()
 
 	promptPath := filepath.Join(tmp, "prompt.md")
 	if err := os.WriteFile(promptPath, spec.TaskPrompt, 0o644); err != nil {
@@ -416,8 +434,10 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// The code snapshot is now durably captured inside the sandbox (cloned from the bundle,
 	// baseline tagged) — only now is it safe for the host repo to be mutated without affecting
 	// this run, so `running` becomes externally visible here, matching the pre-msb rule (§6.2).
+	recMu.Lock()
 	rec.State = StateRunning
 	_, _ = writeRecord(runDir, rec)
+	recMu.Unlock()
 
 	// 4. Exec the agent as the sandbox's non-root user, streamed to the run's log sink.
 	logFile, err := os.Create(filepath.Join(runDir, "logs", "agent.log"))
@@ -495,6 +515,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 
 	// 7. Host: diffstat + safety lint + secret-value scan of the collected patch (§8.4, §14) —
 	// none of this is an exec; the host already holds the patch bytes and every secret value.
+	recMu.Lock()
 	if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
 		rec.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
 	}
@@ -511,6 +532,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		}
 	}
 	res.Safety = rec.Safety
+	recMu.Unlock()
 	return res, nil
 }
 

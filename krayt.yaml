@@ -24,6 +24,7 @@
 # `task:` is intentionally omitted so you always pass --task per run.
 
 image: ghcr.io/418-cloud/krayt-dev:sha-cbca700
+secrets: secrets.env
 
 env:
   CLAUDE_MODEL: claude-sonnet-5

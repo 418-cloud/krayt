@@ -456,6 +456,25 @@ func TestValidateNetworkPolicyForMsbRejectsInjectHostOutsideAllow(t *testing.T) 
 	}
 }
 
+func TestValidateNetworkPolicyForMsbRejectsSecretHostAlsoInPassthrough(t *testing.T) {
+	// A passthrough host is tunneled un-MITM'd (NetworkArgs: --tls-bypass skips both the
+	// substitution and blocking lists in msb's handler), so a secret scoped to that host can
+	// never actually be substituted — the guest would send only the placeholder. This must be
+	// rejected even though ValidateNetworkPolicy's own inject/passthrough conflict check never
+	// sees it: this function always calls that check with np.Inject empty.
+	np := NetworkPolicy{
+		Mode: NetworkAllowlist, Allow: []string{"api.github.com"}, Passthrough: []string{"api.github.com"},
+	}
+	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true},
+		[]ConfigInjectRule{{Key: "GH_TOKEN", Host: "api.github.com"}})
+	if err == nil {
+		t.Fatal("expected an error for a secret host also present in network.passthrough")
+	}
+	if !strings.Contains(err.Error(), "passthrough") {
+		t.Errorf("error %q does not mention passthrough", err)
+	}
+}
+
 func contains(ss []string, v string) bool {
 	for _, s := range ss {
 		if s == v {
