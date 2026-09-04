@@ -26,7 +26,7 @@ func TestNetworkArgsAllowlistGolden(t *testing.T) {
 		"--net-rule", "deny@host",
 		"--net-rule", "allow@api.anthropic.com",
 		"--net-rule", "allow@generativelanguage.googleapis.com",
-		"--on-secret-violation", "block-and-log",
+		"--on-secret-violation", "passthrough",
 	}
 	got, err := NetworkArgs(np, false)
 	if err != nil {
@@ -70,7 +70,7 @@ func TestNetworkArgsFullGolden(t *testing.T) {
 		"--net-rule", "deny@meta",
 		"--net-rule", "deny@multicast",
 		"--net-rule", "deny@host",
-		"--on-secret-violation", "block-and-log",
+		"--on-secret-violation", "passthrough",
 	}
 	got, err := NetworkArgs(np, false)
 	if err != nil {
@@ -118,7 +118,7 @@ func TestNetworkArgsFullDenyRulesPrecedeAnyAllow(t *testing.T) {
 
 func TestNetworkArgsNoneGolden(t *testing.T) {
 	np := NetworkPolicy{Mode: NetworkNone}
-	want := []string{"--no-net", "--on-secret-violation", "block-and-log"}
+	want := []string{"--no-net", "--on-secret-violation", "passthrough"}
 	got, err := NetworkArgs(np, false)
 	if err != nil {
 		t.Fatalf("NetworkArgs: %v", err)
@@ -245,8 +245,8 @@ func TestNetworkArgsOnSecretViolationAlwaysExplicit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NetworkArgs(%+v, %v): %v", np, hasSecrets, err)
 			}
-			if !containsPair(got, "--on-secret-violation", "block-and-log") {
-				t.Errorf("mode=%s hasSecrets=%v: missing explicit --on-secret-violation block-and-log: %v",
+			if !containsPair(got, "--on-secret-violation", "passthrough") {
+				t.Errorf("mode=%s hasSecrets=%v: missing explicit --on-secret-violation passthrough: %v",
 					np.Mode, hasSecrets, got)
 			}
 		}
@@ -330,7 +330,7 @@ func TestNetworkArgsThisRepoConfig(t *testing.T) {
 	for _, h := range cfg.Network.Passthrough {
 		want = append(want, "--tls-bypass", h)
 	}
-	want = append(want, "--tls-intercept", "--on-secret-violation", "block-and-log")
+	want = append(want, "--tls-intercept", "--on-secret-violation", "passthrough")
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("argv mismatch for this repo's krayt.yaml:\n got  %#v\n want %#v", got, want)
@@ -519,5 +519,42 @@ func TestNetworkArgsNoneHasNoDNSRule(t *testing.T) {
 	}
 	if contains(got, "allow@dns") || contains(got, "--net-rule") {
 		t.Errorf("none mode must emit no --net-rule at all: %v", got)
+	}
+}
+
+// TestOnSecretViolationIsPassthroughNotBlocking guards a choice that looks, from the outside, like
+// a hardening regression someone should "fix" back to blocking. It is the opposite, and the
+// reasoning is why this test exists rather than a bare golden line.
+//
+// The flag decides what happens when a secret's PLACEHOLDER — never its value — reaches a host
+// outside that secret's scope. Blocking there is unrecoverable for a coding agent: msb puts the
+// placeholder in the guest's own environment, so one `env` puts it in the agent's conversation,
+// and the agent resends its conversation to the model API every turn. run_df87bfc8 and
+// run_4125ef2e both died that way.
+//
+// Nothing is protected by blocking it. msb gates substitution on the secret's own allowed hosts
+// BEFORE consulting this action (handler.rs:579-600 at v0.6.16), so the placeholder is a public
+// sentinel that cannot be turned into a credential anywhere it should not be — verified on
+// hardware by hack/msb-probes/p7-passthrough-semantics.sh, which also proved in-scope substitution
+// still works under passthrough. Re-run p7 before changing this value.
+func TestOnSecretViolationIsPassthroughNotBlocking(t *testing.T) {
+	for _, np := range []NetworkPolicy{
+		{Mode: NetworkAllowlist, Allow: []string{"api.anthropic.com"}},
+		{Mode: NetworkFull},
+		{Mode: NetworkNone},
+	} {
+		got, err := NetworkArgs(np, true)
+		if err != nil {
+			t.Fatalf("NetworkArgs(%s): %v", np.Mode, err)
+		}
+		for _, blocking := range []string{"block", "block-and-log", "block-and-terminate"} {
+			if containsPair(got, "--on-secret-violation", blocking) {
+				t.Errorf("mode=%s emits --on-secret-violation %s. That blocks a request merely for "+
+					"mentioning a placeholder, which kills any agent that has ever run `env` — and "+
+					"protects nothing, since msb decides substitution from the secret's own scope "+
+					"before this action is read. If this was deliberate, re-run p7 and update the "+
+					"reasoning in NetworkArgs.", np.Mode, blocking)
+			}
+		}
 	}
 }

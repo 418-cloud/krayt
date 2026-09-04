@@ -18,12 +18,23 @@ already checked out (that's what `--repo .` from a local checkout of the branch 
 - `api.github.com` must be in the run's `--allow` egress list for any `gh` call to work. If `gh`
   calls fail with a network/egress error, stop and report that `api.github.com` is missing from
   `--allow` (and, if auth also fails, that `GH_TOKEN` wasn't supplied) — don't guess around it.
-- The token is normally **injected at the host proxy**, so `$GH_TOKEN` holds an obvious placeholder
-  and `/run/secrets/GH_TOKEN` does not exist. That is **not** a misconfiguration and needs no
-  working around: the real token is attached to your requests on the way out and `gh` works
-  normally. Judge auth by whether a `gh` call actually succeeds, never by reading the token — and
-  never try to "fix" it by running `gh auth login`, which would replace a working credential with
-  the placeholder you can see.
+- **`$GH_TOKEN` holds a placeholder, not the real token, and that is correct.** No credential is
+  ever placed inside this sandbox. The sandbox runtime substitutes the real value into your
+  outbound requests at its own TLS boundary, and only for `api.github.com` — so `gh` works
+  normally while nothing in here can read the secret. Judge auth by whether a `gh` call actually
+  succeeds, never by reading the token, and never try to "fix" it with `gh auth login`, which
+  would replace a working credential with the placeholder you can see.
+- **There is no git remote, by design — `gh` needs `GH_REPO`.** `/workspace` is cloned from a git
+  bundle and krayt drops the `origin` that pointed at it, so `git remote -v` is empty. `gh`
+  normally resolves *which repository* from that remote: without help, `gh pr view` fails with
+  `no git remotes found` and `gh api "repos/{owner}/{repo}/..."` has nothing to substitute. The
+  run's config supplies `GH_REPO=<owner>/<name>` in its `env:` block; every `gh` command below
+  assumes it is set. If it is unset, **that** is the fix — report it and stop, rather than working
+  around it.
+- **Do not go hunting in the environment.** If `gh` misbehaves, the cause is one of the three
+  things above — the token, the egress allowlist, or `GH_REPO` — all of which you can check
+  directly. Dumping `env` tells you nothing those do not, and it is the one place the credential
+  placeholder appears in output.
 
 ## Hard constraints — the token is read-only
 
@@ -44,7 +55,12 @@ gh pr view                       # sanity-check: does it resolve to the expected
 number=$(gh pr view --json number -q .number)
 ```
 
-If `gh pr view` can't find a PR for the branch, stop and report that — don't invent a PR number.
+Two different failures look alike here, and only one of them is about the PR:
+
+- `no git remotes found` means `GH_REPO` is unset (see "What you have"). Report that, don't work
+  around it.
+- A clean "no pull requests found" for the branch means what it says. Stop and report it — don't
+  invent a PR number, and don't go looking for one by listing every open PR.
 
 ## Step 2 — fetch the *review* comments (not issue comments)
 
@@ -58,7 +74,8 @@ This distinction is critical and easy to get wrong **silently**:
   gh api "repos/{owner}/{repo}/pulls/${number}/comments" --paginate
   ```
 
-  (`gh api` substitutes `{owner}`/`{repo}` from the repo automatically; `--paginate` gets them all.)
+  (`gh api` substitutes `{owner}`/`{repo}` from `GH_REPO` here, since there is no remote to read
+  them from; `--paginate` gets them all.)
 
 Using the wrong one means you see **zero relevant comments** and wrongly conclude there's nothing to
 do. Fetch the **review** comments. Each entry gives you at least `path`, `line` (or

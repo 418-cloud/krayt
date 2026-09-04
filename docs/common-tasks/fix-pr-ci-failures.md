@@ -26,12 +26,22 @@ branch gives you).
   succeed. If `gh` calls fail on the network, stop and report **which host** was blocked (and, if
   auth also fails, that `GH_TOKEN` wasn't supplied) — don't guess around it. Step 3 gives a
   fallback that stays on `api.github.com`.
-- The token is normally **injected at the host proxy**, so `$GH_TOKEN` holds an obvious placeholder
-  and `/run/secrets/GH_TOKEN` does not exist. That is **not** a misconfiguration and needs no
-  working around: the real token is attached to your requests on the way out and `gh` works
-  normally. Judge auth by whether a `gh` call actually succeeds, never by reading the token — and
-  never try to "fix" it by running `gh auth login`, which would replace a working credential with
-  the placeholder you can see.
+- **`$GH_TOKEN` holds a placeholder, not the real token, and that is correct.** No credential is
+  ever placed inside this sandbox. The sandbox runtime substitutes the real value into your
+  outbound requests at its own TLS boundary, and only for the hosts that secret is scoped to — so
+  `gh` works normally while nothing in here can read the secret. Judge auth by whether a `gh` call
+  actually succeeds, never by reading the token, and never try to "fix" it with `gh auth login`,
+  which would replace a working credential with the placeholder you can see.
+- **There is no git remote, by design — `gh` needs `GH_REPO`.** `/workspace` is cloned from a git
+  bundle and krayt drops the `origin` that pointed at it, so `git remote -v` is empty. `gh`
+  normally resolves *which repository* from that remote: without help, `gh pr view` and `gh run`
+  fail with `no git remotes found` and `gh api "repos/{owner}/{repo}/..."` has nothing to
+  substitute. The run's config supplies `GH_REPO=<owner>/<name>` in its `env:` block; every `gh`
+  command below assumes it is set. If it is unset, **that** is the fix — report it and stop.
+- **Do not go hunting in the environment.** If `gh` misbehaves, the cause is one of the things
+  above — the token, an egress host, or `GH_REPO` — all of which you can check directly. Dumping
+  `env` tells you nothing those do not, and it is the one place the credential placeholder appears
+  in output.
 - The `krayt-dev` toolchain: Go, `golangci-lint`, `buf`, `make`. That's enough to reproduce the
   `test`, `lint`, and `cross-compile-guest` jobs locally. It is **not** enough for the real-VM,
   Docker, or Nix jobs — see Step 4.

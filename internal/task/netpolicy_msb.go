@@ -77,7 +77,37 @@ func NetworkArgs(np NetworkPolicy, hasSecrets bool) ([]string, error) {
 		args = append(args, "--tls-intercept")
 	}
 	// Set explicitly rather than inherited, in every mode, regardless of hasSecrets.
-	args = append(args, "--on-secret-violation", "block-and-log")
+	//
+	// `passthrough`, not msb's `block-and-log` default, and this is a deliberated choice rather
+	// than the "be explicit" reflex that first put block-and-log here.
+	//
+	// What the flag governs is what happens when a secret's PLACEHOLDER — not its value — is seen
+	// heading to a host outside that secret's own scope. Under block-and-log that request is
+	// killed, and for a coding agent this is unrecoverable by construction: msb sets each secret's
+	// env var in the guest to the placeholder itself, so a single `env` (or any tool output that
+	// quotes one) puts the string into the agent's conversation, and the agent resends its whole
+	// conversation to the model API on every turn. Every subsequent turn is then blocked, forever.
+	// Two real runs died exactly this way (run_df87bfc8, run_4125ef2e), the second while the agent
+	// was diagnosing a missing git remote — not doing anything untoward.
+	//
+	// Passing it through is safe, and structurally so rather than by convention: msb decides
+	// substitution from the secret's own allowed hosts BEFORE it consults this action at all
+	// (crates/network/lib/secrets/handler.rs:579-600 at v0.6.16), so no value of this flag can
+	// cause a secret to be substituted at a host outside its scope. A matching passthrough skips
+	// both the substitution list and the blocking list — forwarded unchanged, not blocked
+	// (handler.rs:605-612). Confirmed on hardware, not just read: hack/msb-probes/p7-passthrough-
+	// semantics.sh measured the placeholder arriving out of scope, the identical request blocked
+	// under block-and-log, and in-scope substitution still working.
+	//
+	// The cost, stated plainly: passthrough is SILENT. msb's `secret violation` warning is emitted
+	// inside its BlockingAction match, which passthrough never reaches (handler.rs:1508-1525), so
+	// krayt gives up that log line. It is a warning about a public sentinel that cannot be
+	// substituted anywhere it should not be, and the model host would trip it on every single
+	// turn — noise about a non-event, traded for runs that survive. If the signal is ever wanted
+	// back, the precise instrument is a per-secret `on_violation: Passthrough([<model host>])`
+	// through --secret-conf, which keeps block-and-log everywhere else (SecretEntry.on_violation,
+	// domain.rs:2125-2127; effective_violation_action, handler.rs:2322-2339).
+	args = append(args, "--on-secret-violation", "passthrough")
 
 	return args, nil
 }

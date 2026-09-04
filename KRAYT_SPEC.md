@@ -331,6 +331,27 @@ unconditionally the instant any `--secret` is declared (confirmed on hardware,
 `hack/msb-probes/p3-secret-tls-intercept.sh`, 2026-08-29) — emitted anyway to pin that behavior
 explicitly rather than depend on an undocumented builder side effect in a beta tool.
 
+**`--on-secret-violation` is `passthrough`, deliberately, not msb's blocking default.** The flag
+decides what happens when a secret's *placeholder* — never its value — is seen heading to a host
+outside that secret's own scope. Under a blocking action that request dies, and for a coding agent
+that is unrecoverable: msb sets each secret's guest env var to the placeholder itself, so one `env`
+puts the string into the agent's conversation, and the agent resends its conversation to the model
+API every turn. Two real runs died exactly this way (`run_df87bfc8`, `run_4125ef2e`), the second
+while the agent was diagnosing a missing git remote.
+
+Forwarding it is safe *structurally*, not by convention: msb decides substitution from the secret's
+own allowed hosts **before** it consults this action at all, so no value of the flag can cause a
+secret to be substituted outside its scope. Confirmed on hardware, not merely read out of msb's
+source — `hack/msb-probes/p7-passthrough-semantics.sh` measured the placeholder arriving unchanged
+at an out-of-scope host, the identical request blocked under `block-and-log`, and in-scope
+substitution still working.
+
+The cost is stated rather than glossed: `passthrough` is **silent**, so krayt gives up msb's
+`secret violation` log line — a warning about a public sentinel that cannot become a credential
+anywhere it should not be, and one the model host would trip on every turn. If that signal is ever
+wanted back, the precise instrument is a per-secret `on_violation: Passthrough([<model host>])`
+supplied through `--secret-conf`, which leaves `block-and-log` in force everywhere else.
+
 **`network.mitm` has no msb equivalent and is a hard pre-flight error**
 (`task.ValidateNetworkPolicyForMsb`, the live validator since this cutover, called from
 `internal/cli` before any sandbox is created): under msb there is no configuration in which a
