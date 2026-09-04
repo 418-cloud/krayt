@@ -111,7 +111,7 @@ func TestSetupPatchGitRejectsExistingDir(t *testing.T) {
 // TestMakeContainerWritableSkipsSymlinks is the regression for the symlink-escape review finding:
 // MakeContainerWritable runs as root over an untrusted repo, and os.Chmod follows symlinks — so a
 // workspace symlink pointing outside the tree must NOT get its target chmod'd (§10). Real files in
-// the tree are still relaxed. Moved here from internal/guest when the function was shared with
+// the tree are still relaxed. Moved here from the pre-msb guest agent when the function was shared with
 // cmd/krayt-helper (add-krayt-guest-helper.md).
 func TestMakeContainerWritableSkipsSymlinks(t *testing.T) {
 	// A file OUTSIDE the workspace whose perms must remain untouched.

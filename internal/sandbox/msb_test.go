@@ -8,8 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/418-cloud/krayt/internal/provider"
 )
 
 // newFakeClient points a Client at this test binary (via testBinPath, set by TestMain) and
@@ -31,6 +29,8 @@ func TestCreateSpecArgsStableOrderAndQuoting(t *testing.T) {
 		CPUs:      4,
 		MemoryMiB: 2048,
 		RootDisk:  "flat:/base.img,clone=auto",
+		// msb reads only "<int><unit>", so a Go duration must never reach argv verbatim.
+		MaxDuration: 90 * time.Minute,
 		Env: []EnvVar{
 			{Name: "FOO", Value: "bar"},
 			{Name: "BAZ", Value: "qux=quux"},
@@ -60,8 +60,9 @@ func TestCreateSpecArgsStableOrderAndQuoting(t *testing.T) {
 		"--name", "krayt-run-1",
 		"--user", "agent",
 		"--cpus", "4",
-		"--memory", "2048",
+		"--memory", "2048M",
 		"--root-disk", "flat:/base.img,clone=auto",
+		"--max-duration", "5400s",
 		"--env", "FOO=bar",
 		"--env", "BAZ=qux=quux",
 		"--vsock", "/run/krayt/ask.sock:9000",
@@ -114,7 +115,7 @@ func TestCreateSpecArgsVsockOnlyWhenPopulated(t *testing.T) {
 		}
 	}
 
-	wait := CreateSpec{Image: "img", Vsock: []VsockRoute{{HostPath: "/run/krayt/ask.sock", Port: provider.AskPort}}}.Args()
+	wait := CreateSpec{Image: "img", Vsock: []VsockRoute{{HostPath: "/run/krayt/ask.sock", Port: AskPort}}}.Args()
 	n := 0
 	for _, tok := range wait {
 		if tok == "--vsock" {
@@ -313,9 +314,10 @@ func TestContextReportsBackend(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
+	// msb 0.6.16's actual output, read from `msb context --format json` on macOS/aarch64.
 	t.Run("local", func(t *testing.T) {
 		c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
-			"context": {ExitCode: 0, Stdout: `{"backend":"local"}`},
+			"context": {ExitCode: 0, Stdout: `{"kind":"local","source":"MSB_BACKEND"}`},
 		}})
 		info, err := c.Context(context.Background())
 		if err != nil {
@@ -324,11 +326,14 @@ func TestContextReportsBackend(t *testing.T) {
 		if !info.IsLocal() {
 			t.Fatalf("IsLocal() = false for backend %q, want true", info.Backend)
 		}
+		if info.Source != "MSB_BACKEND" {
+			t.Errorf("Source = %q, want MSB_BACKEND — it is what shows krayt's pin reached msb", info.Source)
+		}
 	})
 
 	t.Run("cloud is not local", func(t *testing.T) {
 		c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
-			"context": {ExitCode: 0, Stdout: `{"backend":"cloud"}`},
+			"context": {ExitCode: 0, Stdout: `{"kind":"cloud","source":"MSB_PROFILE"}`},
 		}})
 		info, err := c.Context(context.Background())
 		if err != nil {
@@ -336,6 +341,43 @@ func TestContextReportsBackend(t *testing.T) {
 		}
 		if info.IsLocal() {
 			t.Fatalf("IsLocal() = true for backend %q, want false", info.Backend)
+		}
+	})
+
+	// The pre-0.6.16 guess. Kept working deliberately: the fallback keys are there to absorb a
+	// rename, and a fallback with no test is a fallback nobody knows is broken.
+	t.Run("legacy backend key still parses", func(t *testing.T) {
+		c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+			"context": {ExitCode: 0, Stdout: `{"backend":"local"}`},
+		}})
+		info, err := c.Context(context.Background())
+		if err != nil {
+			t.Fatalf("Context: %v", err)
+		}
+		if !info.IsLocal() {
+			t.Fatalf("IsLocal() = false for legacy shape, want true")
+		}
+	})
+
+	// No recognised key: fail closed with an empty Backend, but keep the raw bytes so the caller
+	// can show the operator what msb printed (doctor.go's contextCheck does).
+	t.Run("unrecognised schema fails closed but keeps Raw", func(t *testing.T) {
+		const raw = `{"some_future_field":"local"}`
+		c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+			"context": {ExitCode: 0, Stdout: raw},
+		}})
+		info, err := c.Context(context.Background())
+		if err != nil {
+			t.Fatalf("Context: %v", err)
+		}
+		if info.IsLocal() {
+			t.Fatalf("IsLocal() = true for an unrecognised schema, want false")
+		}
+		if info.Backend != "" {
+			t.Errorf("Backend = %q, want empty", info.Backend)
+		}
+		if !strings.Contains(string(info.Raw), "some_future_field") {
+			t.Errorf("Raw = %q, want msb's original output preserved", info.Raw)
 		}
 	})
 }
@@ -379,6 +421,39 @@ func TestTeardownStillBoundedByATimeout(t *testing.T) {
 	}
 }
 
+func TestSystemLogsRendersArgsAndReturnsStdout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"logs": {ExitCode: 0, Stdout: `{"source":"system","line":"boot ok"}` + "\n"},
+	}})
+
+	out, err := c.SystemLogs(context.Background(), "krayt-run-1")
+	if err != nil {
+		t.Fatalf("SystemLogs: %v", err)
+	}
+	if !strings.Contains(string(out), "boot ok") {
+		t.Errorf("SystemLogs output = %q, want it to contain the fake's stdout", out)
+	}
+	call := lastFakeCall(t, home)
+	want := []string{"logs", "--source", "system", "--json", "krayt-run-1"}
+	if !reflect.DeepEqual(call.Args, want) {
+		t.Errorf("SystemLogs args = %v, want %v", call.Args, want)
+	}
+}
+
+func TestSystemLogsErrorsIncludeStderr(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"logs": {ExitCode: 1, Stderr: "sandbox not found"},
+	}})
+	_, err := c.SystemLogs(context.Background(), "nope")
+	if err == nil || !strings.Contains(err.Error(), "sandbox not found") {
+		t.Errorf("SystemLogs error = %v, want it to surface stderr", err)
+	}
+}
+
 func slicesContain(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {
@@ -386,4 +461,27 @@ func slicesContain(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// TestMsbDurationIsSingleUnit pins the rendering msb's parser actually accepts. msb takes one
+// integer plus one unit; time.Duration.String()'s composite form ("30m0s", "1h0m0s") makes it
+// exit with "invalid digit found in string" before it opens its database, so every duration
+// krayt puts on argv is whole seconds.
+func TestMsbDurationIsSingleUnit(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want string
+	}{
+		{30 * time.Second, "30s"},
+		{30 * time.Minute, "1800s"},     // Duration.String() would say "30m0s"
+		{time.Hour, "3600s"},            // Duration.String() would say "1h0m0s"
+		{90 * time.Minute, "5400s"},     // Duration.String() would say "1h30m0s"
+		{1500 * time.Millisecond, "2s"}, // rounds up; never truncates toward "0s"
+		{time.Millisecond, "1s"},        // a sub-second limit stays a limit
+	}
+	for _, tc := range cases {
+		if got := msbDuration(tc.in); got != tc.want {
+			t.Errorf("msbDuration(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
 }

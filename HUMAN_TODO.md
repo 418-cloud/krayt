@@ -15,6 +15,15 @@ Everything closed has been **deleted from this file** rather than kept as ✅ en
 record of what was verified, and how, lives in `git log` (this file's history through #115),
 `KRAYT_SPEC.md` §14's phase checklists, and `docs/ai-tasks/README.md`'s status table. What is left:
 
+**Before picking up any entry below, read this.** The msb cutover
+(`run-tasks-on-microsandbox.md`, hardware-verified 2026-09-04) deleted `internal/proxy`,
+`network.mitm`, and the ephemeral per-run CA that several entries here still reference
+(`mitm: true`, `proxy.log`, `openssl s_client -proxy 127.0.0.1:3128`). Those entries — the
+opencode/gemini-cli `NODE_EXTRA_CA_CERTS` verification, the trixie/rtk credential checks —
+describe a procedure that no longer applies as written: msb substitutes credentials at its own TLS
+boundary, with no `krayt.yaml` `mitm:` key and no `proxy.log` artifact. They have not been
+rewritten; whoever picks one up needs to re-derive the msb-equivalent steps first.
+
 1. **`krayt-agent-opencode`** — the one image never published or exercised. Its entry below covers
    the publish check, an onboarding run, the `ask_human` question round-trip, and the
    `NODE_EXTRA_CA_CERTS` check re-homed from §14 Phase 9.
@@ -23,13 +32,11 @@ record of what was verified, and how, lives in `git log` (this file's history th
 3. **A known defect** in the agent images' `/output/report.md` contract (`[BUG]` below), which will
    corrupt the opencode verification the same way it corrupted a gemini one unless the task writes
    somewhere else.
-4. **One live-run security check** — that the egress-proxy child's real environment on macOS carries
-   no operator credentials (`[security]` below, report §6 item 4).
-5. **`krayt-dev`'s floating base pin** — the rebuild, the repin, and the injected-run verification
+4. **`krayt-dev`'s floating base pin** — the rebuild, the repin, and the injected-run verification
    are all done (`krayt.yaml` runs `sha-cbca700`, built from `main`'s tip). What's left is that
    `hack/krayt-dev/Dockerfile`'s `FROM` is still tag-only, so the base floats, plus two
    CA-sensitive checks nothing has exercised yet (`[tooling]` below).
-6. **The trixie base bump + rtk install** — landed and verified end-to-end **for Claude Code on
+5. **The trixie base bump + rtk install** — landed and verified end-to-end **for Claude Code on
    arm64**: `rtk 0.45.0` runs in the published image, and two real `krayt-dev` runs
    (`run_9e0a56de` on, `run_378dac2d` with `KRAYT_RTK=off`) prove the hook intercepts live tool
    calls and that the opt-out is honoured rather than silently absent. What remains needs live
@@ -190,29 +197,6 @@ reads stdin, which a non-interactive `docker build` can't answer — confirmed i
 - **Blocking:** no — the offline half (hadolint, `go build`/`go test`, the entrypoint-credential
   suite, the gemini merge simulation) already guards the code paths that can be guarded without
   a build.
-
----
-
-## [security] confirm the live egress-proxy child carries no operator credentials
-- Needed: on the Mac, **during a run**, check the real child process's environment. This is item 4
-  of `docs/security-review-host-proxy-report.md` §6 — the live-run half of the F6 fix that gave the
-  child an explicit, minimal environment (`egressProxyChildEnvKeys`,
-  `internal/orchestrator/egressproxy.go`).
-- Why the agent can't: needs a live `krayt run` on real hardware; `ps -E` is macOS-only, and the
-  offline tests can only assert what this process constructs, not what a Mac kernel shows.
-- Exact steps/commands:
-  ```sh
-  # on the Mac, during a run:
-  pgrep -f '__egress-proxy' | head -1 | xargs -I{} ps -E -p {} | tr ' ' '\n' | grep -E 'KEY|TOKEN|SECRET|AWS|PASS'
-  ```
-  Worth running from a shell that has `ANTHROPIC_API_KEY` (or any such variable) exported, so the
-  check can actually fail if the fix regressed.
-- Verify success by: **no matches.** The child's full environment should be only `PATH`, `HOME`,
-  and whichever of `SSL_CERT_FILE`/`SSL_CERT_DIR`/`KRAYT_PROXY_LOG_REQUESTS`/
-  `KRAYT_PROXY_LOG_HEADER_VALUES` were set on the `krayt run` invocation. Drop the `grep` to see
-  the whole list.
-- Blocking: no — the offline half (`TestSpawnEgressProxySecretNeverInArgvEnvOrOutput`,
-  `TestSpawnEgressProxyForwardsLogRequestsEnv`) already guards the code path in CI.
 
 ---
 

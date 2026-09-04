@@ -14,16 +14,19 @@ func TestNetworkArgsAllowlistGolden(t *testing.T) {
 	}
 	want := []string{
 		"--net-default", "deny",
+		// allow@dns comes FIRST, ahead of the deny groups: rules are first-match-wins and the
+		// gateway that `dns` names sits inside `private`, so denying private first resolves
+		// nothing at all. See allowDNSArgs.
+		"--net-rule", "allow@dns",
 		"--net-rule", "deny@private",
 		"--net-rule", "deny@loopback",
 		"--net-rule", "deny@link-local",
 		"--net-rule", "deny@meta",
 		"--net-rule", "deny@multicast",
 		"--net-rule", "deny@host",
-		"--net-rule", "allow@dns",
 		"--net-rule", "allow@api.anthropic.com",
 		"--net-rule", "allow@generativelanguage.googleapis.com",
-		"--on-secret-violation", "block-and-log",
+		"--on-secret-violation", "passthrough",
 	}
 	got, err := NetworkArgs(np, false)
 	if err != nil {
@@ -58,13 +61,16 @@ func TestNetworkArgsFullGolden(t *testing.T) {
 	np := NetworkPolicy{Mode: NetworkFull}
 	want := []string{
 		"--net-default-egress", "allow", "--net-default-ingress", "deny",
+		// full mode needs the same explicit DNS decision, for the same first-match-wins reason:
+		// its egress default is allow, but deny@private would still match the gateway.
+		"--net-rule", "allow@dns",
 		"--net-rule", "deny@private",
 		"--net-rule", "deny@loopback",
 		"--net-rule", "deny@link-local",
 		"--net-rule", "deny@meta",
 		"--net-rule", "deny@multicast",
 		"--net-rule", "deny@host",
-		"--on-secret-violation", "block-and-log",
+		"--on-secret-violation", "passthrough",
 	}
 	got, err := NetworkArgs(np, false)
 	if err != nil {
@@ -87,6 +93,12 @@ func TestNetworkArgsFullDenyRulesPrecedeAnyAllow(t *testing.T) {
 		if strings.HasPrefix(tok, "deny@") {
 			lastDenyIdx = i
 		}
+		// allow@dns is the one deliberate exception to "denies before allows" — it names the
+		// gateway, which `private` also covers, so under first-match-wins it has to win. Every
+		// OTHER allow must still come after every deny. See allowDNSArgs.
+		if tok == "allow@dns" {
+			continue
+		}
 		if strings.HasPrefix(tok, "allow@") && firstAllowIdx == -1 {
 			firstAllowIdx = i
 		}
@@ -106,7 +118,7 @@ func TestNetworkArgsFullDenyRulesPrecedeAnyAllow(t *testing.T) {
 
 func TestNetworkArgsNoneGolden(t *testing.T) {
 	np := NetworkPolicy{Mode: NetworkNone}
-	want := []string{"--no-net", "--on-secret-violation", "block-and-log"}
+	want := []string{"--no-net", "--on-secret-violation", "passthrough"}
 	got, err := NetworkArgs(np, false)
 	if err != nil {
 		t.Fatalf("NetworkArgs: %v", err)
@@ -233,8 +245,8 @@ func TestNetworkArgsOnSecretViolationAlwaysExplicit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NetworkArgs(%+v, %v): %v", np, hasSecrets, err)
 			}
-			if !containsPair(got, "--on-secret-violation", "block-and-log") {
-				t.Errorf("mode=%s hasSecrets=%v: missing explicit --on-secret-violation block-and-log: %v",
+			if !containsPair(got, "--on-secret-violation", "passthrough") {
+				t.Errorf("mode=%s hasSecrets=%v: missing explicit --on-secret-violation passthrough: %v",
 					np.Mode, hasSecrets, got)
 			}
 		}
@@ -308,18 +320,17 @@ func TestNetworkArgsThisRepoConfig(t *testing.T) {
 		t.Fatalf("NetworkArgs: %v", err)
 	}
 
-	want := []string{"--net-default", "deny"}
+	want := []string{"--net-default", "deny", "--net-rule", "allow@dns"}
 	for _, g := range msbDenyGroups {
 		want = append(want, "--net-rule", "deny@"+g)
 	}
-	want = append(want, "--net-rule", "allow@dns")
 	for _, h := range cfg.Network.Allow {
 		want = append(want, "--net-rule", "allow@"+h)
 	}
 	for _, h := range cfg.Network.Passthrough {
 		want = append(want, "--tls-bypass", h)
 	}
-	want = append(want, "--tls-intercept", "--on-secret-violation", "block-and-log")
+	want = append(want, "--tls-intercept", "--on-secret-violation", "passthrough")
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("argv mismatch for this repo's krayt.yaml:\n got  %#v\n want %#v", got, want)
@@ -445,6 +456,25 @@ func TestValidateNetworkPolicyForMsbRejectsInjectHostOutsideAllow(t *testing.T) 
 	}
 }
 
+func TestValidateNetworkPolicyForMsbRejectsSecretHostAlsoInPassthrough(t *testing.T) {
+	// A passthrough host is tunneled un-MITM'd (NetworkArgs: --tls-bypass skips both the
+	// substitution and blocking lists in msb's handler), so a secret scoped to that host can
+	// never actually be substituted — the guest would send only the placeholder. This must be
+	// rejected even though ValidateNetworkPolicy's own inject/passthrough conflict check never
+	// sees it: this function always calls that check with np.Inject empty.
+	np := NetworkPolicy{
+		Mode: NetworkAllowlist, Allow: []string{"api.github.com"}, Passthrough: []string{"api.github.com"},
+	}
+	err := ValidateNetworkPolicyForMsb(np, map[string]bool{"GH_TOKEN": true},
+		[]ConfigInjectRule{{Key: "GH_TOKEN", Host: "api.github.com"}})
+	if err == nil {
+		t.Fatal("expected an error for a secret host also present in network.passthrough")
+	}
+	if !strings.Contains(err.Error(), "passthrough") {
+		t.Errorf("error %q does not mention passthrough", err)
+	}
+}
+
 func contains(ss []string, v string) bool {
 	for _, s := range ss {
 		if s == v {
@@ -461,4 +491,89 @@ func containsPair(ss []string, a, b string) bool {
 		}
 	}
 	return false
+}
+
+// TestNetworkArgsAllowDNSPrecedesEveryDeny is the regression guard for the ENOTFOUND failure:
+// msb's `dns` target is the gateway's port 53, the gateway is inside `private`, and rules are
+// first-match-wins — so emitting deny@private before allow@dns silently left the guest unable to
+// resolve anything, in a sandbox whose policy otherwise looked exactly right. Every mode with a
+// network must therefore put allow@dns ahead of every deny@ rule.
+func TestNetworkArgsAllowDNSPrecedesEveryDeny(t *testing.T) {
+	for _, np := range []NetworkPolicy{
+		{Mode: NetworkAllowlist, Allow: []string{"api.anthropic.com"}},
+		{Mode: NetworkAllowlist}, // empty allowlist still has to resolve
+		{Mode: NetworkFull},
+	} {
+		got, err := NetworkArgs(np, false)
+		if err != nil {
+			t.Fatalf("NetworkArgs(%v): %v", np.Mode, err)
+		}
+		dnsIdx, firstDenyIdx := -1, -1
+		for i, tok := range got {
+			if tok == "allow@dns" && dnsIdx == -1 {
+				dnsIdx = i
+			}
+			if strings.HasPrefix(tok, "deny@") && firstDenyIdx == -1 {
+				firstDenyIdx = i
+			}
+		}
+		if dnsIdx == -1 {
+			t.Errorf("mode %q emitted no allow@dns — the guest would resolve nothing: %v", np.Mode, got)
+			continue
+		}
+		if firstDenyIdx != -1 && dnsIdx > firstDenyIdx {
+			t.Errorf("mode %q: allow@dns (index %d) comes after deny@ (index %d); first-match-wins means DNS is denied: %v",
+				np.Mode, dnsIdx, firstDenyIdx, got)
+		}
+	}
+}
+
+// TestNetworkArgsNoneHasNoDNSRule pins the other half: `none` means no network, so it must not
+// gain a DNS rule from the reordering above — --no-net with any rule beside it would punch
+// through the mode entirely (msb common.rs:2459-2465).
+func TestNetworkArgsNoneHasNoDNSRule(t *testing.T) {
+	got, err := NetworkArgs(NetworkPolicy{Mode: NetworkNone}, false)
+	if err != nil {
+		t.Fatalf("NetworkArgs: %v", err)
+	}
+	if contains(got, "allow@dns") || contains(got, "--net-rule") {
+		t.Errorf("none mode must emit no --net-rule at all: %v", got)
+	}
+}
+
+// TestOnSecretViolationIsPassthroughNotBlocking guards a choice that looks, from the outside, like
+// a hardening regression someone should "fix" back to blocking. It is the opposite, and the
+// reasoning is why this test exists rather than a bare golden line.
+//
+// The flag decides what happens when a secret's PLACEHOLDER — never its value — reaches a host
+// outside that secret's scope. Blocking there is unrecoverable for a coding agent: msb puts the
+// placeholder in the guest's own environment, so one `env` puts it in the agent's conversation,
+// and the agent resends its conversation to the model API every turn. run_df87bfc8 and
+// run_4125ef2e both died that way.
+//
+// Nothing is protected by blocking it. msb gates substitution on the secret's own allowed hosts
+// BEFORE consulting this action (handler.rs:579-600 at v0.6.16), so the placeholder is a public
+// sentinel that cannot be turned into a credential anywhere it should not be — verified on
+// hardware by hack/msb-probes/p7-passthrough-semantics.sh, which also proved in-scope substitution
+// still works under passthrough. Re-run p7 before changing this value.
+func TestOnSecretViolationIsPassthroughNotBlocking(t *testing.T) {
+	for _, np := range []NetworkPolicy{
+		{Mode: NetworkAllowlist, Allow: []string{"api.anthropic.com"}},
+		{Mode: NetworkFull},
+		{Mode: NetworkNone},
+	} {
+		got, err := NetworkArgs(np, true)
+		if err != nil {
+			t.Fatalf("NetworkArgs(%s): %v", np.Mode, err)
+		}
+		for _, blocking := range []string{"block", "block-and-log", "block-and-terminate"} {
+			if containsPair(got, "--on-secret-violation", blocking) {
+				t.Errorf("mode=%s emits --on-secret-violation %s. That blocks a request merely for "+
+					"mentioning a placeholder, which kills any agent that has ever run `env` — and "+
+					"protects nothing, since msb decides substitution from the secret's own scope "+
+					"before this action is read. If this was deliberate, re-run p7 and update the "+
+					"reasoning in NetworkArgs.", np.Mode, blocking)
+			}
+		}
+	}
 }

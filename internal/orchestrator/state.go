@@ -48,8 +48,9 @@ type RunRecord struct {
 	Questions    []QuestionMeta  `json:"questions,omitempty"`
 	Safety       []string        `json:"safety,omitempty"` // patch-lint findings (§14 Phase 5)
 	Error        string          `json:"error,omitempty"`
-	PID          int             `json:"pid,omitempty"`         // supervising process (for `krayt stop`)
-	CtrlSocket   string          `json:"ctrl_socket,omitempty"` // guest control socket (for `krayt answer`, §6.13)
+	PID          int             `json:"pid,omitempty"`          // supervising process (for `krayt stop`)
+	CtrlSocket   string          `json:"ctrl_socket,omitempty"`  // run control socket (for `krayt answer`, §6.13)
+	SandboxName  string          `json:"sandbox_name,omitempty"` // the msb sandbox this run created ("krayt-<id>")
 }
 
 // NetworkMeta is the run's egress policy as recorded in meta.json (§8.4). MITM/InjectedKeys are
@@ -179,20 +180,24 @@ func List(stateDir string) ([]RunRecord, error) {
 // LogPath is the persisted container-log path for a run dir.
 func LogPath(runDir string) string { return filepath.Join(runDir, "logs", "agent.log") }
 
-// ConsoleLogPath is the persisted guest serial-console log path for a run dir — the
-// guest-agent's own stdout/stderr (and anything it execs, e.g. the proxyd-uid
-// krayt-vsock-forward), as opposed to LogPath's container-only stdout/stderr. Populated
-// best-effort by Run before it tears the VM down (provider.VM.LogPaths); may not exist if the
-// provider had nothing to offer (e.g. the fake provider, or a VM that never got far enough to
-// boot).
+// ConsoleLogPath is the persisted boot/system diagnostics path for a run dir — msb's `logs
+// --source system --json` output (run-tasks-on-microsandbox.md decision 7), including the
+// reconstructed error block msb prepends when a sandbox never finished starting. This is the
+// msb-era replacement for the pre-msb guest serial console log; the file name is unchanged so
+// existing `krayt attach`/log-reading tooling need not change. Populated best-effort by Run
+// before it stops+removes the sandbox; may be empty if the sandbox never got far enough to
+// produce anything.
 func ConsoleLogPath(runDir string) string { return filepath.Join(runDir, "logs", "console.log") }
 
-// ProxyLogPath is the persisted HOST-side egress-proxy child log path for a run dir (§6.6, §9
-// of move-egress-proxy-to-host.md): the redacted stdout/stderr of `krayt __egress-proxy`
-// (allow/deny verdicts, dial errors — never bodies). Distinct from ConsoleLogPath, which is
-// still guest-side diagnostics; this is the first artifact whose content originates entirely
-// on the host.
-func ProxyLogPath(runDir string) string { return filepath.Join(runDir, "proxy.log") }
+// TranscriptDirPath is where a run's captured agent session transcript lands (§8.4) — a directory,
+// because an agent may produce more than one session file and krayt copies whatever it finds
+// rather than picking. Written only when the run opted in (--transcript / `transcript: true`) and
+// the selected adapter declares a path; absent otherwise, which is the default.
+//
+// Contents are the agent's own files, redacted against the run's secrets and size-capped, and are
+// an OPAQUE diagnostic artifact: every agent CLI treats its transcript schema as internal and
+// changes it between releases, so this is for humans and grep, never for krayt to parse.
+func TranscriptDirPath(runDir string) string { return filepath.Join(runDir, "logs", "transcript") }
 
 // FollowLog tails runDir/logs/agent.log, writing new bytes to w as they appear, until the
 // run reaches a terminal state (log then drained) or ctx is canceled. Because it reads the

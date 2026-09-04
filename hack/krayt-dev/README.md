@@ -178,36 +178,6 @@ vendored into this image), `go mod download`/`go build` will need to reach the m
 add `proxy.golang.org` and `sum.golang.org` to the run's `--allow` list. Claude Code itself
 needs `api.anthropic.com` (plus whatever host your credential's provider requires).
 
-## Proto codegen (direct, no Nix needed)
-
-`make proto` shells out to `nix run .#proto`. Nix *is* present in this image (for `vendorHash`,
-below), but proto codegen doesn't need it — the direct `protoc` path is lighter and pulls no flake
-inputs, so prefer it. If a task has the agent edit `internal/protocol/krayt.proto`, it needs to
-regenerate `internal/protocol/pb` — the generated code is committed, so this only matters when the
-`.proto` file itself changes.
-
-Two equivalent no-Nix paths, both wrapping the same command as the flake's `proto` derivation
-(verified against `flake.nix`):
-
-```sh
-make proto-direct
-# or directly:
-hack/krayt-dev/proto-direct.sh
-```
-
-which runs:
-
-```sh
-protoc \
-  --proto_path=internal/protocol \
-  --go_out=. --go_opt=module=github.com/418-cloud/krayt \
-  --go-grpc_out=. --go-grpc_opt=module=github.com/418-cloud/krayt \
-  internal/protocol/krayt.proto
-```
-
-Tell the agent (in the task prompt) to run this — and to re-run `go build ./...` /
-`go test ./...` afterwards — whenever it changes `krayt.proto`.
-
 ## Regenerating vendorHash (Nix)
 
 The guest-agent is built with Nix `buildGoModule`, whose `vendorHash` (in `images/flake.nix`) pins

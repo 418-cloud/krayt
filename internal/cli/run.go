@@ -17,10 +17,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/418-cloud/krayt/internal/adapter"
-	"github.com/418-cloud/krayt/internal/guest"
-	"github.com/418-cloud/krayt/internal/imagestore"
 	"github.com/418-cloud/krayt/internal/orchestrator"
-	"github.com/418-cloud/krayt/internal/provider"
+	"github.com/418-cloud/krayt/internal/sandbox"
 	"github.com/418-cloud/krayt/internal/secrets"
 	"github.com/418-cloud/krayt/internal/task"
 )
@@ -36,12 +34,21 @@ const (
 // stdinTaskArg is the --task value that means "read the prompt from stdin" instead of a file path.
 const stdinTaskArg = "-"
 
-// runDeps are the OS-specific collaborators for a run, assembled by the build-tagged
-// newRunDeps (vfkit + the pulled base image on macOS; an error elsewhere until the
-// firecracker backend, Phase 6).
+// runDeps are the collaborators for a run — just the msb driver now that the sandbox layer is
+// rented rather than built (run-tasks-on-microsandbox.md). No longer OS-specific: msb is the
+// one dependency here, and internal/sandbox has no build tags.
 type runDeps struct {
-	provider provider.Provider
-	baseVM   provider.VMSpec
+	sandbox *sandbox.Client
+}
+
+// newRunDeps resolves the msb driver (PATH or KRAYT_MSB_BIN). Version/backend health is
+// `krayt doctor`'s job (internal/sandbox.DoctorChecks), not re-checked on every run.
+func newRunDeps() (runDeps, error) {
+	sb, err := sandbox.NewClient()
+	if err != nil {
+		return runDeps{}, err
+	}
+	return runDeps{sandbox: sb}, nil
 }
 
 // runFlags holds the Phase 2 `krayt run` flag set (a subset of §13; secrets, network, and
@@ -53,6 +60,7 @@ type runFlags struct {
 	repo         string
 	secretsFile  string
 	includeDirty bool
+	transcript   bool
 	netMode      string
 	allow        []string
 	env          map[string]string
@@ -76,13 +84,16 @@ type runFlags struct {
 	// for it in v1 (config-file only), so it stays the secure zero value when no config is present.
 	container task.ContainerPolicy
 
-	// mitm/passthrough/inject are resolved from krayt.yaml's `network:` block
-	// (add-tls-mitm-credential-injection.md §1); config-file only, no CLI flags, so they stay the
-	// secure zero value (mitm off) when no config is present. Only an explicit --config may set
-	// them — see applyConfig.
+	// mitm/passthrough/secrets are resolved from krayt.yaml's `network:` block; config-file only,
+	// no CLI flags, so they stay the secure zero value when no config is present. Only an
+	// explicit --config may set them — see applyConfig. mitm has no msb meaning any more
+	// (task.ValidateNetworkPolicyForMsb hard-errors it) and is kept only so a config that still
+	// sets it is caught and named, not silently dropped. secrets is the msb-era replacement for
+	// the pre-msb inject shape (hand-secrets-to-msb.md): one task.SecretSpec per
+	// network.inject[] entry, naming a secrets-file key and the hosts msb may substitute it into.
 	mitm        bool
 	passthrough []string
-	inject      []task.InjectRule
+	secrets     []task.SecretSpec
 
 	// configPath is the krayt.yaml actually loaded (explicit or auto-discovered), or "" when the
 	// run is flags-only; it names the provenance of the policy in the pre-boot summary.
@@ -113,6 +124,7 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.StringVar(&f.repo, "repo", ".", "host repo to bundle")
 	fl.StringVar(&f.secretsFile, "secrets", "", "per-task secrets file (KEY=VALUE), mounted on tmpfs at /run/secrets")
 	fl.BoolVar(&f.includeDirty, "include-dirty", false, "include uncommitted working-tree changes in the bundle")
+	fl.BoolVar(&f.transcript, "transcript", false, "copy the agent's own session transcript out of the sandbox into .krayt/runs/<id>/logs/transcript/ before teardown — records the tool calls and results the agent log does not (§8.4)")
 	fl.StringVar(&f.netMode, "net", "allowlist", "egress policy: allowlist | full | none")
 	fl.StringArrayVar(&f.allow, "allow", nil, "allowlisted egress domain (repeatable); only with --net allowlist")
 	fl.IntVar(&f.bundleDepth, "bundle-depth", 1, "forward bundle: 1 = single-commit snapshot, 0 = full history")
@@ -276,7 +288,7 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		IncludeDirty: f.includeDirty,
 		Network: task.NetworkPolicy{
 			Mode: netMode, Allow: f.allow,
-			MITM: f.mitm, Passthrough: f.passthrough, Inject: f.inject,
+			MITM: f.mitm, Passthrough: f.passthrough, Secrets: f.secrets,
 		},
 		Env:         f.env,
 		BundleDepth: f.bundleDepth,
@@ -292,11 +304,11 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		Container: f.container,
 	}
 
-	// Optional per-agent adapter (§6.14): validate auth (exactly-one, fail fast before any VM
-	// boots or image pull), merge its env additions — e.g. wiring krayt-ask when questions are
-	// enabled — under the user's env, which wins, and (network.mitm on, an observed credential
-	// shape — inject-claude-oauth-token-at-proxy.md §2/§4) merge its injection rule into
-	// spec.Network.Inject, again with the user's own network.inject winning any conflict.
+	// Optional per-agent adapter (§6.14): validate auth (exactly-one, fail fast before any
+	// sandbox is created), merge its env additions — e.g. wiring krayt-ask when questions are
+	// enabled — under the user's env, which wins, and merge its own secret scope into
+	// spec.Network.Secrets (hand-secrets-to-msb.md), again with the user's own network.inject
+	// winning any conflict.
 	secretKeys, err := loadSecretKeySet(spec.SecretsPath)
 	if err != nil {
 		return err
@@ -304,13 +316,25 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	if err := applyAdapter(cmd.OutOrStdout(), &spec, f.agent, secretKeys); err != nil {
 		return err
 	}
+	if !f.transcript {
+		// Opt-in (§8.3): a transcript is the whole conversation — every file read, every command
+		// and its output — so it is captured only when asked for, never by default.
+		spec.TranscriptDir = ""
+	}
+	if err := task.ValidateContainerPolicyForMsb(spec.Container); err != nil {
+		return err
+	}
 
-	// network.mitm/passthrough/inject pre-flight (§1, add-tls-mitm-credential-injection.md): every
-	// rule — adapter-supplied or hand-written, now merged into one set above — is checked against
-	// the secrets file and the allow/passthrough lists before any VM or image work, so a typo (or
-	// an adapter rule naming a host the user never allowlisted) fails fast instead of producing a
-	// run that fails opaquely once the agent actually tries to authenticate.
-	if err := task.ValidateNetworkPolicy(spec.Network, secretKeys); err != nil {
+	// network.mitm/passthrough/inject pre-flight (run-tasks-on-microsandbox.md): every secret
+	// scope — adapter-supplied or hand-written, now merged into one set above — is checked
+	// against the secrets file and the allow/passthrough lists before any sandbox work, so a
+	// typo (or an adapter scope naming a host the user never allowlisted) fails fast instead of
+	// producing a run that fails opaquely once the agent actually tries to authenticate.
+	// ValidateNetworkPolicyForMsb re-derives specs from an inject list, so the FINAL merged
+	// spec.Network.Secrets is round-tripped back into that shape rather than re-validating only
+	// the user's raw config (which would wrongly reject an adapter-scoped credential that has no
+	// hand-written network.inject entry of its own).
+	if err := task.ValidateNetworkPolicyForMsb(spec.Network, secretKeys, secretsToInjectRules(spec.Network.Secrets)); err != nil {
 		return err
 	}
 
@@ -355,14 +379,9 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		return spawnDetachedRun(cmd, filepath.Join(repoAbs, ".krayt"), spec.ID, spooledTaskFile)
 	}
 
-	// OS-specific provider + base VM image (vfkit on macOS; error elsewhere until Phase 7).
+	// Resolve the msb driver. Image acquisition is msb's own job now (`msb create` pulls it) —
+	// there is no host-side image cache to populate first (§6.11's imagestore is gone).
 	deps, err := newRunDeps()
-	if err != nil {
-		return err
-	}
-
-	// Acquire the user image on the host and pre-load it over vsock (§6.11).
-	img, err := acquireUserImage(cmd, spec.ImageRef)
 	if err != nil {
 		return err
 	}
@@ -374,10 +393,8 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	// Drive the run through the Manager so it writes state under <repo>/.krayt (§6.2) and the
 	// management commands can observe it. v1 supervises in the foreground (this process).
 	mgr := orchestrator.NewManager(orchestrator.Deps{
-		Provider: deps.provider,
-		BaseVM:   deps.baseVM,
-		Image:    img,
-		LogOut:   logOut,
+		Sandbox: deps.sandbox,
+		LogOut:  logOut,
 	}, filepath.Join(repoAbs, ".krayt"), f.maxConc)
 	res, err := mgr.Run(cmd.Context(), spec)
 	if err != nil {
@@ -399,8 +416,24 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	return err
 }
 
+// secretsToInjectRules round-trips a merged []task.SecretSpec back into the
+// []task.ConfigInjectRule shape task.ValidateNetworkPolicyForMsb expects — it re-derives specs
+// from that shape internally (SecretSpecsFromConfig), so validating the truly final, adapter-
+// merged secret scope (rather than only the user's raw krayt.yaml) means handing it back exactly
+// what it would parse to. Key+Hosts round-trip losslessly; SecretSpec carries nothing else.
+func secretsToInjectRules(specs []task.SecretSpec) []task.ConfigInjectRule {
+	if len(specs) == 0 {
+		return nil
+	}
+	out := make([]task.ConfigInjectRule, len(specs))
+	for i, s := range specs {
+		out[i] = task.ConfigInjectRule{Key: s.Key, Hosts: s.Hosts}
+	}
+	return out
+}
+
 // loadSecretKeySet reads the per-task secrets file (if any) and returns just its key NAMES as a
-// set, for network.inject validation (task.ValidateNetworkPolicy) — never the values.
+// set, for network.inject validation (task.ValidateNetworkPolicyForMsb) — never the values.
 func loadSecretKeySet(secretsPath string) (map[string]bool, error) {
 	if secretsPath == "" {
 		return nil, nil
@@ -418,12 +451,12 @@ func loadSecretKeySet(secretsPath string) (map[string]bool, error) {
 
 // applyAdapter runs the optional per-agent adapter's host-side pre-flight (§6.14): it passes only
 // the credential key NAMES — never the values — to the adapter, which enforces the agent's
-// exactly-one auth rule; then it merges the adapter's non-secret env additions (e.g. the
-// krayt-ask socket, or a shape-translation placeholder — inject-claude-oauth-token-at-proxy.md §3)
-// under spec.Env so a user-set value always wins, and unions any adapter-supplied injection rule
-// into spec.Network.Inject (§4) — logged to out so a user overriding an adapter-managed header
-// can see it happened. Called before the VM boots (and before task.ValidateNetworkPolicy, which
-// re-checks the merged set) so a bad credential set or a bad merged rule fails fast.
+// exactly-one auth rule; then it merges the adapter's non-secret env additions (e.g. wiring the
+// krayt-ask socket) under spec.Env so a user-set value always wins, and merges its selected
+// credential's secret scope into spec.Network.Secrets (hand-secrets-to-msb.md) — logged to out so
+// a user who scoped the same credential themselves can see their own hosts won. Called before the
+// sandbox is created (and before task.ValidateNetworkPolicyForMsb, which re-checks the merged
+// set) so a bad credential set or a bad merged scope fails fast.
 func applyAdapter(out io.Writer, spec *task.RunSpec, name string, secretKeys map[string]bool) error {
 	ad, err := adapter.Get(name)
 	if err != nil {
@@ -436,18 +469,19 @@ func applyAdapter(out io.Writer, spec *task.RunSpec, name string, secretKeys map
 	plan, err := ad.Prepare(adapter.Input{
 		SecretKeys:    keys,
 		QuestionsWait: spec.Questions.Mode == task.QuestionWait,
-		AskSocket:     guest.ContainerAskSocket,
-		InjectedKeys:  spec.Network.InjectedSecretKeys(),
-		MITM:          spec.Network.MITM,
+		AskSocket:     sandbox.AskSocketEnv,
 	})
 	if err != nil {
 		return err
 	}
 	mergeEnv(spec, plan.Env)
-	mergeEnv(spec, plan.Placeholders)
-	if len(plan.Inject) > 0 {
-		merged, overrides := task.MergeInjectRules(spec.Network.Inject, plan.Inject)
-		spec.Network.Inject = merged
+	// Recorded unconditionally; the caller clears it when --transcript is off. Keeping the gate at
+	// the one place that knows the flag preserves the invariant the orchestrator relies on — a
+	// non-empty spec.TranscriptDir means "capture this" and nothing else needs consulting.
+	spec.TranscriptDir = plan.TranscriptDir
+	if len(plan.Secrets) > 0 {
+		merged, overrides := task.MergeSecretSpecs(spec.Network.Secrets, plan.Secrets)
+		spec.Network.Secrets = merged
 		for _, o := range overrides {
 			if _, err := fmt.Fprintf(out, "network.inject: %s\n", o); err != nil {
 				return err
@@ -473,23 +507,6 @@ func mergeEnv(spec *task.RunSpec, additions map[string]string) {
 			spec.Env[k] = v
 		}
 	}
-}
-
-// acquireUserImage pulls the user image into the host cache and returns it (§6.11).
-func acquireUserImage(cmd *cobra.Command, ref string) (*imagestore.Image, error) {
-	base, err := krayCacheBase()
-	if err != nil {
-		return nil, err
-	}
-	cacheRoot := filepath.Join(base, "krayt", "imagestore")
-	src, err := imagestore.Remote(ref)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "acquiring image %s …\n", ref); err != nil {
-		return nil, err
-	}
-	return imagestore.Acquire(cmd.Context(), src, ref, cacheRoot)
 }
 
 // spoolTaskPrompt writes a stdin-read task prompt to a file in the run dir so a detached
@@ -686,9 +703,15 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	// means the operator named the file with --config.
 	f.mitm = cfg.Network.MITM
 	f.passthrough = cfg.Network.Passthrough
-	f.inject = task.InjectRulesFromConfig(cfg.Network.Inject)
+	f.secrets, err = task.SecretSpecsFromConfig(cfg.Network.Inject)
+	if err != nil {
+		return fmt.Errorf("config %s: %w", path, err)
+	}
 	if !changed("include-dirty") && cfg.IncludeDirty != nil {
 		f.includeDirty = *cfg.IncludeDirty
+	}
+	if !changed("transcript") && cfg.Transcript != nil {
+		f.transcript = *cfg.Transcript
 	}
 	if !changed("bundle-depth") && cfg.BundleDepth != nil {
 		f.bundleDepth = *cfg.BundleDepth
@@ -851,47 +874,26 @@ func resolveAbs(path string) (string, error) {
 	return filepath.Abs(resolved)
 }
 
-// printNetworkPolicy writes the run's resolved egress policy to w before the VM boots — the
-// operator's last chance to notice a host or an injected header they did not choose, since
-// meta.json/report.md only record it after the fact. Inject rules are summarized by host and
-// header NAME only: the values are secrets-file key names that resolve to real credentials
-// host-side, and neither the key name's value nor a literal belongs on a terminal.
+// printNetworkPolicy writes the run's resolved egress policy to w before the sandbox is created —
+// the operator's last chance to notice a host or a secret scope they did not choose, since
+// meta.json/report.md only record it after the fact. Secrets are summarized by KEY NAME and
+// HOSTS only — msb substitutes the value at the host TLS boundary, so it never belongs on a
+// terminal.
 func printNetworkPolicy(w io.Writer, p task.NetworkPolicy, source string) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "network policy (from %s): mode=%s", source, p.Mode)
 	if p.Mode == task.NetworkAllowlist {
 		fmt.Fprintf(&b, " allow=%s", strings.Join(p.Allow, ","))
 	}
-	fmt.Fprintf(&b, " mitm=%t\n", p.MITM)
+	fmt.Fprintf(&b, " secrets-scoped=%t\n", len(p.Secrets) > 0)
 	if len(p.Passthrough) > 0 {
 		fmt.Fprintf(&b, "  passthrough (not intercepted): %s\n", strings.Join(p.Passthrough, ","))
 	}
-	for _, r := range p.Inject {
-		fmt.Fprintf(&b, "  inject %s:", r.Host)
-		if len(r.Strip) > 0 {
-			fmt.Fprintf(&b, " strip=%s", strings.Join(sortedCopy(r.Strip), ","))
-		}
-		if hs := injectedHeaderNames(r); len(hs) > 0 {
-			fmt.Fprintf(&b, " set=%s", strings.Join(hs, ","))
-		}
-		b.WriteString("\n")
+	for _, s := range p.Secrets {
+		fmt.Fprintf(&b, "  secret %s -> %s\n", s.Key, strings.Join(sortedCopy(s.Hosts), ","))
 	}
 	_, err := io.WriteString(w, b.String())
 	return err
-}
-
-// injectedHeaderNames returns the sorted header names a rule sets, across all three set forms —
-// names only, never the mapped values (a secrets-file key name for Set/SetPrefix, a literal for
-// SetLiteral).
-func injectedHeaderNames(r task.InjectRule) []string {
-	names := make([]string, 0, len(r.Set)+len(r.SetPrefix)+len(r.SetLiteral))
-	for _, m := range []map[string]string{r.Set, r.SetPrefix, r.SetLiteral} {
-		for k := range m {
-			names = append(names, k)
-		}
-	}
-	slices.Sort(names)
-	return slices.Compact(names)
 }
 
 // sortedCopy returns a sorted copy of s, leaving the caller's slice alone.

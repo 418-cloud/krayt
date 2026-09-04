@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/418-cloud/krayt/internal/guest/ask"
+	"github.com/418-cloud/krayt/internal/askbridge"
 )
 
 // execMarkerEnv turns a re-exec of this test binary into the real krayt-ask CLI (the repo's
@@ -78,10 +78,10 @@ func TestRunRoundTrip(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 
-	b := ask.NewBridge(func(_, _ string, _ []string) error { return nil })
+	b := askbridge.NewBridge(func(_, _ string, _ []string) error { return nil })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ask.Serve(ctx, ln, b) }()
+	go func() { _ = askbridge.Serve(ctx, ln, b) }()
 
 	// The first question the bridge registers is "q1"; answer it once it appears.
 	go func() {
@@ -129,10 +129,10 @@ func TestRealBinaryRoundTrip(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 
-	b := ask.NewBridge(func(_, _ string, _ []string) error { return nil })
+	b := askbridge.NewBridge(func(_, _ string, _ []string) error { return nil })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = ask.Serve(ctx, ln, b) }()
+	go func() { _ = askbridge.Serve(ctx, ln, b) }()
 	go func() {
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {

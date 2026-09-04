@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-
-	"github.com/418-cloud/krayt/internal/protocol/pb"
 )
 
 // QuestionRecord is a persisted agent → human Q&A pair at
@@ -27,16 +25,6 @@ type QuestionRecord struct {
 func questionsDir(runDir string) string { return filepath.Join(runDir, "questions") }
 
 // writeQuestion records a newly-asked question (before it is answered).
-func writeQuestion(runDir string, q *pb.Question) error {
-	rec := QuestionRecord{
-		ID:      q.GetId(),
-		Prompt:  q.GetPrompt(),
-		Choices: q.GetChoices(),
-		AskedAt: nowStamp(),
-	}
-	return writeQuestionRecord(runDir, rec)
-}
-
 func writeQuestionRecord(runDir string, rec QuestionRecord) error {
 	dir := questionsDir(runDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

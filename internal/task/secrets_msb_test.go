@@ -96,6 +96,29 @@ func TestSecretSpecsFromConfigEmptyInputIsEmptyOutput(t *testing.T) {
 	}
 }
 
+func TestMergeSecretSpecsUserWins(t *testing.T) {
+	user := []SecretSpec{{Key: "ANTHROPIC_API_KEY", Hosts: []string{"user.example.com"}}}
+	adapter := []SecretSpec{{Key: "ANTHROPIC_API_KEY", Hosts: []string{"api.anthropic.com"}}}
+	merged, overrides := MergeSecretSpecs(user, adapter)
+	if !reflect.DeepEqual(merged, user) {
+		t.Errorf("merged = %+v, want the user's own scope %+v to win", merged, user)
+	}
+	if len(overrides) != 1 {
+		t.Errorf("overrides = %v, want one override line", overrides)
+	}
+}
+
+func TestMergeSecretSpecsAdapterFillsGap(t *testing.T) {
+	adapter := []SecretSpec{{Key: "ANTHROPIC_API_KEY", Hosts: []string{"api.anthropic.com"}}}
+	merged, overrides := MergeSecretSpecs(nil, adapter)
+	if len(overrides) != 0 {
+		t.Errorf("overrides = %v, want none", overrides)
+	}
+	if !reflect.DeepEqual(merged, adapter) {
+		t.Errorf("merged = %+v, want %+v", merged, adapter)
+	}
+}
+
 func TestSecretSpecsFromConfigMultipleEntriesPreserveOrder(t *testing.T) {
 	specs, err := SecretSpecsFromConfig([]ConfigInjectRule{
 		{Key: "ANTHROPIC_API_KEY", Host: "api.anthropic.com"},

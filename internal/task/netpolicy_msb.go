@@ -47,17 +47,18 @@ func NetworkArgs(np NetworkPolicy, hasSecrets bool) ([]string, error) {
 		// Explicit both ways (decision 6): egress allow is the opt-in `full` grants, ingress deny
 		// closes msb's own default-allow ingress posture before krayt ever publishes a port.
 		args = append(args, "--net-default-egress", "allow", "--net-default-ingress", "deny")
+		args = append(args, allowDNSArgs()...)
 		args = append(args, denyGroupArgs()...)
 		// `full`'s allow must not mean "and also the host's LAN" — the deny-group rules above
 		// stand even though the default action already allows everything else.
 
 	case NetworkAllowlist:
 		args = append(args, "--net-default", "deny")
-		args = append(args, denyGroupArgs()...)
 		// The guest gains a real, policed network interface under msb (unlike the pre-msb design,
 		// where allowlist/none left the guest with no usable network at all) — without this rule
 		// nothing resolves (decision 7).
-		args = append(args, "--net-rule", "allow@dns")
+		args = append(args, allowDNSArgs()...)
+		args = append(args, denyGroupArgs()...)
 		for _, h := range np.Allow {
 			args = append(args, "--net-rule", "allow@"+h)
 		}
@@ -76,9 +77,56 @@ func NetworkArgs(np NetworkPolicy, hasSecrets bool) ([]string, error) {
 		args = append(args, "--tls-intercept")
 	}
 	// Set explicitly rather than inherited, in every mode, regardless of hasSecrets.
-	args = append(args, "--on-secret-violation", "block-and-log")
+	//
+	// `passthrough`, not msb's `block-and-log` default, and this is a deliberated choice rather
+	// than the "be explicit" reflex that first put block-and-log here.
+	//
+	// What the flag governs is what happens when a secret's PLACEHOLDER — not its value — is seen
+	// heading to a host outside that secret's own scope. Under block-and-log that request is
+	// killed, and for a coding agent this is unrecoverable by construction: msb sets each secret's
+	// env var in the guest to the placeholder itself, so a single `env` (or any tool output that
+	// quotes one) puts the string into the agent's conversation, and the agent resends its whole
+	// conversation to the model API on every turn. Every subsequent turn is then blocked, forever.
+	// Two real runs died exactly this way (run_df87bfc8, run_4125ef2e), the second while the agent
+	// was diagnosing a missing git remote — not doing anything untoward.
+	//
+	// Passing it through is safe, and structurally so rather than by convention: msb decides
+	// substitution from the secret's own allowed hosts BEFORE it consults this action at all
+	// (crates/network/lib/secrets/handler.rs:579-600 at v0.6.16), so no value of this flag can
+	// cause a secret to be substituted at a host outside its scope. A matching passthrough skips
+	// both the substitution list and the blocking list — forwarded unchanged, not blocked
+	// (handler.rs:605-612). Confirmed on hardware, not just read: hack/msb-probes/p7-passthrough-
+	// semantics.sh measured the placeholder arriving out of scope, the identical request blocked
+	// under block-and-log, and in-scope substitution still working.
+	//
+	// The cost, stated plainly: passthrough is SILENT. msb's `secret violation` warning is emitted
+	// inside its BlockingAction match, which passthrough never reaches (handler.rs:1508-1525), so
+	// krayt gives up that log line. It is a warning about a public sentinel that cannot be
+	// substituted anywhere it should not be, and the model host would trip it on every single
+	// turn — noise about a non-event, traded for runs that survive. If the signal is ever wanted
+	// back, the precise instrument is a per-secret `on_violation: Passthrough([<model host>])`
+	// through --secret-conf, which keeps block-and-log everywhere else (SecretEntry.on_violation,
+	// domain.rs:2125-2127; effective_violation_action, handler.rs:2322-2339).
+	args = append(args, "--on-secret-violation", "passthrough")
 
 	return args, nil
+}
+
+// allowDNSArgs renders the `allow@dns` rule, which must be emitted BEFORE denyGroupArgs in every
+// mode that has a network at all. msb evaluates rules first-match-wins within a direction, and
+// `dns` is not an abstract capability — it is a destination: msb's own help defines it as "the
+// semantic `dns` target for gateway UDP/TCP port 53", and that gateway is the guest's end of a
+// /30 carved out of --net-ipv4-pool, which defaults to 172.16.0.0/12. So `dns` and `private`
+// name overlapping destinations, and whichever rule krayt emits first decides.
+//
+// Emitting the denies first — the ordering translate-network-policy-to-msb.md's general "denies
+// before allows" rule asks for — therefore matched deny@private on the gateway and the guest
+// resolved nothing at all: an agent inside an otherwise correct allowlist sandbox failed every
+// request with ENOTFOUND before a single packet reached an allowed host. `dns` is the one target
+// that has to precede the deny groups, and it is a narrow exception to make: it opens exactly the
+// gateway's port 53, not the private groups those denies exist to close.
+func allowDNSArgs() []string {
+	return []string{"--net-rule", "allow@dns"}
 }
 
 // denyGroupArgs renders one "--net-rule" "deny@<group>" pair per msbDenyGroups entry, in order.
@@ -140,6 +188,7 @@ func ValidateNetworkPolicyForMsb(np NetworkPolicy, secretKeys map[string]bool, i
 	}
 
 	allow := lowerSet(np.Allow)
+	passthrough := lowerSet(np.Passthrough)
 	specKeys := make(map[string]bool, len(specs))
 	for _, s := range specs {
 		specKeys[s.Key] = true
@@ -149,6 +198,15 @@ func ValidateNetworkPolicyForMsb(np NetworkPolicy, secretKeys map[string]bool, i
 			}
 			if np.Mode == NetworkAllowlist && !allow[lower(h)] {
 				return fmt.Errorf("network: inject (%s): host %q must also be in allow (mode: allowlist)", s.Key, h)
+			}
+			// A passthrough host is tunneled un-MITM'd (NetworkArgs: --tls-bypass skips both the
+			// substitution and blocking lists), so a secret scoped there can never be substituted —
+			// the guest would send only the placeholder. ValidateNetworkPolicy's own inject/passthrough
+			// check below cannot catch this: it walks np.Inject, which is always empty here (this
+			// function rejects a populated one above), so msb secret scopes need their own check.
+			if passthrough[lower(h)] {
+				return fmt.Errorf("network: inject (%s): host %q is also in passthrough — a passthrough "+
+					"host is tunneled un-MITM'd and can never receive secret substitution", s.Key, h)
 			}
 		}
 		if secretKeys != nil && !secretKeys[s.Key] {

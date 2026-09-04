@@ -64,6 +64,30 @@ func SecretSpecsFromConfig(crs []ConfigInjectRule) ([]SecretSpec, error) {
 	return specs, nil
 }
 
+// MergeSecretSpecs unions an adapter-selected credential's SecretSpec into the user's own
+// network.inject-derived specs (run-tasks-on-microsandbox.md), mirroring MergeInjectRules'
+// precedent for the pre-msb shape: a key the user already scoped is left untouched (the user's
+// host list wins outright, since there is no per-host merge to do — msb scopes a secret to a
+// set of hosts, not a single header), and adapterSpecs contributes only keys the user did not
+// already name. Returns the merged list plus one human-readable line per key the user's own
+// entry took precedence over, for the caller to log.
+func MergeSecretSpecs(user, adapterSpecs []SecretSpec) (merged []SecretSpec, overrides []string) {
+	merged = append([]SecretSpec(nil), user...)
+	have := make(map[string]bool, len(user))
+	for _, s := range user {
+		have[s.Key] = true
+	}
+	for _, as := range adapterSpecs {
+		if have[as.Key] {
+			overrides = append(overrides, fmt.Sprintf("user config overrides adapter-supplied secret scope for %q", as.Key))
+			continue
+		}
+		have[as.Key] = true
+		merged = append(merged, as)
+	}
+	return merged, overrides
+}
+
 // hostsFromConfigInjectRule resolves the msb shape's host/hosts pair: exactly one of the two
 // singular/plural forms must be set (decision 4's "host xor hosts").
 func hostsFromConfigInjectRule(cr ConfigInjectRule) ([]string, error) {

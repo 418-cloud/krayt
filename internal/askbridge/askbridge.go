@@ -1,20 +1,17 @@
 // Package askbridge is the host-side half of the agent → human question channel under msb
-// (dial-ask-channel-over-vsock.md, §6.13): the moved, hardened continuation of
-// internal/guest/ask, now running in the krayt host process instead of inside the guest.
-// krayt-ask (or its --mcp front-end) inside the sandbox dials AF_VSOCK straight to the host; msb
-// bridges that to a host unix socket (Listen); Serve accepts connections on it and answers each
-// with one question/answer exchange against a Bridge — the same newline-delimited JSON wire
-// protocol, wire structs, and pending-question map internal/guest/ask has always used, unchanged.
+// (dial-ask-channel-over-vsock.md, §6.13), running in the krayt host process rather than inside
+// a guest. krayt-ask (or its --mcp front-end) inside the sandbox dials AF_VSOCK straight to the
+// host; msb bridges that to a host unix socket (Listen); Serve accepts connections on it and
+// answers each with one question/answer exchange against a Bridge — a newline-delimited JSON
+// wire protocol shared with the client half in internal/askclient (the same shape a pre-msb
+// in-guest bridge used, before run-tasks-on-microsandbox.md's cut-over deleted it).
 //
-// This is additive, not a cut-over (dial-ask-channel-over-vsock.md, "Sequencing — additive
-// only"): internal/guest/ask and cmd/krayt-vsock-forward stay live until
-// run-tasks-on-microsandbox.md deletes both. The redaction that guest-side wiring applies before
-// push (internal/guest/service.go) moves with the caller, not into this package: the host already
-// holds every secret value, so whatever constructs a Bridge here can redact in its own push
-// closure before persisting a question — see NewBridge.
+// The redaction a caller applies before push moves with the caller, not into this package: the
+// host already holds every secret value, so whatever constructs a Bridge here can redact in its
+// own push closure before persisting a question — see NewBridge.
 //
-// Serve now runs in the host process, reading bytes an arbitrary sandbox process wrote, so it
-// carries three bounds internal/guest/ask never needed under §10's per-VM resource limits
+// Serve runs in the host process, reading bytes an arbitrary sandbox process wrote, so it
+// carries three bounds a pre-msb in-guest bridge never needed under §10's per-VM resource limits
 // (decision 8): a byte cap on one request (maxAskRequestBytes), a read deadline around decoding
 // only — never around Bridge.Ask, which legitimately blocks for the run's whole
 // --question-timeout — and a cap on in-flight questions (maxPendingQuestions), past which a new
@@ -36,8 +33,8 @@ import (
 )
 
 // wireRequest / wireResponse are the newline-delimited JSON protocol spoken over the socket: the
-// sandbox writes one request, reads one response, per connection. Unchanged from
-// internal/guest/ask (dial-ask-channel-over-vsock.md decision 5).
+// sandbox writes one request, reads one response, per connection — shared verbatim with the
+// client half in internal/askclient (dial-ask-channel-over-vsock.md decision 5).
 type wireRequest struct {
 	Prompt  string   `json:"prompt"`
 	Choices []string `json:"choices,omitempty"`
@@ -150,7 +147,8 @@ const maxAskRequestBytes = 64 << 10
 // askReadDeadline bounds how long Serve waits for a connection to finish writing its request,
 // before Bridge.Ask is ever called (decision 8: a stalled connection is dropped here, while an
 // accepted question survives a wait far longer than this once decoding has already succeeded) —
-// mirroring internal/provider/firecracker/vsock.go's handshakeTimeout.
+// mirroring the same handshakeTimeout idiom the pre-msb Firecracker provider used for its own
+// vsock connection setup.
 //
 // Both timeouts here are constants passed down as arguments rather than vars a test can shrink in
 // place. The shrink-the-package-var pattern is a data race in this package and was caught as one:
@@ -236,13 +234,17 @@ func lingerUntilPeerCloses(conn net.Conn, timeout time.Duration) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(conn, maxAskRequestBytes))
 }
 
-// Listen creates dir (the run's own private state directory, decision 4 — NOT vfkit's shared
-// `/tmp/krayt-<uid>` root, which exists only for macOS's sockaddr_un length limit) if necessary,
-// reusing sockroot.Ensure's hostile-pre-existing-directory refusal (decision 12) rather than a
-// second copy of that check, then binds a unix socket at dir/ask.sock and chmods it 0600 (decision
-// 10) — narrower than the in-guest bridge's 0777, which existed only so a non-root container
-// could reach a root-owned directory; here the socket lives in the run's own directory on the
-// host, so there is no non-root party to widen it for. net.Listen itself never unlinks a
+// Listen creates dir if necessary, binds ask.sock in it, and hardens both. Which directory that
+// is belongs to the caller: orchestrator.runSocketDir prefers the run's own private state
+// directory (decision 4) and falls back to the per-uid `<tmp>/krayt-<uid>` root when the run
+// directory's path would push the socket past macOS's sockaddr_un limit — decision 4's claim that
+// the socket could be kept "short by construction" does not survive an unbounded repo path in
+// front of it. This function treats both the same way, reusing sockroot.Ensure's
+// hostile-pre-existing-directory refusal (decision 12) rather than a second copy of that check,
+// then binds a unix socket at dir/ask.sock and chmods it 0600 (decision 10) — narrower than the
+// in-guest bridge's 0777, which existed only so a non-root container could reach a root-owned
+// directory; here the socket lives in a 0700 directory owned by the invoking user either way, so
+// there is no non-root party to widen it for. net.Listen itself never unlinks a
 // pre-existing path at that name, so a socket already present here is a fail-closed error, not an
 // unlink-then-bind (decision 12).
 //

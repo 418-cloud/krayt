@@ -379,7 +379,7 @@ func TestListenRefusesHostileDir(t *testing.T) {
 // TestBridgeRedactsAtPushBoundary: decision 11 — a prompt/choices carrying a secret value comes
 // back redacted, applied in the push closure the caller supplies to NewBridge (the host already
 // holds the values, so this costs nothing at the boundary where questions are persisted), the
-// host-side equivalent of internal/guest/service.go's guest-side redaction.
+// host-side equivalent of the pre-msb guest agent's own redaction.
 func TestBridgeRedactsAtPushBoundary(t *testing.T) {
 	redactor := secrets.NewRedactor(secrets.Values(map[string]string{"API_KEY": "sk-super-secret"}))
 

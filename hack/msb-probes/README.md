@@ -1,6 +1,6 @@
 # msb-probes — the feasibility gate for the microsandbox (B1) migration
 
-**All five have run — msb 0.6.16, 2026-08-29/30, on an Apple-Silicon Mac.** The outcomes live in
+**All six of P1–P6 have run — P1–P5 on msb 0.6.16, 2026-08-29/30; P6 and P7 on 2026-09-04, same machine.** The outcomes live in
 `KRAYT_SPEC.md` §14 Phase 11's feasibility-gate item and `docs/ai-tasks/README.md`'s row 1, not
 here; what follows is what each probe asks and how to re-run it. The one thread left is P4 on
 Linux/KVM — see its row below. **P1's 2026-09-02 re-runs found a real defect**: msb 0.6.16's vsock
@@ -9,7 +9,7 @@ completed that way, against 25 of 25 when the host waits for the guest. `interna
 waits (`lingerUntilPeerCloses`, `KRAYT_SPEC.md` §6.13), and P1 is the regression check that would
 catch msb changing this back.
 
-Five scripts that answered the questions
+Seven scripts that answered the questions
 [`docs/adr-microsandbox-sandbox-layer.md`](../../docs/adr-microsandbox-sandbox-layer.md) had left
 unverified against real hardware. They are **not** part of `hack/run-integration-tests.sh` and do
 not run in CI — microsandbox (`msb`) is not installed on any CI runner, and these exercise a
@@ -40,10 +40,45 @@ re-checkable. These were written against **0.6.16**.
 | `p3-secret-tls-intercept.sh` | Does declaring `--secret` alone enable TLS interception, or is `--tls-intercept` required separately? | No — confirms a finding already made from msb's source; sizes whether `translate-network-policy-to-msb.md`'s mandatory `--tls-intercept` emission is necessary or can be dropped. |
 | `p4-environ-exposure-window.sh` | Does the real secret value live only in the short-lived `msb create` process's environment, or in the long-lived per-sandbox `msb sandbox` runtime for the whole run? **⚪ Inconclusive on darwin by construction — the one probe worth re-running, on Linux/KVM.** | No — sizes an already-accepted residual (§ "The secret-handling contract" in the ADR); doesn't change the decision either way. |
 | `p5-placeholder-accepted.sh` | Does Claude Code reject msb's default `$MSB_ANTHROPIC_API_KEY` placeholder client-side (length/prefix check) before any request leaves the container? | No — needs a **live Anthropic credential**; decides whether `hand-secrets-to-msb.md` must build the `--secret-conf`-shaped-placeholder contingency. |
+| `p6-credential-not-in-run.sh` | During a **real `krayt run`**, does the credential stay out of every live msb process's argv and environ, out of the guest's own environment, and out of every artifact including `changes.patch`? **✅ PASS 2026-09-04** on three authoritative readings; the environ reading is ⚪ inconclusive on darwin, same as p4. | No — needs a **live credential**; closed criterion 3 of `HUMAN_TODO.md`'s `run-tasks-on-microsandbox.md` hardware entry. |
+
+| `p7-passthrough-semantics.sh` | Does `--on-secret-violation passthrough` forward the placeholder unchanged to an out-of-scope host, or substitute the real value there? Measured against a `block-and-log` control and an in-scope regression guard. **✅ PASS 2026-09-04**: the placeholder is forwarded unchanged out of scope, the identical request blocks under `block-and-log`, and in-scope substitution still works. | **Was** blocking the decision; krayt now emits `passthrough` on the strength of it. |
+
+`p7` **passed on 2026-09-04** and `internal/task/netpolicy_msb.go` now emits
+`--on-secret-violation passthrough` as a result. It is the only probe written to decide a change to
+krayt's own emitted policy rather than to record how msb behaves, so keep it runnable: it is the
+evidence for that flag's value, and the reasoning in `NetworkArgs` points back here. Its expected
+answer was read out of msb's source at v0.6.16
+(substitution is gated on the secret's own scope *before* the violation action is consulted, so no
+value of the flag can leak a credential) — the run exists because msb is beta and a source read is
+not an observation. It takes three measurements because any one alone is unreadable: without the
+`block-and-log` control, "the request succeeded" is equally consistent with "passthrough forwards"
+and "this probe never provoked a violation"; without the in-scope guard, a passthrough that
+silently stopped substituting altogether would look like a pass and break every run.
 
 `p1` and `p2` are the two that *shape the design* of downstream tasks rather than merely sizing a
 residual — both must be answered before `run-tasks-on-microsandbox.md` and
 `dial-ask-channel-over-vsock.md` are implemented.
+
+`p6` **passed on 2026-09-04** (`run_63b9a3bf`): the guest's own `$CLAUDE_CODE_OAUTH_TOKEN` held
+`$MSB_CLAUDE_CODE_OAUTH_TOKEN` — msb's placeholder — and the real value appeared in no msb argv, no
+run artifact and not in `changes.patch`. Its environ reading came back inconclusive for the same
+reason p4's did, which is why **p4 and p6 both want the same Linux/KVM re-run**: that one run
+closes the environ window for msb's runtime process and for krayt's invocation of it at once.
+
+`p6` is the odd one out and deliberately so: every other probe builds a synthetic sandbox to ask a
+question about **msb**, while p6 drives a real `krayt run` to ask a question about **krayt's own
+invocation of msb**. It needs that because the claim under test — only `msb create` ever carries
+the value — is about which of krayt's calls attaches `secretEnv`, which no synthetic sandbox can
+exercise. It parks the run at `--on-question=wait` to get an unlimited observation window, and it
+does not chase the short-lived `msb create` process: reaching `waiting` at all proves the
+credential got there, since the agent had to authenticate to ask its question.
+
+It inherits p4's control-process discipline for the environ reading, and adds the same guard one
+level up: if the host will not let it list processes at all, it **fails** rather than reporting an
+empty process list as a clean one. That is not hypothetical — a sandboxed shell answers
+`pgrep: Cannot get process list` on stderr and nothing on stdout, which with stderr discarded is
+indistinguishable from "no msb is running".
 
 `p3` is **answered, against the ADR's expectation**: on msb 0.6.16 substitution happened with and
 without `--tls-intercept`, because declaring a secret enables interception by itself
