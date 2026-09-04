@@ -454,6 +454,112 @@ func TestSystemLogsErrorsIncludeStderr(t *testing.T) {
 	}
 }
 
+func TestImagesParsesToleratesFieldNameVariants(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"images": {ExitCode: 0, Stdout: `[` +
+			`{"reference":"ghcr.io/x/agent:latest","size":1048576},` +
+			`{"name":"ghcr.io/x/other:v1","size_bytes":2048}` +
+			`]`},
+	}})
+
+	imgs, err := c.Images(context.Background())
+	if err != nil {
+		t.Fatalf("Images: %v", err)
+	}
+	want := []ImageInfo{
+		{Ref: "ghcr.io/x/agent:latest", SizeB: 1048576},
+		{Ref: "ghcr.io/x/other:v1", SizeB: 2048},
+	}
+	if len(imgs) != len(want) {
+		t.Fatalf("Images = %+v, want %d entries", imgs, len(want))
+	}
+	for i, w := range want {
+		if imgs[i].Ref != w.Ref || imgs[i].SizeB != w.SizeB {
+			t.Errorf("Images[%d] = %+v, want %+v", i, imgs[i], w)
+		}
+	}
+	call := lastFakeCall(t, home)
+	want2 := []string{"images", "--format", "json"}
+	if !reflect.DeepEqual(call.Args, want2) {
+		t.Errorf("Images args = %v, want %v", call.Args, want2)
+	}
+}
+
+func TestImageRefsSplitsLines(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"images": {ExitCode: 0, Stdout: "ghcr.io/x/agent:latest\nghcr.io/x/other:v1\n\n"},
+	}})
+
+	refs, err := c.ImageRefs(context.Background())
+	if err != nil {
+		t.Fatalf("ImageRefs: %v", err)
+	}
+	want := []string{"ghcr.io/x/agent:latest", "ghcr.io/x/other:v1"}
+	if !reflect.DeepEqual(refs, want) {
+		t.Errorf("ImageRefs = %v, want %v", refs, want)
+	}
+	call := lastFakeCall(t, home)
+	wantArgs := []string{"images", "-q"}
+	if !reflect.DeepEqual(call.Args, wantArgs) {
+		t.Errorf("ImageRefs args = %v, want %v", call.Args, wantArgs)
+	}
+}
+
+func TestRmiRendersArgs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"rmi": {ExitCode: 0},
+	}})
+
+	if err := c.Rmi(context.Background(), "ghcr.io/x/agent:latest", false); err != nil {
+		t.Fatalf("Rmi: %v", err)
+	}
+	want := []string{"rmi", "ghcr.io/x/agent:latest"}
+	if call := lastFakeCall(t, home); !reflect.DeepEqual(call.Args, want) {
+		t.Errorf("Rmi args = %v, want %v", call.Args, want)
+	}
+
+	if err := c.Rmi(context.Background(), "ghcr.io/x/agent:latest", true); err != nil {
+		t.Fatalf("Rmi --force: %v", err)
+	}
+	wantForce := []string{"rmi", "--force", "ghcr.io/x/agent:latest"}
+	if call := lastFakeCall(t, home); !reflect.DeepEqual(call.Args, wantForce) {
+		t.Errorf("Rmi --force args = %v, want %v", call.Args, wantForce)
+	}
+}
+
+func TestRmiErrorIncludesStderr(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"rmi": {ExitCode: 1, Stderr: "image in use"},
+	}})
+	err := c.Rmi(context.Background(), "ghcr.io/x/agent:latest", false)
+	if err == nil || !strings.Contains(err.Error(), "image in use") {
+		t.Errorf("Rmi error = %v, want it to surface stderr", err)
+	}
+}
+
+func TestImagePruneRendersArgs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"image": {ExitCode: 0},
+	}})
+	if err := c.ImagePrune(context.Background()); err != nil {
+		t.Fatalf("ImagePrune: %v", err)
+	}
+	want := []string{"image", "prune"}
+	if call := lastFakeCall(t, home); !reflect.DeepEqual(call.Args, want) {
+		t.Errorf("ImagePrune args = %v, want %v", call.Args, want)
+	}
+}
+
 func slicesContain(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {

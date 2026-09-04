@@ -696,3 +696,111 @@ func (c *Client) Pull(ctx context.Context, ref string) error {
 	}
 	return nil
 }
+
+// ImageInfo is one parsed entry from `msb images --format json` (retire-vm-image-pipeline.md
+// decision 2: `krayt image ls` is a thin render of this). Like ContextInfo, msb's JSON schema
+// here is not pinned by the ADR or its docs, so field extraction is tolerant of a few plausible
+// names per attribute and Raw always retains the whole decoded entry as a fallback.
+type ImageInfo struct {
+	Ref   string // best-effort reference this image was pulled/tagged under
+	SizeB int64  // best-effort size in bytes; 0 if none of the candidate keys are present
+	Raw   json.RawMessage
+}
+
+// Images runs `msb images --format json` and parses the result.
+func (c *Client) Images(ctx context.Context) ([]ImageInfo, error) {
+	out, stderr, err := c.runCaptured(ctx, []string{"images", "--format", "json"})
+	if err != nil {
+		return nil, fmt.Errorf("sandbox: msb images --format json: %w (%s)", err, firstNonEmpty(stderr, out))
+	}
+	return parseImages(out)
+}
+
+// parseImages reads `msb images --format json`'s array of image entries, tolerant of a few
+// plausible field names per attribute — see ImageInfo.
+func parseImages(raw []byte) ([]ImageInfo, error) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil, fmt.Errorf("sandbox: parse msb images json: %w", err)
+	}
+	out := make([]ImageInfo, 0, len(entries))
+	for _, e := range entries {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(e, &m); err != nil {
+			continue
+		}
+		info := ImageInfo{Raw: e}
+		for _, key := range []string{"reference", "ref", "name", "image", "repository"} {
+			v, ok := m[key]
+			if !ok {
+				continue
+			}
+			var s string
+			if err := json.Unmarshal(v, &s); err == nil && s != "" {
+				info.Ref = s
+				break
+			}
+		}
+		for _, key := range []string{"size", "size_bytes", "sizeBytes"} {
+			v, ok := m[key]
+			if !ok {
+				continue
+			}
+			var n int64
+			if err := json.Unmarshal(v, &n); err == nil {
+				info.SizeB = n
+				break
+			}
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+// ImageRefs runs `msb images -q`, msb's quiet/reference-only listing, and returns one trimmed,
+// non-empty reference per line — the source shell completion uses for `krayt image rm`
+// (retire-vm-image-pipeline.md decision 4/Done-when), cheaper than parsing the full JSON shape
+// just to offer completions.
+func (c *Client) ImageRefs(ctx context.Context) ([]string, error) {
+	out, stderr, err := c.runCaptured(ctx, []string{"images", "-q"})
+	if err != nil {
+		return nil, fmt.Errorf("sandbox: msb images -q: %w (%s)", err, firstNonEmpty(stderr, out))
+	}
+	var refs []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			refs = append(refs, line)
+		}
+	}
+	return refs, nil
+}
+
+// Rmi runs `msb rmi <ref>`, optionally with --force — msb's own `--force` allows removing an
+// image a sandbox still references (retire-vm-image-pipeline.md decision 2). The image is
+// identified by reference, not a krayt-owned digest: msb's store is ref-keyed (decision 4).
+func (c *Client) Rmi(ctx context.Context, ref string, force bool) error {
+	args := []string{"rmi"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, ref)
+	_, stderr, err := c.runCaptured(ctx, args)
+	if err != nil {
+		return fmt.Errorf("sandbox: msb rmi %s: %w (%s)", ref, err, firstNonEmpty(stderr))
+	}
+	return nil
+}
+
+// ImagePrune runs `msb image prune` — msb's own sweep of images unused by any sandbox or indexed
+// snapshot (retire-vm-image-pipeline.md decision 3). krayt's own age/in-use retention runs first,
+// via Rmi against the refs it decides to remove; this is the final sweep for whatever msb's store
+// still considers dangling afterward. msb's prune has no age policy of its own, which is exactly
+// why krayt keeps its own on top rather than calling only this.
+func (c *Client) ImagePrune(ctx context.Context) error {
+	_, stderr, err := c.runCaptured(ctx, []string{"image", "prune"})
+	if err != nil {
+		return fmt.Errorf("sandbox: msb image prune: %w (%s)", err, firstNonEmpty(stderr))
+	}
+	return nil
+}

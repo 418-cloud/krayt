@@ -36,6 +36,9 @@ env:
 
 bundle_depth: 0 # full-history bundle
 
+resources:
+  timeout: 4h
+
 agent:
   adapter: claude-code
 

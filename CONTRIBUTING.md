@@ -22,8 +22,8 @@ go test ./...          # unit tests via the fake VM provider — no real VM need
 go run ./cmd/krayt doctor
 ```
 
-Regenerating protocol code (`internal/protocol/krayt.proto`) or building the VM image needs the
-Nix dev shell (`nix develop`) — see the README; most contributions won't need either.
+There is no `.proto`/codegen or VM image to build any more — krayt drives `msb` as a subprocess
+and ships no sandbox image of its own (`docs/adr-microsandbox-sandbox-layer.md`).
 
 ### Hardware constraints (read this before assuming a test failed)
 

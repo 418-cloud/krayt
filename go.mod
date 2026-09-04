@@ -3,15 +3,12 @@ module github.com/418-cloud/krayt
 go 1.26.3
 
 require (
-	github.com/klauspost/compress v1.19.2
 	github.com/mdlayher/vsock v1.3.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/opencontainers/go-digest v1.0.0
-	github.com/opencontainers/image-spec v1.1.1
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
-	oras.land/oras-go/v2 v2.6.2
 )
 
 require (
