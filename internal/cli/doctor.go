@@ -17,9 +17,12 @@ type checkResult struct {
 }
 
 // commonChecks are the (now OS-agnostic — msb is krayt's only sandbox backend,
-// run-tasks-on-microsandbox.md) prerequisite checks for `krayt doctor`.
+// run-tasks-on-microsandbox.md) prerequisite checks for `krayt doctor`: exactly the four msb
+// checks KRAYT_SPEC.md:1025-1034 defines. baseImageCheck reports on the pre-msb micro-VM image
+// (kernel/initrd/rootfs), which no run under msb ever touches, so it does not belong here —
+// surfacing it would warn a healthy msb host about an image it will never use.
 func commonChecks() []checkResult {
-	return append([]checkResult{baseImageCheck()}, msbChecks()...)
+	return msbChecks()
 }
 
 // newDoctorCmd builds the `doctor` command (§13).

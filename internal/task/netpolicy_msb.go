@@ -188,6 +188,7 @@ func ValidateNetworkPolicyForMsb(np NetworkPolicy, secretKeys map[string]bool, i
 	}
 
 	allow := lowerSet(np.Allow)
+	passthrough := lowerSet(np.Passthrough)
 	specKeys := make(map[string]bool, len(specs))
 	for _, s := range specs {
 		specKeys[s.Key] = true
@@ -197,6 +198,15 @@ func ValidateNetworkPolicyForMsb(np NetworkPolicy, secretKeys map[string]bool, i
 			}
 			if np.Mode == NetworkAllowlist && !allow[lower(h)] {
 				return fmt.Errorf("network: inject (%s): host %q must also be in allow (mode: allowlist)", s.Key, h)
+			}
+			// A passthrough host is tunneled un-MITM'd (NetworkArgs: --tls-bypass skips both the
+			// substitution and blocking lists), so a secret scoped there can never be substituted —
+			// the guest would send only the placeholder. ValidateNetworkPolicy's own inject/passthrough
+			// check below cannot catch this: it walks np.Inject, which is always empty here (this
+			// function rejects a populated one above), so msb secret scopes need their own check.
+			if passthrough[lower(h)] {
+				return fmt.Errorf("network: inject (%s): host %q is also in passthrough — a passthrough "+
+					"host is tunneled un-MITM'd and can never receive secret substitution", s.Key, h)
 			}
 		}
 		if secretKeys != nil && !secretKeys[s.Key] {

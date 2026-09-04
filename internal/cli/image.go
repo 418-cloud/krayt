@@ -123,29 +123,3 @@ func sanitizeRef(ref string) string {
 	r := strings.NewReplacer("/", "_", ":", "_", "@", "_")
 	return r.Replace(ref)
 }
-
-// baseImageCheck reports whether the base VM image is pinned and cached locally. It is
-// optional (a warning, not a failure): the pin is filled in after CI first publishes the
-// image, and `krayt image pull` populates the cache (§11.4).
-func baseImageCheck() checkResult {
-	c := checkResult{name: "base VM image", optional: true}
-	if vmimage.PinnedDigest == "" {
-		c.detail = "no pinned digest yet (image not published; see HUMAN_TODO.md)"
-		return c
-	}
-	dir, err := cacheDir(vmimage.PinnedRef, vmimage.PinnedDigest)
-	if err != nil {
-		c.detail = err.Error()
-		return c
-	}
-	// A boot needs all three artifacts, so a partial cache is not "cached".
-	for _, f := range []string{vmimage.FileKernel, vmimage.FileInitrd, vmimage.FileRootFS} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
-			c.detail = "pinned " + vmimage.PinnedDigest.String() + " not cached — run `krayt image pull`"
-			return c
-		}
-	}
-	c.ok = true
-	c.detail = "cached " + vmimage.PinnedDigest.String()
-	return c
-}

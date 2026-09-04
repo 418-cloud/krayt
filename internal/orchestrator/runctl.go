@@ -3,10 +3,22 @@ package orchestrator
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 )
+
+// runCtlReadDeadline bounds how long handleRunCtlConn waits for a client to send its request
+// (the same idiom internal/askbridge uses for its guest-facing socket): a client that connects
+// and never writes would otherwise block Decode, and this goroutine, forever — closing the
+// listener in serveRunControl's returned stop func does not close connections already accepted.
+const runCtlReadDeadline = 10 * time.Second
+
+// maxRunCtlRequestBytes bounds one request read off the socket, matching
+// internal/askbridge.maxAskRequestBytes's role for the guest-facing wire protocol.
+const maxRunCtlRequestBytes = 64 << 10
 
 // runctl.go is the msb-era replacement for `krayt answer`'s pre-msb path: dialing the guest's
 // vsock control socket directly (any process could reach the VM, so a separate `krayt answer`
@@ -54,16 +66,26 @@ func serveRunControl(dir string, answer AnswerFunc) (string, func(), error) {
 			if err != nil {
 				return
 			}
-			go handleRunCtlConn(conn, answer)
+			go handleRunCtlConn(conn, answer, runCtlReadDeadline)
 		}
 	}()
 	return path, func() { _ = lis.Close() }, nil
 }
 
-func handleRunCtlConn(conn net.Conn, answer AnswerFunc) {
+// handleRunCtlConn answers one connection. readDeadline is a parameter, not a read of the
+// package constant, so a test can bound it without writing to shared state these goroutines race
+// on — the same reasoning internal/askbridge.handleConn documents for its own deadline parameter.
+func handleRunCtlConn(conn net.Conn, answer AnswerFunc, readDeadline time.Duration) {
 	defer func() { _ = conn.Close() }()
+	if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+		return
+	}
 	var req runCtlRequest
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+	dec := json.NewDecoder(io.LimitReader(conn, maxRunCtlRequestBytes+1))
+	if err := dec.Decode(&req); err != nil {
+		return // oversized, malformed, or the deadline fired
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
 	resp := runCtlResponse{OK: true}
