@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // CheckResult is one host-prerequisite check, shaped for internal/cli's `krayt doctor` (§13) to
@@ -71,16 +72,30 @@ func contextCheck(ctx context.Context, c *Client) CheckResult {
 		return CheckResult{Name: name, Detail: "msb context --format json failed: " + err.Error()}
 	}
 	if !info.IsLocal() {
-		backend := info.Backend
-		if backend == "" {
-			backend = "(unknown — could not identify a backend field in msb's json output)"
+		// Two distinct failures share this branch, and they need different advice. An empty
+		// Backend means msb answered but under a key none of parseContext's names matched — a
+		// schema drift in msb, not a misconfigured host — so print what msb actually said and
+		// let the operator (or a bug report) work from the real output. A non-empty, non-local
+		// Backend is the genuine "krayt is pointed somewhere else" case.
+		if info.Backend == "" {
+			return CheckResult{Name: name, Detail: fmt.Sprintf(
+				"could not find a backend field in msb's json output — krayt looks for the keys "+
+					"parseContext lists (msb 0.6.16 uses \"kind\"), so this most likely means msb's "+
+					"schema changed rather than anything being wrong with this host. msb printed: %s",
+				strings.TrimSpace(string(info.Raw)))}
 		}
 		return CheckResult{Name: name, Detail: fmt.Sprintf(
-			"resolved backend is %q, not %q — krayt pins %s=%s on every invocation, so this "+
-				"indicates the pin is not taking effect; every `krayt run` will still refuse to "+
-				"start until this is fixed", backend, BackendLocal, backendEnvKey, BackendLocal)}
+			"resolved backend is %q, not %q — krayt appends %s=%s to every msb invocation, so a "+
+				"different backend here means that pin is not reaching msb", info.Backend,
+			BackendLocal, backendEnvKey, BackendLocal)}
 	}
-	return CheckResult{Name: name, OK: true, Detail: "backend=" + info.Backend}
+	detail := "backend=" + info.Backend
+	if info.Source != "" {
+		// source=MSB_BACKEND is the evidence that krayt's pin reached the child; source=default
+		// means msb would have chosen local anyway, which passes but proves less.
+		detail += " (source=" + info.Source + ")"
+	}
+	return CheckResult{Name: name, OK: true, Detail: detail}
 }
 
 func passthroughDoctorCheck(ctx context.Context, c *Client) CheckResult {

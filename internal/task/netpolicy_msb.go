@@ -47,17 +47,18 @@ func NetworkArgs(np NetworkPolicy, hasSecrets bool) ([]string, error) {
 		// Explicit both ways (decision 6): egress allow is the opt-in `full` grants, ingress deny
 		// closes msb's own default-allow ingress posture before krayt ever publishes a port.
 		args = append(args, "--net-default-egress", "allow", "--net-default-ingress", "deny")
+		args = append(args, allowDNSArgs()...)
 		args = append(args, denyGroupArgs()...)
 		// `full`'s allow must not mean "and also the host's LAN" — the deny-group rules above
 		// stand even though the default action already allows everything else.
 
 	case NetworkAllowlist:
 		args = append(args, "--net-default", "deny")
-		args = append(args, denyGroupArgs()...)
 		// The guest gains a real, policed network interface under msb (unlike the pre-msb design,
 		// where allowlist/none left the guest with no usable network at all) — without this rule
 		// nothing resolves (decision 7).
-		args = append(args, "--net-rule", "allow@dns")
+		args = append(args, allowDNSArgs()...)
+		args = append(args, denyGroupArgs()...)
 		for _, h := range np.Allow {
 			args = append(args, "--net-rule", "allow@"+h)
 		}
@@ -79,6 +80,23 @@ func NetworkArgs(np NetworkPolicy, hasSecrets bool) ([]string, error) {
 	args = append(args, "--on-secret-violation", "block-and-log")
 
 	return args, nil
+}
+
+// allowDNSArgs renders the `allow@dns` rule, which must be emitted BEFORE denyGroupArgs in every
+// mode that has a network at all. msb evaluates rules first-match-wins within a direction, and
+// `dns` is not an abstract capability — it is a destination: msb's own help defines it as "the
+// semantic `dns` target for gateway UDP/TCP port 53", and that gateway is the guest's end of a
+// /30 carved out of --net-ipv4-pool, which defaults to 172.16.0.0/12. So `dns` and `private`
+// name overlapping destinations, and whichever rule krayt emits first decides.
+//
+// Emitting the denies first — the ordering translate-network-policy-to-msb.md's general "denies
+// before allows" rule asks for — therefore matched deny@private on the gateway and the guest
+// resolved nothing at all: an agent inside an otherwise correct allowlist sandbox failed every
+// request with ENOTFOUND before a single packet reached an allowed host. `dns` is the one target
+// that has to precede the deny groups, and it is a narrow exception to make: it opens exactly the
+// gateway's port 53, not the private groups those denies exist to close.
+func allowDNSArgs() []string {
+	return []string{"--net-rule", "allow@dns"}
 }
 
 // denyGroupArgs renders one "--net-rule" "deny@<group>" pair per msbDenyGroups entry, in order.

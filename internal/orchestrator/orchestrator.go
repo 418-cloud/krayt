@@ -15,9 +15,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -199,12 +201,19 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// "fail mode" branch to maintain here the way the pre-msb Start-stream loop needed one.
 	var vsockRoutes []sandbox.VsockRoute
 	var streamCancel context.CancelFunc // set just before the agent Exec call; referenced by the question-timeout closure below
-	var aborted atomic.Bool
+	var aborted abortLatch
 	var outstandingQuestions atomic.Int32
 	setState := func(st string) { rec.State = st; _, _ = writeRecord(runDir, rec) }
 
 	if spec.Questions.Mode == task.QuestionWait {
-		askDir := filepath.Join(runDir, "ask")
+		// Not simply runDir/ask: that path is unbounded on the left (the operator's repo path)
+		// and unix sockets are not — see runSocketDir, which prefers runDir/ask and falls back
+		// to a short hardened root only when it would not fit.
+		askDir, releaseAskDir, derr := runSocketDir(runDir, filepath.Base(runDir))
+		if derr != nil {
+			return nil, derr
+		}
+		defer releaseAskDir()
 		lis, lerr := askbridge.Listen(askDir)
 		if lerr != nil {
 			return nil, fmt.Errorf("orchestrator: listen ask bridge: %w", lerr)
@@ -328,18 +337,44 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return nil, fmt.Errorf("orchestrator: %w", err)
 	}
 
-	copies := [...][2]string{
-		{bundlePath, name + ":" + containerBundlePath},
-		{promptPath, name + ":" + containerTaskFile},
-		{helperLocal, name + ":" + guestbin.GuestPath(guestbin.HelperName)},
-		{askLocal, name + ":" + containerAskBinPath},
+	copies := [...]copySpec{
+		{bundlePath, containerBundlePath},
+		{promptPath, containerTaskFile},
+		{helperLocal, guestbin.GuestPath(guestbin.HelperName)},
+		{askLocal, containerAskBinPath},
 	}
+
+	// `msb copy` writes the destination file but will NOT create a missing parent directory —
+	// it fails with "sandbox fs error: open: No such file or directory". Nothing promises those
+	// parents exist: §8.2's paths (/task, /output, and krayt's own guestbin.GuestRoot) are
+	// "injected by the tool", not part of what an agent image must provide, and even
+	// /usr/local/bin is absent from some Nix-built rootfs. So create every destination's parent
+	// here, derived from the copy table itself rather than a second hand-maintained list that
+	// could drift from it.
+	mkdirs := append(guestParentDirs(copies[:]), containerOutput)
+	if _, err := execCapture(ctx, deps.Sandbox, name, "root", append([]string{"mkdir", "-p"}, mkdirs...)); err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
+		return nil, fmt.Errorf("orchestrator: create guest directories: %w", err)
+	}
+	// /output is the one of those the non-root agent writes to during the run (§8.2), and mkdir
+	// applied root's umask to it. krayt-helper's own finish does the same 0777 chmod for the same
+	// reason; doing it here too is what makes the directory usable BEFORE finish runs.
+	if _, err := execCapture(ctx, deps.Sandbox, name, "root", []string{"chmod", "0777", containerOutput}); err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
+		return nil, fmt.Errorf("orchestrator: chmod %s: %w", containerOutput, err)
+	}
+
 	for _, c := range copies {
-		if err := deps.Sandbox.Copy(ctx, c[0], c[1]); err != nil {
+		dst := name + ":" + c.guest
+		if err := deps.Sandbox.Copy(ctx, c.local, dst); err != nil {
 			if isWallClockTimeout(ctx, err) {
 				return earlyTimeoutResult(runDir), nil
 			}
-			return nil, fmt.Errorf("orchestrator: copy %s: %w", c[1], err)
+			return nil, fmt.Errorf("orchestrator: copy %s: %w", dst, err)
 		}
 	}
 	// Defensive: msb copy's mode-preservation is not a pinned contract, so make sure both
@@ -405,7 +440,15 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	var exitCode int
 	var timedOut bool
 	switch {
-	case execErr != nil && aborted.Load():
+	// Not conditioned on execErr: abort means "fail the run" (§6.13, krayt.yaml's
+	// on_timeout: abort — "fail the run"), and whether cancelling streamCtx actually beat the
+	// agent to the exit is a race krayt does not control. The agent is unblocked by the
+	// no-answer sentinel at the same moment the cancel fires, so a fast agent can finish
+	// cleanly and hand back execErr == nil — reporting that run as a success would let the
+	// agent proceed on a sentinel, which is the exact outcome this policy exists to prevent.
+	// fired() blocks on any timeout handler still in flight, so a handler that has released
+	// the agent but not yet recorded its decision cannot be read as "no abort".
+	case aborted.fired():
 		return nil, fmt.Errorf("orchestrator: question timed out (abort policy, §6.13)")
 	case execErr != nil && isWallClockTimeout(ctx, execErr):
 		timedOut, exitCode = true, -1
@@ -512,11 +555,11 @@ func writeEmbeddedBinary(dir, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, b, 0o755); err != nil {
+	dst := filepath.Join(dir, name)
+	if err := os.WriteFile(dst, b, 0o755); err != nil {
 		return "", fmt.Errorf("write %s: %w", name, err)
 	}
-	return path, nil
+	return dst, nil
 }
 
 // digestFile computes the canonical digest of a file's bytes without loading it all into memory.
@@ -527,6 +570,30 @@ func digestFile(path string) (digest.Digest, error) {
 	}
 	defer func() { _ = f.Close() }()
 	return digest.Canonical.FromReader(f)
+}
+
+// copySpec is one host-file -> guest-path copy-in. The guest path is kept separate from the
+// "<sandbox>:<path>" form msb wants so that guestParentDirs can read it without re-parsing the
+// sandbox name back off the front.
+type copySpec struct{ local, guest string }
+
+// guestParentDirs returns the deduplicated, sorted parent directories of a copy table's guest
+// paths, dropping "/" (which always exists and which `mkdir -p /` would be a nonsense argument
+// for). Guest paths are Linux paths regardless of the host krayt runs on, so this uses path, not
+// path/filepath — on Windows filepath.Dir would hand msb a backslash-separated directory.
+func guestParentDirs(copies []copySpec) []string {
+	seen := make(map[string]bool, len(copies))
+	dirs := make([]string, 0, len(copies))
+	for _, c := range copies {
+		d := path.Dir(c.guest)
+		if d == "/" || d == "." || seen[d] {
+			continue
+		}
+		seen[d] = true
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+	return dirs
 }
 
 // execCapture runs one msb exec to completion, capturing stdout/stderr into buffers rather than
@@ -671,14 +738,50 @@ func earlyTimeoutResult(runDir string) *Result {
 // answered by a human first, since the human's answer already consumed the pending channel). For
 // `abort` it also cancels the agent's exec via *streamCancel (a pointer so it can be armed before
 // the agent's own exec has actually started the real context it will cancel).
-func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Duration, onTimeout task.QuestionTimeoutAction, aborted *atomic.Bool, streamCancel *context.CancelFunc) {
+// abortLatch records whether a question timeout under the `abort` policy fired, and — the part a
+// bare flag cannot do — makes that decision observable to the goroutine that reads it.
+//
+// The read happens right after the agent's exec returns, and the handler releases the agent (via
+// bridge.Answer, which unblocks the waiting ask_human) *before* it has finished deciding. An agent
+// that exits promptly on the no-answer sentinel therefore raced the handler: the exec returned,
+// the flag was still false, and a timed-out run was reported as a success — the exact outcome
+// `abort` exists to prevent. Ordering the stores differently only narrows that window; the
+// handler must instead be uninterruptible from the reader's point of view, which is what holding
+// the mutex across the whole handler body gives. fired() waits for any handler in flight and then
+// reads, so "the agent was released by a timeout" and "the run knows it aborted" can no longer be
+// observed out of order.
+type abortLatch struct {
+	mu      sync.Mutex
+	aborted bool
+}
+
+// begin marks a timeout handler as in flight; the returned function ends it. fired() blocks for
+// the duration.
+func (l *abortLatch) begin() func() {
+	l.mu.Lock()
+	return l.mu.Unlock
+}
+
+// set records the abort. Only ever called by a handler between begin and its release.
+func (l *abortLatch) set() { l.aborted = true }
+
+// fired reports whether a timeout aborted the run, once no handler is mid-decision.
+func (l *abortLatch) fired() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.aborted
+}
+
+func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Duration, onTimeout task.QuestionTimeoutAction, aborted *abortLatch, streamCancel *context.CancelFunc) {
 	time.AfterFunc(to, func() {
+		// Held across the whole body, Answer included: see abortLatch.
+		defer aborted.begin()()
 		if !bridge.Answer(qid, "", true) {
 			return // already answered (by a human, or a previous timeout) — nothing to do
 		}
 		_ = RecordAnswer(runDir, qid, "", true)
 		if onTimeout == task.OnTimeoutAbort {
-			aborted.Store(true)
+			aborted.set()
 			if cancel := *streamCancel; cancel != nil {
 				cancel()
 			}

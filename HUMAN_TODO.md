@@ -15,18 +15,15 @@ Everything closed has been **deleted from this file** rather than kept as ✅ en
 record of what was verified, and how, lives in `git log` (this file's history through #115),
 `KRAYT_SPEC.md` §14's phase checklists, and `docs/ai-tasks/README.md`'s status table. What is left:
 
-0. **`run-tasks-on-microsandbox.md`'s hardware re-verification** — blocking for
-   `retire-vm-image-pipeline.md`. See the entry below; it needs an Apple-Silicon Mac with `msb`
-   installed, which this environment does not have.
+**Before picking up any entry below, read this.** The msb cutover
+(`run-tasks-on-microsandbox.md`, hardware-verified 2026-09-04) deleted `internal/proxy`,
+`network.mitm`, and the ephemeral per-run CA that several entries here still reference
+(`mitm: true`, `proxy.log`, `openssl s_client -proxy 127.0.0.1:3128`). Those entries — the
+opencode/gemini-cli `NODE_EXTRA_CA_CERTS` verification, the trixie/rtk credential checks —
+describe a procedure that no longer applies as written: msb substitutes credentials at its own TLS
+boundary, with no `krayt.yaml` `mitm:` key and no `proxy.log` artifact. They have not been
+rewritten; whoever picks one up needs to re-derive the msb-equivalent steps first.
 
-   **A consequence worth flagging while it's fresh**: this cutover deleted `internal/proxy`,
-   `network.mitm`, and the ephemeral per-run CA that several entries further down in this file
-   reference (`mitm: true`, `proxy.log`, `openssl s_client -proxy 127.0.0.1:3128`). Those entries
-   (the opencode/gemini-cli `NODE_EXTRA_CA_CERTS` verification, the trixie/rtk credential checks)
-   describe a verification procedure that no longer applies as written — msb substitutes
-   credentials at its own TLS boundary with no `krayt.yaml` `mitm:` key and no `proxy.log` artifact.
-   They have NOT been rewritten here (out of scope for this task, which only cuts `krayt run` over
-   to msb); whoever picks one up next will need to re-derive the msb-equivalent steps first.
 1. **`krayt-agent-opencode`** — the one image never published or exercised. Its entry below covers
    the publish check, an onboarding run, the `ask_human` question round-trip, and the
    `NODE_EXTRA_CA_CERTS` check re-homed from §14 Phase 9.
@@ -35,13 +32,11 @@ record of what was verified, and how, lives in `git log` (this file's history th
 3. **A known defect** in the agent images' `/output/report.md` contract (`[BUG]` below), which will
    corrupt the opencode verification the same way it corrupted a gemini one unless the task writes
    somewhere else.
-4. **One live-run security check** — that the egress-proxy child's real environment on macOS carries
-   no operator credentials (`[security]` below, report §6 item 4).
-5. **`krayt-dev`'s floating base pin** — the rebuild, the repin, and the injected-run verification
+4. **`krayt-dev`'s floating base pin** — the rebuild, the repin, and the injected-run verification
    are all done (`krayt.yaml` runs `sha-cbca700`, built from `main`'s tip). What's left is that
    `hack/krayt-dev/Dockerfile`'s `FROM` is still tag-only, so the base floats, plus two
    CA-sensitive checks nothing has exercised yet (`[tooling]` below).
-6. **The trixie base bump + rtk install** — landed and verified end-to-end **for Claude Code on
+5. **The trixie base bump + rtk install** — landed and verified end-to-end **for Claude Code on
    arm64**: `rtk 0.45.0` runs in the published image, and two real `krayt-dev` runs
    (`run_9e0a56de` on, `run_378dac2d` with `KRAYT_RTK=off`) prove the hook intercepts live tool
    calls and that the opt-out is honoured rather than silently absent. What remains needs live
@@ -58,51 +53,6 @@ runs host-side over vsock, terminates TLS for allowlisted hosts, and attaches th
 itself — a subscription token now never enters the VM (`run_df97fffa`, control `run_10fc027d`), and
 Node trusts the ephemeral CA through `NODE_EXTRA_CA_CERTS` (`run_c74208b4`, with `proxy.log`
 corroborating the negative control independently of the agent's own report).
-
----
-
-## [hardware] `run-tasks-on-microsandbox.md` — real end-to-end `krayt run` against msb
-
-- **Needed**: `orchestrator.Run` was rewritten to drive `msb` (microsandbox) instead of
-  krayt's own vfkit/Firecracker VM stack — the whole sandbox layer (`internal/{provider,guest,
-  protocol,proxy,controlclient,imagestore}`, `cmd/krayt-{agent,vsock-forward}`) is deleted in the
-  same change. Every offline test (`go build` both GOOS, `go vet`, `go test -race ./...`,
-  `golangci-lint run`) is green against a scriptable fake `msb`, but nothing in this sandboxed
-  environment can boot a real msb sandbox or reach a real model API — this is the hardware
-  re-verification pass Phase 8 already established the discipline for when it superseded Phase 3's
-  evidence, applied here to the task that deletes the code those earlier hardware runs verified.
-- **Why the agent can't**: msb needs libkrun, which needs a real Linux/KVM host or (the verified
-  path per `probe-microsandbox-feasibility.md`) an Apple-Silicon Mac; this environment has neither.
-  It also needs a live model credential to exercise the claude-code adapter's secret-scoping path
-  for real, and no credential is available here.
-- **Exact steps/commands**:
-  ```sh
-  # once, on the Mac:
-  #   install msb — https://github.com/superradcompany/microsandbox
-  #   krayt doctor            # must show msb found/version/local-backend/msb-doctor all [ok]
-
-  export KRAYT_IMAGE=ghcr.io/418-cloud/krayt-agent-claude-code:latest
-  export KRAYT_SECRETS=/path/to/a/real/secrets.env   # ANTHROPIC_API_KEY=sk-ant-...
-
-  hack/run-integration-tests.sh
-  ```
-  (That script builds krayt, runs `krayt doctor`, then does exactly the two runs below — a plain
-  run and one `--on-question=wait` run — with real commands printed as it goes. Run it, or the two
-  `krayt run` invocations inside it by hand, either is fine.)
-- **Verify success by**:
-  1. The plain run reaches `krayt ls` state `done`, `changes.patch` is non-empty and applies
-     cleanly with `krayt apply`, `report.md` renders, and `meta.json` is well-formed.
-  2. The `--on-question=wait` run reaches `waiting` (confirms the guest's `krayt-ask` really dialed
-     `AF_VSOCK` to host CID 2 and msb bridged it to `internal/askbridge`'s host-side socket);
-     `krayt answer <run-id> <your answer>` resolves it and the run completes.
-  3. `changes.patch` never contains the real `ANTHROPIC_API_KEY` value, and `ps -Eww $(pgrep msb)`
-     (or equivalent) during the run shows the credential only in the `msb create` process's own
-     environ, never in `msb exec`'s.
-  4. Record the run ids (or equivalent identifiers) and outcomes in `docs/ai-tasks/README.md`'s
-     task 7 row and `KRAYT_SPEC.md` §14 Phase 11, replacing the "not yet run on hardware" language
-     there — do not leave this entry's outcome undocumented once it's done.
-- **Blocking**: yes, for `retire-vm-image-pipeline.md` (per that task's own dependency on this
-  cutover being hardware-verified before the VM image pipeline it makes redundant is removed).
 
 ---
 

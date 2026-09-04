@@ -172,12 +172,19 @@ func (c *Client) Version(ctx context.Context) (Version, error) {
 	return parseVersion(strings.TrimSpace(string(out)))
 }
 
-// ContextInfo is the parsed result of `msb context --format json`. The exact JSON shape is not
-// pinned by the ADR or msb's docs beyond the presence of a backend indicator, so parsing checks
-// a small set of plausible key names rather than a single fixed field — see parseContext.
+// ContextInfo is the parsed result of `msb context --format json`. msb 0.6.16 emits
+// {"kind":"local","source":"default"} — `kind` carries the backend, `source` names what selected
+// it — but the shape is not pinned by the ADR or msb's docs, so parsing stays tolerant of other
+// key names (see parseContext).
 type ContextInfo struct {
 	Backend string
-	Raw     json.RawMessage
+	// Source is msb's own account of what selected the backend ("default", "MSB_BACKEND", a
+	// profile name…). krayt appends MSB_BACKEND=local to every invocation (childEnv), so a
+	// healthy host reports "MSB_BACKEND" here — direct evidence the pin reached the child, which
+	// Backend alone cannot give: "local" is also msb's default. Reported, never gated on; msb is
+	// beta and a local backend reached by default is not a failure.
+	Source string
+	Raw    json.RawMessage
 }
 
 // IsLocal reports whether the resolved backend is BackendLocal — the assertion
@@ -196,19 +203,29 @@ func (c *Client) Context(ctx context.Context) (ContextInfo, error) {
 	return parseContext(out)
 }
 
-// parseContext is deliberately tolerant: it looks for a handful of plausible key names for the
-// backend indicator rather than assuming one exact schema, since that schema is unverified
-// against msb's source (probe-microsandbox-feasibility.md's outstanding probes do not cover it,
-// and neither blocks this task). If none match, Backend is empty — which IsLocal correctly
-// reports as false, and callers fail closed on that (decision 5's "a pin that is never checked
-// is a comment").
+// parseContext reads the backend indicator out of `msb context --format json`. `kind` is msb's
+// actual field name, read from msb 0.6.16 on macOS/aarch64:
+//
+//	$ msb context --format json
+//	{"kind":"local","source":"default"}
+//
+// The three names after it are kept as fallbacks. They are NOT observed field names — they were
+// this function's original guesses, made when the schema was unverified, and the guess was wrong:
+// every one of them missed `kind`, so a correctly-pinned host failed `krayt doctor`'s backend
+// check with an empty Backend. Keeping them costs nothing and covers a future rename; `kind` goes
+// first because it is the one name actually confirmed against msb.
+//
+// If none match, Backend is empty — which IsLocal correctly reports as false, and callers fail
+// closed on that (decision 5's "a pin that is never checked is a comment"). Raw is retained so
+// that a caller can show the operator what msb actually printed rather than only that no key
+// matched; the empty-Backend path is exactly where the schema has drifted before.
 func parseContext(raw []byte) (ContextInfo, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return ContextInfo{}, fmt.Errorf("sandbox: parse msb context json: %w", err)
 	}
 	info := ContextInfo{Raw: raw}
-	for _, key := range []string{"backend", "active_backend", "current_backend"} {
+	for _, key := range []string{"kind", "backend", "active_backend", "current_backend"} {
 		v, ok := m[key]
 		if !ok {
 			continue
@@ -217,6 +234,12 @@ func parseContext(raw []byte) (ContextInfo, error) {
 		if err := json.Unmarshal(v, &s); err == nil && s != "" {
 			info.Backend = s
 			break
+		}
+	}
+	if v, ok := m["source"]; ok {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			info.Source = s
 		}
 	}
 	return info, nil
@@ -348,7 +371,9 @@ func (s CreateSpec) Args() []string {
 		args = append(args, "--cpus", strconv.Itoa(s.CPUs))
 	}
 	if s.MemoryMiB > 0 {
-		args = append(args, "--memory", strconv.FormatUint(s.MemoryMiB, 10))
+		// msb parses --memory as a size with an explicit unit suffix ("512M", "1G"); a bare
+		// integer is accepted but its unit is msb's business, not ours. Always spell the M.
+		args = append(args, "--memory", strconv.FormatUint(s.MemoryMiB, 10)+"M")
 	}
 	if s.RootDisk != "" {
 		args = append(args, "--root-disk", s.RootDisk)
@@ -356,7 +381,7 @@ func (s CreateSpec) Args() []string {
 		args = append(args, "--root-disk", strconv.FormatUint(s.DiskGiB, 10)+"G")
 	}
 	if s.MaxDuration > 0 {
-		args = append(args, "--max-duration", s.MaxDuration.String())
+		args = append(args, "--max-duration", msbDuration(s.MaxDuration))
 	}
 	for _, e := range s.Env {
 		args = append(args, "--env", e.Name+"="+e.Value)
@@ -393,6 +418,20 @@ func (s CreateSpec) Args() []string {
 	}
 	args = append(args, s.ExtraArgs...)
 	return args
+}
+
+// msbDuration renders a Go duration the way msb's parser reads one. msb accepts exactly one
+// integer followed by one unit ("30s", "5m", "1h") — time.Duration.String() emits the composite
+// form ("30m0s", "1h0m0s"), which msb rejects with "invalid digit found in string" before it even
+// opens its database. Whole seconds are the one form that is always expressible, so everything is
+// rendered as "<n>s", rounded up so a sub-second limit never collapses to "0s" (which msb would
+// read as no limit at all — the opposite of what the caller asked for).
+func msbDuration(d time.Duration) string {
+	secs := int64(d / time.Second)
+	if d%time.Second != 0 {
+		secs++
+	}
+	return strconv.FormatInt(secs, 10) + "s"
 }
 
 // Create runs `msb create`, with secretEnv appended to the child's environment on top of the

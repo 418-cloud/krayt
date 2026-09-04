@@ -14,13 +14,16 @@ func TestNetworkArgsAllowlistGolden(t *testing.T) {
 	}
 	want := []string{
 		"--net-default", "deny",
+		// allow@dns comes FIRST, ahead of the deny groups: rules are first-match-wins and the
+		// gateway that `dns` names sits inside `private`, so denying private first resolves
+		// nothing at all. See allowDNSArgs.
+		"--net-rule", "allow@dns",
 		"--net-rule", "deny@private",
 		"--net-rule", "deny@loopback",
 		"--net-rule", "deny@link-local",
 		"--net-rule", "deny@meta",
 		"--net-rule", "deny@multicast",
 		"--net-rule", "deny@host",
-		"--net-rule", "allow@dns",
 		"--net-rule", "allow@api.anthropic.com",
 		"--net-rule", "allow@generativelanguage.googleapis.com",
 		"--on-secret-violation", "block-and-log",
@@ -58,6 +61,9 @@ func TestNetworkArgsFullGolden(t *testing.T) {
 	np := NetworkPolicy{Mode: NetworkFull}
 	want := []string{
 		"--net-default-egress", "allow", "--net-default-ingress", "deny",
+		// full mode needs the same explicit DNS decision, for the same first-match-wins reason:
+		// its egress default is allow, but deny@private would still match the gateway.
+		"--net-rule", "allow@dns",
 		"--net-rule", "deny@private",
 		"--net-rule", "deny@loopback",
 		"--net-rule", "deny@link-local",
@@ -86,6 +92,12 @@ func TestNetworkArgsFullDenyRulesPrecedeAnyAllow(t *testing.T) {
 	for i, tok := range got {
 		if strings.HasPrefix(tok, "deny@") {
 			lastDenyIdx = i
+		}
+		// allow@dns is the one deliberate exception to "denies before allows" — it names the
+		// gateway, which `private` also covers, so under first-match-wins it has to win. Every
+		// OTHER allow must still come after every deny. See allowDNSArgs.
+		if tok == "allow@dns" {
+			continue
 		}
 		if strings.HasPrefix(tok, "allow@") && firstAllowIdx == -1 {
 			firstAllowIdx = i
@@ -308,11 +320,10 @@ func TestNetworkArgsThisRepoConfig(t *testing.T) {
 		t.Fatalf("NetworkArgs: %v", err)
 	}
 
-	want := []string{"--net-default", "deny"}
+	want := []string{"--net-default", "deny", "--net-rule", "allow@dns"}
 	for _, g := range msbDenyGroups {
 		want = append(want, "--net-rule", "deny@"+g)
 	}
-	want = append(want, "--net-rule", "allow@dns")
 	for _, h := range cfg.Network.Allow {
 		want = append(want, "--net-rule", "allow@"+h)
 	}
@@ -461,4 +472,52 @@ func containsPair(ss []string, a, b string) bool {
 		}
 	}
 	return false
+}
+
+// TestNetworkArgsAllowDNSPrecedesEveryDeny is the regression guard for the ENOTFOUND failure:
+// msb's `dns` target is the gateway's port 53, the gateway is inside `private`, and rules are
+// first-match-wins — so emitting deny@private before allow@dns silently left the guest unable to
+// resolve anything, in a sandbox whose policy otherwise looked exactly right. Every mode with a
+// network must therefore put allow@dns ahead of every deny@ rule.
+func TestNetworkArgsAllowDNSPrecedesEveryDeny(t *testing.T) {
+	for _, np := range []NetworkPolicy{
+		{Mode: NetworkAllowlist, Allow: []string{"api.anthropic.com"}},
+		{Mode: NetworkAllowlist}, // empty allowlist still has to resolve
+		{Mode: NetworkFull},
+	} {
+		got, err := NetworkArgs(np, false)
+		if err != nil {
+			t.Fatalf("NetworkArgs(%v): %v", np.Mode, err)
+		}
+		dnsIdx, firstDenyIdx := -1, -1
+		for i, tok := range got {
+			if tok == "allow@dns" && dnsIdx == -1 {
+				dnsIdx = i
+			}
+			if strings.HasPrefix(tok, "deny@") && firstDenyIdx == -1 {
+				firstDenyIdx = i
+			}
+		}
+		if dnsIdx == -1 {
+			t.Errorf("mode %q emitted no allow@dns — the guest would resolve nothing: %v", np.Mode, got)
+			continue
+		}
+		if firstDenyIdx != -1 && dnsIdx > firstDenyIdx {
+			t.Errorf("mode %q: allow@dns (index %d) comes after deny@ (index %d); first-match-wins means DNS is denied: %v",
+				np.Mode, dnsIdx, firstDenyIdx, got)
+		}
+	}
+}
+
+// TestNetworkArgsNoneHasNoDNSRule pins the other half: `none` means no network, so it must not
+// gain a DNS rule from the reordering above — --no-net with any rule beside it would punch
+// through the mode entirely (msb common.rs:2459-2465).
+func TestNetworkArgsNoneHasNoDNSRule(t *testing.T) {
+	got, err := NetworkArgs(NetworkPolicy{Mode: NetworkNone}, false)
+	if err != nil {
+		t.Fatalf("NetworkArgs: %v", err)
+	}
+	if contains(got, "allow@dns") || contains(got, "--net-rule") {
+		t.Errorf("none mode must emit no --net-rule at all: %v", got)
+	}
 }

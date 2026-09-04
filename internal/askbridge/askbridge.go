@@ -234,13 +234,17 @@ func lingerUntilPeerCloses(conn net.Conn, timeout time.Duration) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(conn, maxAskRequestBytes))
 }
 
-// Listen creates dir (the run's own private state directory, decision 4 — NOT vfkit's shared
-// `/tmp/krayt-<uid>` root, which exists only for macOS's sockaddr_un length limit) if necessary,
-// reusing sockroot.Ensure's hostile-pre-existing-directory refusal (decision 12) rather than a
-// second copy of that check, then binds a unix socket at dir/ask.sock and chmods it 0600 (decision
-// 10) — narrower than the in-guest bridge's 0777, which existed only so a non-root container
-// could reach a root-owned directory; here the socket lives in the run's own directory on the
-// host, so there is no non-root party to widen it for. net.Listen itself never unlinks a
+// Listen creates dir if necessary, binds ask.sock in it, and hardens both. Which directory that
+// is belongs to the caller: orchestrator.runSocketDir prefers the run's own private state
+// directory (decision 4) and falls back to the per-uid `<tmp>/krayt-<uid>` root when the run
+// directory's path would push the socket past macOS's sockaddr_un limit — decision 4's claim that
+// the socket could be kept "short by construction" does not survive an unbounded repo path in
+// front of it. This function treats both the same way, reusing sockroot.Ensure's
+// hostile-pre-existing-directory refusal (decision 12) rather than a second copy of that check,
+// then binds a unix socket at dir/ask.sock and chmods it 0600 (decision 10) — narrower than the
+// in-guest bridge's 0777, which existed only so a non-root container could reach a root-owned
+// directory; here the socket lives in a 0700 directory owned by the invoking user either way, so
+// there is no non-root party to widen it for. net.Listen itself never unlinks a
 // pre-existing path at that name, so a socket already present here is a fail-closed error, not an
 // unlink-then-bind (decision 12).
 //

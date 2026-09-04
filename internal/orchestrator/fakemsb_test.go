@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -53,7 +54,7 @@ const (
 type fakeAskScript struct {
 	Prompt         string   `json:"prompt"`
 	Choices        []string `json:"choices,omitempty"`
-	AnswerFile     string   `json:"answer_file"`               // relative path under /workspace to record the outcome into
+	AnswerFile     string   `json:"answer_file"`                 // relative path under /workspace to record the outcome into
 	PostAskSleepMS int      `json:"post_ask_sleep_ms,omitempty"` // simulates the agent still working after the answer arrives
 }
 
@@ -288,6 +289,13 @@ func fakeMsbCopy(home string, args []string) int {
 		return copyPathResult(from, to)
 	case !srcRemote && dstRemote:
 		to := filepath.Join(sandboxRoot(home, dstName), dstPath)
+		// Real msb does NOT create a missing parent directory in the guest; it fails with
+		// this exact error. The fake used to MkdirAll it, which is why the suite happily
+		// passed while every real run died on the first copy into /task.
+		if fi, err := os.Stat(filepath.Dir(to)); err != nil || !fi.IsDir() {
+			fmt.Fprintln(os.Stderr, "error: sandbox fs error: open: No such file or directory (os error 2)")
+			return 1
+		}
 		return copyPathResult(srcPath, to)
 	default:
 		fmt.Fprintln(os.Stderr, "fake-msb: copy needs exactly one remote side")
@@ -377,6 +385,8 @@ afterFlags:
 		return fakeHelperSetup(root, cmd[2:])
 	case len(cmd) >= 2 && strings.HasSuffix(cmd[0], "/krayt-helper") && cmd[1] == "finish":
 		return fakeHelperFinish(root, cmd[2:])
+	case len(cmd) >= 1 && cmd[0] == "mkdir":
+		return fakeMkdir(root, cmd[1:])
 	case len(cmd) >= 1 && cmd[0] == "chmod":
 		return fakeChmod(root, cmd[1:])
 	case len(cmd) == 1 && cmd[0] == "/usr/local/bin/krayt-agent-entrypoint":
@@ -460,12 +470,50 @@ func encodeJSON(v any) int {
 	return 0
 }
 
-func fakeChmod(root string, args []string) int {
+// fakeMkdir implements the `mkdir -p DIR...` the copy-in step runs as root before any copy.
+func fakeMkdir(root string, args []string) int {
+	made := 0
 	for _, p := range args {
-		if p == "+x" || !strings.HasPrefix(p, "/") {
+		if p == "-p" {
 			continue
 		}
-		_ = os.Chmod(inSandbox(root, p), 0o755)
+		if !strings.HasPrefix(p, "/") {
+			fmt.Fprintf(os.Stderr, "fake-msb mkdir: not an absolute guest path: %q\n", p)
+			return 1
+		}
+		if err := os.MkdirAll(inSandbox(root, p), 0o755); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-msb mkdir:", err)
+			return 1
+		}
+		made++
+	}
+	if made == 0 {
+		fmt.Fprintln(os.Stderr, "fake-msb mkdir: no operand")
+		return 1
+	}
+	return 0
+}
+
+// fakeChmod handles both forms the orchestrator uses: a symbolic `+x` and an octal mode.
+func fakeChmod(root string, args []string) int {
+	mode := os.FileMode(0o755)
+	for _, p := range args {
+		if p == "+x" {
+			continue
+		}
+		if !strings.HasPrefix(p, "/") {
+			m, err := strconv.ParseUint(p, 8, 32)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "fake-msb chmod: unrecognized operand %q\n", p)
+				return 1
+			}
+			mode = os.FileMode(m)
+			continue
+		}
+		if err := os.Chmod(inSandbox(root, p), mode); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-msb chmod:", err)
+			return 1
+		}
 	}
 	return 0
 }

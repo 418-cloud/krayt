@@ -289,18 +289,20 @@ create` call can reach:
 - **`none`** → `--no-net` and **zero** `--net-rule` flags. `--net none` is deliberately avoided:
   msb still layers any supplied `--net-rule` on top of `NetworkPolicy::none()`, so even one stray
   rule would silently punch a hole through the mode that is supposed to mean no network at all.
-- **`allowlist` (default)** → `--net-default deny`, explicit `deny@<group>` rules for every
-  private destination group (below), `allow@dns`, then one `allow@<host>` per `network.allow`
+- **`allowlist` (default)** → `--net-default deny`, `allow@dns`, explicit `deny@<group>` rules for
+  every private destination group (below), then one `allow@<host>` per `network.allow`
   entry, in the order given — deterministic, so the same config always renders byte-identical
   argv (pinned by golden tests against this repo's own `krayt.yaml`).
-- **`full`** → `--net-default-egress allow --net-default-ingress deny`, plus the *same* explicit
-  `deny@<group>` rules first: `full`'s allow must not mean "and also the host's LAN" — the
+- **`full`** → `--net-default-egress allow --net-default-ingress deny`, plus the *same*
+  `allow@dns` and explicit `deny@<group>` rules: `full`'s allow must not mean "and also the
+  host's LAN" — the
   identical design rule krayt's pre-msb resolved-IP dialer guard used to enforce, now expressed as
   explicit msb rules instead of a Go-side check, since msb — not krayt — is doing the dialing.
 - **Private/loopback/link-local/metadata stay denied in every mode, including `full`** — an
   existing krayt property carried forward, not a new one. msb exposes this as destination groups
   (`private`, `loopback`, `link-local`, `meta`, `multicast`, `host`; `msbDenyGroups` in
-  `netpolicy_msb.go`), denied explicitly and ordered before any allow rule.
+  `netpolicy_msb.go`), denied explicitly and ordered before every allow rule **except
+  `allow@dns`** — see the DNS paragraph below for why that one has to come first.
 - **Ingress is denied explicitly, in every mode** (`--net-default-ingress deny` for `full`; the
   deny-default modes need no separate ingress flag). krayt publishes no ports today, so this is
   inert — but msb's own ingress default is `allow`, and closing it costs one flag now rather than
@@ -312,6 +314,16 @@ proxy. Under msb the guest has a real, policed network interface, so `allowlist`
 `allow@dns` explicitly — msb's `--net-default*` path adds **no** implicit DNS rule the way its
 profile-based default does, so a deny-default allowlist with no explicit `allow@dns` resolves
 nothing — and DNS is policed by msb's own gateway, with DNS-rebind protection on by default.
+
+**`allow@dns` is emitted before the `deny@<group>` rules, and that ordering is load-bearing.**
+msb's `dns` is a *destination*, not a capability — its own CLI help defines it as "the semantic
+`dns` target for gateway UDP/TCP port 53" — and that gateway is the guest's end of a /30 carved
+out of `--net-ipv4-pool`, which defaults to `172.16.0.0/12`. `dns` and `private` therefore name
+overlapping destinations, and msb evaluates rules first-match-wins within a direction, so
+whichever krayt emits first decides. With the denies first the gateway matched `deny@private` and
+the guest resolved nothing: every agent request failed `ENOTFOUND` inside a sandbox whose policy
+was otherwise exactly right. `dns` is the single exception to "denies before allows", and a narrow
+one — it opens the gateway's port 53, not the private groups those denies exist to close.
 
 **`--tls-intercept` is emitted whenever any secret is declared, and only then.** This is
 redundant with msb's own behavior — `SandboxBuilder::secret_entry` turns on interception
@@ -737,8 +749,14 @@ per-VM resource limit: a byte cap on one request (`maxAskRequestBytes`, 64 KiB),
 around decoding the request only — never around `Bridge.Ask`, which legitimately blocks for the
 whole `--question-timeout` — and a cap on in-flight questions, past which a new question gets the
 no-answer sentinel immediately rather than a queue slot. The host socket lives in the run's own
-private state directory (`runDir/ask/ask.sock`, not a shared per-uid root — that existed only for
-macOS's `sockaddr_un` length limit, which the msb path has no equivalent constraint for), hardened
+private state directory (`runDir/ask/ask.sock`) whenever that path fits, and in a per-uid root
+(`<tmp>/krayt-<uid>/<run-id>/`) when it does not — `orchestrator.runSocketDir` chooses. The msb
+path is *not* exempt from macOS's `sockaddr_un` length limit, as this design first assumed: the
+krayt-controlled suffix alone is 43 bytes and the repo path in front of it is unbounded, so a
+scratch repo under macOS's own `$TMPDIR` overflowed 104 bytes and failed every
+`--on-question=wait` run with `bind: invalid argument`. The fallback root is the pre-msb vfkit
+root and is not world-writable: it gets the same `0700`/owner/no-symlink treatment as the run
+directory. Both are hardened
 by `internal/sockroot.Ensure` (extracted from the pre-msb vfkit/Firecracker socket-root check so
 there is one check, not several) and created `0700`, owned by the invoking user; the socket itself
 is `0600` inside it — narrower than the pre-msb in-guest bridge's `0777`, which existed only so a
@@ -2370,13 +2388,29 @@ independently-landed progress rather than a single big-bang "Done when".
   `golangci-lint run` are green; no `internal/provider`/`internal/guest`/`internal/protocol`/
   `internal/proxy`/`internal/controlclient` import remains anywhere; teardown-on-every-path,
   no-secret-on-argv, and orchestrator coverage are all asserted against the fake `msb` with no
-  regression from the pre-cutover suite. **Done when (hardware, `[HUMAN]`) — NOT done, no
-  fabricated result**: a real end-to-end `krayt run` against
-  `ghcr.io/418-cloud/krayt-agent-claude-code` on an Apple-Silicon Mac, plus one
-  `--on-question=wait` run exercising the `ask_human` round trip, are both **outstanding** — no
-  Apple-Silicon hardware is available in this environment. Recorded, blocking for
-  `retire-vm-image-pipeline.md`, in `HUMAN_TODO.md` (`run-tasks-on-microsandbox.md`'s hardware
-  re-verification entry) rather than claimed here.
+  regression from the pre-cutover suite. **Done when (hardware, `[HUMAN]`)**: met 2026-09-04 on an
+  Apple-Silicon Mac (msb 0.6.16, `ghcr.io/418-cloud/krayt-agent-claude-code:latest`, live
+  credential). `run_d25279fb` — plain run, `done`, `exit 0`, non-empty `changes.patch`, rendered
+  `report.md`. `run_aa23143e` — `--on-question=wait`, reached `waiting` with a real
+  `questions/q1.json`, resolved by `krayt answer` over the run control socket, resumed, and
+  finished `done` with the edit it had asked about; that is the `ask_human` round trip through
+  `krayt-ask` → `AF_VSOCK` → msb's `--vsock` bridge → `internal/askbridge`, plus the cross-process
+  `krayt answer` dial. **The pass found five defects the offline suite could not**, each fatal to
+  a real run: msb rejecting Go's composite duration on `--max-duration`; `msb copy` not creating
+  guest parent directories; `deny@private` shadowing `allow@dns` under first-match-wins (§6.6);
+  the ask socket overflowing macOS's `sun_path` limit (§6.13); and `on_timeout: abort` losing a
+  race with the agent's own exit. Two of the five were masked by test doubles more forgiving than
+  the real `msb`, one by a test that passed only because another bug failed every run — recorded
+  in `HUMAN_TODO.md` so the lesson outlives the fixes. Criterion 3 — the credential reaching nothing but `msb
+  create` — is met too (`run_63b9a3bf`, `hack/msb-probes/p6-credential-not-in-run.sh`): the guest
+  held msb's `$MSB_CLAUDE_CODE_OAUTH_TOKEN` placeholder, and the real value appeared in no msb
+  process's argv, no run artifact and not in `changes.patch`. That probe's environ reading is
+  inconclusive on darwin — macOS will not show another process's environment even at the same uid,
+  the limitation `hack/msb-probes/p4-environ-exposure-window.sh` already records — so the environ
+  window closes on the Linux/KVM re-run P4 is already waiting for, not here. `krayt apply` closes the loop: `run_b18ad67e`'s patch
+  applied cleanly to the scratch repo's working tree. **Every criterion of this phase's hardware
+  re-verification is met; the `HUMAN_TODO.md` entry is deleted accordingly**, and
+  `retire-vm-image-pipeline.md` is unblocked.
 - [ ] `retire-vm-image-pipeline.md` — deletes `internal/vmimage`, `images/`, the three image
   workflows, and the Linux-builder requirement.
 - [ ] `add-msb-extra-conf-escape-hatch.md` — opt-in `sandbox.extra_conf: <path>`, explicitly

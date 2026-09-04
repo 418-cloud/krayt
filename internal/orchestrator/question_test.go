@@ -21,11 +21,22 @@ func waitState(t *testing.T, stateDir, id, want string) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("run %s never reached state %q (last=%q)", id, want, rec.State)
+			// Include the record's own error: a bare last="failed" says nothing about why, which
+			// is the difference between a one-line diagnosis and re-instrumenting the test.
+			t.Fatalf("run %s never reached state %q (last=%q, err=%q, read err=%v)", id, want, rec.State, rec.Error, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// The question tests deliberately use plain t.TempDir(), which on macOS roots at $TMPDIR — ~49
+// bytes of /var/folders/<…>/T/ before the test's own name is added. That is exactly the shape
+// that used to overflow the 104-byte sockaddr_un limit once the orchestrator appended
+// runs/<id>/ask/ask.sock, and it is now the shape that exercises runSocketDir's fallback to a
+// short hardened root. These tests previously mkdtemp'd under /tmp to dodge the overflow; that
+// workaround was hiding the defect rather than testing around it — a real `krayt run` from a
+// scratch repo under $TMPDIR hit the same wall and every --on-question=wait run died on
+// "bind: invalid argument". Keeping the long path here is the point.
 
 // TestQuestionWaitAnswer is the ask_human round-trip proof (§6.13): a scripted agent asks a
 // question over the real vsock-route unix socket, driving the run to `waiting`; Manager.Answer
@@ -36,14 +47,14 @@ func TestQuestionWaitAnswer(t *testing.T) {
 	defer cancel()
 
 	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
-		Ask: &fakeAskScript{Prompt: "proceed?", Choices: []string{"yes", "no"}, AnswerFile: "greeting.txt"},
+		Ask:      &fakeAskScript{Prompt: "proceed?", Choices: []string{"yes", "no"}, AnswerFile: "greeting.txt"},
 		ExitCode: 0,
 	}})
+	const id = "run_q"
 	mgr := orchestrator.NewManager(orchestrator.Deps{Sandbox: sb}, t.TempDir(), 0)
 	stateDir := mgr.StateDir()
 	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
 
-	const id = "run_q"
 	runDone := make(chan error, 1)
 	go func() {
 		_, err := mgr.Run(ctx, task.RunSpec{
@@ -90,7 +101,7 @@ func TestQuestionWaitAnswer(t *testing.T) {
 // no separate host-side "sentinel this question" branch to maintain under msb.
 func TestQuestionFailModeSentinel(t *testing.T) {
 	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
-		Ask: &fakeAskScript{Prompt: "proceed?", AnswerFile: "greeting.txt"},
+		Ask:      &fakeAskScript{Prompt: "proceed?", AnswerFile: "greeting.txt"},
 		ExitCode: 0,
 	}})
 	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
@@ -115,14 +126,14 @@ func TestQuestionTimeoutSentinel(t *testing.T) {
 	defer cancel()
 
 	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
-		Ask: &fakeAskScript{Prompt: "proceed?", AnswerFile: "greeting.txt"},
+		Ask:      &fakeAskScript{Prompt: "proceed?", AnswerFile: "greeting.txt"},
 		ExitCode: 0,
 	}})
+	const id = "run_qtimeout"
 	mgr := orchestrator.NewManager(orchestrator.Deps{Sandbox: sb}, t.TempDir(), 0)
 	stateDir := mgr.StateDir()
 	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
 
-	const id = "run_qtimeout"
 	runDone := make(chan error, 1)
 	go func() {
 		_, err := mgr.Run(ctx, task.RunSpec{
@@ -156,14 +167,14 @@ func TestQuestionResolvedResumesWhileAgentStillWorking(t *testing.T) {
 	defer cancel()
 
 	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
-		Ask: &fakeAskScript{Prompt: "proceed?", Choices: []string{"yes", "no"}, AnswerFile: "greeting.txt", PostAskSleepMS: 300},
+		Ask:      &fakeAskScript{Prompt: "proceed?", Choices: []string{"yes", "no"}, AnswerFile: "greeting.txt", PostAskSleepMS: 300},
 		ExitCode: 0,
 	}})
+	const id = "run_resolve"
 	mgr := orchestrator.NewManager(orchestrator.Deps{Sandbox: sb}, t.TempDir(), 0)
 	stateDir := mgr.StateDir()
 	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})
 
-	const id = "run_resolve"
 	runDone := make(chan error, 1)
 	go func() {
 		_, err := mgr.Run(ctx, task.RunSpec{
@@ -199,7 +210,7 @@ func TestQuestionResolvedResumesWhileAgentStillWorking(t *testing.T) {
 // letting the agent proceed on a sentinel (§6.13).
 func TestQuestionTimeoutAbort(t *testing.T) {
 	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{
-		Ask: &fakeAskScript{Prompt: "proceed?", AnswerFile: "greeting.txt"},
+		Ask:      &fakeAskScript{Prompt: "proceed?", AnswerFile: "greeting.txt"},
 		ExitCode: 0,
 	}})
 	src := newRepo(t, map[string]string{"greeting.txt": "hello\n"})

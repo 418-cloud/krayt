@@ -404,7 +404,10 @@ func TestCreateSpecReflectsRunResources(t *testing.T) {
 	}
 	create := calls[0].Args
 	for _, want := range [][2]string{
-		{"--cpus", "4"}, {"--memory", "8192"}, {"--root-disk", "40G"}, {"--max-duration", (20 * time.Minute).String()},
+		// --memory carries an explicit unit and --max-duration is whole seconds: msb accepts
+		// one integer plus one unit and rejects Go's composite "20m0s" outright. Spelled
+		// literally here rather than via Duration.String(), which is what produced the bug.
+		{"--cpus", "4"}, {"--memory", "8192M"}, {"--root-disk", "40G"}, {"--max-duration", "1200s"},
 		{"--security", "restricted"}, {"--user", "agent"},
 	} {
 		if !argPairPresent(create, want[0], want[1]) {

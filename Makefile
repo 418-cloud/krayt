@@ -18,8 +18,10 @@ guest-bins:
 build: guest-bins
 	go build ./...
 
-# Build the krayt CLI binary into ./bin (host OS/arch).
-krayt:
+# Build the krayt CLI binary into ./bin (host OS/arch). Depends on guest-bins because a krayt
+# built with an empty embed cannot do a real run — it fails at `msb copy` time with guestbin's
+# "not embedded" error — so the binary this target produces must always be a runnable one.
+krayt: guest-bins
 	mkdir -p $(BIN)
 	go build -o $(BIN)/krayt ./cmd/krayt
 

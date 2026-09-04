@@ -82,7 +82,13 @@ func TestConcurrentRuns(t *testing.T) {
 // fake agent emits its lines with a real delay between them, exercising msb exec --stream's
 // genuine incremental delivery rather than a buffered dump at the end.
 func TestAttachLive(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Generous, because this budget is a hang-guard and nothing else. What makes the test
+	// meaningful is the runDone check below — output must arrive while the run is STILL
+	// executing — and that assertion is unaffected by how long we are willing to wait. Under
+	// -race every step here is instrumented, the fake msb included (each create/exec/copy is a
+	// race-built subprocess), and the whole package takes ~30x longer; a tight budget turns
+	// that slowdown into a spurious failure about liveness, which is not what it measured.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	sb := newFakeSandboxWithLineDelay(t, t.TempDir(), []string{"line 1", "line 2", "line 3"}, 120*time.Millisecond)
@@ -103,15 +109,13 @@ func TestAttachLive(t *testing.T) {
 	go func() { followDone <- orchestrator.FollowLog(followCtx, runDir, &buf, 20*time.Millisecond) }()
 
 	// We must see the first line while the run is STILL running — that is what makes it live.
-	deadline := time.Now().Add(10 * time.Second)
 	for !strings.Contains(buf.String(), "line 1") {
 		select {
 		case err := <-runDone:
 			t.Fatalf("run finished before any live output was observed (err=%v)", err)
+		case <-ctx.Done():
+			t.Fatalf("no live output before the test context expired; buffer=%q", buf.String())
 		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no live output within deadline; buffer=%q", buf.String())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

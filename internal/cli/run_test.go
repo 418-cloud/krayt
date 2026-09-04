@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/418-cloud/krayt/internal/orchestrator"
+	"github.com/418-cloud/krayt/internal/sandbox"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
@@ -18,7 +20,25 @@ import (
 func newTestRunCmd(f *runFlags) *cobra.Command {
 	cmd := &cobra.Command{Use: "run", RunE: func(*cobra.Command, []string) error { return nil }}
 	bindRunFlags(cmd, f)
+	// Cobra sets a command's context during Execute; these tests call runRun directly, so
+	// without this cmd.Context() is nil and any test that gets as far as orchestrator.Manager.Run
+	// panics on context.WithCancel(nil) rather than failing. Set it here, once, so every test
+	// built on this helper matches how the command is really invoked.
+	cmd.SetContext(context.Background())
 	return cmd
+}
+
+// pinMissingMsb points the msb driver at a path that cannot be executed, so a test that runs
+// past pre-flight fails fast and identically on every machine.
+//
+// resolveBin returns KRAYT_MSB_BIN verbatim without stat-ing it, so newRunDeps still succeeds and
+// the run fails at the first msb exec. Tests that only mean to assert pre-flight behaviour must
+// not depend on whether the developer happens to have msb installed: without this they either
+// bail early (CI, no msb — passing for the wrong reason) or go on to drive a real `msb create`
+// with a bogus image on a machine that has one.
+func pinMissingMsb(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv(sandbox.BinEnv, filepath.Join(dir, "no-such-msb"))
 }
 
 // TestReadTaskPromptStdin covers --task - reading the prompt from cmd.InOrStdin() rather than
@@ -228,10 +248,11 @@ func TestRunRunNetworkInjectPreflightRejectsMissingSecretKey(t *testing.T) {
 
 // TestRunRunNetworkInjectPreflightPassesWithRealSecretKey is the companion positive case: when
 // the referenced key really is in the secrets file, pre-flight validation does not itself
-// reject the run (it may still fail later for unrelated reasons — no msb on this host,
-// same as TestRunRunResourcePreflightBypassedBySkipFlag — that's fine and untested here).
+// reject the run. It still fails afterwards, on the unrunnable msb pinMissingMsb pins — that is
+// deliberate and unasserted here; all this test claims is that the failure is not the pre-flight's.
 func TestRunRunNetworkInjectPreflightPassesWithRealSecretKey(t *testing.T) {
 	dir := t.TempDir()
+	pinMissingMsb(t, dir)
 	taskFile := filepath.Join(dir, "task.md")
 	if err := os.WriteFile(taskFile, []byte("do the thing"), 0o644); err != nil {
 		t.Fatal(err)
