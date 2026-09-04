@@ -60,6 +60,7 @@ type runFlags struct {
 	repo         string
 	secretsFile  string
 	includeDirty bool
+	transcript   bool
 	netMode      string
 	allow        []string
 	env          map[string]string
@@ -123,6 +124,7 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.StringVar(&f.repo, "repo", ".", "host repo to bundle")
 	fl.StringVar(&f.secretsFile, "secrets", "", "per-task secrets file (KEY=VALUE), mounted on tmpfs at /run/secrets")
 	fl.BoolVar(&f.includeDirty, "include-dirty", false, "include uncommitted working-tree changes in the bundle")
+	fl.BoolVar(&f.transcript, "transcript", false, "copy the agent's own session transcript out of the sandbox into .krayt/runs/<id>/logs/transcript/ before teardown — records the tool calls and results the agent log does not (§8.4)")
 	fl.StringVar(&f.netMode, "net", "allowlist", "egress policy: allowlist | full | none")
 	fl.StringArrayVar(&f.allow, "allow", nil, "allowlisted egress domain (repeatable); only with --net allowlist")
 	fl.IntVar(&f.bundleDepth, "bundle-depth", 1, "forward bundle: 1 = single-commit snapshot, 0 = full history")
@@ -314,6 +316,11 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	if err := applyAdapter(cmd.OutOrStdout(), &spec, f.agent, secretKeys); err != nil {
 		return err
 	}
+	if !f.transcript {
+		// Opt-in (§8.3): a transcript is the whole conversation — every file read, every command
+		// and its output — so it is captured only when asked for, never by default.
+		spec.TranscriptDir = ""
+	}
 	if err := task.ValidateContainerPolicyForMsb(spec.Container); err != nil {
 		return err
 	}
@@ -468,6 +475,10 @@ func applyAdapter(out io.Writer, spec *task.RunSpec, name string, secretKeys map
 		return err
 	}
 	mergeEnv(spec, plan.Env)
+	// Recorded unconditionally; the caller clears it when --transcript is off. Keeping the gate at
+	// the one place that knows the flag preserves the invariant the orchestrator relies on — a
+	// non-empty spec.TranscriptDir means "capture this" and nothing else needs consulting.
+	spec.TranscriptDir = plan.TranscriptDir
 	if len(plan.Secrets) > 0 {
 		merged, overrides := task.MergeSecretSpecs(spec.Network.Secrets, plan.Secrets)
 		spec.Network.Secrets = merged
@@ -497,7 +508,6 @@ func mergeEnv(spec *task.RunSpec, additions map[string]string) {
 		}
 	}
 }
-
 
 // spoolTaskPrompt writes a stdin-read task prompt to a file in the run dir so a detached
 // supervisor child — whose stdin is gone after re-exec — can still read it (§6.2). Doubles as a
@@ -699,6 +709,9 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	}
 	if !changed("include-dirty") && cfg.IncludeDirty != nil {
 		f.includeDirty = *cfg.IncludeDirty
+	}
+	if !changed("transcript") && cfg.Transcript != nil {
+		f.transcript = *cfg.Transcript
 	}
 	if !changed("bundle-depth") && cfg.BundleDepth != nil {
 		f.bundleDepth = *cfg.BundleDepth

@@ -48,8 +48,8 @@ type RunRecord struct {
 	Questions    []QuestionMeta  `json:"questions,omitempty"`
 	Safety       []string        `json:"safety,omitempty"` // patch-lint findings (§14 Phase 5)
 	Error        string          `json:"error,omitempty"`
-	PID          int             `json:"pid,omitempty"`         // supervising process (for `krayt stop`)
-	CtrlSocket   string          `json:"ctrl_socket,omitempty"` // run control socket (for `krayt answer`, §6.13)
+	PID          int             `json:"pid,omitempty"`          // supervising process (for `krayt stop`)
+	CtrlSocket   string          `json:"ctrl_socket,omitempty"`  // run control socket (for `krayt answer`, §6.13)
 	SandboxName  string          `json:"sandbox_name,omitempty"` // the msb sandbox this run created ("krayt-<id>")
 }
 
@@ -188,6 +188,16 @@ func LogPath(runDir string) string { return filepath.Join(runDir, "logs", "agent
 // before it stops+removes the sandbox; may be empty if the sandbox never got far enough to
 // produce anything.
 func ConsoleLogPath(runDir string) string { return filepath.Join(runDir, "logs", "console.log") }
+
+// TranscriptDirPath is where a run's captured agent session transcript lands (§8.4) — a directory,
+// because an agent may produce more than one session file and krayt copies whatever it finds
+// rather than picking. Written only when the run opted in (--transcript / `transcript: true`) and
+// the selected adapter declares a path; absent otherwise, which is the default.
+//
+// Contents are the agent's own files, redacted against the run's secrets and size-capped, and are
+// an OPAQUE diagnostic artifact: every agent CLI treats its transcript schema as internal and
+// changes it between releases, so this is for humans and grep, never for krayt to parse.
+func TranscriptDirPath(runDir string) string { return filepath.Join(runDir, "logs", "transcript") }
 
 // FollowLog tails runDir/logs/agent.log, writing new bytes to w as they appear, until the
 // run reaches a terminal state (log then drained) or ctx is canceled. Because it reads the

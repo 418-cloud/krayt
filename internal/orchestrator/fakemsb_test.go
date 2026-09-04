@@ -87,7 +87,17 @@ type fakeAgentScript struct {
 type fakeMsbScript struct {
 	Agent          fakeAgentScript `json:"agent"`
 	CreateExitCode int             `json:"create_exit_code,omitempty"`
+
+	// TranscriptFiles are written into the fake guest's $HOME/.claude/projects/-workspace at
+	// create time, keyed by file name — the shape captureTranscript copies out. Absent means the
+	// guest has no transcript, which must leave the run untouched rather than failing it.
+	TranscriptFiles map[string]string `json:"transcript_files,omitempty"`
 }
+
+// fakeGuestHome is the $HOME the fake reports for `sh -c 'printf %s "$HOME"'` and roots its
+// transcript under — the real claude-code and krayt-dev images' home, so the path the orchestrator
+// builds here is the one it builds in production.
+const fakeGuestHome = "/home/agent"
 
 // fakeCall is one recorded invocation of the fake, appended to fakeMsbCallsFile — the basis for
 // this package's "no secret value on any argv" and "teardown on every path" assertions.
@@ -259,6 +269,7 @@ func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 			return 1
 		}
 	}
+	writeFakeTranscript(root, script.TranscriptFiles)
 	return 0
 }
 
@@ -385,6 +396,12 @@ afterFlags:
 		return fakeHelperSetup(root, cmd[2:])
 	case len(cmd) >= 2 && strings.HasSuffix(cmd[0], "/krayt-helper") && cmd[1] == "finish":
 		return fakeHelperFinish(root, cmd[2:])
+	// The $HOME probe captureTranscript issues before copying a transcript out. Emits on stdout
+	// and exits 0 — Exec treats a non-zero exit with no output as a driver failure, so a probe
+	// that stays silent would be misreported.
+	case len(cmd) == 3 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "$HOME"):
+		fmt.Print(fakeGuestHome)
+		return 0
 	case len(cmd) >= 1 && cmd[0] == "mkdir":
 		return fakeMkdir(root, cmd[1:])
 	case len(cmd) >= 1 && cmd[0] == "chmod":
@@ -398,6 +415,21 @@ afterFlags:
 }
 
 func inSandbox(root, p string) string { return filepath.Join(root, p) }
+
+// writeFakeTranscript seeds the fake guest's transcript dir, mirroring where Claude Code writes
+// one: $HOME/.claude/projects/<slug-of-cwd>/<session>.jsonl, cwd being /workspace in the sandbox.
+func writeFakeTranscript(root string, files map[string]string) {
+	if len(files) == 0 {
+		return
+	}
+	dir := inSandbox(root, filepath.Join(fakeGuestHome, ".claude", "projects", "-workspace"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	for name, content := range files {
+		_ = os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644)
+	}
+}
 
 func fakeHelperSetup(root string, args []string) int {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)

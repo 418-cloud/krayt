@@ -14,11 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -176,6 +178,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		if out, lerr := deps.Sandbox.SystemLogs(ctx, name); lerr == nil || len(out) > 0 {
 			writeConsoleLog(out, runDir, secretValues)
 		}
+		captureTranscript(ctx, deps.Sandbox, name, spec.TranscriptDir, runDir, secretValues)
 		_ = deps.Sandbox.Stop(ctx, name)
 		_ = deps.Sandbox.Remove(ctx, name)
 	}()
@@ -674,6 +677,162 @@ func moveTreeContents(src, dst string) error {
 // run — the container is untrusted (§10), and a run's wall-clock timeout has no fixed ceiling,
 // so nothing bounds how much a hostile or merely broken guest could otherwise cause msb to log.
 const maxConsoleLog = 1 << 20 // 1 MiB
+
+// transcriptTimeout bounds the whole capture — one exec plus one copy — on a run whose own ctx is
+// already dead. Matches the driver's own teardownTimeout so a wedged sandbox cannot hold teardown
+// open twice as long just because a transcript was requested.
+const transcriptTimeout = 30 * time.Second
+
+// maxTranscriptFile bounds one captured transcript file. Transcripts grow with the conversation
+// and are agent-controlled, so they need the same ceiling maxConsoleLog gives the system log —
+// but truncated differently. writeConsoleLog keeps the tail because a boot failure is the last
+// thing in it; in a transcript BOTH ends carry the answer: the first appearance of whatever went
+// wrong (a secret placeholder, a bad command) and the failure it ended in. So elideMiddle keeps
+// a head and a tail and drops the middle.
+const maxTranscriptFile = 4 << 20 // 4 MiB
+
+// transcriptHeadBytes is how much of an over-long transcript's head survives elideMiddle; the
+// remaining budget goes to the tail. Weighted toward the tail because a run usually fails near
+// the end, while the head only needs to reach the first few turns.
+const transcriptHeadBytes = 1 << 20 // 1 MiB
+
+// captureTranscript copies the agent's own session transcript out of the sandbox into
+// runDir/logs/transcript, best-effort. Called from Run's teardown defer, which is one of only two
+// blocks that run on EVERY exit path — and that placement is the entire point. The normal
+// collection path (collectOutput) is skipped on a wall-clock timeout, an aborted question, and any
+// msb driver failure, which are exactly the runs whose transcript is worth having; a run that
+// merely exits non-zero would be served either way.
+//
+// guestDir is spec.TranscriptDir: the adapter's path relative to the container user's $HOME, empty
+// when the run did not opt in or the adapter has none. Empty means do nothing at all — no exec, no
+// copy — so a default run pays nothing for this.
+//
+// Every failure here is swallowed. A transcript is a diagnostic, and a run that already succeeded
+// must not be reported as failed because an optional artifact could not be fetched; a run that
+// already failed must not have its real error replaced by this one.
+func captureTranscript(ctx context.Context, sb *sandbox.Client, name, guestDir, runDir string, secretValues map[string]string) {
+	if guestDir == "" {
+		return
+	}
+	// The run's ctx is frequently already dead here — a wall-clock timeout cancels it, and that is
+	// one of the cases this function exists for. Stop/Remove/SystemLogs each wrap their own
+	// WithoutCancel internally; Exec and Copy do not, so do it here rather than in the driver,
+	// where cancellation still has to work for the copy-IN path.
+	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), transcriptTimeout)
+	defer cancel()
+
+	home := guestHome(tctx, sb, name)
+	if home == "" {
+		return
+	}
+
+	stage, err := os.MkdirTemp(runDir, ".transcript-tmp-")
+	if err != nil {
+		return
+	}
+	defer func() { _ = os.RemoveAll(stage) }()
+
+	// A missing source is an ordinary outcome, not a fault: the agent may never have started, or
+	// this adapter's inferred path may not match the image. msb copy reports it as a non-zero exit,
+	// so it arrives as an error rather than an empty result — swallow it.
+	if err := sb.Copy(tctx, name+":"+path.Join(home, guestDir), stage); err != nil {
+		return
+	}
+	if err := writeTranscript(stage, runDir, secretValues); err != nil {
+		return
+	}
+}
+
+// guestHome asks the sandbox what $HOME is for the user krayt runs the agent as. Resolved rather
+// than hardcoded because the images disagree — /home/agent for claude-code and krayt-dev,
+// /home/node for gemini-cli — and ExecSpec carries no env for krayt to set one itself.
+//
+// `printf %s "$HOME"` and not `test`/`echo -n`: Exec reports a non-zero exit with no output on
+// either stream as ErrMsbFailed rather than as an exit code, so a probe must always emit
+// something. printf also avoids echo's trailing newline without relying on `echo -n`, which is not
+// portable across the shells these images ship.
+func guestHome(ctx context.Context, sb *sandbox.Client, name string) string {
+	var out bytes.Buffer
+	res, err := sb.Exec(ctx, sandbox.ExecSpec{
+		Name: name, User: sandboxAgentUser,
+		Command: []string{"sh", "-c", `printf %s "$HOME"`},
+		Stdout:  &out,
+	})
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	home := strings.TrimSpace(out.String())
+	if !path.IsAbs(home) {
+		return "" // a relative or empty HOME would make path.Join produce a nonsense guest path
+	}
+	return home
+}
+
+// writeTranscript moves the staged copy into runDir/logs/transcript, redacting and size-capping
+// each file on the way. Redaction matters more here than anywhere else krayt writes: a transcript
+// records what the agent read and printed, so unlike changes.patch (which is scanned but never
+// rewritten, because mutating it would break git apply) this artifact can and must be rewritten.
+//
+// Copy's directory shape is not pinned — docker-cp nests or flattens depending on whether the
+// destination existed — so, like collectOutput, this tolerates either by walking whatever arrived.
+func writeTranscript(stage, runDir string, secretValues map[string]string) error {
+	var red *secrets.Redactor
+	if len(secretValues) > 0 {
+		red = secrets.NewRedactor(secrets.Values(secretValues))
+	}
+	dst := TranscriptDirPath(runDir)
+	wrote := false
+	err := filepath.WalkDir(stage, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil // an unreadable entry is skipped, never fatal
+		}
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return nil
+		}
+		b = elideMiddle(b, maxTranscriptFile, transcriptHeadBytes)
+		b = red.Redact(b) // nil-receiver safe
+		if !wrote {
+			if merr := os.MkdirAll(dst, 0o755); merr != nil {
+				return merr
+			}
+			wrote = true
+		}
+		// Flattened deliberately: the guest nests transcripts under a slug directory that encodes
+		// the in-sandbox cwd (always /workspace), which carries no information on the host.
+		return os.WriteFile(filepath.Join(dst, filepath.Base(p)), b, 0o644)
+	})
+	return err
+}
+
+// elideMiddle caps b at max bytes by keeping its first head bytes and its last (max-head), with a
+// marker between, cutting on line boundaries so a line-oriented transcript stays parseable by eye
+// and by grep. Returns b unchanged when it already fits.
+func elideMiddle(b []byte, max, head int) []byte {
+	if len(b) <= max {
+		return b
+	}
+	if head >= max {
+		// Nonsensical budget; keeping the head alone is the safe reading and beats slicing past
+		// the end. Unreachable with the package constants, guarded so a later tweak to either
+		// cannot turn a diagnostic into a panic during teardown.
+		return b[:max]
+	}
+	tail := max - head
+	h := b[:head]
+	if i := bytes.LastIndexByte(h, '\n'); i > 0 {
+		h = h[:i+1]
+	}
+	t := b[len(b)-tail:]
+	if i := bytes.IndexByte(t, '\n'); i >= 0 && i+1 < len(t) {
+		t = t[i+1:]
+	}
+	marker := fmt.Sprintf("\n... krayt elided %d bytes of transcript ...\n", len(b)-len(h)-len(t))
+	out := make([]byte, 0, len(h)+len(marker)+len(t))
+	out = append(out, h...)
+	out = append(out, marker...)
+	return append(out, t...)
+}
 
 // writeConsoleLog persists msb's `logs --source system --json` output — boot/system diagnostics,
 // including the reconstructed error block msb prepends when a sandbox never finished starting

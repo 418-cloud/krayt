@@ -140,3 +140,26 @@ func TestApplyAdapterMITMIsHardErroredByValidation(t *testing.T) {
 		t.Fatalf("want network.mitm to be hard-errored; got %v", err)
 	}
 }
+
+// TestApplyAdapterRecordsTranscriptDir: the adapter owns the in-guest path (it is the only thing
+// that knows which agent runs), and applyAdapter is where it reaches the spec. Recorded
+// unconditionally here — the --transcript gate lives at the call site, so this must not
+// second-guess it.
+func TestApplyAdapterRecordsTranscriptDir(t *testing.T) {
+	spec := &task.RunSpec{}
+	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("ANTHROPIC_API_KEY")); err != nil {
+		t.Fatalf("applyAdapter: %v", err)
+	}
+	if spec.TranscriptDir != ".claude/projects" {
+		t.Errorf("TranscriptDir = %q, want the claude-code adapter's path", spec.TranscriptDir)
+	}
+
+	// `none` declares no path, so a run with no adapter can never capture one.
+	bare := &task.RunSpec{}
+	if err := applyAdapter(io.Discard, bare, "none", keySet()); err != nil {
+		t.Fatalf("applyAdapter(none): %v", err)
+	}
+	if bare.TranscriptDir != "" {
+		t.Errorf("TranscriptDir = %q for adapter none, want empty", bare.TranscriptDir)
+	}
+}

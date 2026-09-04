@@ -24,10 +24,11 @@
 # `task:` is intentionally omitted so you always pass --task per run.
 
 image: ghcr.io/418-cloud/krayt-dev:sha-cbca700
-secrets: secrets.env
+
 env:
   CLAUDE_MODEL: claude-sonnet-5
   CLAUDE_EFFORT: high
+  GH_REPO: 418-cloud/krayt
   # Uncomment for a task that needs verbatim command output — a vendorHash `got: sha256-…`, a full
   # test failure, a filesystem check the agent will branch on (hack/krayt-dev/README.md).
   # KRAYT_RTK: off

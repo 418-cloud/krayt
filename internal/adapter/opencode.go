@@ -33,5 +33,8 @@ func (openCode) Prepare(in Input) (Plan, error) {
 		Env:        askEnv(in),
 		Credential: cred,
 		Secrets:    []task.SecretSpec{{Key: cred, Hosts: []string{openCodeAPIHosts[cred]}}},
+		// Inferred from opencode's XDG data dir, not verified against a real run. Same tolerance as
+		// gemini-cli: wrong path means no transcript, not a failure.
+		TranscriptDir: ".local/share/opencode",
 	}, nil
 }

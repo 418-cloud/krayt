@@ -370,6 +370,7 @@ type configFieldCase struct {
 //	Repo            REFUSED    redirects what is bundled, and where .krayt is written on the host
 //	Secrets         CONTAINED  host file read, shipped into the guest as SecretsBundle
 //	IncludeDirty    SAFE       bundles the operator's own working tree of the same repo
+//	Transcript      SAFE       one more diagnostic file under the run dir krayt already owns
 //	BundleDepth     SAFE       how much of that same repo's history is bundled
 //	Env             SAFE       non-secret container env; guest-side only
 //	Network.Mode    REFUSED for "full" only — allowlist|none do not widen egress
@@ -450,6 +451,10 @@ func TestConfigFieldsAccountedFor(t *testing.T) {
 		{"secrets", []string{"secrets"}, func(c *task.Config) { c.Secrets = "secrets.env" }},
 		{"include_dirty", []string{"include_dirty"}, func(c *task.Config) { b := true; c.IncludeDirty = &b }},
 		{"bundle_depth", []string{"bundle_depth"}, func(c *task.Config) { d := 0; c.BundleDepth = &d }},
+		// transcript only causes krayt to write one more diagnostic file under the run dir it
+		// already owns. It redirects nothing krayt reads on the host and relaxes no confinement,
+		// so an auto-loaded repo config may set it — the same treatment include_dirty gets.
+		{"transcript", []string{"transcript"}, func(c *task.Config) { b := true; c.Transcript = &b }},
 		{"env", []string{"env"}, func(c *task.Config) { c.Env = map[string]string{"K": "v"} }},
 		{"network.mode: allowlist", []string{"network.mode"}, func(c *task.Config) { c.Network.Mode = "allowlist" }},
 		{"network.mode: none", []string{"network.mode"}, func(c *task.Config) { c.Network.Mode = "none" }},
@@ -774,4 +779,26 @@ func containsHost(hosts []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestTranscriptConfigPrecedence pins the same rule include_dirty follows: a flag the operator did
+// not type must not override the config file, and one they did type must win. Getting this
+// backwards would make `transcript: true` in krayt.yaml silently dead, since the flag's zero value
+// is false — the failure mode would be an empty logs/transcript/ and no error anywhere.
+func TestTranscriptConfigPrecedence(t *testing.T) {
+	f, err := applyConfigFromFile(t, t.TempDir(), "transcript: true\n", false)
+	if err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+	if !f.transcript {
+		t.Error("transcript: true in the config did not reach the flags; the run would capture nothing")
+	}
+
+	off, err := applyConfigFromFile(t, t.TempDir(), "image: img:1\n", false)
+	if err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+	if off.transcript {
+		t.Error("transcript defaulted to true; capture must be opt-in")
+	}
 }

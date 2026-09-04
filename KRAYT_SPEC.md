@@ -1116,6 +1116,7 @@ task: ./task.md                 # path to task prompt (or inline `task_text:`)
 repo: .                         # repo to bundle (default: cwd)
 include_dirty: true             # include uncommitted changes (non-mutating capture, §6.7)
 bundle_depth: 1                 # 1 = single-commit snapshot; 0 = full history (§6.7)
+transcript: false               # copy the agent's own session transcript out before teardown (§8.4)
 
 network:
   mode: allowlist               # allowlist | full | none
@@ -1310,6 +1311,13 @@ The container **must** run as a **non-root** uid — this is **enforced, not jus
 never launches (`msb create --user`/`msb exec --user`, always a fixed non-root user, §7). Some
 agents (Claude Code among them) also refuse uid 0 independently.
 
+**The agent's own state directory is read, not injected.** `--transcript` copies the agent's
+session transcript out of `$HOME` (the path is the adapter's, relative to whatever `$HOME` the
+container user actually has — `/home/agent` for the claude-code images, `/home/node` for
+gemini-cli, resolved in-guest rather than assumed). That is a *read* of image-owned state, outside
+this contract's injected paths and outside `/output`; an image owes krayt nothing here, and an
+image whose agent writes no transcript simply yields none.
+
 An image that writes into its own rootfs — e.g. `$HOME` under `/home/agent` (nix profile,
 `~/.claude`, Go caches) — needs a writable rootfs; msb's `--security` profile has no read-only-rootfs
 knob to opt into anyway (`container.readonly_rootfs` is a hard pre-flight error under msb, §8.1).
@@ -1340,7 +1348,7 @@ treatment is stated in one place rather than discovered one field at a time. A f
 | `container.seccomp: unconfined` | **error** | honored | disables the seccomp profile (§8.1) |
 | `secrets:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read; its values are loaded host-side and, per key, substituted by msb into the sandbox's requests (§6.8) |
 | `task:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read, shipped into the guest as the run's prompt |
-| everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `questions`, `include_dirty`, `bundle_depth`, `container.readonly_rootfs`) | honored | honored | configures the run without redirecting what krayt reads/writes on the host or relaxing the container's confinement |
+| everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `questions`, `include_dirty`, `bundle_depth`, `transcript`, `container.readonly_rootfs`) | honored | honored | configures the run without redirecting what krayt reads/writes on the host or relaxing the container's confinement |
 
 A refused field is an **error, not a warning and not a silent ignore** — the run stops, naming the
 field, the file, and the `krayt run --config <path>` opt-in. Silently dropping it would leave the
@@ -1388,9 +1396,25 @@ Every run produces a self-contained directory the human reviews from:
 ├── questions/        # one <qid>.json per agent question + its answer (§6.13), if any
 └── logs/
     ├── agent.log     # sandbox stdout/stderr (merged, timestamped) — from `msb exec --stream`
-    └── console.log   # msb's boot/system diagnostics (`msb logs --source system --json`,
-                       #   redacted), replacing the pre-msb guest serial console (§7 step 2)
+    ├── console.log   # msb's boot/system diagnostics (`msb logs --source system --json`,
+    │                  #   redacted), replacing the pre-msb guest serial console (§7 step 2)
+    └── transcript/   # opt-in (`--transcript`): the agent's own session transcript, copied out
+                       #   of the guest before teardown — redacted and size-capped. Absent by
+                       #   default and whenever the adapter declares no path.
 ```
+
+**`logs/transcript/` is opt-in and is the only artifact krayt reads out of the agent's own `$HOME`
+rather than from `/output`.** It exists because `agent.log` is the agent's *stdout*, which for a
+headless run is just the final message: a failed run leaves no record of which tool calls it made.
+The transcript does record them. It is captured in `Run`'s teardown defer rather than alongside the
+other artifacts, deliberately — `collectOutput` is skipped on a wall-clock timeout, an aborted
+question and any msb driver failure, which are exactly the runs worth debugging.
+
+Treat it as an **opaque diagnostic**: every agent CLI documents its transcript schema as internal
+and changing between releases, so krayt copies, redacts and caps it but never parses it, and
+neither should tooling. Its size cap keeps a head *and* a tail (`elideMiddle`) rather than
+`console.log`'s tail-only truncation, because in a transcript the first appearance of a problem
+matters as much as the failure it ends in.
 
 Two artifacts from the pre-cutover design are gone, not renamed: **`proxy.log`** (there is no
 host-side egress-proxy child any more — msb's own egress enforcement produces no comparable

@@ -13,14 +13,18 @@ import (
 // command-line flags on top, and flags win (defaults → file → flags, §8.3). Pointer/empty
 // fields mean "unset" so the CLI can tell whether the file provided a value.
 type Config struct {
-	Image        string            `yaml:"image"`
-	Task         string            `yaml:"task"`
-	Repo         string            `yaml:"repo"`
-	Secrets      string            `yaml:"secrets"`
-	IncludeDirty *bool             `yaml:"include_dirty"`
-	BundleDepth  *int              `yaml:"bundle_depth"`
-	Env          map[string]string `yaml:"env"`
-	Network      struct {
+	Image        string `yaml:"image"`
+	Task         string `yaml:"task"`
+	Repo         string `yaml:"repo"`
+	Secrets      string `yaml:"secrets"`
+	IncludeDirty *bool  `yaml:"include_dirty"`
+	BundleDepth  *int   `yaml:"bundle_depth"`
+	// Transcript opts the run into copying the agent's own session transcript out of the sandbox
+	// before teardown (§8.4). Pointer so "unset" is distinguishable from "false", same as
+	// IncludeDirty — a flag the operator did not pass must not override a config that sets it.
+	Transcript *bool             `yaml:"transcript"`
+	Env        map[string]string `yaml:"env"`
+	Network    struct {
 		Mode        string             `yaml:"mode"`
 		Allow       []string           `yaml:"allow"`
 		MITM        bool               `yaml:"mitm"`        // opt-in TLS termination + header injection; default false

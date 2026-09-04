@@ -36,6 +36,21 @@ type Plan struct {
 	Env        map[string]string
 	Credential string
 	Secrets    []task.SecretSpec
+
+	// TranscriptDir is where this agent writes its own session transcript, as a path RELATIVE to
+	// the container user's $HOME. Empty means the adapter has no transcript to collect, which is
+	// also what `none` returns — the run then captures nothing.
+	//
+	// Relative, not absolute, because the images disagree on the home directory: claude-code and
+	// krayt-dev run as `agent` out of /home/agent, gemini-cli as `node` out of /home/node. The
+	// orchestrator resolves $HOME inside the guest at capture time and joins it to this, so a
+	// future image that moves its user does not silently capture nothing.
+	//
+	// Only claude-code's value is verified (documented, and no image sets CLAUDE_CONFIG_DIR or any
+	// XDG override). The other two are inferred from each CLI's conventions and unexercised — which
+	// is safe by construction: a wrong path makes the copy fail and the run carries on without a
+	// transcript, exactly as it does today.
+	TranscriptDir string
 }
 
 // Adapter is one agent integration. Name is the config/flag value (§8.1 `agent.adapter`).

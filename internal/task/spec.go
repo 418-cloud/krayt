@@ -12,19 +12,24 @@ import (
 // defaults already merged). The orchestrator derives the provider.VMSpec from
 // RunSpec.Resources plus the pinned base image (§6.1).
 type RunSpec struct {
-	ID           string            // assigned by the orchestrator
-	ImageRef     string            // user OCI image (tag or digest)
-	RepoPath     string            // host repo to bundle (default: cwd)
-	IncludeDirty bool              // include uncommitted changes via non-mutating capture (§6.7); wired in Phase 3
-	BundleDepth  int               // forward-bundle shallow depth (§6.7); default 1, 0 = full history
-	TaskPrompt   []byte            // contents of the task (file or inline)
-	Env          map[string]string // non-secret env for the container
-	SecretsPath  string            // path to per-task secrets file (may be empty)
-	Network      NetworkPolicy     // mode + allowlist (mirrors the proto enum, §6.5)
-	Resources    Resources         // CPUs, MemoryMiB, DiskGiB, Timeout
-	Questions    QuestionsPolicy   // mode + per-question timeout + on-timeout (§6.13)
-	Container    ContainerPolicy   // least-privilege OCI overrides applied by the guest runner (§6.10, §10)
-	Detach       bool              // headless vs stream-to-terminal
+	ID           string // assigned by the orchestrator
+	ImageRef     string // user OCI image (tag or digest)
+	RepoPath     string // host repo to bundle (default: cwd)
+	IncludeDirty bool   // include uncommitted changes via non-mutating capture (§6.7); wired in Phase 3
+	// TranscriptDir is the agent's session-transcript directory inside the sandbox, relative to
+	// the container user's $HOME (adapter.Plan.TranscriptDir). Non-empty means "capture it": the
+	// CLI sets it only when --transcript/transcript:true is on AND the selected adapter has a
+	// path, so the orchestrator needs no separate opt-in bool to consult.
+	TranscriptDir string
+	BundleDepth   int               // forward-bundle shallow depth (§6.7); default 1, 0 = full history
+	TaskPrompt    []byte            // contents of the task (file or inline)
+	Env           map[string]string // non-secret env for the container
+	SecretsPath   string            // path to per-task secrets file (may be empty)
+	Network       NetworkPolicy     // mode + allowlist (mirrors the proto enum, §6.5)
+	Resources     Resources         // CPUs, MemoryMiB, DiskGiB, Timeout
+	Questions     QuestionsPolicy   // mode + per-question timeout + on-timeout (§6.13)
+	Container     ContainerPolicy   // least-privilege OCI overrides applied by the guest runner (§6.10, §10)
+	Detach        bool              // headless vs stream-to-terminal
 }
 
 // ContainerPolicy is the resolved per-task container hardening policy the guest runner turns

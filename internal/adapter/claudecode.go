@@ -32,5 +32,9 @@ func (claudeCode) Prepare(in Input) (Plan, error) {
 		Env:        askEnv(in),
 		Credential: cred,
 		Secrets:    []task.SecretSpec{{Key: cred, Hosts: []string{claudeCodeAPIHost}}},
+		// $HOME/.claude/projects/<slugified-cwd>/<session-uuid>.jsonl — verified against Claude Code's
+		// documented session storage; -p (print mode) persists a transcript the same as an
+		// interactive session, and it records tool calls AND their results, which stdout does not.
+		TranscriptDir: ".claude/projects",
 	}, nil
 }

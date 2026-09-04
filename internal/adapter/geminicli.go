@@ -25,5 +25,8 @@ func (geminiCLI) Prepare(in Input) (Plan, error) {
 		Env:        askEnv(in),
 		Credential: cred,
 		Secrets:    []task.SecretSpec{{Key: cred, Hosts: []string{geminiCLIAPIHost}}},
+		// Inferred from Gemini CLI's own convention ($HOME/.gemini/tmp/<project-hash>/), not verified
+		// against a real run. A wrong path costs a missing transcript, never a failed run.
+		TranscriptDir: ".gemini/tmp",
 	}, nil
 }

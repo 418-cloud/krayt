@@ -180,3 +180,39 @@ func TestGetUnknown(t *testing.T) {
 		t.Errorf("empty adapter should default to none: %v", err)
 	}
 }
+
+// TestTranscriptDirPerAdapter pins each adapter's declared transcript location. The values are
+// paths inside someone else's image, so the thing worth guarding is not the exact string but the
+// two properties that make a wrong one safe and a right one work: it must be relative (the
+// orchestrator joins it to the guest's own $HOME, because the images disagree — /home/agent for
+// claude-code, /home/node for gemini-cli), and `none` must declare nothing at all.
+func TestTranscriptDirPerAdapter(t *testing.T) {
+	cases := []struct {
+		adapter string
+		keys    []string
+		want    string
+	}{
+		{"claude-code", []string{"ANTHROPIC_API_KEY"}, ".claude/projects"},
+		{"gemini-cli", []string{"GEMINI_API_KEY"}, ".gemini/tmp"},
+		{"opencode", []string{"ANTHROPIC_API_KEY"}, ".local/share/opencode"},
+		{"none", nil, ""},
+	}
+	for _, tc := range cases {
+		ad, err := adapter.Get(tc.adapter)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", tc.adapter, err)
+		}
+		plan, err := ad.Prepare(adapter.Input{SecretKeys: tc.keys})
+		if err != nil {
+			t.Fatalf("%s Prepare: %v", tc.adapter, err)
+		}
+		if plan.TranscriptDir != tc.want {
+			t.Errorf("%s TranscriptDir = %q, want %q", tc.adapter, plan.TranscriptDir, tc.want)
+		}
+		if strings.HasPrefix(plan.TranscriptDir, "/") {
+			t.Errorf("%s TranscriptDir %q is absolute; it must be relative to the guest's $HOME so "+
+				"an image with a different home directory still captures a transcript",
+				tc.adapter, plan.TranscriptDir)
+		}
+	}
+}
