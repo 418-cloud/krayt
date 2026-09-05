@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch: # lets you run the path-filtered arm64/windows jobs on demand
 
 permissions:
   contents: read
@@ -49,6 +50,102 @@ jobs:
       # cmd/krayt-helper and cmd/krayt-ask (the two embedded guest binaries, §9.1) and the
       # OS-agnostic core must cross-compile to the sandbox's arch.
       - run: GOOS=linux GOARCH=arm64 go build ./...
+
+  # Cheap sanity check that the whole non-guest tree cross-compiles to windows/amd64 — runs on
+  # every PR (unlike the native windows job below) since a plain `go build` here is nearly free
+  # and catches an accidental non-windows-safe import immediately rather than only when the
+  # path filter happens to trigger the native job.
+  cross-compile-windows:
+    name: cross-compile (windows/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: GOOS=windows GOARCH=amd64 go build ./...
+      - run: GOOS=windows GOARCH=amd64 go vet ./...
+
+  # Gate for the native-runner jobs below. The unit `test`/`lint` jobs run on every PR regardless;
+  # a real arm64/Windows host job is cheap compared to the old real-VM `integration-linux` suite
+  # this path-filtering idiom is taken from, but still not free, so each only runs when something
+  # that could behave differently on that platform changed (or on manual dispatch). A tiny filter
+  # job keeps that path-scoping out of the workflow-level `on:` (which would filter ALL jobs,
+  # including the always-on unit tests).
+  changes:
+    name: detect platform-affecting changes
+    runs-on: ubuntu-latest
+    outputs:
+      arm64: ${{ steps.filter.outputs.arm64 }}
+      windows: ${{ steps.filter.outputs.windows }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        # Skipped on workflow_dispatch (no diff base); the gated jobs' `if` runs them anyway then.
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          filters: |
+            shared: &shared
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+              - '.github/workflows/ci.yml'
+            arm64: *shared
+            windows: *shared
+
+  # linux/arm64 was blocked by krayt's own (now-deleted) VM image, not by krayt's code
+  # (expand-platforms-under-msb.md) — this is the job that actually exercises the target on real
+  # arm64 hardware (a GitHub-hosted native runner, not emulation) rather than merely
+  # cross-compiling it, the way cross-compile-guest above only proves the guest binaries link.
+  test-linux-arm64:
+    name: build + test (linux/arm64, native)
+    needs: changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.arm64 == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make guest-bins
+      - run: go build ./...
+      - run: go test -race ./...
+
+  # Windows had no path to krayt at all before msb (expand-platforms-under-msb.md); this is the
+  # real port's exercise on a native Windows runner. No `-race`: the race detector needs cgo and
+  # a C compiler, which isn't a given on the hosted Windows image, and the Done-when for this task
+  # only asks for a passing `go test ./...` here. Guest-bins is inlined rather than `make
+  # guest-bins` — `make` isn't a given on windows-latest either, and this is 4 lines; `shell: bash`
+  # picks up the Git Bash the runner ships so the mkdir/build syntax matches the other platforms
+  # exactly. cmd/krayt-helper, its probe-guest hack counterpart, and internal/sockroot are
+  # linux/unix-only (§9.1) and are silently skipped by the `./...` pattern on this platform, the
+  # same way cross-compile-guest's arm64 build silently skips darwin-only files.
+  test-windows:
+    name: build + test (windows/amd64, native)
+    needs: changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.windows == 'true' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: guest-bins
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p internal/sandbox/guestbin/bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o internal/sandbox/guestbin/bin/krayt-helper-linux-amd64 ./cmd/krayt-helper
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o internal/sandbox/guestbin/bin/krayt-helper-linux-arm64 ./cmd/krayt-helper
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o internal/sandbox/guestbin/bin/krayt-ask-linux-amd64 ./cmd/krayt-ask
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o internal/sandbox/guestbin/bin/krayt-ask-linux-arm64 ./cmd/krayt-ask
+      - run: go build ./...
+      - run: go test ./...
 
   lint:
     name: golangci-lint (${{ matrix.os }})

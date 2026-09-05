@@ -13,8 +13,9 @@ release-please watches `main` and keeps a **"release PR"** open that bumps the v
 1. Land your changes on `main` with Conventional Commit messages.
 2. When ready to ship, **merge the open release PR**. That:
    - tags `vX.Y.Z` and creates the GitHub Release with notes, and
-   - builds `krayt` for `darwin/arm64` + `darwin/amd64` + `linux/amd64`, writes `checksums.txt`,
-     and uploads them to the release (in the same workflow run — no PAT needed).
+   - builds `krayt` for `darwin/arm64` + `darwin/amd64` + `linux/amd64` + `linux/arm64` +
+     `windows/amd64` (the last as a `.zip`, every other target as a `.tar.gz`), writes
+     `checksums.txt`, and uploads them to the release (in the same workflow run — no PAT needed).
 
 That's it. No manual tagging.
 

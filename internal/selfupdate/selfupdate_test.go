@@ -2,6 +2,7 @@ package selfupdate
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -40,6 +41,25 @@ func buildFixtureTarGz(t *testing.T, content []byte) ([]byte, string) {
 	}
 	sum := sha256.Sum256(content)
 	return buf.Bytes(), hex.EncodeToString(sum[:])
+}
+
+// buildFixtureZip builds a single-file zip named "krayt.exe" containing content, mirroring
+// release-please.yml's windows/amd64 `zip` build step.
+func buildFixtureZip(t *testing.T, content []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("krayt.exe")
+	if err != nil {
+		t.Fatalf("create zip entry: %v", err)
+	}
+	if _, err := w.Write(content); err != nil {
+		t.Fatalf("write zip content: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // newFixtureServer serves a single release tagged tag with one tarball asset (tarballName /
@@ -143,8 +163,9 @@ func TestAssetName(t *testing.T) {
 		{"darwin", "arm64", false, "krayt_v0.6.1_darwin_arm64.tar.gz"},
 		{"darwin", "amd64", false, "krayt_v0.6.1_darwin_amd64.tar.gz"},
 		{"linux", "amd64", false, "krayt_v0.6.1_linux_amd64.tar.gz"},
-		{"linux", "arm64", true, ""},
-		{"windows", "amd64", true, ""},
+		{"linux", "arm64", false, "krayt_v0.6.1_linux_arm64.tar.gz"},
+		{"windows", "amd64", false, "krayt_v0.6.1_windows_amd64.zip"},
+		{"windows", "arm64", true, ""},
 		{"plan9", "386", true, ""},
 	}
 	for _, c := range cases {
@@ -274,6 +295,57 @@ func TestExtractBinary(t *testing.T) {
 		}
 		if info.Mode().Perm() != 0o755 {
 			t.Errorf("mode = %v, want 0755", info.Mode().Perm())
+		}
+	})
+
+	t.Run("zip round-trip", func(t *testing.T) {
+		zipBytes := buildFixtureZip(t, content)
+		srcDir := t.TempDir()
+		zipPath := filepath.Join(srcDir, "krayt.zip")
+		if err := os.WriteFile(zipPath, zipBytes, 0o644); err != nil {
+			t.Fatalf("write fixture zip: %v", err)
+		}
+		destDir := t.TempDir()
+		binPath, err := ExtractBinary(zipPath, destDir)
+		if err != nil {
+			t.Fatalf("ExtractBinary: %v", err)
+		}
+		got, err := os.ReadFile(binPath)
+		if err != nil {
+			t.Fatalf("read extracted binary: %v", err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Errorf("content mismatch: got %q, want %q", got, content)
+		}
+		info, err := os.Stat(binPath)
+		if err != nil {
+			t.Fatalf("stat extracted binary: %v", err)
+		}
+		if info.Mode().Perm() != 0o755 {
+			t.Errorf("mode = %v, want 0755", info.Mode().Perm())
+		}
+	})
+
+	t.Run("zip wrong name", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		w, err := zw.Create("not-krayt.exe")
+		if err != nil {
+			t.Fatalf("create zip entry: %v", err)
+		}
+		if _, err := w.Write(content); err != nil {
+			t.Fatalf("write zip content: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("close zip writer: %v", err)
+		}
+		srcDir := t.TempDir()
+		zipPath := filepath.Join(srcDir, "wrongname.zip")
+		if err := os.WriteFile(zipPath, buf.Bytes(), 0o644); err != nil {
+			t.Fatalf("write wrong-name zip: %v", err)
+		}
+		if _, err := ExtractBinary(zipPath, t.TempDir()); err == nil {
+			t.Fatal("ExtractBinary(zip wrong name): want error, got nil")
 		}
 	})
 

@@ -294,3 +294,73 @@ The only agent image never published or exercised. **The publish itself may alre
   evidence: `krayt ls` reaching `done`/`EXIT 0`, `changes.patch` applying cleanly, the collected
   `/output/opencode-report.md`, and `proxy.log`.
 - **Blocking:** no.
+
+---
+
+## [HUMAN] real `krayt run` on a linux/arm64 host with KVM
+
+`expand-platforms-under-msb.md` Part A adds linux/arm64 to the release matrix
+(`release-please.yml`), teaches `krayt upgrade` the new asset name (`internal/selfupdate`, unit
+tested against an `httptest` fixture), lists it in `README.md`'s supported-platforms paragraph,
+and closes the open question in `KRAYT_SPEC.md` §15. CI now builds and unit-tests the whole repo
+natively on a hosted `ubuntu-24.04-arm` runner (`.github/workflows/ci.yml`'s `test-linux-arm64`
+job) rather than merely cross-compiling it — but that runner has no KVM (it's itself a VM), so it
+cannot prove the one thing that actually matters: a real msb sandbox booting on arm64 KVM.
+
+- **Needed:** on a real arm64 Linux host with `/dev/kvm` and `msb` installed, run `krayt doctor`
+  (all four msb checks pass) then a plain `krayt run --image <agent image> --task <file> --repo
+  .`, through to `done`/`exit 0` with a non-empty `changes.patch` — the same bar
+  `run-tasks-on-microsandbox.md`'s hardware pass set for the amd64/Apple-Silicon case
+  (`run_d25279fb`).
+- **Why the agent can't:** no arm64 Linux host with KVM available in this environment; the hosted
+  CI runner above only proves the binary builds and unit-tests correctly on the arch, not that a
+  sandbox boots.
+- **Verify success by:** `krayt ls` reaching `done`, `changes.patch` applying cleanly
+  (`krayt apply`), and `krayt doctor` passing on that host.
+- **Blocking:** no — Part A's non-hardware criteria are all met and shippable without this; this
+  closes the loop the way §14 Phase 11's hardware pass did for the msb cutover.
+
+---
+
+## [HUMAN] real `krayt run` on Windows 11 with WHP, including a `--on-question=wait` round trip
+
+`expand-platforms-under-msb.md` Part B ports krayt's small OS-specific seam to Windows: the
+cross-process concurrency lock (`LockFileEx`), the ask_human channel (a named pipe via
+`github.com/Microsoft/go-winio` instead of a unix socket), where the ask/control sockets live, the
+detached-supervisor process attributes, and the RAM/disk preflight probe
+(`GlobalMemoryStatusEx`/`GetDiskFreeSpaceEx`). `GOOS=windows GOARCH=amd64 go build ./...`/`go vet
+./...` are green, and CI runs `go build`/`go test ./...` natively on a hosted `windows-latest`
+runner — but that runner has no WHP available (nested virtualization isn't exposed there), so it
+proves the port compiles and the OS-agnostic suite passes, not that a real sandbox boots.
+
+- **Needed:**
+  1. `krayt doctor` on a real Windows 11 host with WHP enabled and `msb` installed — all msb
+     checks pass, including `msb doctor`'s own WHP report.
+  2. A plain `krayt run --image <agent image> --task <file> --repo .` through to `done`/`exit 0`
+     with a non-empty `changes.patch` — the same bar `run-tasks-on-microsandbox.md`'s hardware pass
+     set for the amd64/Apple-Silicon case (`run_d25279fb`).
+  3. **One `--on-question=wait` run**, confirming the full `ask_human` round trip over the
+     Windows-specific path this task added: the guest dials vsock as it always does, msb bridges
+     that to the named pipe `internal/askbridge.Listen` created (not a unix socket), and `krayt
+     answer` resolves the question via the (unix-domain, unchanged) run-control socket. This is the
+     one piece of this port with no offline equivalent — `listen_windows_test.go` proves the
+     listener round-trips a connection, but only real msb vsock-to-pipe bridging proves the wiring
+     end to end (the same gap `hack/msb-probes/p1-vsock-nonroot.sh` closed for macOS's unix-socket
+     path in §14 Phase 11).
+  4. **A `krayt stop` on a live run**, to confirm the documented residual (§12): it should
+     hard-terminate the supervisor (no graceful msb teardown), so check afterward whether `msb ls`
+     still shows the sandbox running — expected, and the point of recording this here rather than
+     letting it surprise someone as a "stop doesn't work" bug report.
+  5. Optionally, exercise `krayt upgrade` on Windows once a real release exists — confirm the `.zip`
+     asset resolves and that replacing the running `krayt.exe` via rename succeeds (`selfupdate.Apply`'s
+     doc comment records this as an assumption based on how Windows self-updaters generally work,
+     not something verified on real hardware).
+- **Why the agent can't:** no Windows host with WHP available in this environment (or any Windows
+  host at all); the hosted CI runner above only proves the binary builds and unit-tests correctly,
+  not that WHP boots a real sandbox or that msb's vsock-to-named-pipe bridge behaves the way
+  `KRAYT_SPEC.md` §12 assumes.
+- **Verify success by:** `krayt ls` reaching `done`, `changes.patch` applying cleanly, `krayt
+  questions`/`krayt answer` resolving a real waiting question, and `krayt doctor` passing.
+- **Blocking:** no — Part B's non-hardware criteria (build, vet, unit tests, CI) are all met and
+  shippable without this; it closes the loop the way §14 Phase 11's hardware pass did for the msb
+  cutover, and the way the linux/arm64 entry above closes it for that platform.

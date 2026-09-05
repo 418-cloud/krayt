@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -604,8 +603,9 @@ func spawnDetachedRun(cmd *cobra.Command, stateDir, id, spooledTaskFile string) 
 }
 
 // spawnDetached starts exe (args, env) as a new-session background process whose stdio is
-// redirected to logPath (stdin from /dev/null), returning its pid. Setsid puts it in its own
-// session so it detaches from the controlling terminal and outlives the launching shell (§6.2).
+// redirected to logPath (stdin from /dev/null), returning its pid. detachSysProcAttr
+// (proc_unix.go/proc_windows.go) puts it in its own session/process group so it detaches from
+// the controlling terminal and outlives the launching shell (§6.2).
 func spawnDetached(exe string, args, env []string, logPath string) (int, error) {
 	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -623,7 +623,7 @@ func spawnDetached(exe string, args, env []string, logPath string) (int, error) 
 	c.Stdin = devnull
 	c.Stdout = logf
 	c.Stderr = logf
-	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	c.SysProcAttr = detachSysProcAttr()
 	if err := c.Start(); err != nil {
 		return 0, err
 	}

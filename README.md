@@ -20,22 +20,29 @@ need on your machine* and *how to get started*. Architecture and rationale live 
 
 krayt no longer builds its own VM. It drives [**msb** (microsandbox)](https://github.com/superradcompany/microsandbox)
 as a subprocess to rent a sandboxed micro-VM per run — the same `msb` binary, the same driver
-(`internal/sandbox`), on **macOS and Linux alike**. There is no more per-OS `Provider` split:
-orchestrator, patch generation, secrets, and egress policy are one code path on both platforms.
+(`internal/sandbox`), on **macOS, Linux, and Windows alike**. There is no more per-OS `Provider`
+split: orchestrator, patch generation, secrets, and egress policy are one code path on all three
+platforms, save for the small OS-tagged seams `KRAYT_SPEC.md` §9.1 lists (Windows needs its own
+file-lock and ask-channel primitives; everything else is shared).
 See [`docs/adr-microsandbox-sandbox-layer.md`](./docs/adr-microsandbox-sandbox-layer.md) for why.
 
 What this means in practice:
 - The whole codebase builds and unit-tests anywhere via a scriptable fake `msb` binary — no real
   sandbox needed.
 - **Hardware verification still needs a real host with `msb` installed** — msb's own sandboxes are
-  libkrun-based micro-VMs, so on macOS that means Apple Silicon and on Linux it means a host with
-  KVM available (msb's prerequisite, not krayt's — see "Prerequisites" below). This can't run in an
-  ordinary CI runner or a cloud agent without nested virtualization.
+  libkrun-based micro-VMs, so on macOS that means Apple Silicon, on Linux it means a host with KVM
+  available, and on Windows it means the Windows Hypervisor Platform (msb's prerequisites, not
+  krayt's — see "Prerequisites" below). This can't run in an ordinary CI runner or a cloud agent
+  without nested virtualization.
 
-**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64** and
-**linux/amd64** — the two tested targets — and **darwin/amd64**, which compiles and *should* run on
-Intel Macs but is **not tested**. There is no **linux/arm64** build yet (tracked separately from
-this migration). Verify a download against the release's `checksums.txt`.
+**Prebuilt binaries.** Each release (see `RELEASING.md`) publishes `krayt` for **darwin/arm64**,
+**linux/amd64**, and **linux/arm64** — the tested targets — and **darwin/amd64**, which compiles
+and *should* run on Intel Macs but is **not tested**. There is no darwin/amd64 local backend
+either way: msb's macOS support is Apple Silicon only. A **windows/amd64** build is also published
+(as a `.zip`, not a `.tar.gz`); msb supports Windows 11 via the Windows Hypervisor Platform — see
+`KRAYT_SPEC.md` §12 for the Windows-specific gotchas (weaker secret-handling guarantee, the
+Defender Firewall prompt on published ports). Verify a download against the release's
+`checksums.txt`.
 
 **Upgrading.** Once krayt is installed, `krayt upgrade` updates it in place: it finds the latest
 GitHub release (or a pinned one), downloads the right platform tarball, verifies it against that
@@ -48,7 +55,7 @@ downgrades, or reinstalls a specific release instead of latest.
 
 ## Prerequisites
 
-Just **Go and msb** — the same on macOS and Linux, no per-OS split and no Nix dev shell. krayt
+Just **Go and msb** — the same on macOS, Linux, and Windows, no per-OS split and no Nix dev shell. krayt
 ships no VM image of its own to build (`docs/adr-microsandbox-sandbox-layer.md`), so there is no
 second tier of tooling.
 
@@ -61,9 +68,11 @@ second tier of tooling.
   curl -fsSL https://install.microsandbox.dev | sh
   ```
   _(verify current — check the linked repo for the latest install method)._ msb itself needs
-  **Apple Silicon** on macOS or a **KVM-capable** host on Linux (its own prerequisite, not a
-  separate krayt setup step — there is no more `/dev/kvm` group wrangling, tap device, or NAT
-  script for krayt to own; msb manages its own sandbox networking).
+  **Apple Silicon** on macOS, a **KVM-capable** host on Linux, or the **Windows Hypervisor
+  Platform** on Windows 11 (its own prerequisite, not a separate krayt setup step — there is no
+  more `/dev/kvm` group wrangling, tap device, or NAT script for krayt to own; msb manages its own
+  sandbox networking). `krayt doctor` delegates straight to `msb doctor` for all three, which on
+  Windows also offers `--fix` to enable WHP via an elevated prompt.
 - **Claude Code** — if you're driving development with the agent (see below)
 
 Run **`krayt doctor`** after installing msb; it checks msb is on `PATH` (or `KRAYT_MSB_BIN`),

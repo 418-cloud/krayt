@@ -7,6 +7,7 @@ package selfupdate
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"compress/gzip"
@@ -96,15 +97,17 @@ func getRelease(ctx context.Context, client *http.Client, url, tag string) (Rele
 	return rel, nil
 }
 
-// AssetName returns the release asset filename for the given platform and tag. Only the three
+// AssetName returns the release asset filename for the given platform and tag. Only the
 // combinations actually published by .github/workflows/release-please.yml's build matrix
-// (darwin/arm64, darwin/amd64, linux/amd64) are supported — kept as an explicit switch here since
-// it can't share code with the YAML build matrix and the two must be kept in sync by hand. There
-// is no linux/arm64 build; see README.md's "Prebuilt binaries" paragraph for why.
+// (darwin/arm64, darwin/amd64, linux/amd64, linux/arm64, windows/amd64) are supported — kept as
+// an explicit switch here since it can't share code with the YAML build matrix and the two must
+// be kept in sync by hand. windows/amd64 is the one .zip; every other target is a .tar.gz.
 func AssetName(goos, goarch, tag string) (string, error) {
 	switch goos + "/" + goarch {
-	case "darwin/arm64", "darwin/amd64", "linux/amd64":
+	case "darwin/arm64", "darwin/amd64", "linux/amd64", "linux/arm64":
 		return fmt.Sprintf("krayt_%s_%s_%s.tar.gz", tag, goos, goarch), nil
+	case "windows/amd64":
+		return fmt.Sprintf("krayt_%s_%s_%s.zip", tag, goos, goarch), nil
 	default:
 		return "", fmt.Errorf(
 			"krayt upgrade does not support %s/%s — see README.md's \"Prebuilt binaries\" paragraph for supported platforms",
@@ -210,54 +213,23 @@ func DownloadAndVerify(ctx context.Context, client *http.Client, url, wantSHA256
 	return tmpPath, nil
 }
 
-// ExtractBinary gunzips + untars tarGzPath, which must contain exactly one regular-file entry
-// named "krayt" (the workflow that produces it always tars a single file named "krayt"), and
-// writes that entry's bytes to a new 0755 temp file in destDir. It fails closed — erroring
-// rather than guessing — if the archive has zero entries, more than one entry, its one entry
-// isn't a regular file, or that entry isn't named "krayt".
-func ExtractBinary(tarGzPath, destDir string) (string, error) {
-	f, err := os.Open(tarGzPath)
+// ExtractBinary unpacks archivePath — a .tar.gz for every Unix target or a .zip for
+// windows/amd64 (release-please.yml's two build steps, dispatched on here by extension since
+// that's the one thing distinguishing them at this call site) — which must contain exactly one
+// regular-file entry named "krayt" (Unix) or "krayt.exe" (Windows), and writes that entry's bytes
+// to a new 0755 temp file in destDir. It fails closed — erroring rather than guessing — if the
+// archive has zero entries, more than one entry, its one entry isn't a regular file, or that
+// entry isn't named as expected.
+func ExtractBinary(archivePath, destDir string) (string, error) {
+	wantName := "krayt"
+	extract := extractTarGzEntry
+	if strings.HasSuffix(archivePath, ".zip") {
+		wantName = "krayt.exe"
+		extract = extractZipEntry
+	}
+	content, err := extract(archivePath, wantName)
 	if err != nil {
 		return "", err
-	}
-	defer func() { _ = f.Close() }()
-
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return "", fmt.Errorf("open %s as gzip: %w", tarGzPath, err)
-	}
-	defer func() { _ = gz.Close() }()
-
-	tr := tar.NewReader(gz)
-	var hdr *tar.Header
-	var content []byte
-	entries := 0
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("read tar %s: %w", tarGzPath, err)
-		}
-		entries++
-		if entries > 1 {
-			return "", fmt.Errorf("%s: expected exactly one entry, found more than one", tarGzPath)
-		}
-		hdr = h
-		content, err = io.ReadAll(tr)
-		if err != nil {
-			return "", fmt.Errorf("read entry %s from %s: %w", h.Name, tarGzPath, err)
-		}
-	}
-	if entries == 0 {
-		return "", fmt.Errorf("%s: archive is empty", tarGzPath)
-	}
-	if hdr.Typeflag != tar.TypeReg {
-		return "", fmt.Errorf("%s: entry %s is not a regular file", tarGzPath, hdr.Name)
-	}
-	if name := strings.TrimPrefix(hdr.Name, "./"); name != "krayt" {
-		return "", fmt.Errorf("%s: expected entry named %q, found %q", tarGzPath, "krayt", hdr.Name)
 	}
 
 	tmp, err := os.CreateTemp(destDir, ".krayt-upgrade-bin-*.tmp")
@@ -279,6 +251,89 @@ func ExtractBinary(tarGzPath, destDir string) (string, error) {
 		return "", fmt.Errorf("chmod extracted binary: %w", err)
 	}
 	return tmpPath, nil
+}
+
+// extractTarGzEntry gunzips + untars tarGzPath and returns wantName's content, applying
+// ExtractBinary's fail-closed entry-count/name/type checks.
+func extractTarGzEntry(tarGzPath, wantName string) ([]byte, error) {
+	f, err := os.Open(tarGzPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("open %s as gzip: %w", tarGzPath, err)
+	}
+	defer func() { _ = gz.Close() }()
+
+	tr := tar.NewReader(gz)
+	var hdr *tar.Header
+	var content []byte
+	entries := 0
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read tar %s: %w", tarGzPath, err)
+		}
+		entries++
+		if entries > 1 {
+			return nil, fmt.Errorf("%s: expected exactly one entry, found more than one", tarGzPath)
+		}
+		hdr = h
+		content, err = io.ReadAll(tr)
+		if err != nil {
+			return nil, fmt.Errorf("read entry %s from %s: %w", h.Name, tarGzPath, err)
+		}
+	}
+	if entries == 0 {
+		return nil, fmt.Errorf("%s: archive is empty", tarGzPath)
+	}
+	if hdr.Typeflag != tar.TypeReg {
+		return nil, fmt.Errorf("%s: entry %s is not a regular file", tarGzPath, hdr.Name)
+	}
+	if name := strings.TrimPrefix(hdr.Name, "./"); name != wantName {
+		return nil, fmt.Errorf("%s: expected entry named %q, found %q", tarGzPath, wantName, hdr.Name)
+	}
+	return content, nil
+}
+
+// extractZipEntry reads zipPath and returns wantName's content, applying the same fail-closed
+// checks as extractTarGzEntry.
+func extractZipEntry(zipPath, wantName string) ([]byte, error) {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, fmt.Errorf("open %s as zip: %w", zipPath, err)
+	}
+	defer func() { _ = zr.Close() }()
+
+	if len(zr.File) == 0 {
+		return nil, fmt.Errorf("%s: archive is empty", zipPath)
+	}
+	if len(zr.File) > 1 {
+		return nil, fmt.Errorf("%s: expected exactly one entry, found more than one", zipPath)
+	}
+	entry := zr.File[0]
+	if entry.FileInfo().IsDir() || !entry.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: entry %s is not a regular file", zipPath, entry.Name)
+	}
+	if name := strings.TrimPrefix(filepath.ToSlash(entry.Name), "./"); name != wantName {
+		return nil, fmt.Errorf("%s: expected entry named %q, found %q", zipPath, wantName, entry.Name)
+	}
+	rc, err := entry.Open()
+	if err != nil {
+		return nil, fmt.Errorf("open entry %s in %s: %w", entry.Name, zipPath, err)
+	}
+	defer func() { _ = rc.Close() }()
+	content, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, fmt.Errorf("read entry %s from %s: %w", entry.Name, zipPath, err)
+	}
+	return content, nil
 }
 
 // CompareVersions numerically compares two "vX.Y.Z" or "X.Y.Z" version strings, returning -1, 0,
@@ -324,7 +379,11 @@ func parseVersion(v string) ([3]int, error) {
 // writable, backs up currentPath to currentPath+".bak" (overwriting any prior backup), then
 // atomically renames newBinaryPath into place. Replacing an open, currently-executing file this
 // way is well-defined on Unix — the running process keeps its already-mapped inode until it
-// exits. Never attempts privilege escalation: an unwritable directory is a plain error.
+// exits. On Windows, replacing a running executable's directory entry via rename (as opposed to
+// deleting it) is the standard self-update technique and is expected to work the same way — the
+// image loader opens the running .exe with share-delete, not an exclusive lock — but this is
+// unverified on real hardware; see HUMAN_TODO.md's Windows `krayt run`/`krayt upgrade` entry.
+// Never attempts privilege escalation: an unwritable directory is a plain error.
 func Apply(currentPath, newBinaryPath string) (string, error) {
 	dir := filepath.Dir(currentPath)
 
