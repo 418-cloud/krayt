@@ -8,12 +8,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
-	"github.com/418-cloud/krayt/internal/guest/ask"
+	"github.com/418-cloud/krayt/internal/askclient"
 )
 
 // defaultSocket is the container-side ask-bridge socket path (§6.13, §8.2).
@@ -102,8 +103,15 @@ func run(args []string, socketEnv string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	resp, noAnswer, err := ask.OverSocket(socket, question, ch)
+	resp, noAnswer, err := askclient.OverSocket(socket, question, ch)
 	if err != nil {
+		if errors.Is(err, askclient.ErrMalformedSocket) || errors.Is(err, askclient.ErrVsockUnsupported) {
+			// A bad or unusable KRAYT_ASK_SOCKET value is a misconfiguration, not "no human
+			// available" — a usage error so it is never mistaken for the agent quietly
+			// proceeding (§6.13).
+			_, _ = fmt.Fprintf(stderr, "krayt-ask: %v\n", err)
+			return exitUsage
+		}
 		// Bridge unreachable (fail mode / not wired) → sentinel so the agent proceeds (§6.13).
 		_, _ = fmt.Fprintf(stderr, "krayt-ask: no answer (%v)\n", err)
 		return exitNoAnswer

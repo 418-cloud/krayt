@@ -108,6 +108,85 @@ func TestSetupPatchGitRejectsExistingDir(t *testing.T) {
 	}
 }
 
+// TestMakeContainerWritableSkipsSymlinks is the regression for the symlink-escape review finding:
+// MakeContainerWritable runs as root over an untrusted repo, and os.Chmod follows symlinks — so a
+// workspace symlink pointing outside the tree must NOT get its target chmod'd (§10). Real files in
+// the tree are still relaxed. Moved here from the pre-msb guest agent when the function was shared with
+// cmd/krayt-helper (add-krayt-guest-helper.md).
+func TestMakeContainerWritableSkipsSymlinks(t *testing.T) {
+	// A file OUTSIDE the workspace whose perms must remain untouched.
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.txt")
+	if err := os.WriteFile(outside, []byte("do not touch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ws := t.TempDir()
+	wsFile := filepath.Join(ws, "real.txt")
+	if err := os.WriteFile(wsFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(ws, "escape")); err != nil {
+		t.Skipf("symlinks unavailable in this sandbox: %v", err)
+	}
+
+	if err := patch.MakeContainerWritable(ws); err != nil {
+		t.Fatalf("MakeContainerWritable: %v", err)
+	}
+
+	// The real workspace file is relaxed so the non-root agent can write it.
+	if fi, err := os.Stat(wsFile); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm()&0o006 == 0 {
+		t.Errorf("workspace file not relaxed: mode %v", fi.Mode().Perm())
+	}
+	// The symlink target outside the workspace was NOT followed/chmod'd.
+	if fi, err := os.Stat(outside); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0o600 {
+		t.Errorf("symlink target outside the workspace was chmod'd to %v — symlink was followed", fi.Mode().Perm())
+	}
+}
+
+// TestMakeContainerWritableLeavesPatchGitAlone is the ordering regression from
+// add-krayt-guest-helper.md: SetupPatchGit must run BEFORE MakeContainerWritable relaxes the
+// workspace, so the root-only patchgit snapshot's permissions are never touched by the relax
+// step (§6.7, §10 finding #2). It only walks root, so a sibling patchgit dir is untouched by
+// construction — this pins that guarantee against a future refactor that widens the walk root.
+func TestMakeContainerWritableLeavesPatchGitAlone(t *testing.T) {
+	ctx := context.Background()
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	bundle := filepath.Join(t.TempDir(), "repo.bundle")
+	if _, err := patch.CreateBundle(ctx, src, bundle, 1, false); err != nil {
+		t.Fatalf("CreateBundle: %v", err)
+	}
+	ws := filepath.Join(t.TempDir(), "ws")
+	if _, err := patch.Ingest(ctx, bundle, ws, patch.DefaultIdentity); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	pg := filepath.Join(t.TempDir(), "patchgit")
+	if err := patch.SetupPatchGit(ws, pg); err != nil {
+		t.Fatalf("SetupPatchGit: %v", err)
+	}
+	pgConfig := filepath.Join(pg, "config")
+	before, err := os.Stat(pgConfig)
+	if err != nil {
+		t.Fatalf("stat patchgit config before relax: %v", err)
+	}
+
+	if err := patch.MakeContainerWritable(ws); err != nil {
+		t.Fatalf("MakeContainerWritable: %v", err)
+	}
+
+	after, err := os.Stat(pgConfig)
+	if err != nil {
+		t.Fatalf("stat patchgit config after relax: %v", err)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Errorf("patchgit config mode changed by relaxing the workspace: before=%v after=%v", before.Mode().Perm(), after.Mode().Perm())
+	}
+}
+
 // TestIngestOutsideGitRepo guards the regression where `git bundle verify` failed in the
 // guest with "need a repository to verify a bundle": it is a repository command, but the
 // guest-agent's cwd is not a repo. The other tests masked this by running inside the krayt

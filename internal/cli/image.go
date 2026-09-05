@@ -2,20 +2,19 @@ package cli
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
-	"github.com/opencontainers/go-digest"
 	"github.com/spf13/cobra"
 
-	"github.com/418-cloud/krayt/internal/vmimage"
+	"github.com/418-cloud/krayt/internal/sandbox"
 )
 
 func newImageCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "image",
-		Short: "Manage cached base-VM and container images",
+		Short: "Manage images in msb's own store",
+		Long: "A thin front-end over msb's image store (retire-vm-image-pipeline.md) — krayt " +
+			"keeps no image cache of its own any more. `krayt run` never needs `image pull` first: " +
+			"`msb create` resolves and pulls the agent image itself.",
 	}
 	cmd.AddCommand(newImagePullCmd())
 	cmd.AddCommand(newImageLsCmd())
@@ -25,127 +24,23 @@ func newImageCmd() *cobra.Command {
 }
 
 func newImagePullCmd() *cobra.Command {
-	var ref, dig string
 	cmd := &cobra.Command{
-		Use:   "pull",
-		Short: "Pull and verify the base VM image (kernel + initrd + rootfs)",
-		Long: "Pulls the digest-addressed base VM image OCI artifact, verifies its digest, " +
-			"and caches it locally for CoW cloning (§11.4).",
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if ref == "" {
-				ref = vmimage.PinnedRef
+		Use:   "pull <ref>",
+		Short: "Pull an image into msb's store ahead of a run",
+		Long: "Pulls <ref> via `msb pull` so it's already cached before `krayt run` needs it. Not " +
+			"required — `msb create` pulls on demand — this just moves the wait earlier.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sb, err := sandbox.NewClient()
+			if err != nil {
+				return err
 			}
-			want := vmimage.PinnedDigest
-			if dig != "" {
-				want = digest.Digest(dig)
-				if err := want.Validate(); err != nil {
-					return fmt.Errorf("invalid --digest %q: %w", dig, err)
-				}
+			if err := sb.Pull(cmd.Context(), args[0]); err != nil {
+				return err
 			}
-			return runImagePull(cmd, ref, want)
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "pulled %s\n", args[0])
+			return err
 		},
 	}
-	cmd.Flags().StringVar(&ref, "ref", "", "registry reference (default: pinned "+vmimage.PinnedRef+")")
-	cmd.Flags().StringVar(&dig, "digest", "", "expected manifest digest (default: pinned)")
 	return cmd
-}
-
-func runImagePull(cmd *cobra.Command, ref string, want digest.Digest) error {
-	w := cmd.OutOrStdout()
-	if want == "" {
-		if _, err := fmt.Fprintln(w, "warning: no pinned digest set — pulling without digest verification (see HUMAN_TODO.md)"); err != nil {
-			return err
-		}
-	}
-
-	dest, err := cacheDir(ref, want)
-	if err != nil {
-		return err
-	}
-	src, err := vmimage.Open(ref)
-	if err != nil {
-		return err
-	}
-
-	if _, err := fmt.Fprintf(w, "pulling %s …\n", ref); err != nil {
-		return err
-	}
-	img, err := vmimage.Pull(cmd.Context(), src, ref, want, dest)
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintf(w, "verified %s\n  kernel: %s\n  initrd: %s\n  rootfs: %s\n",
-		img.Digest, img.Kernel, img.Initrd, img.RootFS)
-	return err
-}
-
-// krayCacheBase is the root under which all of krayt's host-side caches live (vmimage,
-// imagestore, vms). It is `os.UserCacheDir()` in production; the KRAYT_CACHE_DIR env var
-// overrides it so tests (and anyone wanting a non-default location) can point every cache
-// at one directory. Read consistently by cacheDir, acquireUserImage, and imageCacheRoots.
-func krayCacheBase() (string, error) {
-	if d := os.Getenv("KRAYT_CACHE_DIR"); d != "" {
-		return d, nil
-	}
-	base, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve cache dir: %w", err)
-	}
-	return base, nil
-}
-
-// cacheDir returns the local cache directory for a base image, keyed by digest when
-// known (otherwise by a sanitized ref) so different images never collide.
-func cacheDir(ref string, want digest.Digest) (string, error) {
-	base, err := krayCacheBase()
-	if err != nil {
-		return "", err
-	}
-	key := want.Encoded()
-	if key == "" {
-		key = sanitizeRef(ref)
-	}
-	return filepath.Join(base, "krayt", "vmimage", key), nil
-}
-
-// imageCacheRoots returns the two digest-keyed cache roots `krayt image ls/rm/prune` operate
-// over: the base VM image cache (vmimage, §11.4) and the user-image cache (imagestore, §6.11).
-func imageCacheRoots() (vmimageRoot, imagestoreRoot string, err error) {
-	base, err := krayCacheBase()
-	if err != nil {
-		return "", "", err
-	}
-	return filepath.Join(base, "krayt", "vmimage"), filepath.Join(base, "krayt", "imagestore"), nil
-}
-
-func sanitizeRef(ref string) string {
-	r := strings.NewReplacer("/", "_", ":", "_", "@", "_")
-	return r.Replace(ref)
-}
-
-// baseImageCheck reports whether the base VM image is pinned and cached locally. It is
-// optional (a warning, not a failure): the pin is filled in after CI first publishes the
-// image, and `krayt image pull` populates the cache (§11.4).
-func baseImageCheck() checkResult {
-	c := checkResult{name: "base VM image", optional: true}
-	if vmimage.PinnedDigest == "" {
-		c.detail = "no pinned digest yet (image not published; see HUMAN_TODO.md)"
-		return c
-	}
-	dir, err := cacheDir(vmimage.PinnedRef, vmimage.PinnedDigest)
-	if err != nil {
-		c.detail = err.Error()
-		return c
-	}
-	// A boot needs all three artifacts, so a partial cache is not "cached".
-	for _, f := range []string{vmimage.FileKernel, vmimage.FileInitrd, vmimage.FileRootFS} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
-			c.detail = "pinned " + vmimage.PinnedDigest.String() + " not cached — run `krayt image pull`"
-			return c
-		}
-	}
-	c.ok = true
-	c.detail = "cached " + vmimage.PinnedDigest.String()
-	return c
 }

@@ -12,19 +12,24 @@ import (
 // defaults already merged). The orchestrator derives the provider.VMSpec from
 // RunSpec.Resources plus the pinned base image (§6.1).
 type RunSpec struct {
-	ID           string            // assigned by the orchestrator
-	ImageRef     string            // user OCI image (tag or digest)
-	RepoPath     string            // host repo to bundle (default: cwd)
-	IncludeDirty bool              // include uncommitted changes via non-mutating capture (§6.7); wired in Phase 3
-	BundleDepth  int               // forward-bundle shallow depth (§6.7); default 1, 0 = full history
-	TaskPrompt   []byte            // contents of the task (file or inline)
-	Env          map[string]string // non-secret env for the container
-	SecretsPath  string            // path to per-task secrets file (may be empty)
-	Network      NetworkPolicy     // mode + allowlist (mirrors the proto enum, §6.5)
-	Resources    Resources         // CPUs, MemoryMiB, DiskGiB, Timeout
-	Questions    QuestionsPolicy   // mode + per-question timeout + on-timeout (§6.13)
-	Container    ContainerPolicy   // least-privilege OCI overrides applied by the guest runner (§6.10, §10)
-	Detach       bool              // headless vs stream-to-terminal
+	ID           string // assigned by the orchestrator
+	ImageRef     string // user OCI image (tag or digest)
+	RepoPath     string // host repo to bundle (default: cwd)
+	IncludeDirty bool   // include uncommitted changes via non-mutating capture (§6.7); wired in Phase 3
+	// TranscriptDir is the agent's session-transcript directory inside the sandbox, relative to
+	// the container user's $HOME (adapter.Plan.TranscriptDir). Non-empty means "capture it": the
+	// CLI sets it only when --transcript/transcript:true is on AND the selected adapter has a
+	// path, so the orchestrator needs no separate opt-in bool to consult.
+	TranscriptDir string
+	BundleDepth   int               // forward-bundle shallow depth (§6.7); default 1, 0 = full history
+	TaskPrompt    []byte            // contents of the task (file or inline)
+	Env           map[string]string // non-secret env for the container
+	SecretsPath   string            // path to per-task secrets file (may be empty)
+	Network       NetworkPolicy     // mode + allowlist (mirrors the proto enum, §6.5)
+	Resources     Resources         // CPUs, MemoryMiB, DiskGiB, Timeout
+	Questions     QuestionsPolicy   // mode + per-question timeout + on-timeout (§6.13)
+	Container     ContainerPolicy   // least-privilege OCI overrides applied by the guest runner (§6.10, §10)
+	Detach        bool              // headless vs stream-to-terminal
 }
 
 // ContainerPolicy is the resolved per-task container hardening policy the guest runner turns
@@ -133,20 +138,25 @@ func ParseNetworkMode(s string) (NetworkMode, error) {
 	}
 }
 
-// NetworkPolicy is the host-side network policy for a run; it mirrors the proto enum
-// in §6.5 and is translated to protocol.NetworkPolicy before being pushed to the guest.
-//
-// MITM/Passthrough/Inject are host-only (§6.6, add-tls-mitm-credential-injection.md): they
-// never ride the guest protocol — only the resulting CA certificate does (NetworkPolicy.ca_cert
-// in krayt.proto). The proxy child receives them over its stdin JSON config
-// (internal/orchestrator's spawnEgressProxy), never on argv or in env.
+// NetworkPolicy is the host-side network policy for a run (§6.6); internal/task/netpolicy_msb.go
+// translates it into msb's own `--net-rule`/`--net-default*`/`--tls-intercept`/`--tls-bypass`
+// argv, and internal/sandbox.SecretArgs/SecretEnv render Secrets into `--secret` flags plus the
+// msb child's environment. None of this ever rides the guest — msb substitutes each declared
+// secret's value at the host TLS boundary and the sandbox never holds anything but a placeholder.
 type NetworkPolicy struct {
 	Mode  NetworkMode
 	Allow []string
 
-	MITM        bool         // opt-in TLS termination + header injection at the host proxy; default false
-	Passthrough []string     // hosts tunneled (never MITM'd) even when MITM is on; subset of Allow in allowlist mode
-	Inject      []InjectRule // per-host header injection rules; requires MITM
+	MITM        bool         // pre-msb only; hard-errored by ValidateNetworkPolicyForMsb (run-tasks-on-microsandbox.md)
+	Passthrough []string     // hosts tunneled (never MITM'd/never intercepted); msb: --tls-bypass
+	Inject      []InjectRule // pre-msb only; hard-errored by ValidateNetworkPolicyForMsb
+
+	// Secrets is the msb-era secret-scoping list (hand-secrets-to-msb.md, wired at the
+	// run-tasks-on-microsandbox.md cut-over): one SecretSpec per credential, resolved from
+	// network.inject's raw config entries (SecretSpecsFromConfig) merged with any adapter-selected
+	// credential (MergeSecretSpecs). Never populated alongside a non-empty Inject — a run uses one
+	// delivery shape or the other, matching which orchestrator path actually consumes it.
+	Secrets []SecretSpec
 }
 
 // InjectRule is one `network.inject[]` entry (§8.1): for requests to Host through the MITM
@@ -179,7 +189,7 @@ type InjectRule struct {
 
 // RefreshRule declaratively names an upstream credential-refresh endpoint for one InjectRule
 // (§4.6). The proxy is generic: it recognizes the shape and, on this task, provides only the
-// generic "one refresh, one retry" mechanism (internal/proxy's RefreshFunc seam) — it does not
+// generic "one refresh, one retry" mechanism (the pre-msb host proxy's RefreshFunc seam) — it does not
 // know how to actually perform a refresh for any specific vendor. That knowledge (request
 // construction, response parsing) belongs in a per-agent adapter (§6.14), the first consumer
 // being inject-claude-oauth-token-at-proxy.md (step 3).

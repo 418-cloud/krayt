@@ -59,9 +59,15 @@ thing that flows back is a reviewable text patch.
 
 ## 3. Design Principles
 
-1. **The Provider interface is the only OS-specific seam.** Everything above it
-   (orchestration, protocol, patch logic, secrets, CLI) is OS-agnostic Go. The guest
-   agent runs inside Linux on both platforms, so it is shared too.
+1. **krayt consumes a sandbox rather than building one.** `internal/sandbox` (§6.15) drives the
+   `msb` (microsandbox) CLI as a subprocess over argv/stdio — the only place in krayt that knows
+   a sandbox runtime exists, and it has no build tags, since msb itself is what does the
+   OS-specific work on each platform. Everything above it (orchestration, patch logic, secrets,
+   CLI) is plain, OS-agnostic Go. *(Supersedes the original v1 principle — "the Provider interface
+   is the only OS-specific seam," with a shared guest agent running inside a krayt-built VM on
+   both vfkit/macOS and Firecracker/Linux — decided superseded 2026-08-29 by ADR option B1,
+   `docs/adr-microsandbox-sandbox-layer.md`, and deleted by `run-tasks-on-microsandbox.md`. See §15
+   for the full record.)*
 2. **Agent-agnostic core, convention-driven contract.** The tool injects inputs at
    well-known paths and reads outputs from well-known paths. Optional adapters add
    convenience for specific agents but are never required.
@@ -77,14 +83,15 @@ thing that flows back is a reviewable text patch.
 |---|---|
 | Language | Go |
 | Primary OS | macOS (Apple Silicon) |
-| macOS VM backend | **vfkit** (`crc-org/vfkit`) for v1 — drives Virtualization.framework via a tested, pre-signed subprocess; direct `Code-Hex/vz` embedding is the documented swap-in fallback, both behind the `Provider` seam (§6.3) |
-| Linux VM backend (future) | Firecracker or Cloud Hypervisor via the same `Provider` interface |
+| Sandbox backend | **microsandbox (`msb`)** — a libkrun-based microVM runtime, driven as a subprocess by `internal/sandbox` (§6.15). One backend for macOS and Linux alike; no `Provider` interface, no per-OS provider package. *Decided 2026-08-29, ADR option B1 (`docs/adr-microsandbox-sandbox-layer.md`); supersedes the two rows below — see §15.* |
+| ~~macOS VM backend~~ *(superseded)* | ~~**vfkit** (`crc-org/vfkit`) for v1 — drives Virtualization.framework via a tested, pre-signed subprocess; direct `Code-Hex/vz` embedding is the documented swap-in fallback, both behind the `Provider` seam~~ — deleted by `run-tasks-on-microsandbox.md`; see §15 |
+| ~~Linux VM backend (future)~~ *(superseded)* | ~~Firecracker or Cloud Hypervisor via the same `Provider` interface~~ — built in Phase 7 as a Firecracker provider behind `Provider`, deleted by `run-tasks-on-microsandbox.md`; see §15 |
 | Tool ↔ agent | Convention-first contract + optional orchestration adapters |
-| Networking | Per-task policy; **default allowlist** enforced by an in-guest egress proxy |
+| Networking | Per-task policy; **default allowlist**, translated to a fully explicit `msb create` policy (§6.6) |
 | Interaction | **Headless default**, attachable live log streaming |
 | Concurrency | **Multiple concurrent** agent VMs |
 | Output | `git diff` patch only; **manual apply** on host |
-| Secrets | Per-task **secrets file**, transferred over the control channel, never persisted to VM disk |
+| Secrets | Per-task **secrets file**; a declared secret's value travels only in the `msb create` child's env, never on argv, never persisted (§6.6.1, §6.8) |
 | Task definition | **CLI flags + optional config file** (flags override file) |
 | Resource limits | Sensible defaults (e.g. 2 vCPU / 4 GB / 20 GB / 30 min), **fully configurable** |
 | Agent → human questions | Optional async `ask_human` via an MCP server + `krayt-ask` CLI over an agnostic question channel; **default `fail`** (autonomous), opt into `wait`; timeout → sentinel by default (§6.13) |
@@ -94,44 +101,52 @@ thing that flows back is a reviewable text patch.
 
 ## 5. High-Level Architecture
 
+> **Redrawn by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11).** krayt no longer
+> builds the isolation boundary — the guest agent, the gRPC control protocol, and the in-VM/
+> host-side egress proxy are all deleted (§6.3–§6.5, §6.6, §6.10–§6.12). It rents one from `msb`
+> instead. See git history for the pre-msb diagram.
+
 ```
 ┌──────────────────────────────── HOST (macOS / Linux) ────────────────────────────────┐
 │                                                                                        │
-│   krayt CLI                                                                         │
-│        │                                                                               │
-│        ▼                                                                               │
-│   Orchestrator ──────────── manages N concurrent Runs, IDs, state, cleanup            │
-│        │                                                                               │
-│        ▼                                                                               │
-│   Provider (interface)                                                                 │
-│     ├── vfkit provider       (macOS, Virtualization.framework)   ← v1                 │
-│     ├── vz provider          (macOS, direct Code-Hex/vz)         ← fallback           │
-│     └── firecracker provider (Linux, KVM)                        ← later              │
-│        │                                                                               │
-│        │  boots                                                                        │
-│        ▼                                                                               │
-│   ┌──────────────── MICRO-VM (minimal Linux) ─────────────────┐                        │
-│   │                                                            │                        │
-│   │   guest-agent (Go, static linux binary)                   │                        │
-│   │     ├── vsock control server  ◄──── host control channel ─┼── bundle in / logs+patch out
-│   │     ├── egress proxy (allowlist) + default-deny firewall  │                        │
-│   │     └── containerd (Go client) + egress proxy + nftables       │                        │
-│   │            │                                              │                        │
-│   │            ▼                                              │                        │
-│   │   ┌──────── USER OCI IMAGE ───────────┐                   │                        │
-│   │   │  AI agent (claude code / gemini)  │                   │                        │
-│   │   │  + tools                          │                   │                        │
-│   │   │  /workspace   ← repo snapshot     │                   │                        │
-│   │   │  /task/prompt.md ← the task       │                   │                        │
-│   │   │  /run/secrets/*  ← tmpfs secrets  │                   │                        │
-│   │   │  /output/*    ← patch + report    │                   │                        │
-│   │   └───────────────────────────────────┘                   │                        │
-│   └────────────────────────────────────────────────────────────┘                      │
+│   krayt CLI                                                                           │
+│        │                                                                              │
+│        ▼                                                                              │
+│   Orchestrator ──────────── manages N concurrent Runs, IDs, state, cleanup (§6.2)     │
+│        │                                                                              │
+│        ▼                                                                              │
+│   internal/sandbox (msb driver, §6.15) ── argv/stdio only, no network protocol of its own
+│        │                                                                              │
+│        │  msb create / msb copy / msb exec --stream / msb logs / msb stop / msb rm    │
+│        ▼                                                                              │
+│   msb (microsandbox CLI, subprocess) ── rents, does not build, the isolation boundary  │
+│        │                                                                              │
+│        │  boots (libkrun)                                                             │
+│        ▼                                                                              │
+│   ┌──────────────── microVM sandbox (msb-managed) ──────────────────┐                 │
+│   │                                                                  │                 │
+│   │   agentd (msb's own, PID 1)                                     │                 │
+│   │     └── the user's OCI IMAGE, as the sandbox rootfs             │                 │
+│   │            AI agent (claude code / gemini / …) + tools          │                 │
+│   │            /workspace          ← repo snapshot (krayt-helper)   │                 │
+│   │            /task/prompt.md     ← the task                      │                 │
+│   │            /output/*           ← patch + report                │                 │
+│   │            /usr/local/bin/krayt-ask  ← ask_human CLI front-end  │                 │
+│   └──────────────────────────────────────────────────────────────────┘                │
+│        ▲                                                                              │
+│        │ krayt-ask dials AF_VSOCK → host CID 2 : AskPort, over msb's own --vsock route │
+│        │ (guest-initiated; the only channel that isn't a krayt→msb subprocess call)    │
+│        │                                                                              │
+│   internal/askbridge ── host unix socket (runDir/ask/ask.sock), §6.13                 │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The **control channel** is `vsock` (virtio sockets) — supported by Virtualization.framework
-on macOS and by KVM/Firecracker on Linux — so the same protocol works on both platforms.
+There is no protocol of krayt's own on the host↔sandbox path: `internal/sandbox` shells out to
+`msb` and reads its `--format json`/`--stream` output (§6.15, §7) — no vsock, no gRPC, nothing
+generated. The one exception is `ask_human` (§6.13): the sandbox's `krayt-ask` dials `AF_VSOCK` to
+host CID 2 directly, which msb's own `--vsock HOST_PATH:PORT` route bridges to the host unix
+socket `internal/askbridge` listens on. No guest daemon, and no control protocol on either side of
+that channel either.
 
 ---
 
@@ -233,560 +248,209 @@ in the run dir.
   localized to the run entrypoint — the rest is unchanged.
 
 ### 6.3 Provider interface (`internal/provider`)
-The single OS-specific seam.
+Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
+(`docs/adr-microsandbox-sandbox-layer.md`, `run-tasks-on-microsandbox.md`). See git history for
+the pre-msb text.
 
-```go
-type VMSpec struct {
-    ID        string
-    Kernel    string // path to vmlinuz (or EFI image)
-    RootFS    string // path to the BASE rootfs image; provider makes a CoW clone per run
-    CID       uint32 // vsock guest CID — Firecracker only; ignored by the vfkit/vz providers (§6.12)
-    CPUs      int
-    MemoryMiB uint64
-    DiskGiB   uint64
-}
+### 6.4 Guest agent (`internal/guest`)
+Deleted — superseded by `internal/sandbox` (§6.15) and `cmd/krayt-helper` (§6.7) under ADR option
+B1 (`docs/adr-microsandbox-sandbox-layer.md`, `run-tasks-on-microsandbox.md`). See git history for
+the pre-msb text.
 
-type Provider interface {
-    Create(ctx context.Context, spec VMSpec) (VM, error)
-}
+### 6.5 Control protocol (`internal/protocol`)
+Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
+(`docs/adr-microsandbox-sandbox-layer.md`, `run-tasks-on-microsandbox.md`). There is no gRPC, no
+`.proto`, and no generated Go on either side of the sandbox boundary any more — krayt drives `msb`
+over argv/stdio instead (§6.15, §7). See git history for the pre-msb text.
 
-type VM interface {
-    Start(ctx context.Context) error
-    // DialControl opens the control channel to the guest-agent (guest listens, host
-    // connects). On vz this goes through the per-VM VZVirtioSocketDevice; on Firecracker
-    // it is an AF_VSOCK connect to the guest CID. Returns a net.Conn usable as a gRPC
-    // transport (see §6.12). `port` is the guest vsock port (fixed; see §6.12).
-    DialControl(ctx context.Context, port uint32) (net.Conn, error)
-    Stop(ctx context.Context) error
-    Destroy(ctx context.Context) error // also removes the CoW clone
-    ID() string
-}
-```
+### 6.6 Networking & egress policy (`internal/task`, `internal/sandbox`)
+> **Rewritten by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11).** krayt's own
+> in-guest/host-side egress proxy — `internal/proxy`, `internal/guest/proxy`,
+> `cmd/krayt-vsock-forward`, the guest-initiated `EgressPort` vsock channel, and the per-VM tap +
+> `/30` + `cap_net_admin` Linux setup (`hack/linux-net-setup.sh`) — is **deleted**. msb (§2, §6.15)
+> owns egress policy and TLS interception itself; krayt's job shrinks to translating `krayt.yaml`'s
+> network vocabulary into a fully explicit `msb create` policy and never letting an implicit msb
+> default govern a run. Everything below is the current, live design — see git history for the
+> pre-cutover text; `docs/adr-microsandbox-sandbox-layer.md` ("Default posture: what a bare
+> sandbox gets") is the strategic record of why this shape was chosen, and
+> `translate-network-policy-to-msb.md` built the pure translator this section now describes as
+> live rather than additive.
 
-- **`internal/provider/vfkit`** (v1): drives `crc-org/vfkit`, which itself wraps
-  `Code-Hex/vz/v3`. `Create` builds the VM config via vfkit's `pkg/config` Go API and
-  launches the signed vfkit binary as a subprocess; lifecycle is controlled over vfkit's
-  REST API (unix socket). vfkit is used in production by podman/minikube/crc.
-  - **CoW clone:** `Create` clones the base **raw** rootfs image with APFS `clonefile(2)`
-    (vfkit needs raw/ISO, not qcow2); vfkit boots from the clone via its Linux bootloader
-    (kernel + initrd + rootfs) or EFI. `Destroy` kills the vfkit process and deletes the clone.
-  - **vsock:** vfkit exposes the guest vsock port as a **host unix socket**
-    (`--device virtio-vsock,port=1024,socketURL=…`); `DialControl` is a plain unix-socket
-    dial (see §6.12). No `CID` needed.
-  - **Signing:** the entitlement lives on the vfkit binary, not krayt — see §12.
-- **`internal/provider/vz`** (fallback, not built in v1): embeds `Code-Hex/vz/v3` directly
-  in-process for a zero-runtime-dependency, fully-controllable path. Swap target if vfkit's
-  API ever becomes a control ceiling. Same `Provider`/`VM` interface — no other code changes.
-- **`internal/provider/firecracker`** (v1, Linux): same interface over Firecracker/KVM. `Create`
-  clones the raw rootfs, allocates the VM's tap device + vsock CID, and `Start` launches the
-  `firecracker` binary as a subprocess configured over its **REST API on a unix socket** — the
-  same subprocess+REST idiom as the vfkit provider, hand-rolled rather than pulled from
-  `firecracker-go-sdk` (§9.1). Three things differ materially from vfkit:
-  - **CoW clone:** there is no `clonefile(2)`. `Create` uses the `FICLONE` ioctl (reflink) where
-    the filesystem supports it — Btrfs, or XFS with `reflink=1` — and falls back to a
-    sparse-aware copy where it does not. **ext4 has no reflink support at all**, so on the
-    common Linux setup each VM costs a real copy of the base rootfs (~2 GiB); putting krayt's
-    run dir on XFS/Btrfs makes clones O(1) with no code change. Firecracker takes raw block
-    devices only, so a qcow2 backing file is not an option.
-  - **vsock:** a unix socket plus the `CONNECT` handshake, not `AF_VSOCK` — see §6.12.
-  - **Networking:** Firecracker has **no built-in NAT device and no DHCP server** (vfkit has
-    both). The provider creates a tap device per VM, gives it its own `/30`, and passes the
-    guest its address on the kernel command line; the host needs one-time setup for this. See
-    §6.6.
+**The never-empty-policy rule.** msb's own default egress policy — when no
+`--net`/`--no-net`/`--net-default*` flag is present at all — is `from_profiles([Public])`: an
+implicit `allow@public` rule granting the *entire public internet*, and critically, `--net-rule`
+alone does **not** suppress it; it only layers krayt's rules on top of that default. So
+`task.NetworkArgs(spec.Network, hasSecrets)` (`internal/task/netpolicy_msb.go`), called from
+`orchestrator.Run` (§7 step 1) on every `krayt run`, always emits one of `--no-net`,
+`--net-default deny`, or the `--net-default-egress`/`--net-default-ingress` pair — computing "no
+policy" is a translation error the function itself refuses to return, never a state a real `msb
+create` call can reach:
 
-> Everything outside this package is platform-agnostic.
+- **`none`** → `--no-net` and **zero** `--net-rule` flags. `--net none` is deliberately avoided:
+  msb still layers any supplied `--net-rule` on top of `NetworkPolicy::none()`, so even one stray
+  rule would silently punch a hole through the mode that is supposed to mean no network at all.
+- **`allowlist` (default)** → `--net-default deny`, `allow@dns`, explicit `deny@<group>` rules for
+  every private destination group (below), then one `allow@<host>` per `network.allow`
+  entry, in the order given — deterministic, so the same config always renders byte-identical
+  argv (pinned by golden tests against this repo's own `krayt.yaml`).
+- **`full`** → `--net-default-egress allow --net-default-ingress deny`, plus the *same*
+  `allow@dns` and explicit `deny@<group>` rules: `full`'s allow must not mean "and also the
+  host's LAN" — the
+  identical design rule krayt's pre-msb resolved-IP dialer guard used to enforce, now expressed as
+  explicit msb rules instead of a Go-side check, since msb — not krayt — is doing the dialing.
+- **Private/loopback/link-local/metadata stay denied in every mode, including `full`** — an
+  existing krayt property carried forward, not a new one. msb exposes this as destination groups
+  (`private`, `loopback`, `link-local`, `meta`, `multicast`, `host`; `msbDenyGroups` in
+  `netpolicy_msb.go`), denied explicitly and ordered before every allow rule **except
+  `allow@dns`** — see the DNS paragraph below for why that one has to come first.
+- **Ingress is denied explicitly, in every mode** (`--net-default-ingress deny` for `full`; the
+  deny-default modes need no separate ingress flag). krayt publishes no ports today, so this is
+  inert — but msb's own ingress default is `allow`, and closing it costs one flag now rather than
+  becoming a live gap the moment krayt publishes anything.
 
-### 6.4 Guest agent (`internal/guest`, built for `linux/arm64` + `linux/amd64`)
-A small static Go binary baked into the VM rootfs and run as a **systemd service**
-(`Type=notify`, ordered `After=containerd.service` and the network target). The VM uses
-NixOS + systemd (see §11.1/§11.6); systemd owns init, mounts, and service ordering, so the
-guest-agent stays a plain service rather than a hand-rolled PID 1.
-Responsibilities:
-- Run the **gRPC control server** on a fixed vsock port (§6.5, §6.12).
-- Receive the **image archive**, **repo bundle**, **task**, **secrets**, and **network policy**.
-- Bring up the **egress proxy + nftables firewall** (default-deny except the proxy; §6.6).
-- Drive **containerd** (via its native Go client) to import + run the user's OCI image as a
-  single container with the right mounts/env (see §6.10).
-- **Stream container logs** back over the control channel.
-- On container exit, **generate the patch** (§6.7) and **stream the artifact bundle** back.
-- Signal completion / exit code, then idle for teardown.
+**The guest regains DNS — a genuine capability gain, stated plainly.** Under the pre-msb design
+the guest had no usable network at all in `allowlist`/`none` — everything rode vsock to a host
+proxy. Under msb the guest has a real, policed network interface, so `allowlist` mode emits
+`allow@dns` explicitly — msb's `--net-default*` path adds **no** implicit DNS rule the way its
+profile-based default does, so a deny-default allowlist with no explicit `allow@dns` resolves
+nothing — and DNS is policed by msb's own gateway, with DNS-rebind protection on by default.
 
-### 6.5 Control protocol (`internal/protocol`, shared host+guest)
-**Decision: gRPC over vsock.** Typed messages + first-class streaming for logs, tar, and
-the image archive. The **guest is the gRPC server** (listens on a fixed vsock port); the
-**host is the client** (connects through the provider's `DialControl`, see §6.12). The
-`.proto` is the single source of truth, compiled to Go for both sides.
+**`allow@dns` is emitted before the `deny@<group>` rules, and that ordering is load-bearing.**
+msb's `dns` is a *destination*, not a capability — its own CLI help defines it as "the semantic
+`dns` target for gateway UDP/TCP port 53" — and that gateway is the guest's end of a /30 carved
+out of `--net-ipv4-pool`, which defaults to `172.16.0.0/12`. `dns` and `private` therefore name
+overlapping destinations, and msb evaluates rules first-match-wins within a direction, so
+whichever krayt emits first decides. With the denies first the gateway matched `deny@private` and
+the guest resolved nothing: every agent request failed `ENOTFOUND` inside a sandbox whose policy
+was otherwise exactly right. `dns` is the single exception to "denies before allows", and a narrow
+one — it opens the gateway's port 53, not the private groups those denies exist to close.
 
-```proto
-syntax = "proto3";
-package krayt.v1;
-option go_package = "github.com/<you>/krayt/internal/protocol/pb";
+**`--tls-intercept` is emitted whenever any secret is declared, and only then.** This is
+redundant with msb's own behavior — `SandboxBuilder::secret_entry` turns on interception
+unconditionally the instant any `--secret` is declared (confirmed on hardware,
+`hack/msb-probes/p3-secret-tls-intercept.sh`, 2026-08-29) — emitted anyway to pin that behavior
+explicitly rather than depend on an undocumented builder side effect in a beta tool.
 
-service GuestAgent {
-  // Handshake + version negotiation.
-  rpc Hello(HelloRequest) returns (HelloResponse);
+**`--on-secret-violation` is `passthrough`, deliberately, not msb's blocking default.** The flag
+decides what happens when a secret's *placeholder* — never its value — is seen heading to a host
+outside that secret's own scope. Under a blocking action that request dies, and for a coding agent
+that is unrecoverable: msb sets each secret's guest env var to the placeholder itself, so one `env`
+puts the string into the agent's conversation, and the agent resends its conversation to the model
+API every turn. Two real runs died exactly this way (`run_df87bfc8`, `run_4125ef2e`), the second
+while the agent was diagnosing a missing git remote.
 
-  // Incremental image transfer (§6.11): host asks which blobs the guest already has,
-  // then streams only the missing ones.
-  rpc QueryImageBlobs(BlobQuery) returns (BlobPresence);
-  rpc PushImage(stream Chunk) returns (Ack);        // OCI archive, client-streaming
+Forwarding it is safe *structurally*, not by convention: msb decides substitution from the secret's
+own allowed hosts **before** it consults this action at all, so no value of the flag can cause a
+secret to be substituted outside its scope. Confirmed on hardware, not merely read out of msb's
+source — `hack/msb-probes/p7-passthrough-semantics.sh` measured the placeholder arriving unchanged
+at an out-of-scope host, the identical request blocked under `block-and-log`, and in-scope
+substitution still working.
 
-  rpc PushCode(stream Chunk) returns (Ack);         // git bundle stream, client-streaming (§6.7)
-  rpc PushTask(TaskSpec) returns (Ack);
-  rpc PushSecrets(SecretsBundle) returns (Ack);     // held in memory only (§6.8)
-  rpc SetNetworkPolicy(NetworkPolicy) returns (Ack);
+The cost is stated rather than glossed: `passthrough` is **silent**, so krayt gives up msb's
+`secret violation` log line — a warning about a public sentinel that cannot become a credential
+anywhere it should not be, and one the model host would trip on every turn. If that signal is ever
+wanted back, the precise instrument is a per-secret `on_violation: Passthrough([<model host>])`
+supplied through `--secret-conf`, which leaves `block-and-log` in force everywhere else.
 
-  // Start the container and stream events until it exits. The final RunEvent carries
-  // the terminal Status (exit code); the stream then closes.
-  rpc Start(StartRequest) returns (stream RunEvent);
+**`network.mitm` has no msb equivalent and is a hard pre-flight error**
+(`task.ValidateNetworkPolicyForMsb`, the live validator since this cutover, called from
+`internal/cli` before any sandbox is created): under msb there is no configuration in which a
+secret is declared without TLS interception, so the opt-in the key used to represent has nothing
+left to opt into. See §6.6.1 for what replaced `network.inject`'s header-shaped vocabulary.
 
-  rpc CollectArtifacts(CollectRequest) returns (stream Chunk); // patch+report tar (+ optional commits.bundle, §6.7)
-  rpc Answer(AnswerRequest) returns (Ack);          // host answers an agent question (§6.13)
-  rpc Shutdown(ShutdownRequest) returns (Ack);
-}
+**The un-stripped-header regression (§10).** msb never strips a pre-existing auth header the way
+`internal/proxy` used to before setting its own — a credential the agent obtained elsewhere and
+placed in a header addressed to an allowed host now goes out **untouched**. Bounded by the
+allowlist (the agent can only send it somewhere already permitted), not eliminated; see §10's
+threat table for the full statement.
 
-message HelloRequest  { string client_version = 1; }
-message HelloResponse { string agent_version = 1; string containerd_version = 2; }
+**Container hardening follows the same "removed key, named replacement" shape.**
+`internal/task/container_msb.go`'s `ValidateContainerPolicyForMsb` is the container-policy
+counterpart to `ValidateNetworkPolicyForMsb` (§8.1, §6.10 stub): msb's `--security
+default|restricted` replaces krayt's own OCI-spec capability/seccomp/rootfs knobs entirely
+(`harden-container-oci-spec.md`'s work is superseded by this cutover), so `container.capabilities`,
+`container.seccomp: unconfined`, and `container.readonly_rootfs` are removed keys that hard-error,
+each naming `--security` as the replacement. Every krayt sandbox is created with `--security
+restricted` (fixed, not user-configurable) — chosen because `probe-microsandbox-feasibility.md`'s
+P2 (2026-08-30) confirmed `msb exec --user root` still works under `--security restricted` with a
+root-owned path staying unreadable to an `--user agent` exec, so the guest helper (§6.7) keeps
+BOTH the restricted profile AND its own privilege separation rather than trading one for the
+other.
 
-message BlobQuery     { repeated string digests = 1; } // sha256: of image layers/config
-message BlobPresence  { repeated string missing_digests = 1; }
+#### 6.6.1 Secret substitution at the host (`internal/task`, `internal/sandbox`)
+> **Rewritten by `run-tasks-on-microsandbox.md` (the cut-over).** The host-side TLS-intercepting
+> MITM proxy this section used to describe (`internal/proxy`'s CA/leaf-cache/injection machinery,
+> `network.mitm`/`network.inject[].{strip,set,set_prefix,set_literal,refresh}`,
+> `internal/adapter/anthropic_wire.go`) is **deleted**. msb owns credential substitution itself;
+> krayt's job shrinks to naming which secrets-file key may reach which hosts. See git history for
+> the pre-cutover text.
 
-message Chunk { bytes data = 1; string digest = 2; bool last = 3; } // digest set on blob/stream boundaries
+**Three channels, one carries a value** (`docs/adr-microsandbox-sandbox-layer.md`, "How secrets
+actually reach msb"; §6.15, §8.1):
 
-message TaskSpec      { bytes prompt = 1; map<string,string> env = 2; } // env = non-secret
-message SecretsBundle { map<string,string> values = 1; }               // tmpfs at /run/secrets
-message NetworkPolicy { enum Mode { ALLOWLIST = 0; FULL = 1; NONE = 2; }
-                        Mode mode = 1; repeated string allow = 2; }
+| krayt input | Channel | Carries a value? |
+|---|---|---|
+| `krayt.yaml` `network.inject[]` → `task.SecretSpec{Key, Hosts}` | `--secret NAME@host1,host2,...` — one per credential, rendered by `internal/sandbox.SecretArgs` | no — name + hosts only |
+| `krayt.yaml` `network.allow`/`network.mode` | `--net-rule`/`--net-default*` (`task.NetworkArgs`, §6.6) | no |
+| the secrets file's real values | `cmd.Env` on the spawned `msb create` process only (`internal/sandbox.SecretEnv`) | **yes — this only** |
 
-message StartRequest  { string image_ref = 1; uint32 timeout_secs = 2; }
+msb itself enforces the argv half: `--secret` accepts only `NAME@HOST[,HOST...]` and rejects an
+inline `NAME=VALUE@HOST` on both `create` and `modify`. The value channel is `exec.Cmd.Env`, never
+`os.Environ()` — `internal/sandbox.Client`'s closed child-env allowlist (§6.15) plus the resolved
+`KEY=VALUE` pairs for exactly the declared keys, appended only to the one `msb create` invocation
+that starts the sandbox. `Client.Create` is the only method with a `secretEnv` parameter — every
+other method, `Exec` included, has none — so the Timing rule below is structural, not
+conventional.
 
-message RunEvent {
-  oneof kind {
-    LogLine  log = 1;
-    Status   status = 2;          // terminal; last message on the stream
-    Question question = 3;        // agent paused to ask the human (§6.13); not terminal
-  }
-}
-message LogLine { enum Stream { STDOUT = 0; STDERR = 1; } Stream stream = 1; bytes line = 2; int64 ts_unix_ms = 3; }
-message Status  { int32 exit_code = 1; bool timed_out = 2; string error = 3; }
+**The narrowed contract (decided in the ADR, "The secret-handling contract").** krayt's pre-msb
+rule was "never on argv, never in env" — the deleted proxy's stdin channel existed specifically to
+meet it. Under msb the requirement narrows to **never on argv, never persisted**:
+`/proc/<pid>/environ` is mode `0400` (same-uid only), unlike the world-readable
+`/proc/<pid>/cmdline` that makes argv unacceptable, and the adversary the narrowed rule admits —
+someone who can already read `secrets.env` (0600), ptrace krayt, or read msb's own heap, where the
+value lives for the sandbox's lifetime un-zeroized regardless of how it arrived — has host
+compromise already, which is out of scope for both threat models. This is a decision made once,
+in the ADR, not a silent regression nobody noticed.
 
-// Agent → human question (§6.13). Pushed on the Start stream; host replies via Answer().
-message Question      { string id = 1; string prompt = 2; repeated string choices = 3; uint32 timeout_secs = 4; }
-message AnswerRequest { string question_id = 1; string response = 2; bool no_answer = 3; } // no_answer = timeout/declined
+**Timing.** msb reads a secret's value "at start time", not at config-load time — the environment
+must be set on whichever invocation actually starts the sandbox (`msb create`). A later `msb exec`
+against the running sandbox needs no env at all; the per-sandbox host runtime holds the value for
+the sandbox's lifetime.
 
-message CollectRequest  {}
-message Ack             { bool ok = 1; string error = 2; }
-message ShutdownRequest {}
-```
+**Every secret must be network-scoped — a capability loss, stated plainly (§6.8, §8.1).** Under
+the pre-msb design a `secrets.env` key could be materialized inside the guest and used *there* —
+an SSH key, a signing key, a local database password. msb has no equivalent channel: `--secret`
+never puts a value in the guest (the guest gets msb's own placeholder instead), `--env KEY=VALUE`
+puts the value on argv (disqualified), and `msb copy` into a tmpfs mount would require writing the
+value to a host temp file first (rejected — it trades away "never persisted" for a weaker
+property). `task.ValidateNetworkPolicyForMsb` therefore hard-errors a `secrets.env` key with no
+`network.inject` entry naming it, pre-flight, rather than silently delivering something weaker
+than the key's name promises.
 
-Notes for implementers:
-- `Chunk` is the shared streaming primitive (image, code, artifacts). Keep chunk size
-  ~1–4 MiB. Never buffer a whole stream in memory on either side.
-- `Start` is the spine: one server-stream that multiplexes log lines and ends with a
-  single `Status`. The host writes logs to disk and (if attached) to the terminal.
-- All secret material lives only in `SecretsBundle` → guest memory → container tmpfs;
-  it is never written to the RunEvent stream or any artifact.
+**The mechanism difference from krayt's own, deleted proxy.** krayt used to do *shape
+translation*: know the provider's wire format, strip a named header, set a different one
+(`internal/adapter/anthropic_wire.go`, deleted by this cutover). msb does *placeholder
+substitution*: it finds the placeholder string the workload already sent — under its own default,
+`$MSB_<NAME>`, or a shaped placeholder if one is set — and swaps it in place, wherever it appears,
+without needing to know which header it was in. `network.inject`'s schema shrank accordingly
+(§8.1): a `krayt.yaml` entry now names a secrets-file **key** and the **hosts** it may be
+substituted to, nothing else — no header name, no prefix, no literal, no refresh hook.
+`task.SecretSpecsFromConfig` hard-errors, naming itself, on any of the old
+`host`/`strip`/`set`/`set_prefix`/`set_literal`/`refresh` fields appearing on an entry, rather than
+silently ignoring one — silently dropping `strip` specifically would reopen the regression below
+without telling anyone.
 
-### 6.6 Networking & egress proxy (`internal/proxy`, `internal/guest/proxy`, `internal/orchestrator`)
-> **Amended by `move-egress-proxy-to-host.md` (step 1 of a three-step arc, §14).** The L7
-> allowlist proxy moved from an in-guest process to a separate **host** process, reached over a
-> new guest→host vsock channel. This is a **behavior-preserving, security-strictly-improving**
-> move for the container: identical allowlist semantics, identical `HTTP_PROXY` contract — the
-> only user-visible changes are DNS now resolving in the host's network context (was: a
-> hardcoded `1.1.1.1`) and the SSRF guard's private-range carve-out being deleted outright (was:
-> permitted under `mode: full`). Everything below reflects the current (post-move) design;
-> superseded statements are not preserved inline — see git history for the pre-move text.
+**The un-stripped-header regression (§10, §6.6).** msb never strips a pre-existing auth header
+before substituting its own placeholder's real value in — krayt's deleted proxy stripped
+`authorization`/`x-api-key` first. A credential the agent obtained elsewhere and placed in that
+header, addressed to an allowed host, now goes out **untouched**. Bounded by the allowlist (the
+agent can only send it somewhere already permitted), not eliminated — see §10.
 
-The container runs in the **VM's own network namespace** (no CNI bridge) — there is one
-container per VM, so the VM boundary *is* the network boundary and host-networking-in-VM
-is the simplest correct choice. Enforcement layers:
-
-- **VM interface:** one NAT interface (vz NAT device / Firecracker tap), brought up by
-  the NixOS network config. **This interface applies no filtering of its own** — vfkit/the
-  Virtualization.framework NAT device forwards whatever the guest sends; the hypervisor is not a
-  firewall.
-- **Host side of the wire — the one real asymmetry between backends (Phase 7).** vfkit hands the
-  VM a NAT'd NIC with a DHCP server built in, so a macOS host needs no setup. **Firecracker
-  provides neither**: it gives the VM a bare tap device and nothing else. So on Linux the
-  *provider* owns the host end:
-  - **tap + subnet per VM.** Each VM gets its own tap device and its own `/30` out of
-    `172.16.0.0/16` (host `.1`, guest `.2`), rather than a shared bridge — so two concurrent
-    runs share no L2 segment and cannot see each other's traffic (§10). Allocation is guarded by
-    an flock'd slot file, because `krayt run --detach` means several krayt *processes* can be
-    booting VMs at once (§6.2).
-  - **Address delivery.** With no DHCP server, the guest's address travels on the kernel command
-    line (`ifname=`/`ip=`/`nameserver=`, dracut syntax). Note that the *kernel's* `ip=`
-    autoconfiguration does **not** read it — that needs `CONFIG_IP_PNP`, which the nixpkgs kernel
-    does not set, so the kernel ignores the parameter silently. It is consumed in userspace by
-    **`systemd-network-generator`**, which the image enables (§11.6); it writes the corresponding
-    `.network`/`.link` files before networkd starts. The vfkit path is untouched: with no `ip=`
-    on the cmdline nothing is generated and the image's DHCP unit applies as before.
-  - **One-time host setup, not per-run privilege.** Creating a tap needs `CAP_NET_ADMIN`, and
-    routing guests out needs IP forwarding + a NAT masquerade rule. These are granted once
-    (`hack/linux-net-setup.sh`: a `setcap cap_net_admin+ep` file capability on the krayt binary,
-    so krayt does **not** run as root, plus the forwarding/masquerade rules) and checked by
-    `krayt doctor`. The tap is handed to the invoking uid (`TUNSETOWNER`) so the *firecracker*
-    process itself needs no capabilities at all. This NIC still exists (`full` mode still needs
-    it — see below), but in `allowlist`/`none` the guest no longer strictly needs it; making it
-    conditional is a follow-up (§15), not done here.
-  - **None of this weakens the guest's egress policy.** What a container may reach is still
-    decided by the allowlist proxy (now host-side, below) + the nftables loopback-only lock,
-    identically on both backends. The host network setup only provides the `full`-mode wire.
-- **The L7 allowlist proxy runs on the HOST, as a separate process (`internal/proxy`).** A
-  small **HTTP/HTTPS CONNECT forward proxy** (hand-rolled) checks the `CONNECT` host and
-  plain-HTTP `Host` against the per-task allowlist — exactly as before, just relocated.
-  Concretely: the run supervisor spawns `krayt __egress-proxy` (a hidden cobra subcommand,
-  `internal/cli`) via **self-exec** (`os.Executable()`, overridable with
-  `KRAYT_EGRESS_PROXY_BIN`) as its own OS process — it must not share an address space with the
-  process that (from step 2 of this task's arc onward) holds the user's real credentials,
-  writes their repo, and runs the run supervisor. The parent creates and binds the listener
-  socket and hands it to the child on **fd 3** (`cmd.ExtraFiles`), so the child needs no
-  filesystem access to the socket directory at all — a socket **path** is never passed. Policy
-  arrives as flags (`--mode`, `--allow`, `--dns`), matching the old in-guest contract shape.
-  A failure to spawn the child, or an early child exit, is a fail-fast run error: the VM never
-  boots with its only egress path already dead.
-- **The guest→host vsock channel (`EgressPort = 1025`, `internal/provider`).** This is the one
-  genuinely new primitive: every other vsock channel in krayt is host-initiated
-  (`DialControl`/`ControlPort = 1024`); this one is **guest-initiated**. `VM.ListenEgress(ctx,
-  port)` returns a listener accepting guest connections, called by the orchestrator after
-  `Create` and before `Start` (the socket must exist before the backend process launches, so a
-  guest connection racing boot never finds it missing):
-  - **vfkit:** a *second* virtio-vsock device, `VirtioVsockNew(EgressPort, egressSock, true)` —
-    `listen=true` means connections are guest→host, and (unintuitively) the **host** is the one
-    that binds and listens on `egressSock`; vfkit itself is the *client*, dialing in each time
-    the guest connects out. `ListenEgress` is a plain `net.Listen("unix", egressSock)`, called
-    before vfkit's subprocess starts. `egressSock` lives in the same short, `0700` per-VM socket
-    dir as `ctrlSock` (§6.12's socket-root hardening applies identically).
-  - **Firecracker:** no device to add and no `CONNECT <port>\n` handshake (that dance is
-    host→guest only, §6.12) — a guest connection to `(VMADDR_CID_HOST, port)` is bridged by
-    Firecracker to a host unix socket at `<uds_path>_<port>`, which Firecracker dials as a
-    *client*, symmetric with the vfkit case: the host must already be listening there.
-    `ListenEgress` is `net.Listen("unix", vsockSock+"_"+port)`.
-  - **fake provider:** a REAL unix-socket listener in a per-VM temp dir (not an in-memory
-    pipe), so orchestrator-level tests genuinely exercise the fd-passing path in §4 of the task,
-    not a mock of it.
-  - **Why vsock and not a gateway-bound TCP proxy.** The tempting shortcut — point
-    `HTTP_PROXY` at the VM's gateway IP and run the proxy there — is wrong. §6.6's tap+`/30`
-    isolation (above) exists precisely so two concurrent VMs share no L2 segment; vfkit/vmnet's
-    NAT gives no such isolation, so a gateway-bound proxy would be reachable by *every other
-    run's VM on the host*, and a `0.0.0.0` bind mistake would expose it to the LAN — a
-    materially worse blast radius once step 2 makes this process hold the user's real
-    credentials. vsock has neither problem: on vfkit each VM gets its own host unix socket, on
-    Firecracker its own `uds_path` — the channel is authenticated by construction and is not
-    routable. Concurrent-VM isolation over this channel is asserted on hardware by
-    `TestConcurrentRealVMs` (§14).
-- **The guest side is now a dumb pipe (`cmd/krayt-vsock-forward`, `internal/guest/proxy`).**
-  `krayt-vsock-forward --listen 127.0.0.1:3128 --vsock-port 1025` accepts TCP on `--listen`
-  (the container's `HTTP_PROXY` target) and, for each accepted connection, dials the host over
-  vsock and splices the two byte streams — **one vsock connection per accepted TCP connection**
-  (no multiplexing; `HTTP_PROXY` keep-alive means the container opens several concurrently). It
-  **parses nothing**: no HTTP, no TLS, no allowlist. That is the whole point — the
-  adversarially-exposed parser moved off the guest entirely, so nothing may follow it back onto
-  the guest side; if a future change makes this binary want to look at a byte, the design has
-  regressed. It still runs as the dedicated `proxyd` uid (`internal/guest/proxy/controller_linux.go`)
-  as defense in depth — a non-root uid for the one guest process touching container-controlled
-  bytes is free — but this is **no longer load-bearing for the L3 lock** (below); do not delete
-  it as vestigial.
-- **L3 enforcement, simplified to loopback-only.** With the L7 proxy off the guest entirely, the
-  guest needs no DNS (the host proxy resolves), no registry egress (§6.11 pre-loads images over
-  vsock), and no bundle egress (§6.7 rides vsock) — so in `allowlist`/`none` there is nothing for
-  the container to legitimately reach except the forwarder on loopback:
-
-  ```
-  table inet krayt_egress {
-    chain output {
-      type filter hook output priority 0; policy drop;
-      oif "lo" accept
-    }
-  }
-  ```
-  The lock is in the **`inet` family** (IPv4 + IPv6 alike). **No rule keys on a uid anymore** —
-  the `meta skuid "proxyd"` accept and its `ct state established,related` companion are both
-  gone, because there is no longer an external flow for the guest to legitimately originate at
-  all. This **deletes the cross-module invariant** the old design depended on (§10): previously
-  the lock's correctness lived partly outside `firewall_linux.go`, in the container's dropped
-  `CAP_SETUID`/`CAP_SETGID` and enforced non-root (§6.10) — a future OCI-spec regression there
-  could silently reopen the egress bypass (finding #1). Moving the proxy off-box **deletes that
-  invariant rather than defending it**: the guest chain no longer keys on identity at all, so
-  there is nothing for a capability regression to unlock. `full` mode is **unchanged** — it
-  still deletes the table outright, so raw egress over the NIC still works as an explicit
-  escape hatch; unifying `full` onto the proxy path is a legitimate follow-up (§15), not done
-  here.
-
-  **Single-netns assumption** (unchanged). This `output`-hook rule is correct only while the
-  container shares the **VM's** network namespace (`oci.WithHostNamespace`, one container per
-  VM) — the VM boundary is the network boundary, so the container's sockets traverse this hook.
-  A future change that gives the container its own netns would move its traffic out of
-  `output`'s view and require a `forward` chain instead.
-- **Container env:** launched with `HTTP_PROXY` / `HTTPS_PROXY` pointing at the forwarder
-  (`http://127.0.0.1:3128`) and `NO_PROXY=localhost,127.0.0.1` (the lowercase
-  `http_proxy` / `https_proxy` / `no_proxy` forms are set too, for tools that only read those)
-  — byte-for-byte the same contract the container saw before this task; only what is on the
-  other end of `127.0.0.1:3128` changed.
-- **DNS resolves in the HOST's network context now, not the VM's.** The host-side proxy
-  resolves through the **host's system resolver** by default — respecting the user's
-  VPN/split-horizon/corporate DNS, which a hardcoded server cannot. `--dns` (a child-process
-  flag, no `network.dns` user-facing config surface yet) still overrides it, mirroring the old
-  `krayt-proxy --dns` contract shape. This is a documented, intended behavior change: DNS used
-  to resolve as the VM would see it; now it resolves as the host does.
-- **Policy modes:** `allowlist` (default) — the proxy permits only the hosts the task lists
-  (`--allow` / `network.allow`); with none listed it is **deny-all**, so a task that needs the
-  AI endpoints (`api.anthropic.com`, `generativelanguage.googleapis.com`) or a package
-  registry must allow them explicitly — krayt does **not** auto-seed them. `full` — nftables
-  policy switched to accept (explicit opt-in, guest-side, unchanged by this task); `none` —
-  proxy denies everything (usable because image acquisition is off the VM net path, §6.11). The
-  agent's **auth/refresh** endpoints must be allowlisted alongside the inference endpoint
-  (§6.14); an OAuth/`apiKeyHelper` refresh flow may touch more hosts than a static API key, so
-  it can need a wider list.
-- **The allowlist is per-*host*, not per-host:port — one entry authorizes every TCP port on that
-  host.** The policy decision is made on the bare hostname (the CONNECT authority's port is
-  stripped before the allowlist lookup), but the **full authority is what gets dialed**. So
-  `allow: [api.example.com]` permits `CONNECT api.example.com:443` *and* `:22`, `:11434`, `:1` —
-  each dialed at the port the guest named, and under `mitm` each receiving the injected
-  credential at `https://<host>:<that port>`. This is intended: §6.6 speaks of hosts throughout,
-  and `passthrough`'s stated purpose (git+ssh on 443) depends on the port being the guest's
-  choice. But "exact-host allowlist" reads narrower than it is — an allowlisted host is reachable
-  on **any** port, subject only to the resolved-IP guard below. If a host must be reachable on one
-  port only, krayt has no mechanism for that today.
-- **What a `passthrough` host gives up (§6.6.1).** From `200 Connection established` onward the
-  proxy is a **byte pipe**. Still enforced for such a host: the allowlist decision on the CONNECT
-  authority, `checkDialAddr` on every resolved IP, the fact that the CONNECT authority is what
-  gets dialed, and a single `observe CONNECT … via=tunnel` line. Given up **entirely**: the
-  request line, path and query; every request and response header; status codes; bodies; whether
-  the traffic is even HTTP; any injection or stripping (§6.6.1); the per-request observation log;
-  and any notion of how much data moved — on **any** port (see the bullet above). Operationally
-  this is a one-word cliff: adding a host to `passthrough` silently converts it from "inspected
-  and injectable" to "opaque", and the only place that conversion shows up is that one log line,
-  emitted only when request observation is on — `KRAYT_PROXY_LOG_REQUESTS=1`, or
-  `KRAYT_PROXY_LOG_HEADER_VALUES=<names>` (which implies it).
-- **Resolved-IP guard (SSRF / DNS-rebinding) — now a HARD block on every proxy-mediated dial, no
-  carve-out.** The host-string allowlist is not enough on its own: an allowlisted name (or, in
-  `full`, any name) could resolve to an internal address. After the proxy resolves an upstream
-  name, it checks the **resolved IP** — on *every* A/AAAA answer and every connection attempt,
-  via the dialer's `Control` hook, covering both the CONNECT tunnel dial and the plain-HTTP
-  transport dial — and refuses, **unconditionally, in every policy mode including `full`**:
-  loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), the cloud
-  **metadata** IP `169.254.169.254`, the unspecified address (`0.0.0.0`, `::`), multicast, and
-  (since this task) **private / ULA ranges** — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
-  the `100.64.0.0/10` CGNAT range, and `fc00::/7` — **with no `mode: full` exception anymore**.
-  Public addresses are allowed (still subject to the host allowlist above). The check is
-  **fail-closed**: an address that cannot be parsed is refused. A refusal returns a `403`. **This
-  guard is proxy-side, so it only covers traffic that is actually proxy-mediated** — see the
-  `full`-mode caveat immediately below.
-
-  **Why the carve-out was deleted rather than kept.** The old `mode: full` exception existed
-  because the dialer lived *inside* the VM: letting it reach `192.168.0.0/16` meant "the VM's
-  own NAT segment is reachable" — a contained, low-stakes trade. With the dialer now on the
-  **host**, the identical carve-out would mean "the sandbox can reach the user's real LAN and
-  loopback services from a trusted host process" — a materially worse trade, so it is refused
-  outright rather than widened. **This is a deliberate, documented casualty for proxy-mediated
-  traffic:** a well-behaved agent that honors `HTTP_PROXY` — a local Ollama/LM Studio on
-  `127.0.0.1:11434`, a LAN package mirror — cannot reach it through the proxy, in any policy
-  mode. That use case, if wanted, needs a purpose-built mechanism (an explicitly named forward
-  target), not a range unblock; it is recorded as a possible follow-up (§15), not built here.
-  **It is not a hard guarantee in `mode: full`**, though: `full` also deletes the guest's
-  nftables table outright (above), so software that ignores `HTTP_PROXY` — or opens a raw socket
-  — bypasses the proxy (and this guard) entirely and can reach any routable private/LAN address
-  directly over the NIC, identically to before this task. Only the proxy path gained the
-  unconditional block; `full`'s raw-NIC escape hatch is unchanged and was never proxy-mediated.
-
-  Because the *resolved* IP is what's checked (not the requested name), this also mitigates
-  **DNS-rebinding** to internal addresses.
-- **Isolated as a swappable, memory-safety-critical component — more so now that it is
-  off-VM.** The proxy is a **standalone host process** (`krayt __egress-proxy`, spawned by
-  self-exec or `KRAYT_EGRESS_PROXY_BIN`) sitting behind a stable contract: fixed flags in
-  (`--mode` / `--allow` / `--dns` / `--mitm` / `--run-id`, §6.6.1), a listener on fd 3, a
-  JSON `StdinConfig` (passthrough + resolved inject rules — the only place secret material
-  reaches this process, §6.6.1) on stdin, the ephemeral MITM CA's public cert (or nothing)
-  written once to fd 4, logs on stdout/stderr (`internal/orchestrator` redirects them into
-  `proxy.log`, §9). Nothing else in krayt depends on *how* it is implemented —
-  `internal/proxy`'s `Factory`/`newHandler` seam (unchanged since before
-  `add-tls-mitm-credential-injection.md`; MITM is a mode of the existing handler, not a fork
-  of it) still lets the allowlist/MITM handler itself be swapped (e.g. for `elazarl/goproxy`)
-  without touching the process wiring. Because it is the component most directly exposed to
-  **untrusted, adversarial network input**, and now sits *outside* the VM boundary rather than
-  inside a disposable one, a memory-safe reimplementation (e.g. Rust/Zig) matters *more* here
-  than it did in-guest — drop in a binary honoring the same flags/fd-3/stdin/fd-4/log contract
-  via `KRAYT_EGRESS_PROXY_BIN`, and neither the orchestrator nor the guest changes.
-- **`proxy.log` — a new, host-redacted run artifact (§9).** `net/http`'s CONNECT-proxy client
-  discards the response body on a non-2xx CONNECT, so the *only* place a denial's real reason
-  (DNS failure, connection refused, blocked-address guard, …) appears is the proxy's own
-  server-side log. The run supervisor captures the child's stdout/stderr and, on teardown,
-  redacts it against the task's secrets (the first HOST-side redaction path in krayt — §6.8) and
-  writes it to `.krayt/runs/<id>/proxy.log`. What lands there is **failures and policy denials
-  only** — a run in which every request succeeded correctly leaves the file **empty**.
-- **`KRAYT_PROXY_LOG_REQUESTS=1` — the opt-in request-observation mode
-  (`internal/proxy/observe.go`).** Set on the `krayt run` invocation (the proxy child inherits the
-  environment), it adds one `proxy.log` line per handled request: the request line, the
-  already-approved host, header **names**, query-parameter **names**, and the response status —
-  never a header value, never a query value, never a body, the same rule §6.6.1 sets for
-  everything else this process logs. This is what makes the proxy an *instrument* — the only way
-  to answer "which host, path, and auth header did this agent actually use", which a wire-format
-  probe (§6.14, `inject-claude-oauth-token-at-proxy.md` P1–P4) must observe before an injection
-  rule may be written for a credential shape. Off by default, because an always-on version would
-  persist the hosts and paths every ordinary run visited. It is an env var rather than a flag on
-  purpose: the flag set is the `KRAYT_EGRESS_PROXY_BIN` swap contract above, and a replacement
-  binary must be able to ignore a diagnostics request instead of dying on an unknown flag.
-- **`KRAYT_PROXY_LOG_HEADER_VALUES=<names>` — the one narrow relaxation of "never a value".** A
-  comma-separated list of header names whose values the observation log may record in full (implies
-  the mode above). It exists because a header *name* is not always enough: an API's required opt-in
-  flags (a beta or version header) are non-secret facts a probe must record **exactly**, and guessing
-  them is precisely what the probe protocol forbids. A **credential-bearing** name never yields its
-  value — `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`, and
-  any header this run's own `network.inject[]` rules touch are reduced to
-  `<scheme="Bearer" credential_len=N>`: the public RFC 7235 scheme plus the length of the material
-  after it. That shape is what answers a probe's two remaining questions — "Bearer-prefixed or raw
-  token?" and "is the credential forwarded verbatim, or did the client exchange it first?" (compare
-  `credential_len` against the secrets-file value's own length) — without a credential ever entering
-  the artifact. Disclosing a high-entropy token's *length* into an already-redacted, per-run,
-  explicitly-opted-into log is the deliberate trade being made here.
-
-#### 6.6.1 TLS MITM & credential injection (`internal/proxy`, `add-tls-mitm-credential-injection.md`)
-> **Amended by `add-tls-mitm-credential-injection.md` (step 2 of the three-step host-side-proxy
-> arc, §14; depends on `move-egress-proxy-to-host.md`, step 1, above).** Everything below is
-> **opt-in** (`network.mitm: false` by default, §8.1) — a user who does not set it observes
-> **zero behavior change** from step 1: same tunnel path, no CA in the guest's env map, byte-
-> identical `internal/proxy` behavior.
-
-**What it buys.** Today an agent credential rides `SecretsBundle` → guest memory → container
-tmpfs at `/run/secrets` (§6.8, §6.14): the agent process can read it, and so can anything that
-compromises it, and a stolen credential **outlives the run** — the one thing the ephemeral-VM
-model otherwise prevents. With `network.mitm: true` plus `network.inject[]` naming a host, the
-proxy terminates that host's TLS on the host and attaches the credential itself; the named
-secrets-file key is **withheld from `SecretsBundle` entirely** (§6.8) — the container never
-holds it, so there is nothing in the VM for a compromise to steal.
-
-**What it does *not* buy — be honest about this, it is the main way overselling it goes wrong:**
-- **It removes credential *theft*, not credential *use*.** The proxy cannot distinguish an
-  agent-initiated request from a legitimate one: a compromised agent still has unlimited
-  *authenticated* access to every allowlisted host for the run's duration. This converts
-  exfiltration into a confused deputy — a real improvement (a confused deputy dies with the VM;
-  a stolen key does not) but not "no risk".
-- **It only covers HTTP-shaped credentials.** An SSH key, a signing key, or anything a tool
-  computes over cannot move to the proxy; those still ride `SecretsBundle` unchanged.
-- **It does not stop the credential being *reflected back* to the container.** The injected header
-  goes to an allowlisted host; if that host has any endpoint that echoes request headers — a
-  `/headers` or `/debug` route, an error page that quotes the request, a verbose 4xx — the
-  credential comes back **in the response body, in plaintext**, and the proxy streams that body to
-  the guest untouched. Nothing could catch it without reading response bodies, which the
-  hostile-input rules below forbid outright. So the honest statement is conditional: **if** every
-  host in `network.allow` that also has an `inject` rule is one the operator trusts not to reflect
-  request headers, **then** a compromised agent can *use* the credential for the run's duration but
-  cannot learn its bytes. That conditional is doing all the work here, and **krayt enforces no part
-  of it** — it is an operator assumption about the allowlisted hosts, checked by nothing.
-- **It moves the adversarial parser outside the blast-radius boundary a second time.** §6.6
-  already names the proxy "the component most directly exposed to untrusted, adversarial network
-  input" post step-1: a proxy compromise there bought unrestricted egress from a VM about to be
-  destroyed. After this task, it buys code execution in the one host process holding the user's
-  real credentials. Go's memory safety helps; request-smuggling and header-confusion bugs do not
-  care — the hostile-input rules below (and §10's residual) are the mitigation, not optional
-  garnish.
-
-**Design decisions:**
-- **`mitm` is allowed in every mode, `full` included.** In `mode: full` + `mitm`, every TLS
-  connection not in `passthrough` is intercepted — including hosts on no allowlist at all. That
-  is the point of `full`, but it makes leaf-cert generation unbounded (the guest, not the
-  operator, picks every SNI), so the SNI leaf cache **must** be capped (below) rather than
-  growing for the run's lifetime.
-- **Ephemeral per-run CA, in memory, never written to host disk.** A persistent krayt CA on the
-  user's disk that VMs trust would be a worse artifact than the one step 1 removed. `internal/proxy`
-  generates one ECDSA P-256 CA per proxy-process lifetime (one process per run) and discards it at
-  teardown; there is no exported API path that can return its private key (only `CACertPEM()`,
-  the public certificate).
-- **ECDSA P-256** for the CA and every leaf — per-connection RSA keygen is visibly slow. Leaves
-  are cached by SNI, bounded at 1024 entries with eviction on overflow (a performance cache, not
-  a security boundary, so eviction policy needn't be precise LRU).
-- **Secret material reaches the proxy child on stdin, never argv or env.** Flags land in the
-  process table; env is readable from `/proc/<pid>/environ`. The run supervisor writes one JSON
-  document — the passthrough list and every inject rule, with `set`'s secrets-file key names
-  already resolved to values — to the child's stdin at startup, then closes it.
-- **`http/1.1` only in ALPN.** A hijacked `CONNECT` does not get `net/http`'s automatic h2
-  upgrade; advertising `h2` and then serving 1.1 breaks clients. The *upstream* leg (the shared,
-  SSRF-guarded transport) keeps `ForceAttemptHTTP2` as before.
-- **`FlushInterval: -1`** on the `httputil.ReverseProxy` that serves the decrypted request:
-  `ReverseProxy` only auto-flushes `text/event-stream` by default, and streaming NDJSON/long-poll
-  would otherwise buffer and stutter the agent's token stream.
-- **Per-host `passthrough` (tunnel, no MITM) list.** Pinned TLS clients and non-HTTP-over-TLS
-  (git+ssh on 443) must survive; those hosts get the plain step-1 tunnel, byte-for-byte, by
-  definition — never intercepted, never injected into.
-- **Never log request or response bodies.** Every byte is now cleartext in a process that writes
-  logs; headers may be logged name-only, same rule as step 1's `proxy.log`.
-- **`net/http/httputil.ReverseProxy`, stdlib only.** No new dependency — `internal/proxy` was
-  already hand-rolled (the `elazarl/goproxy` option in §6.6 was never adopted), so this removes
-  no third-party framework either.
-
-**Config (`network.mitm` / `network.passthrough` / `network.inject[]`, §8.1).** `inject[].strip`
-and `.set` are separate lists on purpose: the header the container sends is not necessarily the
-header that goes upstream (`inject-claude-oauth-token-at-proxy.md`, step 3, removes one auth
-header and sets a different one). `set` values are secrets-file **key names**, resolved
-host-side; `set_literal` values are fixed, non-secret strings — kept syntactically distinct so a
-literal can never be mistaken for a resolved secret. One further key exists because a credential's
-wire format is not always "this header = this value" (added by
-`inject-claude-oauth-token-at-proxy.md` from the 2026-08-17 subscription-token observation):
-- **`set_prefix`** — a literal prefix on a `set` header's resolved value, i.e. an auth **scheme**
-  (`authorization: Bearer <token>`). Folded in host-side while the secrets-file key is resolved, so
-  `internal/proxy`'s contract stays "set this header to this exact string" and no scheme knowledge
-  crosses that boundary. Skipped when the resolved value is empty, so the proxy's fail-closed
-  unresolved-credential check still fires instead of seeing a plausible bare `Bearer `.
-
-Every rule is validated at `krayt run`
-pre-flight, before any VM or image work: `inject` requires `mitm: true`; a rule's host must not
-be in `passthrough`, and (in `mode: allowlist`) must be in `allow`; every `set` key must exist in
-the secrets file; header names must be valid HTTP tokens and not hop-by-hop; `passthrough ⊆
-allow` in `mode: allowlist`; every `set_prefix` must name a header that `set` also names
-(case-insensitively) and carry a non-empty, CR/LF-free value. Injection targets **HTTPS only** — a plain-HTTP request to a host
-with an inject rule is refused outright (400) rather than forwarded unauthenticated or given the
-credential in cleartext; the MITM path is structurally the only place injection can fire.
-
-**The MITM path (`internal/proxy`'s `handler.connect` → `connectMITM`).** After the existing
-allowlist check: a `passthrough` host, or MITM being off, gets the unmodified step-1 tunnel —
-that fallback must stay reachable no matter what MITM does, so it is never modified to depend on
-MITM state. Otherwise: hijack the client connection, write `200 Connection established`, wrap it
-in `tls.Server` with a leaf for the CONNECT authority (never a guest-supplied `Host` header — the
-allowlist already approved the CONNECT authority, not whatever the decrypted request claims), and
-serve HTTP/1.1 over it via `httputil.ReverseProxy`. The `Rewrite` hook sets the outbound URL from
-the CONNECT authority; `Transport` is the **same, already SSRF-guarded** transport the tunnel and
-plain-HTTP paths use, so `checkDialAddr`'s resolved-IP guard (§6.6) runs on every MITM upstream
-dial too — proxy-mediated traffic gets the identical guarantee regardless of path. Injection
-applies **after** `Rewrite`, in order: delete every header named in `strip`, then set every header
-in `set`/`set_literal` — stripping before setting is what makes a guest header unable to smuggle
-a second value past an injected one.
-
-**Treating guest input as hostile (§10).** The proxy now parses attacker-controlled HTTP inside
-attacker-controlled TLS, on the host, holding real credentials — non-negotiable rules: an inner
-request's `Host` that disagrees with the CONNECT authority is a smuggling signal, refused with
-400, never forwarded; the inner HTTP server bounds `MaxHeaderBytes` (1 MiB) and
-`ReadHeaderTimeout` on top of step 1's existing timeouts; a CONNECT authority that isn't a valid
-`host[:port]` is refused with 400; an injected value that resolves empty at request time (a
-config error the pre-flight check didn't catch, e.g. an empty secrets-file value) is a 500, never
-sent upstream unauthenticated; any MITM setup failure — leaf generation, TLS handshake — **fails
-the connection outright**, never silently degrades to the plain tunnel (a silent fallback would
-drop injection and send the agent out unauthenticated, a confusing failure far from its cause).
-
-**Optional per-rule `refresh` (plumbing only).** A rule may declare `refresh: {host, path_prefix,
-response_token_fields}` naming an upstream credential-refresh endpoint. `internal/proxy` ships
-only the generic mechanism — a `RefreshFunc` seam wired into the MITM upstream transport that,
-on a `401` for a rule with `refresh` configured **and** a `RefreshFunc` actually registered,
-performs exactly one refresh and retries the original request exactly once (buffering the
-request body up to 4 MiB to make the retry correct; a larger body skips the retry rather than
-buffer without bound). A second `401` is always surfaced as-is — never a loop. The proxy stays
-generic on purpose: it has no idea what Anthropic (or anyone) is. Constructing the actual refresh
-request and parsing its response is vendor-specific knowledge that belongs in a per-agent adapter
-(§6.14), not the core — `inject-claude-oauth-token-at-proxy.md` (step 3, Phase 10) is the intended
-first consumer of this seam, but only if its P3 probe forces the fallback design (§6.14); the
-primary design (the one currently implemented) needs no `RefreshFunc` at all, since a
-translated-to-API-key credential never refreshes. With no `RefreshFunc` registered — true for
-every run today — this remains a zero-overhead no-op and a `401` behaves exactly as it would with
-no `refresh` block at all.
-
-**Delivering the CA to the container (§8.2).** The credential never enters the VM; the run's
-ephemeral CA's **public** certificate does, over the channel that already exists:
-`NetworkPolicy.ca_cert` (`internal/protocol/krayt.proto`, empty when `network.mitm` is false).
-The guest (`internal/guest/proxy/controller_linux.go`) writes it to `/run/krayt/ca.crt` (0644 —
-it is public) and sets `KRAYT_CA_CERT` plus best-effort `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
-`NODE_EXTRA_CA_CERTS` pointing at it; the **distro-specific** part — concatenating that with the
-container's own system bundle so `passthrough` hosts still verify — is the container entrypoint's
-job (§8.2), not the guest's.
+**Adapter-contributed secrets.** An adapter (§6.14) contributes its own selected credential as a
+`task.SecretSpec` via `Plan.Secrets` rather than an `Inject` rule; `task.MergeSecretSpecs` unions
+it under the user's own `network.inject`-derived specs, with the user's own entry winning on a key
+collision — the same "user wins" precedence the deleted `MergeInjectRules` used, carried forward
+onto the new shape.
 
 ### 6.7 Code transfer & patch generation (`internal/patch`)
 The repo enters the VM as a **git bundle** — a single self-contained byte stream carrying
@@ -915,8 +579,8 @@ security-critical `changes.patch`).
 
 **Integrity.** The bundle is a single artifact, hashable and checkable (`git bundle verify`
 plus a digest). The host digests the exact bundle bytes it streams to the guest — via
-`opencontainers/go-digest` (the `sha256:<hex>` convention already used for the OCI artifact
-(§6.11) and secrets (§6.8)) — and records it as `provenance.bundle_digest` in `meta.json`
+`opencontainers/go-digest` (the same `sha256:<hex>` convention secrets already use, §6.8) — and
+records it as `provenance.bundle_digest` in `meta.json`
 alongside the run's commit provenance (§8.4).
 
 **Provenance.** Because the imported HEAD is usually *not* the user's real HEAD (a snapshot's
@@ -935,59 +599,99 @@ can tell whether that equality is expected.
 - **Submodules:** a superproject bundle includes the gitlink but **not** submodule contents,
   so repos with submodules won't have submodule working trees in the guest. Out of scope for v1.
 
-### 6.8 Secrets (`internal/secrets`)
-- Read from a **per-task secrets file** (e.g. `secrets.env` or `secrets.yaml`).
-- Transferred over the encrypted-by-isolation vsock channel.
-- Mounted in the container on **tmpfs** at `/run/secrets/` (and/or injected as env).
-- **Never** written to the VM's persistent disk image.
-- Destroyed with the VM.
+**Under B1 (microsandbox, `docs/adr-microsandbox-sandbox-layer.md`), `cmd/krayt-helper` performs
+this entire sequence — it is now the only implementation.** There is no more guest-agent: every
+"the guest"/"guest-agent" reference above (ingest, baseline tagging, the root-only `patchgit`
+snapshot, force-cleared git knobs, `changes.patch`/`commits.bundle` generation) describes
+`internal/patch` functions that `cmd/krayt-helper` now calls directly, run as root via
+`msb exec --user root` against a workspace the non-root `agent` user has already edited
+(`add-krayt-guest-helper.md`) — the mechanics are unchanged byte-for-byte, only the process
+calling them changed. The helper is **stateless, exec'd, argv in and JSON on stdout, exits**: no
+gRPC, no control protocol, no long-running process, no listener of any kind — growing one would
+re-create the guest agent inside someone else's sandbox. It takes no secrets argument and performs
+no secret scan; that scan is host-side (§6.8, §8.4) because secret values never enter the sandbox
+at all under B1. It exposes exactly two subcommands, run in this order per §7:
 
-**Redaction scope.** Until `move-egress-proxy-to-host.md` this was "all in the guest, so no
-secret value crosses the vsock un-redacted" — that guest-side claim is still true for every
-artifact below, but it is no longer the *whole* story: `proxy.log` (§6.6, §9) is the **first
-host-side** redaction path, because the egress proxy that produces it now runs on the host, not
-in the guest. The guest builds one `Redactor` per run from the secret values (§6.5) and applies
-it to everything the agent controls that the host will keep:
-- **Live container logs** — each stdout/stderr line is redacted before it is streamed as a
-  `RunEvent`. This is line/chunk-oriented, so a value split across two chunks is a known,
-  accepted miss (see §10 residuals); it only affects live logs.
-- **`report.md`** — the agent-written `/output/report.md` is redacted in place after the run,
-  before it is collected, so the notes the host folds into the final report carry no value.
-- **`ask_human` prompt + choices** — redacted at the bridge boundary before the question leaves
-  the VM, covering both the live display and the persisted `questions/<id>.json`. Answers come
-  from the human (host side), not the agent, so they are not a leak path.
-- **`changes.patch` is scanned, NOT redacted.** Rewriting hunk bytes would corrupt the diff and
-  break `git apply`, so the patch is left byte-exact. Instead the guest scans it for secret
-  values and, on a hit, writes a `secret-scan.json` marker naming the matched **keys only**
-  (never the values, §8.4); the host raises a Safety warning per key in `report.md`/`meta.json`
-  so the human reviews before applying. Whole-buffer scan, so unlike live logs there is no
-  split-chunk gap here.
-- **`proxy.log` — HOST-side, built from a `Redactor` constructed the same way (§6.5's secret
-  values, loaded host-side from the same secrets file), applied once, whole-buffer, when the
-  run supervisor persists the egress proxy child's captured stdout/stderr (§6.6, §9).** This
-  exists because, for plain-HTTP forwards, the proxy sees full request URLs, which can carry a
-  token in a query string — the same class of risk `changes.patch`'s scan-not-redact already
-  documents, just on a different artifact and (since the source is a log, not a git diff)
-  redactable in place like the other logs above, not merely scanned. Fail-closed like
-  `writeConsoleLog`: if the secret values can't be loaded to redact against, the file is
-  dropped rather than risked in the clear.
+- `krayt-helper setup --bundle <path> --workspace <path> --patch-git <path> --agent-user <name>`
+  runs `Ingest`, then `SetupPatchGit` **before** relaxing the tree, then
+  `MakeContainerWritable` — in that order, non-negotiably: the pristine root-only patchgit
+  snapshot must be taken before the tree becomes agent-writable, or the container→sandbox-root
+  isolation `fix-guest-git-config-rce.md` bought is void. Prints `{"baseline", "workspace",
+  "patch_git", "agent_user"}` on stdout.
+- `krayt-helper finish --workspace <path> --patch-git <path> --baseline <ref> --out <dir>` runs
+  `Diff` into `<out>/changes.patch` and `BundleCommits` into `<out>/commits.bundle` when the agent
+  committed, against the same root-only `patchgit` and force-cleared git knobs described above.
+  Prints `{"baseline", "commits_bundle", "diff_bytes"}` on stdout.
+
+Both print human-readable errors on stderr and exit non-zero on failure. Distribution is
+`go:embed` per architecture (`runtime.GOARCH`; the sandbox OS under msb is always Linux, so there
+is no second dimension to select on) — no registry, no OCI artifact, no Nix, no boot test, since
+the helper is neither a kernel nor a rootfs.
+
+### 6.8 Secrets (`internal/secrets`, `internal/sandbox`, `internal/task`)
+
+- Read from a **per-task secrets file** (e.g. `secrets.env`) on the host — the key set is
+  read pre-flight (never the values) for adapter/exactly-one/pre-flight checks (§6.14, §8.1);
+  the values themselves are loaded once, host-side, when a run actually starts (`internal/orchestrator.Run`).
+- **Every secret must be network-scoped.** `network.inject[]` names a secrets-file key and the
+  host(s) msb may substitute its value into (`key:`/`host:`|`hosts:`, §8.1); a key with no
+  matching `inject` entry is a **pre-flight error** (`task.ValidateNetworkPolicyForMsb`), not a
+  silently-dropped capability. There is no channel for a secret to be *used inside* the sandbox —
+  unlike the pre-msb design, where every `secrets.env` key was materialized at `/run/secrets/<KEY>`
+  regardless of how it was used, msb offers no equivalent: `--secret` never puts a value in the
+  guest (the guest gets msb's own placeholder instead, §6.14), `--env KEY=VALUE` puts the value on
+  argv (disqualified), and `msb copy` into a tmpfs mount would require writing the value to a host
+  temp file first (rejected — it trades away "never persisted" for a weaker property). This is a
+  real capability loss versus the pre-msb design and is documented as such, not smoothed over: a
+  value that genuinely must be readable inside the sandbox belongs in plain `env:` instead, with
+  the user's eyes open.
+- **Three channels a secret's parts travel, only one carries a value.** `network.inject[]` becomes
+  `--secret KEY@HOST[,HOST...]` argv (`internal/sandbox.SecretArgs`) — a name and an allow list,
+  never a value; `network.allow`/`passthrough` become `--net-rule`/`--tls-bypass` argv
+  (`task.NetworkArgs`, §6.6); the secrets-file **value** travels only in `cmd.Env` on the spawned
+  `msb create` child (`internal/sandbox.SecretEnv`) — never on disk, never on argv, never on any
+  other invocation of `msb`. msb itself enforces the argv half: `--secret` accepts only
+  `KEY@HOST[,HOST...]`, and rejects an inline `KEY=VALUE@HOST` on both `create` and `modify`.
+- **Timing.** msb reads a secret's value "at start time", not at config-load time, so the
+  environment is set only on the invocation that actually starts the sandbox — `msb create`. A
+  later `msb exec` against the running sandbox needs none, because the per-sandbox host runtime
+  holds the value for the sandbox's lifetime; `internal/sandbox.Client` enforces this
+  structurally, not by convention — `Exec` has no parameter through which a secret could reach it
+  at all, and only `Create` accepts one (`secretEnv []string`).
+- **The narrowed threat requirement.** `/proc/<pid>/environ` is mode `0400` — same-uid only,
+  unlike the world-readable `/proc/<pid>/cmdline` that makes argv unacceptable. The adversary the
+  env channel admits is one who can already read `secrets.env` (0600), ptrace krayt, and read
+  msb's own heap, where the value lives for the sandbox's lifetime regardless of how it arrived,
+  un-zeroized, by msb's own documentation. Host compromise is out of scope, so the requirement is
+  **never on argv, never persisted** — a deliberate, recorded decision (`docs/adr-microsandbox-sandbox-layer.md`,
+  "The secret-handling contract"), not a weakening nobody noticed.
+- **Where the real value ends up.** msb substitutes it at its own TLS interception boundary, on
+  the host, into requests the sandbox sends toward an allowed host for that key — the sandbox
+  itself only ever holds msb's placeholder (§6.14). Declaring any secret turns on TLS interception
+  for the whole sandbox automatically (a beta-tool behavior krayt pins explicitly with
+  `--tls-intercept` anyway, §6.6).
+
+**The host-side secret-key scanner (`internal/orchestrator.PatchSecretKeys`).** `changes.patch` is
+scanned, never redacted: rewriting hunk bytes would corrupt the diff and break `git apply`, so the
+patch is collected byte-exact and scanned afterward for the secrets file's real values. A hit
+raises a Safety warning naming the matched **key only** (never the value) in `report.md`/
+`meta.json`, for the human to review before applying. Under B1 this runs entirely host-side and is
+best-effort defense in depth rather than a real leak path: no secret value can legitimately reach
+the sandbox at all (it is never delivered as anything but msb's own placeholder), so a genuine hit
+here would itself indicate something else has gone wrong. It reuses `secrets.ScanKeys`, the same
+substring-over-the-whole-buffer matcher an artifact redactor would use.
+
+**Other host-side artifacts.** The run's persisted `logs/console.log` (msb's `logs --source system
+--json` output, §7) and `ask_human`'s persisted `questions/<id>.json` prompt/choices
+(`internal/askbridge.Bridge`'s `push` callback, §6.13) are both redacted host-side against the same
+secrets-file values before being written — the host already holds every value it needs to redact
+against, so this costs nothing extra. Live agent stdout/stderr (`logs/agent.log`) is **not**
+redacted line-by-line the way the pre-msb guest redacted it, since the agent process never
+legitimately holds a value to leak into its own output in the first place.
 
 Agent model-provider credentials (e.g. Claude Code's `ANTHROPIC_API_KEY` or
-`CLAUDE_CODE_OAUTH_TOKEN`) ride this same mechanism — see agent authentication (§6.14) for
-how a credential maps to the right env var and the exactly-one rule the adapter enforces.
-
-**Secrets partitioning (`network.mitm` + `network.inject`, §6.6.1).** When a secrets-file key is
-named in any `inject[].set` rule, it is **withheld from `SecretsBundle` entirely** — the load-
-bearing change of `add-tls-mitm-credential-injection.md`. The above bullet list ("read from a
-per-task secrets file... mounted on tmpfs... transferred over vsock") is no longer true for an
-injected key specifically: it is loaded host-side, attached to the matching request by the MITM
-proxy, and never crosses into `SecretsBundle`, guest memory, or `/run/secrets` at all — the
-container that would otherwise hold it runs credential-free for that key. It **remains** in the
-host `Redactor` set used for run logs, `report.md`, and `proxy.log` (above), since a value the
-proxy attaches can still appear in `proxy.log` the same way any other secret can. `meta.json`/
-`report.md` record **which keys were injected** (names only) so the human reviewing a run can see
-the container ran without them — the user-visible payoff of this whole mechanism. Everything else
-in this section is unchanged: a non-injected secret still rides `SecretsBundle` exactly as before.
+`CLAUDE_CODE_OAUTH_TOKEN`) ride this same `network.inject` mechanism — see agent authentication
+(§6.14) for how a credential maps to a host and the exactly-one rule the adapter enforces.
 
 ### 6.9 Logging & streaming (`internal/orchestrator` + guest)
 - Container stdout/stderr → guest → vsock `Logs` stream → host.
@@ -995,185 +699,18 @@ in this section is unchanged: a non-injected secret still rides `SecretsBundle` 
 - `krayt attach <id>` tails the live stream; `krayt logs <id>` reads persisted logs.
 
 ### 6.10 Container runtime — containerd (`internal/guest/runner`)
-The guest runs the user's OCI image with **containerd**, driven from the Go guest-agent
-via containerd's **native Go client** over its local gRPC socket.
-
-- **Why containerd over podman here:** the guest-agent is a Go program controlling the
-  runtime programmatically, one container per VM, with no human at a CLI. containerd is
-  designed to be embedded/driven by another program and exposes a typed Go client for
-  pull/import, create, start, stdio attach, wait, and delete. Podman's strengths
-  (Docker-CLI compatibility, first-class rootless) don't apply: there is no human CLI,
-  and the **VM is already the isolation boundary**, so rootless-in-VM is not a
-  differentiator. Driving podman over an API would also require running
-  `podman system service` — reintroducing a daemon and negating its daemonless selling
-  point.
-- **Image loading:** prefer importing the image as an **OCI archive into containerd's
-  content store** (matches the "pre-load over vsock, no registry egress" model in §15).
-  Falls back to a registry pull only if the network policy allows it.
-- **Single-container model:** exactly one container per VM. **No Docker socket is
-  exposed** and docker-in-docker is unsupported (see Non-Goals §2).
-- **Low-level OCI runtime:** `runc` (default) or `crun` (lighter, faster start) — either
-  is acceptable; selectable in the Nix image. Startup difference is not significant here.
-- **Mounts/env per the container contract (§8.2):** `/workspace`, `/task/prompt.md`,
-  `/run/secrets/*` (tmpfs), `/output/`, plus `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` for
-  the egress proxy.
-- **Least-privilege OCI spec (hardened, §10).** The container runs the untrusted agent, so
-  the guest builds its OCI spec fail-closed rather than inheriting containerd's permissive
-  defaults:
-  - **All Linux capabilities dropped by default** (bounding/effective/permitted/inheritable
-    all empty, ambient explicitly cleared). A task may re-grant a specific few via
-    `container.capabilities` (§8.1); the setuid class (`CAP_SETUID`/`SETGID`/`SETPCAP`),
-    the network-admin class (`CAP_NET_ADMIN`/`NET_RAW`), and broad escape primitives
-    (`CAP_SYS_ADMIN`/`SYS_PTRACE`/`DAC_READ_SEARCH`/`BPF`) are **never** grantable — they
-    would re-open the VM escape surface. Dropping `CAP_SETUID`/`SETGID` is no longer what
-    the egress lock's correctness depends on — since `move-egress-proxy-to-host.md` the
-    guest's nftables chain is loopback-only and keys on no uid at all (§6.6) — but keeping
-    the caps dropped remains real defense-in-depth against everything else this OCI spec
-    guards against.
-  - **Enforced non-root, fail-closed.** An image that would run as uid 0 (explicit `USER root`
-    or an unset `USER`) **fails the run** with a clear error — krayt never silently forces a
-    uid. Non-root is load-bearing for secret confinement (§8.2); it is no longer load-bearing
-    for egress the way it was before `move-egress-proxy-to-host.md` (§6.6, §10).
-  - **Containerd's default seccomp profile** is applied by default; a task opts out with
-    `container.seccomp: unconfined` (§8.1).
-  - **`NoNewPrivileges=true`** (containerd default) is kept.
-  - **Read-only rootfs is a per-task opt-in** (`container.readonly_rootfs: true`, default
-    OFF), paired with writable ephemeral tmpfs for `/tmp` and `/run` only (never a blanket
-    tmpfs over a populated dir). Default-off is deliberate — see §8.2 for the two reasons
-    (image compatibility + marginal benefit in the ephemeral-VM model).
-
-  The container-policy inputs travel host→guest in `TaskSpec` (§6.5); the host validates and
-  normalizes the capability list before pushing, so a typo or a denylisted cap fails fast at
-  config load, before any VM boots.
-
-### 6.11 Image acquisition — host pull + vsock pre-load (`internal/imagestore`)
-The **host** is the only component that touches a registry. The user's image is
-acquired on the host and streamed into the VM over the same vsock control channel used
-for code and task — the VM itself never needs registry egress.
-
-Flow:
-1. **Resolve + pull (host):** the host resolves the user's image (tag or digest) and
-   pulls it into a local OCI store, reusing the same OCI plumbing as the base VM image
-   (`oras-go` / a containerd content store on the host).
-2. **Export (host):** export the image as a standard **OCI archive** (`oci-layout` tar).
-3. **Stream (vsock):** send it as another protocol message — `PushImage{oci archive
-   stream}` (§6.5) — structurally identical to `PushCode`, just larger. Streamed, never
-   fully buffered in RAM on either side.
-4. **Import + run (guest):** the guest imports the archive into containerd's content
-   store via `client.Import(...)`, then creates and runs the container (§6.10).
-
-Key properties:
-- **Digest-keyed host cache:** the exported archive is cached on the host keyed by image
-  **digest**. Repeat runs of the same image skip pull + export entirely.
-- **Incremental transfer:** because OCI layers are content-addressed, the host streams
-  only the blobs the guest's content store is missing — important when spinning up many
-  ephemeral VMs, otherwise each run pays a multi-GB vsock copy.
-- **Integrity for free:** containerd's content store verifies blob digests on `Import`,
-  giving the same digest-verification guarantee the base image already has.
-- **Network consequence:** image acquisition is fully off the VM's network path, so the
-  per-task network policy governs **only** the agent's runtime traffic. `mode: none`
-  becomes genuinely usable for tasks needing no runtime network, and there is no "VM
-  needs registry egress just to start" caveat anywhere.
-
-**Cache management (`krayt image ls/rm/prune`).** The digest-keyed host cache grows
-unbounded — a multi-GB agent image rebuilt every commit leaves a directory per digest, and
-nothing reclaims them. `krayt image ls` lists both host caches (this one plus the base VM
-image, §11.4) in one table — kind, short digest, best-effort ref, recursive size, and
-**last used**; `krayt image rm <digest>` removes one by full digest or unambiguous hex prefix;
-`krayt image prune` bulk-reclaims under a retention policy (§11.4). Each cache entry carries a
-`.krayt-last-used` sentinel file whose mtime is the last-used signal: `Acquire` refreshes it
-on **both** the fresh-pull and cache-hit paths (best-effort — a touch failure never fails
-acquisition, it only makes the `ls` timestamp stale), and `ls`/`prune` fall back to the
-directory mtime when the sentinel is absent (an image cached before this existed).
+Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
+(`docs/adr-microsandbox-sandbox-layer.md`, `run-tasks-on-microsandbox.md`). msb runs the user's
+OCI image itself (libkrun, `agentd` as PID 1); krayt drives no container runtime of its own any
+more, and the container-hardening knobs this section used to specify are replaced by msb's
+`--security default|restricted` (§6.6, §8.1). See git history for the pre-msb text.
 
 ### 6.12 vsock transport & gRPC wiring (the host/guest asymmetry)
-This is the subtlest cross-platform detail and the easiest to get wrong. vsock is **not**
-symmetric across the two backends, so the `Provider` hides the difference behind
-`DialControl` (§6.3) and everything above it speaks plain gRPC.
-
-- **Guest side (identical on both backends):** the guest-agent listens on a **fixed vsock
-  port** (e.g. `1024`) using `github.com/mdlayher/vsock` — `vsock.Listen(1024, nil)`
-  returns a `net.Listener`, which is handed straight to `grpc.NewServer().Serve(lis)`.
-- **Host side — vfkit (macOS, v1):** there is **no `AF_VSOCK` on a macOS host**, so vfkit
-  bridges the guest vsock port to a **host unix socket** (started with
-  `--device virtio-vsock,port=1024,socketURL=/…/ctrl.sock`). `Provider.DialControl` is then
-  a plain `net.Dial("unix", socketURL)`, and the gRPC client uses it via
-  `grpc.WithContextDialer(...)` + `grpc.WithTransportCredentials(insecure.NewCredentials())`
-  (the link is isolated to this VM). This is simpler than the direct-vz path below.
-- **Host side — direct vz (macOS fallback):** if embedding `Code-Hex/vz/v3`, the host
-  connects through the per-VM `VZVirtioSocketDevice` (`device.Connect(1024)` → `net.Conn`)
-  instead of a unix socket. Same `DialControl` contract, different innards.
-- **Host side — Firecracker (Linux):** the host does **not** use `AF_VSOCK`. Firecracker
-  deliberately bypasses the host's vhost stack and mediates between an **`AF_UNIX` socket on
-  the host** and `AF_VSOCK` in the guest, so a host→guest connection is a unix dial to the
-  device's `uds_path` followed by a text **handshake**: send `CONNECT <port>\n`, read back
-  `OK <assigned_hostside_port>\n` (or the connection is closed, if nothing is listening on
-  that port in the guest yet). `DialControl` performs the handshake and hands the caller the
-  post-ack `net.Conn`, so everything above it still sees a plain gRPC transport. *(Verified
-  against Firecracker v1.16.1, `docs/vsock.md`. Earlier drafts of this spec claimed an
-  `AF_VSOCK` connect to the guest CID; that was wrong.)*
-- **Why no CID management anywhere:** with vfkit each VM has its own `socketURL`, with direct
-  vz each VM owns its own `VZVirtioSocketDevice`, and with Firecracker each VM owns its own
-  `uds_path` — **on none of the three backends is there a shared host CID namespace to
-  allocate**, and CIDs cannot collide between VMs. `VMSpec.CID` is the guest's context ID and
-  is meaningful only to Firecracker (which requires one in its vsock config); the firecracker
-  provider still hands out a unique CID per VM, but for traceability, not isolation. What
-  actually isolates two concurrent VMs is the per-VM unix socket.
-- **Host→guest bridging (Firecracker):** `krayt answer`/`stop` reach a *running* VM from a
-  separate process by dialing the socket path recorded from `VM.ControlSocket()` with a bare
-  `net.Dial("unix", …)` (§6.2, §6.13) — no handshake. So the firecracker provider does not
-  expose firecracker's raw `uds_path` as its `ControlSocket()`; it runs a small in-provider
-  listener that accepts plain connections and splices each to a freshly handshaken one. The
-  handshake stays inside the provider, which is the point of the seam.
-- **Security note:** the channel needs no TLS — a vsock link reaches exactly one VM and is
-  not on any network. `insecure` transport credentials are correct here, not a shortcut.
-- **Socket-root hardening (vfkit, macOS):** the host unix sockets that bridge the vsock
-  control channel and vfkit's REST lifecycle API live under a short base directory
-  (`/tmp/krayt-<uid>`, per-user) — short because `sockaddr_un.sun_path` is capped at 104
-  bytes and `$TMPDIR` is too long. Because `/tmp` is shared, the provider **verifies or
-  creates** this root on every run: if it does not exist it is created with `os.Mkdir`
-  (0700; fails, rather than following, on a symlink pre-placed at the path); if it already
-  exists it must be a real directory owned by the current uid with mode exactly `0700`, or
-  krayt **fails closed** with a clear error rather than placing control sockets under a
-  directory another local user controls. krayt never chmod/chowns a directory it does not
-  own. The per-VM socket dir inside it is an atomic `0700` `MkdirTemp`. The egress socket
-  below lives in this same per-VM dir and inherits the same hardening.
-
-- **The guest→host direction (`EgressPort = 1025`, added by `move-egress-proxy-to-host.md`).**
-  Every channel above is **host-initiated** — the host dials, the guest listens. `EgressPort`
-  is the opposite: the **guest** initiates, over `VM.ListenEgress(ctx, port) (net.Listener,
-  error)`, called by the orchestrator after `Create` and before `Start` (§6.6). Both backends
-  turn out to support this the same shape as the host→guest direction, just mirrored — the
-  host binds and listens, and the backend's own process is the *client* dialing in once the
-  guest connects out:
-  - **vfkit:** a *second* `virtio-vsock` device with `listen=true` —
-    `config.VirtioVsockNew(EgressPort, egressSock, true)`. Per vfkit's `pkg/config/virtio.go`,
-    `Listen=true` means *"vsock connections will have to be done from guest to host"*; per
-    `pkg/vf/vsock.go`'s `listenVsock`, vfkit "proxies connections from a vsock port to a host
-    unix socket" — i.e. vfkit is the client of `egressSock`, not its server. Because vfkit
-    fixes its device list at `Create` time, this device is added unconditionally there, even
-    though the socket itself is not bound until `ListenEgress` runs (right before `Start`).
-    vfkit's multiple-`--device virtio-vsock` support is per-port, not per-device: "there will
-    only be a single virtio-vsock device added to the VM regardless of the number of
-    occurrences" — the two `VirtioVsockNew` calls (control port 1024, egress port 1025) map
-    onto one underlying vsock device with two port forwards, not two devices.
-  - **Firecracker:** no device to add, and — unlike `DialControl` — **no `CONNECT <port>\n`
-    handshake**; that dance is host→guest only. A guest connection to `(VMADDR_CID_HOST,
-    port)` is bridged by Firecracker to a host unix socket at `<uds_path>_<port>`, which
-    Firecracker dials as a client the moment the guest connects, symmetric with the vfkit case
-    above. `ListenEgress` is a bare `net.Listen("unix", vsockSock+"_"+port)` — no bridge type
-    is needed the way `DialControl`'s host→guest direction needed one, because there is no
-    handshake to hide from callers.
-  - **fake provider:** returns a REAL unix-socket listener in a per-VM temp dir (not an
-    in-memory `bufconn` pipe like `DialControl`'s loopback), specifically so
-    orchestrator-level tests can fd-pass it to a real spawned `krayt __egress-proxy` child and
-    exercise the whole path for real (§6.6).
-  - Closing the returned listener stops accepting; the VM itself is unaffected. The listener's
-    underlying socket **file** is not explicitly unlinked by the process that closes it —
-    `(*net.UnixListener).SetUnlinkOnClose(false)` is set first, so a guest connection racing the
-    handoff to the spawned proxy child never finds the path gone — cleanup happens once, when
-    the provider tears down the VM's per-run socket dir (`Destroy`), not via any listener
-    `Close` in between.
+Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
+(`docs/adr-microsandbox-sandbox-layer.md`, `run-tasks-on-microsandbox.md`). krayt drives `msb` over
+argv/stdio, not a network protocol of its own; the one remaining vsock use is `ask_human` dialing
+straight from the sandbox to the host over msb's own `--vsock` route (§6.13), with no gRPC and no
+host/guest asymmetry to hide behind an interface. See git history for the pre-msb text.
 
 ### 6.13 Agent → human questions (`ask_human`)
 An **optional, asynchronous** way for the agent to pause and ask the human a question, get
@@ -1182,25 +719,80 @@ stays batch; enabled per run. The design keeps the agnostic core intact and puts
 agent-specific part in the adapter.
 
 **Three layers:**
-- **Question channel (agnostic core — `internal/guest/ask` + host):** the stable contract.
-  A small in-VM bridge accepts a question from inside the container (over a local unix
-  socket to the guest-agent), the guest-agent pushes it to the host as a
-  `RunEvent.Question` on the `Start` stream (§6.5), blocks until the host calls
-  `Answer(question_id, response)` (or the timeout fires), then returns the answer into the
-  container. Independent of which agent is running.
+- **Question channel (agnostic core — `internal/askbridge` on the host, `internal/askclient` in
+  the sandbox):** the stable contract, rewritten by `run-tasks-on-microsandbox.md` (the cut-over,
+  §14 Phase 11). There is no guest daemon and no control protocol on either side: `krayt-ask` (and
+  its `--mcp` front-end) inside the sandbox dials `AF_VSOCK` **straight to the host** — no listener
+  inside the sandbox, ever — over msb's own `--vsock HOST_PATH:PORT` route, which bridges guest CID
+  2 on `sandbox.AskPort` (`internal/sandbox`, §6.15) to a host unix socket. `internal/askbridge`
+  (`Bridge`/`Serve`/`Listen`) listens on that socket and answers each connection with one
+  question/answer exchange, a newline-delimited JSON wire protocol: the sandbox writes a question,
+  blocks, and the host writes back an answer (or the no-answer sentinel on timeout) before the
+  sandbox continues. Independent of which agent is running. This replaces the pre-msb design's
+  in-VM bridge + guest-agent + gRPC `RunEvent.Question` push entirely — see git history for that
+  text.
 - **Two front-ends onto the channel:**
-  - **`ask_human` MCP server:** a tiny MCP server krayt runs inside the VM exposing one
-    tool — `ask_human{ question, choices?, context? }` — bridged to the question channel.
-    Idiomatic for MCP-speaking agents; the tool *description* steers *when* to ask
-    ("only when genuinely blocked on a decision a human must make"). This is the premium path.
-  - **`krayt-ask` CLI:** a small binary in the base image, mounted into the container, that
-    any agent can shell out to (`krayt-ask [--choices a,b] "question"` → answer on stdout).
-    Universal lowest-common-denominator fallback. Same channel underneath.
+  - **`ask_human` MCP server:** a tiny MCP server krayt runs inside the sandbox exposing one
+    tool — `ask_human{ question, choices?, context? }` — bridged to the question channel via
+    `internal/askclient.OverSocket`. Idiomatic for MCP-speaking agents; the tool *description*
+    steers *when* to ask ("only when genuinely blocked on a decision a human must make"). This is
+    the premium path.
+  - **`krayt-ask` CLI:** a small binary copied into the sandbox per run (`guestbin.AskName`,
+    §6.15), that any agent can shell out to (`krayt-ask [--choices a,b] "question"` → answer on
+    stdout). Universal lowest-common-denominator fallback. Same channel underneath.
 - **Registration (per-agent adapter):** wiring the agent's config to the MCP server is
   agent-specific (Claude Code et al. each configure MCP differently), so it lives in the
   optional adapter — **not** the agnostic core. The adapter wires the CLI **only when
-  `--on-question=wait`** (Phase 5); MCP-server registration lands with the MCP server itself
-  (Phase 6).
+  `--on-question=wait`**; MCP-server registration lands with the MCP server itself.
+
+**Transport — a direct vsock dial, no guest listener.** `internal/askbridge` is the moved,
+hardened continuation of the pre-msb in-VM bridge; `internal/askclient` is the in-sandbox client
+half split out of the pre-msb in-guest `ask` package (`OverSocket`, `parseDialAddr` supporting both
+a bare unix path and a `vsock://cid:port` URL, and a build-tagged `dialVsock` confined to linux,
+since the vsock transport is only ever exercised inside the linux sandbox). `KRAYT_ASK_SOCKET`
+keeps its name and now always carries the URL form under msb: `vsock://2:1026`
+(`sandbox.AskSocketEnv`). The `--vsock` route is created only under `--on-question=wait`
+(`orchestrator.Run`, §7 step 3), matching the CLI/MCP wiring's own existing "only when wait" rule —
+a `fail` run gets no guest→host channel at all, so `krayt-ask` inside the container simply fails to
+dial and its CLI front-end maps that straight to the no-answer sentinel; there is no separate
+in-process "fail mode" branch to maintain.
+
+Because the host process reads bytes an arbitrary sandbox process wrote directly (no gRPC, no
+generated protobuf, no framing library standing between the sandbox and krayt),
+`internal/askbridge.Serve` carries three bounds the pre-msb in-VM bridge never needed under a
+per-VM resource limit: a byte cap on one request (`maxAskRequestBytes`, 64 KiB), a read deadline
+around decoding the request only — never around `Bridge.Ask`, which legitimately blocks for the
+whole `--question-timeout` — and a cap on in-flight questions, past which a new question gets the
+no-answer sentinel immediately rather than a queue slot. The host socket lives in the run's own
+private state directory (`runDir/ask/ask.sock`) whenever that path fits, and in a per-uid root
+(`<tmp>/krayt-<uid>/<run-id>/`) when it does not — `orchestrator.runSocketDir` chooses. The msb
+path is *not* exempt from macOS's `sockaddr_un` length limit, as this design first assumed: the
+krayt-controlled suffix alone is 43 bytes and the repo path in front of it is unbounded, so a
+scratch repo under macOS's own `$TMPDIR` overflowed 104 bytes and failed every
+`--on-question=wait` run with `bind: invalid argument`. The fallback root is the pre-msb vfkit
+root and is not world-writable: it gets the same `0700`/owner/no-symlink treatment as the run
+directory. Both are hardened
+by `internal/sockroot.Ensure` (extracted from the pre-msb vfkit/Firecracker socket-root check so
+there is one check, not several) and created `0700`, owned by the invoking user; the socket itself
+is `0600` inside it — narrower than the pre-msb in-guest bridge's `0777`, which existed only so a
+non-root container could reach a root-owned directory on the guest side. There is no non-root party
+on the host side to widen it for. Secret redaction moved host-side with the boundary: the host
+already holds every secret value, so `orchestrator.Run`'s push callback (§7 step 3) redacts the
+prompt/choices against the secrets file's values in its own closure before a `QuestionRecord` is
+persisted, at no extra cost. `cmd/krayt-vsock-forward` and the pre-msb in-guest `ask` package are
+deleted by this cutover — nothing keeps the old transport alive as a fallback.
+
+**The host writes its answer and then waits for the sandbox to close** — it never closes first.
+This is a property of the channel, not an implementation detail: msb 0.6.16's vsock relay discards
+a reply that is still in flight when the host end of the bridged unix socket closes, and it does so
+most of the time. `hack/msb-probes/p1-vsock-nonroot.sh` measures 21 of 75 round trips completing
+with the host closing immediately after writing, against 25 of 25 with the host waiting (2026-09-02,
+Apple-Silicon Mac; §14 Phase 11's P1 bullet carries the per-shape rates, and the loss is
+indistinguishable from the guest — EOF with zero bytes read — so nothing downstream could detect
+it). `internal/askbridge.lingerUntilPeerCloses` therefore drains the connection until the sandbox
+closes it, bounded by its own deadline and byte cap so a sandbox that goes silent, or talks instead
+of closing, delays only itself. `krayt-ask` closes as soon as it has decoded its answer, which is
+what makes that wait cost microseconds; a future guest-side client must keep doing so.
 
 **Modes — `--on-question`, default `fail`:**
 - `fail` (default): neither front-end is wired → `ask_human` is absent and `krayt-ask`
@@ -1264,9 +856,10 @@ worked example; its specifics below track the official auth docs
   it nowhere). It authenticates against a Pro/Max/Team/Enterprise subscription and is scoped
   to inference only.
 
-Either way the user lists one credential in the secrets file, krayt streams it in
-`SecretsBundle` (§6.5), and the adapter exports it into the container environment. No core
-code knows it is an auth credential rather than any other secret.
+Either way the user lists one credential in the secrets file, the adapter scopes it to
+`api.anthropic.com` (§6.8, §6.14), and msb substitutes the real value at its own TLS boundary; the
+container only ever sees msb's placeholder under that credential's own env var. No core code
+knows it is an auth credential rather than any other secret.
 
 **Exactly-one rule.** Claude Code resolves credentials in a fixed precedence — cloud-provider
 creds (`CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`/`_FOUNDRY`) → `ANTHROPIC_AUTH_TOKEN` →
@@ -1316,114 +909,216 @@ where you want to spend your own seat → `CLAUDE_CODE_OAUTH_TOKEN`. The safe de
 API key — matches krayt's headline use case (an agent working over an untrusted codebase), so
 the docs and examples lead with it.
 
-**Injection as the preferred delivery for HTTP-shaped credentials (§6.6.1).** Everything above
-describes the credential riding `SecretsBundle` into the container, which is still the only
-option for anything that isn't a bare HTTP header (an `apiKeyHelper` script, an SSH/signing key,
-anything a tool computes over) and remains the default. For a credential that is *just* an HTTP
-header on requests to one host — `ANTHROPIC_API_KEY` on `api.anthropic.com` is the canonical
-case — `network.mitm: true` + `network.inject[]` (§6.6.1, §8.1) is the **preferred** delivery
-where the trust-model trade is acceptable: the key never enters the VM at all, closing the
-"Auth-credential blast radius" residual below for that credential specifically, at the cost of
-concentrating more trust in the host proxy process (§10). It composes with everything above:
-which credential shape to use is unaffected, and the adapter's exactly-one rule still applies to
-whatever ends up in the secrets file — injection only changes *where* the chosen credential is
-attached, not which one is chosen.
+**Delivery: msb secret scoping, not a header table (§6.8, §6.15).** Every adapter (`claude-code`,
+`gemini-cli`, `opencode`) enforces the exactly-one rule above, then returns exactly one
+`task.SecretSpec{Key, Hosts}` naming the selected credential and the host(s) it authenticates
+against — for `claude-code`, `api.anthropic.com`. `internal/orchestrator` merges the adapter's
+spec under the user's own `network.inject[]` (the user's own scope for that key wins if they wrote
+one, `task.MergeSecretSpecs`) and passes the result to `internal/sandbox` as `--secret
+KEY@HOST[,HOST...]`. msb does the rest: it turns on TLS interception for the sandbox, sets the
+guest's OWN credential env var to its own default placeholder, and substitutes the real value at
+its host-side TLS boundary into any request the sandbox sends toward an allowed host — the agent
+CLI emits its normal `x-api-key`/`authorization` header unprompted (or whatever else it composes)
+and msb matches the placeholder string wherever it lands, with no header-name table or wire-shape
+knowledge on krayt's side at all. This retires the pre-msb design's `internal/adapter/anthropic_wire.go`
+(a vendor-specific table of which header a credential rides, deleted at the run-tasks-on-microsandbox.md
+cut-over) and its `network.mitm`/header-strip/set/prefix vocabulary (§6.6.1) — msb's placeholder
+substitution needs none of it, since it matches a string rather than replacing a named header.
 
-**Credential shape translation — hiding OAuth entirely (`inject-claude-oauth-token-at-proxy.md`,
-step 3 of the host-side-proxy arc).** Plain header injection above still delivers whichever
-credential the user actually configured, in its own shape — an OAuth-configured container is
-still OAuth-configured, just without the token in `/run/secrets`. Shape translation goes one step
-further: **when `network.mitm` is on and the selected credential's wire format has been observed**
-(`internal/adapter/anthropic_wire.go`), the container is configured with a **non-secret placeholder
-under the credential's own variable**, and the real value is attached entirely host-side in whatever
-shape the provider actually wants:
+**Residual: no header stripping.** The pre-msb host proxy stripped whatever auth header a
+container sent before attaching the real credential; msb does not — it substitutes a placeholder
+string wherever it finds one but never removes a *different* header the agent set. A credential
+the agent obtained some other way and placed in a header addressed to an allowed host goes out
+untouched (§10). This is bounded by the allowlist — it can only reach a host the run already
+permits — but is a real, accepted regression from the pre-msb design, not an oversight.
 
-| User's secrets file has | Container gets | Proxy sends upstream |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use` | `x-api-key: <real key>` |
-| `CLAUDE_CODE_OAUTH_TOKEN` | `CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-krayt-placeholder-do-not-use` | `authorization: Bearer <real token>` |
+**Verified on hardware (2026-08-18, pre-msb design, referenced for provenance).** Before this
+mechanism moved to msb, the equivalent property — a real credential never entering the sandboxed
+VM, the container running on a placeholder — was verified end to end for both Anthropic credential
+shapes (`run_df97fffa` OAuth, `run_c654e575` API key, with `mitm: false` control `run_10fc027d`),
+including that Claude Code does not validate credential format client-side. The msb-era mechanism
+inherits the same shape-agnostic design but has not yet had its own hardware confirmation run — see
+`HUMAN_TODO.md`.
 
-**Shape mirroring (owner decision, 2026-08-18).** The placeholder deliberately mirrors the *kind* of
-credential the user supplied, rather than presenting every credential to the container as an API key.
-The agent then runs its own code path for that credential — composing the `anthropic-beta` opt-in
-list, the request line, and every other shape-specific detail itself — and krayt substitutes exactly
-one header value, synthesizing nothing. The alternative (always configure `ANTHROPIC_API_KEY` and
-have the proxy build the OAuth request shape) requires krayt to guess which of the API-key path's
-beta flags an OAuth credential will accept, and to re-guess whenever either path changes.
+**Recommended default (unchanged in substance).** A compromised agent has unlimited *authenticated*
+access to every allowlisted host, and can spend the credential's quota/rate budget, for the run's
+duration regardless of delivery mechanism. Prefer a scoped, independently-revocable API key over a
+subscription token for untrusted code either way (§10).
 
-What mirroring gives up is the claim that the container cannot tell which credential kind is in use.
-That was never actually true: a subscription's own responses carry
-`anthropic-ratelimit-unified-5h-*`/`-7d-*` headers where an API key's carry
-`anthropic-ratelimit-requests-*`/`-tokens-*`, and the container reads the response either way.
-Preserving the illusion would mean fabricating response headers, which krayt does not do. Two
-consequences follow:
-- **The exactly-one rule still matters inside the container**, though it is not at risk: the
-  container is configured with exactly one credential variable, so the entrypoint's own
-  first-match-wins selection (§8.2) can never see two and pick the wrong one.
-- **Bare mode's `CLAUDE_CODE_OAUTH_TOKEN` caveat above still applies** to a translated subscription
-  token, since the container really is OAuth-configured. krayt never invokes `--bare`, so this
-  affects nobody today; it is recorded because the earlier design did obsolete this caveat and the
-  change is easy to miss.
-- **The container's `network.allow` stays minimal**: any refresh/token endpoint the real credential
-  needs is dialed by the *proxy*, upstream of the guest's own allowlist entirely, so it never needs
-  to appear in the guest's `network.allow`. The refresh case remains hypothetical for env-var
-  delivery — a CLI configured this way holds an access token and no refresh token, which is why
-  neither probe run contacted a token endpoint at all.
+### 6.15 microsandbox driver (`internal/sandbox`)
 
-**What's actually implemented vs. observed (2026-08-18).** The mechanism — adapter-produced
-`InjectRule`s, merge-with-user-config precedence (§8.1), pre-flight re-validation, the placeholder
-contract — is fully implemented and generic; it will translate ANY credential shape the vendor
-table has an entry for. Both Anthropic shapes are now in it, each backed by a live observation
-recorded in that file's PROVENANCE comment and pinned by a golden test:
-- **`ANTHROPIC_API_KEY` on `api.anthropic.com`** (strip `x-api-key`/`authorization`, set
-  `x-api-key`): observed live via `add-tls-mitm-credential-injection.md`'s hardware verification
-  (`run_c654e575`), reused rather than re-run.
-- **`CLAUDE_CODE_OAUTH_TOKEN` on `api.anthropic.com`** (strip both, set `authorization` to
-  `Bearer ` + the secret): observed live on 2026-08-17 from two like-for-like MITM runs of the same
-  task — `run_b408545b` with a genuine subscription token, `run_99bd261c` with a genuine API key.
-  Same host, same `POST /v1/messages` path in both; the token goes on the wire **verbatim**
-  (`credential_len` matched the secrets-file value's own length), so no exchange or refresh is
-  involved. Metering follows the credential, which settles this section's earlier
-  `(verify current)` on headless billing.
+Under ADR option B1 (`docs/adr-microsandbox-sandbox-layer.md`), krayt drives its sandbox layer
+through [microsandbox](https://github.com/superradcompany/microsandbox) (`msb`), a libkrun-based
+microVM runtime, as a subprocess over argv, stdio and its `--format json` / `--json` output
+(§6.6, §12) — not the Go SDK, which is a cgo `dlopen` bridge that would cost `CGO_ENABLED=0`
+without buying independence from the `msb` binary (the SDK downloads it too).
 
-**Verified on hardware:** Claude Code accepts a *placeholder* on its OAuth path at startup, and the
-whole run works end to end (`run_df97fffa`, 2026-08-18, with `mitm: false` control `run_10fc027d`).
-It also does for `ANTHROPIC_API_KEY` (`run_c654e575` authenticated with a prefix-less placeholder,
-which is also evidence the CLI does not validate credential format). See `HUMAN_TODO.md` for both
-runs and their `proxy.log` lines.
+`internal/sandbox` is the *only* place in krayt that knows `msb` exists — nothing above it may
+construct an `msb` argv directly; `internal/orchestrator` calls it exclusively through `Client`'s
+methods and the pure `CreateSpec`/`SecretArgs`/`SecretEnv` argv builders below (§7). It is
+OS-agnostic (no build tags) and has no cgo.
 
-**Recommended default, updated.** Translation means a subscription token no longer outlives the
-run (it never enters the VM at all, and the proxy discards it at run teardown), so the
-blast-radius argument for preferring a scoped API key over a subscription token (below) **softens**
-under `mitm: true` with an observed shape — but it does **not disappear**: a compromised agent
-still has unlimited *authenticated* access to every allowlisted host, and can spend the seat's
-quota and rate budget, for the run's duration regardless of how the credential got attached. Prefer
-a scoped API key for untrusted code either way; translation narrows the cost of a subscription
-token's exposure, it doesn't remove the reason to be careful with one.
+**`Client`** wraps one resolved `msb` binary path and is stateless — every method spawns its own
+process, killed with the caller's `context.Context` like every other orchestrator-driven
+subprocess (§6.2). `KRAYT_MSB_BIN` overrides the resolved path — the test seam, and the escape
+hatch for a non-`PATH` install. Methods: `Version` (parses `msb --version` against `MinVersion`,
+currently `0.6.16` — the version the ADR was verified against), `Context` (`msb context --format
+json`, the backend assertion below), `Create` (`msb create`, argv rendered by `CreateSpec.Args()`,
+a pure function so the whole surface is unit-testable without spawning anything), `Exec` (`msb exec
+--stream`, see below), `Copy` (`msb copy`, docker-cp syntax), `Logs` (`msb logs --json`, JSON
+Lines tagged by stream), `SystemLogs` (`msb logs --source system --json`, boot/system diagnostics —
+§7 step 2), `Stop`/`Remove` (`msb stop` / `msb rm --force`), and `Pull` (`msb pull`).
+`CreateSpec` and friends carry no `krayt.yaml` vocabulary and no lifecycle policy — which flags a
+run deserves is decided above this package (network-policy translation §6.6, secret handling §6.8,
+and the run's own order of operations §7 all belong to `internal/orchestrator`, not to the driver
+itself).
+
+**The child environment is a closed allowlist, never `os.Environ()`**: an unset `cmd.Env` would
+hand the `msb` child whatever the operator happened to have exported (an API key, a stray
+`MSB_PROFILE=prod`) when they ran `krayt run`. The allowlist forwards `PATH`, `HOME` (msb resolves
+its own runtime under `$HOME/.microsandbox`), `MSB_HOME`, `SSL_CERT_FILE`, and `SSL_CERT_DIR` only
+when the operator already has them set — none is fabricated.
+
+**`MSB_BACKEND=local` is pinned on every invocation — always set, never forwarded from this
+process's own environment.** This is a security requirement, not tidiness. msb resolves its
+backend as *programmatic → `MSB_BACKEND` → `MSB_PROFILE` → `active_profile` in
+`~/.microsandbox/config.json` → local*, so an operator who has ever `export MSB_BACKEND=cloud`, or
+who has a cloud `active_profile` saved from an unrelated session, would otherwise have `krayt run`
+silently execute the task — and hand it credentials — on microsandbox's hosted service. Pinning
+`MSB_BACKEND=local` defeats both the environment and the saved profile, since `MSB_BACKEND`
+outranks both. The pin is asserted, not just set: `Client.Context` runs `msb context --format
+json` and callers must refuse to proceed unless it reports the local backend — a pin that is never
+checked is a comment.
+
+**Streaming.** `msb exec`'s default non-interactive mode buffers the entire command's output and
+writes it only after the process exits, which is unusable for krayt's live log streaming (§6.9),
+so `Exec` always passes `--stream`. Its one constraint is that stdin must be a real pipe, never a
+terminal; `Exec` gives it an explicit pipe deliberately (defaulting to an empty reader when the
+caller supplies none) rather than leaving it to inherit. `msb exec` propagates the guest command's
+own exit code via `std::process::exit`, while msb's *own* failures also exit `1` via an `anyhow`
+error — so exit `1` alone cannot distinguish "the agent returned 1" from "msb could not start the
+command". `Exec` resolves this structurally: a non-zero exit with **no** output observed on either
+stream is reported as `ErrMsbFailed`, a distinct error the orchestrator can branch on, rather than
+guessed at as the agent's own exit code.
+
+**Secret handling (§6.8).**
+`Client.Create` is the only method that accepts a `secretEnv []string` parameter, appended to the
+child's environment on top of the closed allowlist above; every other method (`Exec` included)
+has no such parameter at all, so the Timing rule (§6.8: a secret's value is set once, on whichever
+invocation starts the sandbox) is structural, not conventional. Two pure functions, next to
+`CreateSpec.Args()`, render the two channels a secret actually travels: `SecretArgs([]task.SecretSpec)
+[]string` renders one `--secret NAME@HOST[,HOST...]` flag per spec, deterministically ordered by
+key; `SecretEnv([]task.SecretSpec, map[string]string) ([]string, error)` returns the `KEY=VALUE`
+entries for `secretEnv`, for exactly the declared keys — erroring on a declared key the secrets
+file lacks, so a misconfigured run refuses pre-flight rather than reaching msb unauthenticated.
+
+**Version floor.** `MinVersion` (`0.6.16`) is enforced by `krayt doctor` (below) — msb is beta and
+has shipped a breaking wire change in a patch release, so a silent version drift below the
+verified floor must be surfaced, not discovered as an outage.
+
+**`krayt doctor` checks.** `commonChecks()` (`internal/cli/doctor.go`) runs four checks, delegated
+to `internal/sandbox.DoctorChecks`: msb found on `PATH` (or via `KRAYT_MSB_BIN`), its version
+against `MinVersion`, `msb context --format json` resolving to the local backend under krayt's own
+pinned child env (reporting the resolved backend either way, so an operator with a cloud profile
+sees krayt overriding it rather than silently benefiting from it), and an `msb doctor` passthrough
+— msb ships its own host-readiness command (hypervisor availability, KVM interrupt acceleration on
+Linux, a clone probe inside `MSB_HOME`), and krayt surfaces its exit status as one check rather
+than reimplementing any of it. All four are **mandatory** (`[FAIL]`, not `[warn]`): msb is krayt's
+only sandbox backend, so a host without a healthy install cannot run anything. There are no more
+vfkit/firecracker/`/dev/kvm`/tap/NAT checks — that whole host-network-setup surface (§6.3, §6.6
+pre-msb) was deleted with the providers themselves.
 
 ---
 
 ## 7. Run Lifecycle (Step by Step)
 
-1. **Resolve spec** — merge flags + config file into a `RunSpec` (image, task, repo,
-   network policy, secrets file, resources, env).
-2. **Bundle code** — create a self-contained git bundle (parentless snapshot, or full history at
-   `bundle_depth 0`; non-mutating temp-index capture if `include_dirty`) → byte stream (§6.7).
-3. **Acquire image (host)** — resolve + pull the user's OCI image into the host store and
-   export an OCI archive; reuse the digest-keyed cache to skip if already present (§6.11).
-4. **Provision VM** — `Provider.Create` makes a CoW copy of the base rootfs, assigns a CID;
-   `VM.Start` boots it.
-5. **Connect** — host dials the guest-agent over vsock; handshake.
-6. **Push inputs** — image archive (incremental: only missing blobs), code bundle, task,
-   secrets, network policy.
-7. **Start** — guest imports the image into containerd, brings up firewall+proxy, runs the container with mounts/env.
-8. **Stream** — logs flow to host (and disk). Wall-clock timeout armed.
-9. **Complete** — container exits (or timeout kills it). Guest diffs against the recorded
-   `krayt-baseline` for `changes.patch` (+ optional `commits.bundle`) and writes the report (§6.7).
-10. **Collect** — host pulls the artifact bundle → `.krayt/runs/<id>/`
-    (`changes.patch`, `report.md`, `logs/`, `meta.json`).
-11. **Destroy** — `VM.Destroy` tears down the VM and deletes the CoW disk. Guaranteed via defer/signal handling.
-12. **Review & apply** — human inspects the patch; `git apply` if satisfied.
+> **Rewritten by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11).** `internal/
+> orchestrator/orchestrator.go` was rewritten from scratch around `internal/sandbox` (§6.15); the
+> previous 12-step list (provision a VM, dial the guest-agent, push inputs over vsock, stream a
+> gRPC event, destroy the VM) described the deleted `internal/{provider,guest,protocol}` stack.
+> `Deps` is now just `{Sandbox *sandbox.Client, LogOut io.Writer, OnClient func(runID string,
+> answer AnswerFunc)}` — no `Provider`/`BaseVM`/`Image`. See git history for the pre-msb list.
+
+1. **Resolve spec** — merge flags + config file into a `RunSpec` (image, task, repo, network
+   policy, secrets file, resources, env), same as before, plus resolve `spec.Network.Secrets
+   []task.SecretSpec` and load the secrets file's values.
+2. **Name the sandbox and register teardown immediately** — `name := "krayt-" + spec.ID`
+   (`sandboxName`, §6.15 decision 8). A single deferred function is registered right here, before
+   `Create` is even attempted, so it runs on **every** exit path — success, agent failure, msb
+   failure, wall-clock timeout, or ctx cancellation: it (a) calls `deps.Sandbox.SystemLogs(ctx,
+   name)` and persists it, redacted against the secrets file's values, to `logs/console.log` (msb's
+   replacement for the pre-msb guest serial console — `msb logs --source system --json` includes a
+   reconstructed `boot-error.json` block when a sandbox never finished starting), then (b) calls
+   `Stop` then `Remove`, both of which wrap `context.WithoutCancel` plus a 30s timeout internally
+   (`sandbox.teardownTimeout`) so the caller need not.
+3. **Wire the `ask_human` channel, only if `spec.Questions.Mode == task.QuestionWait`** —
+   `askbridge.Listen(runDir/ask)` binds `ask.sock`; a `Bridge` is constructed whose push callback
+   redacts the prompt/choices against the secrets file's values, persists a `QuestionRecord`, flips
+   the run to `waiting`, and fires a desktop notification; a per-question timeout, if set, arms
+   `armQuestionTimeout`, which calls `bridge.Answer(qid, "", true)` **directly in-process** — there
+   is no RPC round trip, unlike the pre-msb design, because the bridge itself is the authority.
+   `bridge.OnResolved` flips the state back to `running` once the last outstanding question clears.
+   A second unix socket, `control.sock` (`internal/orchestrator/runctl.go`'s `serveRunControl`), is
+   bound in the same directory so a *separate* `krayt answer` process — a different terminal, or a
+   detached run — can still deliver an answer; this replaces the pre-msb design's trick of dialing
+   the guest's vsock control socket directly, which has no msb equivalent (the sandbox never
+   listens for anything; it only dials out). `RunRecord.CtrlSocket` now names this host-side
+   control socket, not a guest one, and `RunRecord` gains `SandboxName`. Only in this mode does
+   `CreateSpec.Vsock` get one entry (`{HostPath: runDir/ask/ask.sock, Port: sandbox.AskPort}`), and
+   `KRAYT_ASK_SOCKET` is merged into `spec.Env` as `sandbox.AskSocketEnv`
+   (`"vsock://2:1026"`) — in `fail` mode **no** `--vsock` route is created at all, so the sandbox's
+   own `krayt-ask` simply fails to dial and its CLI front-end maps that to the no-answer sentinel;
+   there is no separate host-side "fail mode" branch to maintain.
+4. **`msb create`** — `sandbox.CreateSpec{Image: spec.ImageRef, Name: name, User: "agent",
+   CPUs/MemoryMiB/DiskGiB: from spec.Resources, MaxDuration: spec.Resources.Timeout, Env:
+   spec.Env (sorted), Vsock: (see step 3), Secrets: one `SecretRef` per `spec.Network.Secrets`
+   entry, Security: "restricted" (fixed, not configurable, §6.6), ExtraArgs:
+   task.NetworkArgs(spec.Network, hasSecrets)}`. `secretEnv` (the `KEY=VALUE` pairs, via
+   `sandbox.SecretEnv`) is passed **only** to this one call — msb's Timing rule (§6.6.1): a
+   secret's value is set once, at sandbox creation. Belt-and-braces alongside `--max-duration`:
+   the whole `Run` call is also wrapped in `context.WithTimeout(ctx, spec.Resources.Timeout)` —
+   the ctx is what makes teardown deterministic, `--max-duration` is what stops a wedged guest
+   outliving it.
+5. **Copy in** — the git bundle (`patch.CreateBundle`, unchanged, §6.7), `/task/prompt.md`, and
+   the two embedded guest binaries (`guestbin.Binary(name, runtime.GOARCH)` — msb's guest arch
+   always equals the host's, since libkrun runs same-arch). `krayt-helper` is copied to
+   `guestbin.GuestPath("krayt-helper")` (`/.krayt/krayt-helper`); `krayt-ask` is copied straight
+   to `/usr/local/bin/krayt-ask` (the fixed path §8.2's container contract already promises, so no
+   agent image needed rebuilding). A defensive `chmod +x` runs as root afterward, since msb's
+   mode-preservation on copy is not a pinned contract.
+6. **`msb exec --user root`** — `krayt-helper setup --bundle /tmp/repo.bundle --workspace
+   /workspace --patch-git /.krayt/patchgit --agent-user agent`, JSON stdout parsed for
+   `baseline`. Only now — once the code snapshot is durably cloned into the sandbox — does
+   `rec.State` flip to `running`, preserving the pre-msb invariant that `running` means "safe to
+   mutate the host repo now" (§6.2).
+7. **`msb exec --user agent --stream`** — runs the one fixed command every agent image exposes,
+   `/usr/local/bin/krayt-agent-entrypoint` (uniform across every published agent image; no
+   per-adapter command table needed), stdout+stderr both wired to `io.MultiWriter(logFile,
+   LogOut-if-not-detached)`. A non-zero exit with **zero bytes observed on either stream** is
+   `sandbox.ErrMsbFailed` and surfaces as a **failed run** naming the driver failure explicitly —
+   never reported as "the agent exited N" (`internal/sandbox.Client.Exec`'s own structural
+   heuristic, consumed via `errors.Is`). A wall-clock timeout (ctx deadline exceeded) produces the
+   same `{TimedOut: true, ExitCode: -1}` result shape whether it fires here or during any earlier
+   step — `isWallClockTimeout` is just a `ctx.Err()`/deadline comparison now, with no gRPC-specific
+   checks left. On a timeout, helper `finish` and artifact collection are skipped (ctx is already
+   dead), same as the pre-msb behavior.
+8. **`msb exec --user root`, again** — `krayt-helper finish --workspace /workspace --patch-git
+   /.krayt/patchgit --baseline <from step 6> --out /output`.
+9. **Copy out** — `msb copy name:/output <local-tmp-under-runDir>`, tolerant of either a nested
+   (`tmp/output/...`) or flat (`tmp/...`) copy shape, since msb's exact docker-cp semantics for a
+   directory source aren't pinned by anything verifiable offline; moved into the run dir via
+   `os.Rename` (staged under `runDir` itself so it's guaranteed same-filesystem).
+10. **Host-side, no exec involved** (unchanged code, just re-wired inputs) — `patch.Stat`/
+    `patch.Lint` on the collected `changes.patch`; `orchestrator.PatchSecretKeys(patchPath,
+    secretValues)` (built unwired by a prior task, now actually called) scans the collected patch
+    for the secrets file's real values and turns any hit into a Safety warning naming the KEY only,
+    never the value — the **only** secret-scanning path now, since under msb no secret value ever
+    legitimately enters the sandbox at all, so this is defense-in-depth, not a real leak path any
+    more. `writeReport`/`meta.json` are otherwise byte-for-byte the pre-existing code (§8.4's
+    schema is unchanged except `NetworkMeta.InjectedKeys`/`.MITM`, see §8.4).
+11. **Teardown** fires via the deferred function from step 2 no matter which of the above steps
+    errored, timed out, or the ctx was cancelled.
+12. **Review & apply** — human inspects the patch; `git apply` if satisfied. Unchanged.
 
 ---
 
@@ -1436,6 +1131,7 @@ task: ./task.md                 # path to task prompt (or inline `task_text:`)
 repo: .                         # repo to bundle (default: cwd)
 include_dirty: true             # include uncommitted changes (non-mutating capture, §6.7)
 bundle_depth: 1                 # 1 = single-commit snapshot; 0 = full history (§6.7)
+transcript: false               # copy the agent's own session transcript out before teardown (§8.4)
 
 network:
   mode: allowlist               # allowlist | full | none
@@ -1543,97 +1239,105 @@ fails opaquely 30s into the agent); `passthrough ⊆ allow` in `mode: allowlist`
 intercepts **every** TLS connection the agent makes except those listed in `passthrough` — that
 is the point of `full`, stated plainly here so it isn't a surprise.
 
-**Adapter-supplied injection and merge precedence (`inject-claude-oauth-token-at-proxy.md` §2/§4).**
-An adapter's `Prepare` can return `Inject` rules of its own (§6.14's credential shape translation
-is the first and, so far, only user of this) alongside the `Env` additions it already contributed.
-Before any VM or image work:
-- The adapter's `Inject` rules are **unioned** into `network.inject` from the config file/flags —
-  `task.MergeInjectRules` — per host: a host the user never wrote a rule for gets the adapter's
-  rule verbatim; a host the user already has a rule for is merged header-by-header. On a
-  **conflict** (the same host AND the same header, matched case-insensitively, in either `set` or
-  `set_literal`) **the user's explicit config wins** and the run logs which adapter-supplied
-  header was overridden — a user who wrote their own `network.inject` rule for a host an adapter
-  also manages is never silently second-guessed.
-  `Strip` lists are unioned rather than conflict-checked (there's no "value" to disagree about); a
-  user-supplied `refresh` block for a host likewise always wins over an adapter-supplied one.
-- The **merged** set — adapter-supplied and hand-written rules alike — is re-run through the exact
-  same `ValidateNetworkPolicy` pre-flight described above. An adapter rule naming a host outside
-  `network.allow` (in `mode: allowlist`) fails the run before any VM boots, exactly as a typo'd
-  hand-written rule would — an adapter's suggestion is never exempt from the check a human's
-  config is held to.
-- The merged set is what actually gets serialized into the egress-proxy child's stdin config
-  (§6.6, §6.6.1) — adapter-supplied rules travel the identical path hand-written ones do; there is
-  no second, adapter-only channel into the proxy.
+**Under msb — the target model, additive and not yet wired (§6.6, `translate-network-policy-to-msb.md`,
+`hand-secrets-to-msb.md`).** `task.ValidateNetworkPolicyForMsb` exists beside `ValidateNetworkPolicy`
+above but is not yet called from anywhere — the vfkit/Firecracker path this section describes is
+still the one that executes, and it still requires `mitm: true` to inject anything, including for
+this repo's own `krayt.yaml`. When `run-tasks-on-microsandbox.md` swaps the call site,
+`network.mitm` becomes a hard pre-flight error naming itself and its replacement: under msb,
+declaring any secret enables TLS interception automatically, so the key has nothing left to opt
+into.
+
+`network.inject` keeps its name — §8.3's containment table already refuses it from an
+auto-loaded repo-local config by key name, and that protection carries over without re-deriving it
+— but loses most of its schema. `host`/`strip`/`set`/`set_prefix`/`set_literal`/`refresh` are the
+pre-msb, header-shaped vocabulary above; under msb an entry instead names a secrets-file **key**
+and the **hosts** it may be substituted to, nothing else, because msb substitutes a placeholder
+*string* wherever it appears rather than replacing a named header:
+
+```yaml
+network:
+  inject:
+    - key: GH_TOKEN              # secrets-file key name; never a value
+      hosts: [api.github.com]    # hosts allowed to receive it
+    - key: ANTHROPIC_API_KEY
+      host: api.anthropic.com    # singular form accepted; `host` xor `hosts`
+```
+
+`task.ConfigInjectRule` carries both shapes' fields at once (a plain, unvalidated parse); which
+shape a given entry uses is decided by which fields it sets. `task.SecretSpecsFromConfig` converts
+the msb shape into `task.SecretSpec{Key, Hosts}` and hard-errors, naming itself, on `strip`, `set`,
+`set_prefix`, `set_literal` or `refresh` appearing on an entry — silently ignoring one of these,
+`strip` above all, would weaken the posture (an un-stripped pre-existing auth header reaching an
+allowed host untouched, §10) without telling anyone. `task.ValidateNetworkPolicyForMsb` calls it,
+then additionally enforces: every `network.inject` entry's key must exist in the task's secrets
+file (the same typo protection the pre-msb shape already has) and, the new rule msb's model
+requires (§6.8), every key that *does* exist in the secrets file must have a `network.inject`
+entry — a secret with nowhere to be scoped can never be delivered under msb at all, so leaving one
+unscoped is refused pre-flight rather than silently dropped.
+
+`internal/sandbox.SecretArgs`/`SecretEnv` (§6.15) render the resulting specs into the two channels
+a secret actually travels — argv (names and hosts only) and the msb child's env (the one channel
+that carries a value, §6.8) — and `adapter.Plan.Secrets` (§6.14) is how an adapter contributes its
+own selected credential to the same list.
+
+**Adapter-supplied secret scoping and merge precedence.** An adapter's `Prepare` returns exactly
+one `task.SecretSpec` for its selected credential (§6.14) alongside the `Env` additions it already
+contributes. Before any sandbox work:
+- The adapter's spec is merged into `network.inject`'s specs from the config file/flags —
+  `task.MergeSecretSpecs` — by key: a credential the user never scoped gets the adapter's `Hosts`
+  verbatim; a credential the user already scoped keeps the **user's own hosts entirely**, and the
+  run logs that the adapter's own scope was overridden — a user who scoped a credential themselves
+  is never silently second-guessed.
+- The **merged** set is re-run through the exact same `ValidateNetworkPolicyForMsb` pre-flight
+  described above. An adapter-scoped credential naming a host outside `network.allow` (in `mode:
+  allowlist`) fails the run before any sandbox work, exactly as a typo'd hand-written scope
+  would — an adapter's suggestion is never exempt from the check a human's config is held to.
+- The merged set is what actually becomes `--secret KEY@HOST[,HOST...]` argv on `msb create`
+  (§6.15) — adapter-supplied scopes travel the identical path hand-written ones do; there is no
+  second, adapter-only channel into msb.
 
 ### 8.2 Container contract (convention)
 Injected by the tool, regardless of adapter:
 - `/workspace` — the repo snapshot (agent's working dir).
 - `/task/prompt.md` — the task description.
-- `/run/secrets/*` — secrets (tmpfs), **including any agent auth credential** (e.g.
-  `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`); the adapter exports it into the
-  environment from there (§6.14).
-- `/output/` — agent/guest writes `changes.patch` + `report.md` here (or guest generates the patch).
-- `/usr/local/bin/krayt-ask` — the `krayt-ask` CLI front-end (§6.13), bind-mounted on the PATH so
-  any agent can shell out to it; `/run/krayt/ask.sock` is the bridge it connects to.
+- `/output/` — the agent (or `cmd/krayt-helper`, run as root via `msb exec`, for
+  `changes.patch`/`commits.bundle`) writes here; the whole directory is collected (§6.7, §7).
+- `/usr/local/bin/krayt-ask` — the `krayt-ask` CLI front-end (§6.13), copied in per run
+  (`msb copy`) rather than baked into the image, so it needs no image rebuild; any agent can shell
+  out to it. `KRAYT_ASK_SOCKET` names the bridge it connects to — always a `vsock://cid:port` URL
+  under msb (`dial-ask-channel-over-vsock.md`), where `krayt-ask` dials the host directly and no
+  guest process listens at all.
+- **The model-provider credential env var** (e.g. `ANTHROPIC_API_KEY`), if the adapter selected
+  one — but the entrypoint never finds it in a file. See below.
 
-Because the container runs **non-root** (below), the tool makes these usable by any non-root uid:
-`/run/secrets` is world-readable, `/workspace` and `/output` are writable, and the ask socket is
-connectable (§8.2 was root-only before Phase 5 — fixed in the guest).
+**There is no `/run/secrets` under msb.** Every credential krayt hands to a run is delivered by
+msb's own placeholder-substitution mechanism (§6.8, §6.14): msb sets the sandbox's own credential
+env var to its default placeholder itself, the moment `--secret` names it, and substitutes the
+real value host-side into requests toward an allowed host. A compliant entrypoint must therefore
+treat **an already-set, recognized credential env var** as sufficient — it must never require a
+`/run/secrets/<key>` file, and must never overwrite a credential variable that arrives already
+set. `hack/test-entrypoint-credentials.sh` guards this contract; every reference image satisfies
+it already, since none needed rebuilding for the msb cutover (msb sets the guest environment
+itself, and `krayt-ask` was already copied in rather than baked in).
 
-The container **must** run as a **non-root** uid — this is now **enforced, not just a
-convention** (§6.10, §10): an image whose `USER` is root (uid 0) or unset **fails the run**
-with a clear error and never launches. Non-root is load-bearing, not cosmetic: dropped
-`CAP_SETUID`/`SETGID` plus a non-root uid are jointly what stop the container from becoming
-proxyd's uid and bypassing the egress allowlist (§6.6). Set a non-root `USER` in the image
-(the reference images use `USER agent`, uid 1000). Some agents (Claude Code among them) also
-refuse uid 0 independently.
+The container **must** run as a **non-root** uid — this is **enforced, not just a convention**
+(§10): an image whose `USER` is root (uid 0) or unset **fails the run** with a clear error and
+never launches (`msb create --user`/`msb exec --user`, always a fixed non-root user, §7). Some
+agents (Claude Code among them) also refuse uid 0 independently.
+
+**The agent's own state directory is read, not injected.** `--transcript` copies the agent's
+session transcript out of `$HOME` (the path is the adapter's, relative to whatever `$HOME` the
+container user actually has — `/home/agent` for the claude-code images, `/home/node` for
+gemini-cli, resolved in-guest rather than assumed). That is a *read* of image-owned state, outside
+this contract's injected paths and outside `/output`; an image owes krayt nothing here, and an
+image whose agent writes no transcript simply yields none.
 
 An image that writes into its own rootfs — e.g. `$HOME` under `/home/agent` (nix profile,
-`~/.claude`, Go caches) — is **incompatible with `container.readonly_rootfs: true`** (§8.1);
-read-only rootfs is opt-in (default OFF) partly for this reason. When enabled, only `/tmp` and
-`/run` are writable (ephemeral tmpfs); a writable tmpfs is never mounted over a populated dir.
+`~/.claude`, Go caches) — needs a writable rootfs; msb's `--security` profile has no read-only-rootfs
+knob to opt into anyway (`container.readonly_rootfs` is a hard pre-flight error under msb, §8.1).
 
-**The `KRAYT_CA_CERT` contract (§6.6.1, only when `network.mitm: true`).** The guest writes the
-run's ephemeral MITM CA's **public** certificate to `/run/krayt/ca.crt` (0644 — it is public,
-never the private key), bind-mounts it read-only at that SAME path inside the container (so
-`KRAYT_CA_CERT` resolves on both sides of the mount namespace, not just the guest's own), and
-sets `KRAYT_CA_CERT=/run/krayt/ca.crt` plus best-effort `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/
-`NODE_EXTRA_CA_CERTS` pointing at it. This is a **no-op when `network.mitm` is false** — no file,
-no mount, no env var, byte-identical to a run without the feature.
-
-**The `KRAYT_INJECTED_CREDENTIAL` contract (§6.14, only when the adapter's selected credential is
-named in `network.inject[].set`).** That credential is withheld from `SecretsBundle` entirely
-(§6.6.1) — no `/run/secrets/<key>` file ever arrives for it — so a compliant entrypoint must not
-require the file before starting. It decides it has a credential, in this order:
-
-1. a `/run/secrets/<key>` file (ordinary delivery);
-2. **a recognized credential env var that is already set** — krayt configures the container with a
-   placeholder under the credential's own name (shape mirroring, §6.14), and the entrypoint must
-   accept that value **as-is**, never overwriting it; this is the shape-translation path;
-3. `KRAYT_INJECTED_CREDENTIAL` naming the (non-secret) key, for a krayt that set the name but no
-   value — the pre-shape-translation contract, kept for compatibility.
-
-The real value is attached to outgoing requests by the host proxy regardless of what the container
-sends, so a placeholder only needs to satisfy the agent's own "a credential is configured" check.
-Rule 2 is not optional: an entrypoint implementing only 1 and 3 exits `EX_CONFIG` (78) on every
-shape-translated run — which is exactly what every krayt agent image did until 2026-08-18, and what
-`hack/test-entrypoint-credentials.sh` now guards against.
-A compliant entrypoint that wants MITM'd hosts to verify, **and** wants `passthrough` hosts (which
-see the real upstream, not krayt's CA) to keep verifying too, must:
-- Check `KRAYT_CA_CERT` is set and non-empty before doing anything distro-specific.
-- For Go/OpenSSL-based tools, `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` **replace** the system trust
-  store rather than appending to it — pointing them at `KRAYT_CA_CERT` alone would break
-  verification for every `passthrough` host. Concatenate the image's own distro CA bundle (e.g.
-  `/etc/ssl/certs/ca-certificates.crt` on the Debian-based reference images) with `$KRAYT_CA_CERT`
-  into one file and point both vars at **that** instead.
-- `NODE_EXTRA_CA_CERTS` is genuinely additive, so it can point at `$KRAYT_CA_CERT` directly with
-  no concatenation. **Node does not read the system trust store at all**, which is why this is
-  required, not optional, for every one of the three current reference agent images
-  (`claude-code`, `gemini-cli`, `opencode`) — all node-based.
-- Do all of this only when `KRAYT_CA_CERT` is set, so a `mitm: false` run's entrypoint behavior
-  is unchanged.
-
-Completion = container process exit. Exit code is surfaced in `meta.json`.
+Completion = the agent's exec exit code (§7). Exit code is surfaced in `meta.json`.
 
 ### 8.3 Flag/file precedence
 CLI flags override config file values, which override built-in defaults.
@@ -1657,9 +1361,9 @@ treatment is stated in one place rather than discovered one field at a time. A f
 | `repo:` | **error** | honored | redirects **which host directory is bundled into the VM** — and is also the run-artifact root `.krayt/` is written under |
 | `container.capabilities` (non-empty) | **error** | honored | re-grants Linux capabilities the run drops by default (§8.1) |
 | `container.seccomp: unconfined` | **error** | honored | disables the seccomp profile (§8.1) |
-| `secrets:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read, shipped into the guest as the run's `SecretsBundle` |
+| `secrets:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read; its values are loaded host-side and, per key, substituted by msb into the sandbox's requests (§6.8) |
 | `task:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read, shipped into the guest as the run's prompt |
-| everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `questions`, `include_dirty`, `bundle_depth`, `container.readonly_rootfs`) | honored | honored | configures the run without redirecting what krayt reads/writes on the host or relaxing the container's confinement |
+| everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `questions`, `include_dirty`, `bundle_depth`, `transcript`, `container.readonly_rootfs`) | honored | honored | configures the run without redirecting what krayt reads/writes on the host or relaxing the container's confinement |
 
 A refused field is an **error, not a warning and not a silent ignore** — the run stops, naming the
 field, the file, and the `krayt run --config <path>` opt-in. Silently dropping it would leave the
@@ -1676,7 +1380,7 @@ artifacts into whatever directory the poisoned file named, at the operator's uid
 legitimately names its gitignored secrets file and its checked-in task prompt. The value is resolved
 against the repo root and `filepath.Clean`ed; an absolute path (`/Users/x/.env`, `/etc/hostname`) or
 one that climbs out (`../../.env`) is rejected — otherwise a poisoned repo could ship an arbitrary
-host file into the guest, as the run's `SecretsBundle` or as its prompt (which the agent can then
+host file's contents into a run — as declared secrets or as its prompt (which the agent can then
 echo into `report.md` or `changes.patch`). Containment is judged on the path that will actually be
 **opened**, not on how it is spelled: every symlink in the value and in the repo root is resolved
 first, so a repo shipping `secrets.env -> ~/.aws/credentials` is rejected too. A path that does not
@@ -1691,6 +1395,10 @@ the operator's last chance to notice a host they did not choose. `meta.json`/`re
 only record the policy after the fact.
 
 ### 8.4 Run output artifacts (`.krayt/runs/<id>/`)
+> **Amended by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11).** The artifact tree
+> and `meta.json` schema below are otherwise byte-for-byte the pre-existing design — see the two
+> call-outs after the tree and the `NetworkMeta` note below for exactly what changed.
+
 Every run produces a self-contained directory the human reviews from:
 
 ```
@@ -1699,14 +1407,36 @@ Every run produces a self-contained directory the human reviews from:
 ├── commits.bundle    # optional: reverse range bundle of the agent's commits (§6.7), if returned
 ├── report.md         # human-readable summary (see below)
 ├── meta.json         # machine-readable run record (schema below)
-├── secret-scan.json  # optional: present only if a secret value appears in changes.patch (§6.8)
-├── proxy.log         # host-side egress proxy child's redacted stdout/stderr (§6.6, §6.8)
+├── ask/              # ask_human bridge state under --on-question=wait: ask.sock, control.sock (§6.13)
 ├── questions/        # one <qid>.json per agent question + its answer (§6.13), if any
 └── logs/
-    ├── agent.log     # container stdout/stderr (merged, timestamped)
-    ├── console.log   # guest-agent's own stdout/stderr, incl. krayt-vsock-forward (§6.6)
-    └── events.jsonl  # one JSON object per RunEvent (optional, for tooling)
+    ├── agent.log     # sandbox stdout/stderr (merged, timestamped) — from `msb exec --stream`
+    ├── console.log   # msb's boot/system diagnostics (`msb logs --source system --json`,
+    │                  #   redacted), replacing the pre-msb guest serial console (§7 step 2)
+    └── transcript/   # opt-in (`--transcript`): the agent's own session transcript, copied out
+                       #   of the guest before teardown — redacted and size-capped. Absent by
+                       #   default and whenever the adapter declares no path.
 ```
+
+**`logs/transcript/` is opt-in and is the only artifact krayt reads out of the agent's own `$HOME`
+rather than from `/output`.** It exists because `agent.log` is the agent's *stdout*, which for a
+headless run is just the final message: a failed run leaves no record of which tool calls it made.
+The transcript does record them. It is captured in `Run`'s teardown defer rather than alongside the
+other artifacts, deliberately — `collectOutput` is skipped on a wall-clock timeout, an aborted
+question and any msb driver failure, which are exactly the runs worth debugging.
+
+Treat it as an **opaque diagnostic**: every agent CLI documents its transcript schema as internal
+and changing between releases, so krayt copies, redacts and caps it but never parses it, and
+neither should tooling. Its size cap keeps a head *and* a tail (`elideMiddle`) rather than
+`console.log`'s tail-only truncation, because in a transcript the first appearance of a problem
+matters as much as the failure it ends in.
+
+Two artifacts from the pre-cutover design are gone, not renamed: **`proxy.log`** (there is no
+host-side egress-proxy child any more — msb's own egress enforcement produces no comparable
+per-run log krayt captures) and **`secret-scan.json`** — a patch-secret-value hit is now folded
+directly into `meta.json`'s/`report.md`'s existing `Safety` list (`orchestrator.PatchSecretKeys`,
+§6.6.1, §6.8), rather than written as its own file. **`events.jsonl`** is also gone: there is no
+`RunEvent` stream any more (§6.5 stub) to serialize one JSON object per event from.
 
 `meta.json` — written by the host on completion; the schema is fixed so tooling and the
 `ls` command can rely on it:
@@ -1736,6 +1466,8 @@ Every run produces a self-contained directory the human reviews from:
   "questions": [
     { "id": "q1", "prompt": "Target Postgres or SQLite?", "answer": "postgres", "answered_by": "human", "waited_secs": 35 }
   ],
+  "sandbox_name": "krayt-run_2f9c1a",
+  "ctrl_socket": "/path/to/.krayt/runs/run_2f9c1a/ask/control.sock",
   "error": ""
 }
 ```
@@ -1746,6 +1478,19 @@ imported as `krayt-baseline` and diffed against for `changes.patch` — equal to
 the full-history/no-dirty case, synthetic otherwise. `bundle_depth`/`include_dirty` are the request
 flags that determine whether that equality is expected, and `bundle_digest` is a
 `opencontainers/go-digest` hash of the exact bundle bytes streamed to the guest.
+
+**`network.mitm`/`network.injected_keys` are reinterpreted, not renamed, under msb.** The JSON
+field names (`NetworkMeta.MITM`/`.InjectedKeys`) are unchanged from the pre-cutover schema, but
+what they mean shifted with the design: `mitm` now reports "any secret was declared for this run"
+(msb turns on TLS interception automatically the instant a `--secret` is present, §6.6 — there is
+no longer a separate opt-in to report on) and `injected_keys` now lists **every** declared secret's
+key (§6.6.1) rather than only those an explicit `network.inject[].set` rule named, since under msb
+every declared secret is substituted the same way. `sandbox_name` is the `msb` sandbox this run
+created (`"krayt-<id>"`, §6.15 decision 8), useful for a manual `msb logs`/`msb exec` against a
+stuck run. `ctrl_socket` now names the **host-side** run-control socket
+(`internal/orchestrator/runctl.go`'s `serveRunControl`, §6.13, §7 step 3) that a separate `krayt
+answer` invocation dials — not a guest-reachable socket, since under msb the sandbox never listens
+for anything; it only dials out.
 
 `report.md` — a short, fixed-section human summary (the guest may also write its own to
 `/output/report.md`; if present, the host prefers that and appends the run facts):
@@ -1775,57 +1520,54 @@ the same trusted host process, so it cannot detect a deliberate, consistent edit
 *does* do is let someone holding `report.md` apart from `meta.json` (e.g. pasted into a ticket)
 confirm the two still match, or notice `meta.json` was later corrupted/overwritten.
 
-Secret **values** never appear in `report.md`, `meta.json`, the question records, or
-`secret-scan.json` — the guest redacts the report and question text and scans (not redacts) the
-patch (§6.8). The one exception is `changes.patch` itself: it is left byte-exact so `git apply`
-works, so a secret an agent wrote into a tracked file *is* present there. When that happens the
-guest emits `secret-scan.json`:
-
-```json
-{ "patch_contains_secret_keys": ["ANTHROPIC_API_KEY"] }
-```
-
-— naming the matched secret **keys only** (never the values) — and the host adds a **Safety**
-warning per key to `report.md`/`meta.json` (e.g. *"changes.patch contains the value of secret
-ANTHROPIC_API_KEY — review before applying"*), so the human catches it before applying. `krayt
+Secret **values** never appear in `report.md`, `meta.json`, or the question records — the host
+redacts the report and question text (§6.8, §6.13) against the secrets file's values. The one
+exception is `changes.patch` itself: it is left byte-exact so `git apply` works, so a secret an
+agent wrote into a tracked file *is* present there. When that happens the host's
+`orchestrator.PatchSecretKeys` (§6.6.1, §6.8 — the only secret-scanning path now that no secret
+value ever legitimately enters the sandbox) appends a **Safety** warning per matched key directly
+to `rec.Safety`, naming the key only (never the value), e.g. *"changes.patch contains the value of
+secret ANTHROPIC_API_KEY — review before applying"* — rendered into both `report.md`'s Safety
+section and `meta.json`'s `safety` array, so the human catches it before applying. There is no
+separate `secret-scan.json` file (§8.4's artifact-tree note above). `krayt
 ls` reads `meta.json`; `krayt patch`/`apply` read `changes.patch`.
 
 ---
 
 ## 9. Project Structure
 
+> **Amended by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11) and
+> `retire-vm-image-pipeline.md` (§14 Phase 11).** `internal/
+> {provider,guest,protocol,proxy,controlclient,imagestore,vmimage,imagecache}` and
+> `cmd/krayt-{agent,vsock-forward}` are all deleted, along with `images/{flake.nix,flake.lock}` and
+> the root `flake.nix`; `internal/sandbox` (+ `internal/sandbox/guestbin`), `internal/askbridge`,
+> `internal/askclient`, `internal/sockroot`, and `cmd/krayt-helper` are the packages that replace
+> them (§6.15, §6.13, §6.7). `images/agents/` (the published agent images, unrelated to the deleted
+> VM image pipeline) is untouched.
+
 ```
 krayt/
-├── cmd/krayt/main.go
+├── cmd/
+│   ├── krayt/main.go
+│   ├── krayt-ask/           # in-sandbox CLI front-end for ask_human, dials AF_VSOCK directly (§6.13)
+│   └── krayt-helper/        # //go:build linux — stateless root-run guest binary: setup/finish (§6.7)
 ├── internal/
-│   ├── cli/                 # cobra commands, flag/config merge
-│   ├── orchestrator/        # run lifecycle, concurrency, teardown, state
-│   ├── provider/
-│   │   ├── provider.go      # Provider/VM interfaces (OS-agnostic)
-│   │   ├── vfkit/           # macOS via crc-org/vfkit subprocess   ← v1
-│   │   ├── vz/              # macOS via direct Code-Hex/vz          ← fallback
-│   │   └── firecracker/     # Linux (firecracker-go-sdk)           ← later
-│   ├── protocol/            # vsock control protocol (shared host+guest)
-│   ├── guest/               # guest-agent (compiled to linux)
-│   │   ├── agent.go         # init/control server
-│   │   ├── proxy/           # simplified L3 lock (loopback-only) + the guest forwarder's Controller (§6.6)
-│   │   ├── ask/             # in-VM question bridge + ask_human MCP server (§6.13)
-│   │   └── runner/          # containerd Go client (single container per VM)
-│   ├── proxy/               # host-side L7 egress allowlist proxy (`krayt __egress-proxy`, §6.6)
-│   ├── adapter/             # optional per-agent adapters (claude-code, gemini-cli, opencode); MCP/CLI wiring (§6.13)
-│   ├── task/                # config schema + parsing
+│   ├── cli/                 # cobra commands, flag/config merge (OS-agnostic; the run_{darwin,linux,other}.go
+│   │                         #   split collapsed into one run.go — msb is the only backend now)
+│   ├── orchestrator/        # run lifecycle, concurrency, teardown, state (§7); drives internal/sandbox only
+│   ├── sandbox/             # the msb CLI driver: Client, CreateSpec.Args(), Secret{Args,Env}, Images/Rmi/ImagePrune, DoctorChecks (§6.15)
+│   │   └── guestbin/        # go:embed of the krayt-helper/krayt-ask static linux binaries; GuestRoot = "/.krayt"
+│   ├── askbridge/           # host-side ask_human bridge: Bridge, Listen, Serve (§6.13)
+│   ├── askclient/           # in-sandbox client half of the ask_human channel: OverSocket, vsock dialer (§6.13)
+│   ├── sockroot/            # hardens a directory before binding a socket in it; shared by askbridge
+│   ├── adapter/             # optional per-agent adapters (claude-code, gemini-cli, opencode); MCP/CLI wiring (§6.13, §6.14)
+│   ├── task/                # config schema + parsing, incl. netpolicy_msb.go / secrets_msb.go / container_msb.go
 │   ├── patch/               # git bundle create/verify/clone/diff (+ optional reverse bundle); non-mutating dirty capture; host-side apply helpers (§6.7)
-│   ├── imagestore/          # host pull + OCI export + digest-keyed cache (§6.11)
 │   └── secrets/             # secrets loading + redaction
-├── cmd/krayt-ask/main.go    # tiny in-container CLI front-end for ask_human (§6.13)
-├── cmd/krayt-vsock-forward/ # guest-side parse-nothing TCP<->vsock pipe to the host proxy (§6.6)
-├── images/                  # Nix-based VM image definition (kernel + rootfs)
-│   ├── flake.nix            # declarative base image; pins kernel, runtime, guest-agent
-│   ├── flake.lock           # pinned inputs (the update surface)
-│   └── microvm.nix          # Linux backend (firecracker/cloud-hypervisor)  ← later
+├── images/
+│   └── agents/               # published, ready-to-run agent images (CI-built) — the base sandbox image is msb's concern (§11), not built here
 ├── configs/                 # example krayt.yaml, default allowlist
-├── flake.nix                # dev shell (protoc/buf/oras pinned) + codegen target (§9.2)
-├── Makefile                 # `make proto`, build, test targets
+├── Makefile                 # build, test, `make guest-bins` targets (no `make proto`, no Nix)
 ├── docs/
 └── README.md
 ```
@@ -1834,416 +1576,180 @@ krayt/
 Use these exact modules so the agent doesn't guess. (Pin concrete versions in `go.mod`
 at implementation time; major versions shown where they matter.)
 
+> **Amended by `run-tasks-on-microsandbox.md` and `retire-vm-image-pipeline.md`.** The macOS/Linux
+> VM-backend rows, the gRPC/protobuf/proto-codegen rows, the guest vsock listener, the containerd
+> client, and the hand-rolled/`goproxy` egress-proxy row are all **dropped** — nothing in krayt
+> links any of them once `internal/{provider,guest,protocol,proxy}` are deleted.
+> `oras.land/oras-go/v2` and `github.com/opencontainers/image-spec` are dropped too:
+> `internal/vmimage`, their only caller, is deleted along with the rest of the image pipeline —
+> `krayt image` now shells out to `msb` (§6.15) instead of pulling OCI artifacts itself. See git
+> history for the dropped rows' original text.
+
 | Concern | Module | Notes |
 |---|---|---|
-| macOS VM backend (v1) | `github.com/crc-org/vfkit` (`pkg/config` + REST) | drives a signed vfkit subprocess; pure-Go host (no cgo); pin version |
-| macOS VM backend (fallback) | `github.com/Code-Hex/vz/v3` | direct in-process embedding; cgo + macOS SDK; used only if the vz provider is built |
-| Guest vsock listener | `github.com/mdlayher/vsock` | `vsock.Listen` → `net.Listener` for gRPC (guest, linux) |
-| Linux VM backend (Phase 7) | *none — hand-rolled REST client over Firecracker's API unix socket* | **decided in Phase 7, superseding `firecracker-go-sdk`.** The SDK's last tagged release is v1.0.0 (Aug 2022) — using it means pinning a `main` pseudo-version — and it drags `go-openapi` + CNI/containernetworking into krayt's `go.mod`, which `buildGoModule` then vendors into the guest image (§11.1) for no runtime benefit. The API surface krayt needs is six `PUT`s (`/machine-config`, `/boot-source`, `/drives/{id}`, `/network-interfaces/{id}`, `/vsock`, `/actions`); driving it directly mirrors what the vfkit provider already does with vfkit's REST API and **adds no new dependencies at all**, so the guest image's `vendorHash` is unchanged. Verified against the Firecracker v1.16.1 API spec. |
-| gRPC | `google.golang.org/grpc` + `google.golang.org/protobuf` | control protocol (§6.5) |
-| Proto codegen | `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc` | or `buf`; run via Nix/CI |
-| Container runtime client | `github.com/containerd/containerd/v2/client` | guest, drives containerd (§6.10) |
-| OCI registry / image pull+export | `oras.land/oras-go/v2` | host imagestore (§6.11) |
-| OCI types/layout | `github.com/opencontainers/image-spec` | media types, `oci-layout` |
-| Egress proxy (optional) | `github.com/elazarl/goproxy` | or hand-rolled CONNECT proxy (§6.6) |
+| Sandbox runtime | *none — `msb` is driven as a subprocess, not a Go dependency* | `internal/sandbox` shells out to the `msb` binary and parses its `--format json`/`--stream` output; no SDK, no cgo (§6.15) |
 | CLI | `github.com/spf13/cobra` (+ `spf13/pflag`) | command surface (§13) |
 | Config | `gopkg.in/yaml.v3` | task config file (§8.1) |
-| `ask_human` MCP server | `github.com/modelcontextprotocol/go-sdk` (v1.2.0, `/mcp`) | stdio MCP server for `krayt-ask --mcp` (§6.13, Phase 6); pulled only by `cmd/krayt-ask`, so it vendors into the guest-agent image → regenerate `flake.nix` `vendorHash` |
+| `ask_human` MCP server | `github.com/modelcontextprotocol/go-sdk` (v1.2.0, `/mcp`) | stdio MCP server for `krayt-ask --mcp` (§6.13); pulled only by `cmd/krayt-ask` |
 
-Build constraints: `internal/provider/vfkit` and `internal/provider/vz` are
-`//go:build darwin` (vfkit is pure-Go host-side; the vz fallback adds cgo). `internal/guest`
-and its children are `//go:build linux` and cross-compiled to `linux/arm64`. Keep the
-OS-agnostic core (orchestrator, protocol, task, imagestore host side, patch) free of
-build tags so it compiles on both. Runtime: the vfkit provider requires the `vfkit` binary
-installed (brew); `krayt doctor` checks for it (§13).
+Build constraints: `cmd/krayt-helper` is `//go:build linux` (the guest is always Linux under
+libkrun); `cmd/krayt-ask`'s vsock dialer and `internal/cli/resources_*.go` are the only other
+OS-tagged files in the repo (`run-tasks-on-microsandbox.md`'s Done-when explicitly checks this —
+the OS-specific seam is gone because the OS-specific work is msb's now). Everything else,
+including `internal/sandbox` itself, is OS-agnostic. Runtime: `krayt run` requires the `msb`
+binary installed; `krayt doctor` checks for it and its version floor (§6.15, §12).
 
 ### 9.2 Code generation
-The `.proto` (§6.5) lives at `internal/protocol/krayt.proto`; generated Go lands in
-`internal/protocol/pb`. **The generated code is checked into the repo**, so building or
-running krayt — and Claude Code compiling it — needs **no `protoc`**. Only *regenerating*
-after editing the `.proto` needs the codegen toolchain.
-
-Regeneration runs behind a single pinned target so plugin/version skew never produces noisy
-diffs:
-
-```
-make proto        # wraps `nix run .#proto` (or buf); pins protoc + protoc-gen-go + protoc-gen-go-grpc
-```
-
-This gives three prerequisite tiers (mirrored in the README):
-- **Build/run krayt:** Go + vfkit + git. No protoc (generated code is committed).
-- **Regenerate protocol:** Nix (or `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc`, or
-  `buf`) — only when the `.proto` changes.
-- **Build the VM image (CI):** arm64 Linux runner + Nix + `oras` + registry creds (§11.5).
-
-> Guest-side runtime deps (`containerd`, `runc`/`crun`, `nftables`) live **inside** the
-> Nix-built VM image, not on the dev machine — the flake owns them (§11.1/§11.6).
-
-A root `flake.nix` `devShell` provides the codegen + image tools (`protoc`,
-`protoc-gen-go`, `protoc-gen-go-grpc`, `buf`, `oras`) at pinned versions, so `nix develop`
-is all a contributor needs for tiers 2–3 — no per-tool installs. `make proto` runs inside it.
+Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
+(`docs/adr-microsandbox-sandbox-layer.md`, `run-tasks-on-microsandbox.md`). There is no `.proto`,
+no generated Go, and no `make proto`/`protoc`/`buf` toolchain left in the repo — krayt drives `msb`
+over argv/stdio, and there is nothing to codegen. See git history for the pre-msb text.
 
 ---
 
 ## 10. Security Model
 
-**Trust boundary:** the VM (separate Linux kernel) is the primary isolation boundary
-between untrusted agent code and the host. The host kernel and filesystem are never
-exposed.
+> **Amended by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11).** krayt's own
+> in-guest/host-side egress proxy, its container-hardening OCI-spec code, and
+> `internal/adapter/anthropic_wire.go`'s credential shape translation are all **deleted**; msb
+> owns egress enforcement, TLS interception, and container hardening itself. The table and
+> residuals below are rewritten for that reality — see git history for the pre-cutover text,
+> which described a design that no longer runs.
+
+**Trust boundary:** the microVM (separate Linux kernel, libkrun via msb) is the primary
+isolation boundary between untrusted agent code and the host. The host kernel and filesystem are
+never exposed.
 
 | Surface | Control |
 |---|---|
-| Host kernel | Not shared — full VM boundary |
+| Host kernel | Not shared — full VM boundary (§2, §6.15) |
 | Host filesystem | No live mount; input via git bundle, output via reviewed patch |
-| Repo ingest | git bundle cloned in-guest — source `.git/hooks` are never executed or imported, and the guest commits under a throwaway krayt bot identity. The workspace `.git` is left container-writable (so the agent can commit) but is **never trusted by the root guest-agent's git**: patch generation runs against a root-only `patchgit` snapshot with `core.fsmonitor`/`core.hooksPath` force-cleared and `--no-textconv`, so container-written `.git/config`/hooks/attributes cannot execute as root (§6.7, finding #2) |
-| Network egress | Default-deny + allowlist proxy, per-task opt-in to widen — **enforced host-side** since `move-egress-proxy-to-host.md`. The L7 allowlist proxy is a separate HOST process reached over a guest-initiated vsock channel; the guest's L3 lock is loopback-only and keys on **no uid at all**, so there is no container-hardening dependency left for it to bypass (§6.6) |
-| Container privileges | **All Linux capabilities dropped** by default (validated, denylisted opt-in only); **enforced non-root** (uid-0 image fails the run); containerd **seccomp** profile applied; `NoNewPrivileges=true`; read-only rootfs available as a per-task opt-in (§6.10, §8.1) |
-| Secrets | tmpfs only, never on disk, destroyed with VM; **redacted in the guest** from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted** (redacting hunks would break `git apply`); a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
-| TLS MITM / credential injection | **Opt-in, default off** (`network.mitm`, §6.6.1). An injected secrets-file key is **withheld from `SecretsBundle` entirely** — the container never holds it, closing "Auth-credential blast radius" (below) for that credential. Ephemeral per-run CA, in memory only, private key never exported. Trades a HOST-process compromise for a *stronger* claim than plain egress enforcement: the proxy process now also holds real user credentials, not just a policy decision (residual below) |
-| Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3, whose table is the full field-by-field boundary): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy, redirect what krayt reads or writes on the host, or relax the container's confinement**. Refused with an error: `network.mitm`, `network.inject`, `network.passthrough`, `network.mode: full`, `repo:`, `container.capabilities`, `container.seccomp: unconfined`. Contained to the repo root (no absolute path, no `..` escape, no symlink resolving out): `secrets:`, `task:`. Without this split a poisoned repo could turn on MITM and name the operator's own secrets-file key as the credential injected into an attacker-controlled host, bundle a *different*, private repo into the VM for the agent to read, read an arbitrary host file in as the run's prompt, or hand the container back the capabilities and seccomp profile §8.1 takes away — with every consistency check passing, because the file is only ever compared against itself |
-| Persistence | CoW disk destroyed on teardown; fresh VM per run |
+| Repo ingest | git bundle cloned in the sandbox by `cmd/krayt-helper` (§6.7) — source `.git/hooks` are never executed or imported, and the sandbox commits under a throwaway krayt bot identity. The workspace `.git` is left agent-writable (so the agent can commit) but is **never trusted by the root-run helper's git**: patch generation runs against a root-only `patchgit` snapshot with `core.fsmonitor`/`core.hooksPath` force-cleared and `--no-textconv`, so agent-written `.git/config`/hooks/attributes cannot execute as root (§6.7, finding #2) |
+| Network egress | Default-deny, translated to a **fully explicit** `msb create` policy (`task.NetworkArgs`, §6.6) — enforced entirely by msb's own userspace network stack, not by anything krayt runs. The guest now has a real, policed network interface (including DNS in `allowlist` mode) rather than none at all — a genuine capability gain over the pre-msb design, policed by msb's own gateway with DNS-rebind protection on by default |
+| `ask_human` bridge | A host-side process reading sandbox-authored input: `krayt-ask` dials the host directly over vsock — no guest listener, ever. `internal/askbridge.Serve` decodes the question with a byte cap, a decode-only read deadline, and a cap on in-flight questions (§6.13). Unauthenticated by construction — any sandbox process can dial it — but bounded to one question/answer exchange per connection (residual below) |
+| Container privileges | msb's own `--security restricted` profile (§6.6, §8.1), fixed and not user-configurable. krayt's pre-msb OCI-spec hardening (dropped Linux capabilities, containerd seccomp, enforced non-root, opt-in read-only rootfs) is **superseded, not layered on top** — `container.capabilities`, `container.seccomp: unconfined`, and `container.readonly_rootfs` are removed keys that hard-error, naming `--security` as the only, coarser replacement (`task.ValidateContainerPolicyForMsb`) |
+| Secrets | A declared secret's real value travels only in the `msb create` child's env — never on disk, never on argv (§6.6.1, §6.8). **Redacted host-side** (there is no guest process left to redact in — the sandbox never holds a value) from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted**; a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
+| Secret substitution at the host | Declaring any secret **automatically** enables TLS interception (§6.6.1) — there is no "secret without MITM" under msb, unlike the pre-msb opt-in `network.mitm`. msb substitutes the placeholder string the workload already sent, wherever it appears, but **never strips a pre-existing auth header first** the way krayt's own deleted proxy did. **The one real regression against krayt's pre-msb design**: a credential the agent obtained elsewhere and placed in a header addressed to an allowed host goes out **untouched**. Bounded by the allowlist — the agent can only send it somewhere already permitted — not eliminated |
+| Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3, whose table is the full field-by-field boundary): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy, redirect what krayt reads or writes on the host, or relax the container's confinement**. Refused with an error: `network.mitm` (now a hard error everywhere, not just here — §6.6), `network.inject`, `network.passthrough`, `network.mode: full`, `repo:`, `container.capabilities`, `container.seccomp: unconfined` (likewise hard errors everywhere — §6.6, §8.1). Contained to the repo root (no absolute path, no `..` escape, no symlink resolving out): `secrets:`, `task:`. Without this split a poisoned repo could name the operator's own secrets-file key as scoped to an attacker-controlled host (`network.inject`), bundle a *different*, private repo into the VM for the agent to read, or read an arbitrary host file in as the run's prompt — with every consistency check passing, because the file is only ever compared against itself |
+| Persistence | msb sandbox stopped and removed on teardown; fresh sandbox per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
 
 **Residual considerations to document:**
-- Proxy-bypass via raw sockets is caught by the default-deny, loopback-only L3 lock (§6.6). The
-  original historical gap (finding #1) was **uid assumption**: with the L7 proxy in-guest and
-  the L3 lock keyed on `skuid "proxyd"`, a container that kept `CAP_SETUID` could `setuid()` to
-  proxyd (uid learned from `/proc/net/tcp` in the shared netns) and satisfy the `skuid` accept —
-  bypassing the allowlist entirely. That was closed once (hardened OCI spec dropping
-  `CAP_SETUID`/`SETGID` and enforcing non-root, §6.10) and is now closed a second, independent
-  way by `move-egress-proxy-to-host.md`: the guest chain no longer has a `skuid` rule *at all* —
-  egress-worthy content the container could send is either loopback (permitted, reaches only the
-  parse-nothing forwarder) or dropped, full stop, with no identity for a capability regression to
-  exploit. Regression-guarded by the `egressRuleset`-shape unit test (now also asserting `skuid`
-  is *absent*) and, on hardware, by the `setuid(proxyd)=EPERM` + allowlist-enforcement
-  integration tests — the `EPERM` assertion is kept as a still-useful non-root regression check,
-  it just no longer doubles as the egress-bypass's load-bearing proof.
-- Container-runtime / guest-kernel bugs — blast radius minimized by the least-privilege OCI
-  spec (dropped caps, seccomp, no-new-privs, non-root) inside the already-isolated VM (§6.10).
+- **Egress enforcement is msb's, entirely — krayt owns none of it any more.** The pre-msb design's
+  residual here was about a host-process proxy compromise; that proxy is deleted, and with it the
+  whole class of "guest-root escape defeats the allowlist by flushing guest nftables" finding —
+  there is no guest-side firewall for a guest-root escape to flush, because msb's policy engine
+  runs entirely outside the sandbox, in msb's own userspace network stack. What krayt is
+  responsible for is narrower and different: emitting a **complete, correct** `msb create` policy
+  every time (the never-empty-policy rule, §6.6) — a translation bug there is a config error, not
+  a runtime bypass a compromised agent can trigger.
+- Container-runtime / guest-kernel bugs — blast radius minimized by libkrun's own VM boundary plus
+  msb's `--security restricted` profile (§6.6), which is msb's to maintain, not krayt's.
 - Malicious patch content (e.g. `.git/hooks`, build scripts) applied on the **host** — the
-  source repo's hooks are already never run in-guest, and now the *guest's own* root git no
-  longer trusts container-written `.git` config/hooks/attributes either (patch generation is
-  isolated in the root-only `patchgit`, §6.7 / finding #2). What remains is that the emitted
+  source repo's hooks are already never run in the sandbox, and the root-run helper's own git no
+  longer trusts agent-written `.git` config/hooks/attributes either (patch generation is isolated
+  in the root-only `patchgit`, §6.7 / finding #2). What remains is that the emitted
   `changes.patch` could still add files like `.git/hooks/*` or build scripts that run on the
   **host** after apply; reviewing the diff before `git apply` is the control, and a
   `--strip-hooks` / lint pass on patches is a possible future addition.
-- **Egress enforcement is host-side now — a different trade, not a strictly safer one.**
-  `move-egress-proxy-to-host.md` moved the L7 allowlist proxy out of the VM entirely; this
-  supersedes the old "single-layer, in-guest only" residual (the allowlist was previously
-  enforced *entirely inside* the VM, with the host applying no filtering at all — that is no
-  longer true). The honest statement of the new trade: a **guest-root escape can no longer
-  defeat the allowlist** by flushing guest nftables or assuming a guest uid, because the L7
-  decision does not live in the guest anymore — but a **compromise of the proxy process itself
-  is now a HOST compromise**, not an escape from a disposable VM that was about to be destroyed
-  anyway. This is why the proxy is a **separate process** (self-exec, not linked into the run
-  supervisor) that **parses nothing it does not have to** — the guest's own forwarder
-  (`krayt-vsock-forward`) is a byte-for-byte pipe with zero parsing surface, so the entire
-  adversarial-input attack surface concentrates in one host process running the hand-rolled (or
-  swapped-in, `KRAYT_EGRESS_PROXY_BIN`) `internal/proxy` package, rather than being spread across
-  a guest process *and* a uid-keyed firewall rule whose correctness depended on container
-  capabilities. The vsock channel this process is reached over additionally gives **concurrent-VM
-  isolation by construction**: each VM gets its own host unix socket (vfkit) or `uds_path`
-  (Firecracker), so one run's egress channel is not reachable from another run's VM — unlike a
-  gateway-bound TCP proxy would be on vfkit/vmnet's shared-segment NAT (§6.6); asserted on
-  hardware by `TestConcurrentRealVMs`. The container-hardening controls (dropped
-  `CAP_SETUID`/`CAP_SETGID`, enforced non-root, seccomp, isolated `patchgit` patch generation —
-  §6.10, §6.7) remain real defense-in-depth for everything else in this table, but are no longer
-  what the egress allowlist's correctness depends on.
-- Secret redaction coverage — the guest redacts every artifact it can safely rewrite (live
-  logs, `report.md`, `ask_human` prompt/choices, §6.8). Three known, accepted gaps: (1) live-log
-  redaction is chunk-oriented, so a secret value split across two log chunks is not caught — it
-  affects only the streamed logs, since `report.md` and the patch are scanned as whole buffers;
-  (2) `changes.patch` is left byte-exact (redacting hunks would break `git apply`), so a secret
-  an agent wrote into a tracked file *is* present there — this is surfaced, not hidden, via the
-  `secret-scan.json` marker and a per-key Safety warning for the human's pre-apply review (§8.4);
-  (3) **redaction matches the secret value verbatim, so an agent that transforms it before
-  emitting it is not caught** — masking the middle, chunking it across lines, or encoding it all
-  defeat an exact-match `Redactor`. This is not hypothetical: Phase 9's `mitm: false` regression
-  run (`run_117d6f75`) hit it with a *cooperative* agent, which masked the middle of the API key
-  on its own initiative before writing the report. No exact match existed, so the `Redactor`
-  never fired at all, and a 19-character key prefix persisted in `report.md` and the agent log.
-  This limit is inherent to output filtering: it defends against accidental verbatim disclosure,
-  not against a container that holds the secret and chooses how to emit it — an agent set on
-  exfiltration can always encode it through an allowlisted channel. The structural fix for a
-  credential is to never give it to the container: `network.mitm` + `network.inject` (§6.6.1),
-  whose companion run (`run_c654e575`) had no credential in the VM to leak in any form.
-- Resource exhaustion — bounded by per-VM CPU/mem/disk + wall-clock timeout.
-- Auth-credential blast radius — a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) is tied to
-  a personal/seat plan and is less granularly revocable than a scoped API key; exposing one
-  to untrusted code risks that seat's consumption and rate budget. Prefer a scoped,
-  independently-revocable API key for untrusted runs (§6.14). **Fully closed for an *injected*
-  credential** (`network.mitm` + `network.inject`, §6.6.1) — it never enters the VM, so there is
-  nothing there for a compromise to steal; this residual is otherwise unchanged for any
-  credential still delivered via `SecretsBundle` (the default, and the only option for anything
-  that isn't a bare HTTP header). **Softened further, not eliminated, by credential shape
-  translation** (`inject-claude-oauth-token-at-proxy.md`, §6.14): when `mitm` is on and the
-  selected shape is observed, a subscription token no longer outlives the run at all (it's
-  discarded with the proxy process at teardown, same as an injected API key) — but a compromised
-  agent can still spend that seat's quota and rate budget for the run's duration either way, so
-  "prefer a scoped API key for untrusted code" still stands; translation narrows the exposure
-  window, it doesn't remove the reason to be careful with a subscription token.
-- **Placeholder shape, one per credential kind** (`sk-ant-krayt-placeholder-do-not-use`,
-  `sk-ant-oat01-krayt-placeholder-do-not-use`). No client-side format check is known to exist:
-  `run_c654e575` authenticated fine with the entrypoint's prefix-less
-  `krayt-injected-at-host-proxy`, so the real thing's prefix is carried as cheap insurance, not to
-  satisfy a demonstrated requirement — the rest of each string is deliberately
-  human-legible-as-fake. The OAuth path validates neither path's credential format either: the
-  `run_df97fffa` hardware run authenticated with the entrypoint's own prefix-less
-  `krayt-injected-at-host-proxy` placeholder, same as the API-key path did. If a future probe (or a
-  different vendor) forces a
-  stricter-looking placeholder, that requirement is itself a finding worth recording here, because
-  a placeholder forced to look more like a real credential is more likely to be mistaken for one by
-  a human reading a log.
-- **Accepted maintenance dependency on Anthropic's wire format** (`inject-claude-oauth-token-at-proxy.md`).
-  Credential shape translation makes krayt responsible for tracking exactly what headers/endpoints
-  Claude Code's API-key and subscription paths use — a fact that can change without notice on
-  Anthropic's side and silently break every translated run until caught. The golden test
-  (`TestAnthropicWireRulesGolden`) is offline and cannot detect that change itself — it only pins
-  `internal/adapter/anthropic_wire.go`'s table against its own literal, so it fails if the two
-  drift apart, not if Anthropic's live behavior does. A live failure or a re-probe is what surfaces
-  the actual change; this is accepted, not incidental: the mitigation is confining every such fact
-  to one dated, golden-tested file so that once a change is found, fixing it is "update one table,
-  update the golden literal alongside it — the diff IS the changelog" — not "re-understand the
-  proxy". `network.mitm: false` and non-translated credentials are entirely unaffected by a
-  wire-format change; the dependency is scoped to the opt-in translation path only.
-- **TLS MITM / credential injection — an honest trade, not a strict improvement** (§6.6.1,
-  `add-tls-mitm-credential-injection.md`). Opt-in and off by default, but when on:
-  - **It removes credential *theft*, not credential *use*.** The proxy cannot distinguish an
-    agent-initiated request from a legitimate one — a compromised agent still has unlimited
-    *authenticated* access to every allowlisted host for the run's duration. This converts
-    exfiltration into a confused deputy (dies with the VM, unlike a stolen key) but is not "no
-    risk".
-  - **It only covers HTTP-shaped credentials.** An SSH key, a signing key, or anything a tool
-    computes over cannot move to the proxy; those still ride `SecretsBundle` unchanged.
-  - **It moves the adversarial parser outside the blast-radius boundary a second time.** A proxy
-    compromise before this task bought unrestricted egress from a VM about to be destroyed; after
-    it, the same compromise buys code execution in the one host process holding the user's real
-    credentials. Go's memory safety helps; request-smuggling and header-confusion bugs do not
-    care — mitigated, not eliminated, by the hostile-input rules in §6.6.1 (inner-Host/authority
-    match, bounded headers, fail-closed on any MITM setup failure, never a silent tunnel
-    fallback) and by keeping the CA private key in memory only, behind an accessor that returns
-    only the public certificate.
+- Secret redaction coverage — the host redacts every artifact it can safely rewrite (live logs,
+  `report.md`, `ask_human` prompt/choices, §6.8) using the same secrets-file values it loaded to
+  create the sandbox. Two known, accepted gaps: (1) live-log redaction is chunk-oriented, so a
+  secret value split across two log chunks is not caught — it affects only the streamed logs,
+  since `report.md` and the patch are scanned as whole buffers; (2) **redaction matches the secret
+  value verbatim, so an agent that transforms it before emitting it is not caught** — masking the
+  middle, chunking it across lines, or encoding it all defeat an exact-match `Redactor`. This is
+  not hypothetical: a pre-msb regression run (`run_117d6f75`) hit it with a *cooperative* agent,
+  which masked the middle of the API key on its own initiative before writing the report — no
+  exact match existed, so the `Redactor` never fired at all, and a 19-character key prefix
+  persisted in `report.md` and the agent log. This limit is inherent to output filtering: it
+  defends against accidental verbatim disclosure, not against a sandbox that holds the secret and
+  chooses how to emit it — an agent set on exfiltration can always encode it through an
+  allowlisted channel. Under msb this is **narrower than it was**: since no secret value ever
+  legitimately enters the sandbox at all (msb substitutes only at its own network boundary), the
+  scenario requires the agent to have first obtained the value some other way.
+- Resource exhaustion — bounded by per-sandbox CPU/mem/disk (`--cpus`/`--memory`/`--root-disk`)
+  plus `--max-duration` and krayt's own `context.WithTimeout` (§7 step 4, belt and braces).
+- **`ask_human` — any sandbox process can dial the bridge.** The channel is unauthenticated by
+  construction: nothing about `krayt-ask` dialing straight to the host adds or removes an identity
+  check. A hostile process in the same sandbox can ask a plausible-looking question and collect
+  the human's answer meant for the agent. It does not reach the host beyond the one bounded
+  question/answer exchange `internal/askbridge.Serve` performs, and the existing controls are
+  unchanged: the prompt is labeled agent-originated on display, and a human is never expected to
+  auto-fill a secret into an answer (§6.13).
+- **`ask_human` — cross-run isolation is per-sandbox by construction.** vsock maps guest CID 2:port
+  to whichever host path was named on *that* sandbox's `create`, so one fixed `sandbox.AskPort` is
+  safe to reuse across every concurrent run — there is no shared host CID namespace for two runs
+  to collide in (§6.15, §7 step 3).
+- Auth-credential blast radius — a subscription token (`CLAUDE_CODE_OAUTH_TOKEN`) is tied to a
+  personal/seat plan and is less granularly revocable than a scoped API key; exposing one to
+  untrusted code risks that seat's consumption and rate budget. Prefer a scoped,
+  independently-revocable API key for untrusted runs (§6.14). Under msb this is **fully closed for
+  every declared secret, not only an explicitly injected one**: no secret value ever legitimately
+  enters the sandbox (§6.6.1), so there is nothing there for a compromise to steal regardless of
+  credential shape — the pre-msb distinction between "delivered via `SecretsBundle`" and
+  "injected" no longer exists. What is unchanged: a compromised agent can still spend the
+  credential's quota and rate budget against every allowed host for the run's duration, so
+  "prefer a scoped API key for untrusted code" still stands.
+- **Placeholder shape.** msb's own default placeholder is `$MSB_<NAME>`; krayt may supply a
+  credential-shaped custom placeholder via msb's `placeholder` field instead (see §6.14, §6.15).
+  P5 (`probe-microsandbox-feasibility.md`, 2026-08-29) confirmed Claude Code accepts msb's default
+  placeholder unmodified — no client-side credential-format check is known to exist — so this is
+  recorded as an available option, not a demonstrated requirement. If a future probe (or a
+  different vendor) forces a stricter-looking placeholder, that requirement is itself a finding
+  worth recording here, because a placeholder forced to look more like a real credential is more
+  likely to be mistaken for one by a human reading a log.
 
 ---
 
-## 11. The Minimal VM Image (Nix-based)
+## 11. The Sandbox Image
 
-A small Linux image whose only job is to run the guest-agent + a container runtime.
-The image is **defined declaratively with Nix** and built reproducibly. This is the
-isolation boundary, so we want to know exactly what is in it and be able to rebuild it
-bit-for-bit.
+Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
+(`docs/adr-microsandbox-sandbox-layer.md`, `retire-vm-image-pipeline.md`). krayt built and shipped
+its own Nix-defined micro-VM image (kernel + initrd + rootfs, a NixOS closure running the
+guest-agent over containerd) through Phase 10; `run-tasks-on-microsandbox.md` (§14 Phase 11)
+stopped anything from consuming it, and this task deleted the pipeline itself — the flake under
+`images/`, the arm64-Linux-runner CI that built it, the OCI publish/pull/zstd path, and the
+RC/graduate tagging workflows (`RELEASING.md`).
 
-> Scope note: Nix governs **only** this base micro-VM image. The user's Docker image
-> (the AI + tools) is supplied at run time and is explicitly **not** Nix-built. Keep the
-> two separate.
-
-### 11.1 What the image contains
-- **Kernel:** a minimal Linux kernel (pinned via nixpkgs) with virtio, vsock, overlayfs,
-  and nftables enabled.
-- **Userland:** minimal NixOS closure — **containerd** as the container runtime (driven
-  by the guest-agent's Go client; see §6.10) with `runc` or `crun` as the OCI runtime,
-  nftables, and the embedded **guest-agent** binary, started as a systemd service.
-- **guest-agent build:** built with `buildGoModule` so the Go toolchain is pinned too —
-  the whole artifact is reproducible end to end.
-- **Boot:** vz supports Linux kernel boot and EFI on macOS 13+. Standardize on one
-  (kernel + initrd/rootfs is the simpler path for vz).
-
-### 11.2 Why Nix
-- **Reproducible:** every input pinned via `flake.lock`; a given `krayt` version maps
-  to a known image hash.
-- **Declarative:** the entire system (packages, kernel version + config, services,
-  nftables rules, runtime) lives in one expression — no imperative Dockerfile/rootfs drift.
-- **Read-only by design:** the `/nix/store` is immutable, matching the "minimal,
-  untampered VM" philosophy.
-- **Cheap updates:** bumping the kernel or any package is a one-line input/lock change —
-  important because the guest kernel is the security boundary and needs timely patching.
-- **Linux backend bonus:** `microvm.nix` is purpose-built for minimal NixOS microVMs on
-  firecracker / cloud-hypervisor / qemu — nearly turnkey for the Phase 7 Linux provider.
-
-### 11.3 The macOS build caveat (settled: build in CI)
-Apple's Virtualization.framework is **not** a `microvm.nix` backend, and building
-Linux/NixOS images **on a Mac requires a Linux builder**. Resolution:
-- On macOS, Nix is the **builder** that produces the `vmlinuz` + rootfs artifacts the
-  `vz` provider boots — not an integrated hypervisor layer.
-- **Canonical build path = GitHub Actions on an arm64 Linux runner** (see §11.5). On a
-  Linux runner this is effectively a no-op, so the "Mac needs a Linux builder" caveat
-  disappears for the build path.
-- A local `nix-darwin` `linux-builder` VM is **optional** — only worth setting up if you
-  want fast local image iteration without round-tripping through CI.
-
-### 11.4 Specify, distribute, update
-- **Specify:** the flake under `images/` is the single source of truth for the base image.
-- **Build:** CI on an **arm64 Linux runner** builds the kernel + rootfs natively for
-  `aarch64-linux` (no emulation) and emits a versioned, content-addressed artifact.
-- **Distribute:** the artifact is packaged as a standard **OCI artifact** and pushed to
-  an OCI registry (the `rootfs.img` layer is zstd-compressed in transit, to shrink the
-  ~2 GiB cold-pull download — see below). The OCI **digest is the content address** —
-  `krayt` pins its version → digest and **verifies the digest** on `krayt image pull`
-  (and `doctor`) before first use. The registry is interchangeable (ghcr.io is the
-  convenient default, but any OCI-compliant registry works — **no hard dependency on
-  ghcr.io**).
-- **Run:** each run gets a **copy-on-write clone** of the verified base image so runs
-  never share state.
-- **Update:** bump the flake input/lock → CI rebuilds → push new OCI artifact → bump the
-  pinned digest in `krayt`. Fully auditable in git.
-- **Reclaim:** the base image is cached per digest under `<user-cache-dir>/krayt/vmimage/<digest>/`
-  (from `os.UserCacheDir()`; typically `~/.cache/krayt/...` on Linux and `~/Library/Caches/krayt/...` on macOS) and, like the user-image cache (§6.11), never cleaned up on its own. `krayt image ls/rm/prune`
-  manage both caches together (§6.11); the base-image side of the retention policy is simply
-  *keep the pinned digest, drop the rest* — `krayt run` only ever reads the pinned digest's
-  directory, so any other vmimage entry (an old pin, or a stale sanitized-ref dir) is dead
-  weight and pruned unconditionally.
-
-**Retention policy (`krayt image prune`).** Removes everything outside these keeps, deleting
-by default (no `--dry-run` needed to take effect):
-- **base VM image:** keep **only** the entry matching the pinned digest; every other vmimage
-  entry is removed unconditionally. `--all` never removes the pinned entry — use
-  `krayt image rm --force <digest>` for that one specifically.
-- **container image:** keep it if **either** (a) it was last used within `--older-than`
-  (default `24h`), **or** (b) its digest matches the image of a **non-terminal** run under
-  `--repo` (default `.`) whose recorded `image_ref` is *itself* a digest reference
-  (`…@sha256:<hex>`, direct string match — a tag-based ref can't be resolved to a cache digest
-  offline and relies on the age floor instead; a known, documented gap).
-- `--all` bypasses **both** container-kind protections (age + in-use). `--dry-run` reports
-  exactly what would be removed/kept and why, and the reclaimable total, without deleting.
-`krayt image rm <digest>` accepts a full digest or an unambiguous hex prefix (docker-rmi
-style) and errors — without deleting anything — on no match, an ambiguous prefix, or the
-pinned base image without `--force`.
-
-> Fallback if Nix ever becomes friction: `mkosi` (systemd's image builder) is the
-> next-best declarative option — gentler, reasonably reproducible — at the cost of
-> Nix's strict reproducibility and the `microvm.nix` integration. Not needed for a
-> single-trusted-owner setup.
-
-### 11.5 CI / build pipeline (GitHub Actions)
-The canonical build path. Clean and simple: build natively on arm64, publish as an
-OCI artifact.
-
-- **Runner:** an **arm64 Linux runner** (e.g. `ubuntu-24.04-arm`). Building natively for
-  `aarch64-linux` keeps the toolchain clean — no `binfmt`/QEMU cross-emulation, and the
-  artifact arch matches the vz VM (arm64) exactly.
-- **Nix:** install via `DeterminateSystems/nix-installer-action` (or
-  `cachix/install-nix-action`); optional binary cache to speed rebuilds.
-- **Build:** `nix build .#vmImage` → versioned kernel + rootfs artifacts.
-- **Package & push:** wrap the artifacts as an **OCI artifact** (e.g. via `oras push`)
-  with a descriptive media type; the registry returns/records the **digest**.
-- **Pin:** the build records `version → digest`; `krayt` consumes that mapping and
-  verifies the digest at pull time.
-- **Trigger:** on tag / release (and on `images/flake.lock` changes, to catch kernel and
-  package bumps automatically).
-
-Sketch:
-```yaml
-jobs:
-  build-image:
-    runs-on: ubuntu-24.04-arm        # native aarch64-linux, no emulation
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - run: nix build .#vmImage      # -> ./result (kernel + rootfs)
-      - run: |
-          zstd -19 -T0 -o rootfs.img.zst ./result/rootfs.img
-          oras push <registry>/krayt-vmimage:${GITHUB_REF_NAME} \
-            ./result/vmlinuz:application/vnd.krayt.kernel \
-            ./rootfs.img.zst:application/vnd.krayt.rootfs+zstd
-      # capture the pushed digest -> record as the pinned image reference
-```
-`rootfs.img` is the only layer compressed (`vmlinuz`/`initrd` are too small for it to be worth
-the complexity) — the client (`vmimage.Pull`) decompresses it back to plain raw bytes
-immediately after download, so nothing past `Pull` ever sees the compressed form.
-
-Consumer side: `krayt image pull` resolves its pinned digest, pulls the OCI artifact
-from whichever registry is configured, verifies the digest, and caches the base image
-locally for CoW cloning. Because it is a plain OCI artifact addressed by digest, the
-registry is swappable and the image is portable across hosts.
-
-### 11.6 Image internals & boot contract (sub-spec)
-This is the riskiest deliverable and the one Claude Code cannot fully verify locally
-(building/boot-testing needs a Linux builder — own it in CI; see §11.3). What the flake
-must produce and guarantee:
-
-- **Init:** NixOS with **systemd** (decision settled — consistent with `microvm.nix` on
-  the Linux backend; systemd owns mounts, ordering, and network bring-up). No hand-rolled
-  PID 1.
-- **Services (systemd units), ordered:**
-  1. `containerd.service` — containerd daemon, socket at `/run/containerd/containerd.sock`.
-  2. `krayt-agent.service` — the guest-agent, `Type=notify`,
-     `After=containerd.service network-online.target`, `Wants=network-online.target`.
-- **Filesystems:** kernel built with `virtio`, `vsock` (`CONFIG_VSOCKETS`,
-  `CONFIG_VIRTIO_VSOCKETS`), `overlayfs`, `nftables`. Rootfs as the boot disk vz mounts;
-  `/run`, `/tmp` on tmpfs; containerd state under `/var/lib/containerd`.
-- **Networking:** one NAT NIC up via `systemd-networkd`; nftables ruleset from §6.6 applied
-  by the guest-agent at run start (not baked statically — it depends on per-task policy).
-- **Closure contents (and nothing else):** kernel, systemd, containerd + `runc`/`crun`,
-  nftables, the static guest-agent binary, CA certificates, busybox-equivalent coreutils, and
-  the pieces the run pipeline shells out to: **`gitMinimal`** for the §6.7 bundle
-  ingest/diff, **`e2fsprogs` + `util-linux`** to format + mount the per-run scratch disk
-  (§6.10), and — since `move-egress-proxy-to-host.md` replaced the in-guest L7 proxy with a
-  host process — the **`krayt-vsock-forward`** binary (a dumb TCP<->vsock pipe, not a proxy)
-  run as the dedicated **`proxyd`** user, kept as defense in depth though no longer load-bearing
-  for the L3 lock (§6.6). No editors, no shells beyond what systemd needs, no package manager.
-- **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — neither backend
-  takes qcow2), built for **both** `aarch64-linux` and `x86_64-linux` from one flake and one
-  NixOS config, and published as a **single multi-arch OCI index** (§11.5). `rootfs.img` is
-  compressed (`+zstd`) for the registry transfer only; `krayt image pull` decompresses it back
-  to the same raw format before anything touches it, so the raw-on-disk / CoW-clone contract
-  stated here is unchanged. krayt pins the
-  *index* digest — one `PinnedRef`, one `PinnedDigest`, no architecture anywhere in the pin —
-  and resolves it to the arch it can boot at pull time (`vmimage.selectPlatform`): arm64 for
-  vfkit, amd64 for firecracker.
-  - **The per-arch artifacts must carry an OCI image config declaring `{"architecture":…,
-    "os":"linux"}`** (`oras push --config`). This is easy to miss and fails in an ugly way:
-    these are *artifacts* with custom media types, not container images, so nothing else carries
-    an architecture. Without the config, `oras manifest index create` cannot infer a platform,
-    the index entries get a null `platform`, and selection then matches **nothing on any host** —
-    a broken pull for everyone, from an index that published perfectly cleanly. CI asserts the
-    platforms are present rather than trusting it.
-- **The x86_64 (firecracker) boot contract differs from the aarch64 (vfkit) one** in three ways
-  that are easy to get wrong and fail obscurely:
-  1. **The kernel must be an uncompressed ELF `vmlinux`.** Firecracker's x86_64 loader cannot
-     boot the `bzImage` that `system.boot.loader.kernelFile` names — upstream's own CI kernels
-     are `vmlinux-*` ELF binaries for this reason. nixpkgs ships the ELF as `vmlinux` in the
-     kernel's **`dev` output**; the flake strips it (379 MiB → ~55 MiB, debug info only) and
-     publishes it as `vmlinuz`. The kernel has `CONFIG_PVH=y`, so Firecracker finds the PVH
-     entry note.
-  2. **virtio-MMIO, not virtio-PCI.** Firecracker has no PCI bus, so `virtio_mmio` must be in
-     `boot.initrd.availableKernelModules` or root will not mount. (Both transports are listed;
-     the unused one simply never matches a device.)
-  3. **Console is `ttyS0`** (8250 serial), not vfkit's `hvc0` virtio-console. The provider
-     normalises this itself, so a `VMSpec` written for either backend boots on both.
-- **`systemd-network-generator` must be enabled** (it ships with systemd but is off by default).
-  It is what turns the firecracker provider's cmdline `ip=`/`ifname=` into networkd config; see
-  §6.6. Without it the guest boots fine and answers `Hello` with **no network address at all** —
-  a silent failure, so it has its own on-hardware regression test.
-- **Boot contract (what the host relies on):** within N seconds of `VM.Start` (vfkit
-  process up + VM booted), the guest-agent is listening on vsock port `1024` (bridged to the
-  host `socketURL`) and answers `Hello`. The host treats a successful `Hello` as "VM ready";
-  failure within a timeout → abort + `Destroy`.
-
-> Practical ownership: have Claude Code author `flake.nix` and the systemd units, but make
-> the boot-test (vfkit boots the image → `Hello` round-trips) a human/CI checkpoint, since
-> the agent's sandbox can't build or boot the Linux image.
+The sandbox image is entirely **msb's concern now**: `msb create --image <ref>` resolves and pulls
+the user's own agent image itself, the same way `docker run` would, and msb's libkrun VM boots
+under that image directly — there is no separate krayt-built base image underneath it to version,
+build, or pin. krayt ships no VM image of its own, has no Nix build, and needs no Linux builder for
+anything (§11.3's old caveat, and `docs/macos-linux-builder.md`, are gone with it). See
+`docs/adr-microsandbox-sandbox-layer.md` for the full rationale, and §6.15 for the driver. `krayt
+image` (§13) survives as a thin front-end over msb's own image store, not a reimplementation of
+one — see git history for the pre-msb text if the old Nix-based design is ever useful again.
 
 ---
 
 ## 12. macOS Specifics & Gotchas
 
-- **Entitlement / signing — handled by vfkit (v1):** the `com.apple.security.virtualization`
-  entitlement is carried by the **vfkit** binary, which ships signed (installed via brew),
-  so **krayt itself does not need the virtualization entitlement or special code-signing**.
-  This removes the signing handoff that the direct-vz path would require. `krayt doctor`
-  verifies vfkit is installed and runnable. *(If you ever switch to the direct `vz`
-  provider, the entitlement + signing requirement moves onto the krayt binary — that becomes
-  a `[HUMAN: signing identity]` step again.)*
-- **Runtime dependency:** the vfkit provider needs the `vfkit` binary present (brew, pinned
-  version). `doctor` checks presence + version; document the install in the README.
-- **Image format:** vfkit boots **raw**/ISO images only (no qcow2). Keep `rootfs.img` raw;
-  CoW clone via APFS `clonefile` works on raw images.
-- **Apple Silicon:** ensure kernel/rootfs are `arm64`. Guest-agent and user images must
-  match the VM architecture (arm64) unless emulating (avoid).
-- **vsock:** no host `AF_VSOCK` on macOS — vfkit bridges the guest vsock port to a host
-  unix socket (`socketURL`); the control channel dials that socket (§6.12).
-- **NAT networking:** vfkit provides NAT; domain filtering is *our* responsibility (the
-  in-guest egress proxy, §6.6), as neither vfkit nor the framework filters by domain.
+> **Amended by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11).** `vfkit` is no
+> longer a prerequisite — the vfkit provider is deleted along with the rest of
+> `internal/provider`. **`msb`** is the one thing `krayt run` needs installed. See git history for
+> the pre-cutover text.
+
+- **Runtime dependency: `msb`.** `krayt run` needs the `msb` binary installed and resolvable via
+  `PATH` (or `KRAYT_MSB_BIN`, §6.15). `krayt doctor`'s msb checks (§6.15) are now **mandatory, not
+  optional** — msb is the only sandbox backend, so a host without a healthy msb install fails
+  `krayt doctor` outright, and version drift below `sandbox.MinVersion` is reported as a failure,
+  not a warning.
+- **Signing / entitlements.** msb's own installer/runtime carries whatever signing its
+  libkrun-based VM boundary needs; **krayt itself needs no virtualization entitlement or special
+  code-signing of its own** — the same property the vfkit-carries-the-entitlement design had,
+  just owned by a different vendored binary now.
+- **Apple Silicon:** the user's OCI image runs same-arch under libkrun (arm64 on an
+  Apple-Silicon host) — there is no separate "guest-agent architecture" to match any more, since
+  krayt ships no guest-agent (§6.4 stub). `guestbin.Binary(name, runtime.GOARCH)` (§6.15, §7 step
+  5) picks the matching `krayt-helper`/`krayt-ask` binary for the host's own arch.
+- **vsock:** the one remaining vsock use is `ask_human` — `krayt-ask` inside the sandbox dials
+  `AF_VSOCK` to host CID 2, which msb's own `--vsock HOST_PATH:PORT` route bridges to a host unix
+  socket `internal/askbridge` listens on (§6.13). There is no host/guest asymmetry left for krayt
+  to hide behind an interface (§6.12 stub) — msb owns the vsock plumbing on both sides.
+- **Networking:** msb owns network policy entirely (§6.6); domain filtering, TLS interception, and
+  the private/loopback/metadata denylist are all msb's userspace network stack, not anything
+  krayt runs on the host or in the guest.
 
 ---
 
@@ -2264,11 +1770,11 @@ krayt patch   <run-id>         # print/locate the run's changes.patch
 krayt apply   <run-id>         # helper: git apply the patch onto the host (after review)
 krayt stop    <run-id>         # stop + destroy a run's VM
 krayt rm      <run-id>         # remove run artifacts
-krayt image pull  [--ref] [--digest]                 # pull + verify the base VM image (§11.4)
-krayt image ls                                       # list cached base-VM + container images with size/last-used
-krayt image rm    <digest> [--force]                 # remove one cached image by digest/prefix (--force for the pinned base)
-krayt image prune [--repo] [--older-than DUR] [--all] [--dry-run]   # bulk-reclaim cache disk under the retention policy
-krayt doctor                   # check host prereqs (vfkit installed+runnable on macOS; /dev/kvm on linux)
+krayt image pull  <ref>                              # pre-warm msb's own image store (`msb pull`, §11)
+krayt image ls                                       # list images in msb's own store (`msb images --format json`)
+krayt image rm    <ref> [--force]                    # remove one image by reference (`msb rmi`; --force for one a sandbox still references)
+krayt image prune [--repo] [--older-than DUR] [--all] [--dry-run]   # bulk-reclaim under krayt's own age/in-use retention, then `msb image prune`
+krayt doctor                   # check host prereqs (msb installed+healthy, version floor, local backend — §6.15)
 krayt upgrade [--version vX.Y.Z] [--yes|-y] [--check]   # update krayt in place from a GitHub release
 ```
 
@@ -2290,9 +1796,8 @@ completes command and flag names. On top of that, the run-scoped commands (`appl
 `attach`, `stop`, `rm`, `patch`, `questions`, `answer`) dynamically complete `<run-id>` from
 `.krayt/` state under `--repo`, each filtered to the runs it can act on (`stop`/`attach` → live
 runs, `rm` → finished unless `--force`, `answer` → `waiting`), and `answer` also completes the
-run's pending `<question-id>`. `image rm` completes `<digest>` from the cached images in both
-cache roots (offering the full digest so a pick is unambiguously removable), annotated with each
-image's kind and size and `(pinned)` for the base image. `run`'s enum flags (`--net`, `--on-question`, `--on-question-timeout`,
+run's pending `<question-id>`. `image rm` completes `<ref>` from msb's own store (`msb images -q`)
+— krayt keeps no image cache of its own to read completions from any more (§11). `run`'s enum flags (`--net`, `--on-question`, `--on-question-timeout`,
 `--agent`) and `questions --sort` complete their fixed value sets from the same constants that
 validate them; `run`'s `--image`/`--allow` complete from this repo's run history. Untrusted
 agent-originated text (question prompts) is sanitized (§6.13) before appearing in a completion
@@ -2302,13 +1807,18 @@ description.
 
 ## 14. Milestone Roadmap
 
-**Test strategy (applies to every phase).** The `Provider` interface is the seam that
-makes the core testable without a VM: implement a `fakeProvider` whose VM loops back the
-gRPC server in-process, and unit-test the orchestrator, protocol, imagestore (host side),
-patch, and CLI against it on any OS. Real-VM behaviour (vz boot, image import, networking)
-is covered by an integration harness gated behind a build tag and run on a real Mac / in
-CI. Each phase below lists a concrete **Done when** checkpoint — prefer wiring that as an
-automated test.
+**Test strategy (applies to every phase).** *(Rewritten by `run-tasks-on-microsandbox.md`, §14
+Phase 11 — the sentence this replaces, "the `Provider` interface is the seam that makes the core
+testable without a VM," is now **false**: `internal/provider` and its `fakeProvider` are deleted.
+See git history for the pre-cutover text.)* The test seam is a **scriptable fake `msb` binary**
+the orchestrator's own tests re-exec themselves as — the same idiom `internal/sandbox`'s own
+tests already used one layer down (`add-msb-sandbox-driver.md`): a real `exec.Cmd` runs a
+re-exec'd test binary that plays `msb`, detected by argv verb rather than an env flag (the child
+env is a closed allowlist by design, §6.15, so a marker on the outer process can't reach it).
+Unit-test the orchestrator, task, patch, and CLI against it on any OS. Real-sandbox behaviour
+(msb boot, image pull, network policy enforcement) is covered by an integration harness gated
+behind a build tag and run on a real Mac / in CI, with a real `msb` installed. Each phase below
+lists a concrete **Done when** checkpoint — prefer wiring that as an automated test.
 
 ### Implementation protocol for the coding agent
 Some steps cannot be completed by the coding agent alone — they need credentials, real
@@ -2333,12 +1843,11 @@ image digests, no "boot succeeded" without a real boot. An honestly-blocked step
 correct; a faked one is a defect.
 
 **Categories that require a human:**
-- Apple Developer signing identity / notarization — **only if** you switch to the direct
-  `vz` provider; the v1 vfkit path needs no krayt signing (§12). vfkit install is trivial.
-- A Linux builder or CI run to build/boot the Nix image (§11.3, §11.6).
-- Registry or other credentials/secrets (publishing the OCI artifact, §11.5).
-- Real-hardware checks: vz boot on a Mac, `/dev/kvm` on Linux (Phase 1 / 6 "Done when").
+- Real-hardware checks: a real `msb`-backed sandbox boot on an Apple-Silicon Mac or a KVM-capable
+  Linux host (§6.15, §12) — krayt ships no VM image of its own to build or sign (§11).
 - Live API keys / secrets needed to exercise a real agent image (Phase 5).
+- Registry credentials for publishing an agent image (`images/agents/`), unrelated to the (now
+  deleted) VM image pipeline.
 
 **`HUMAN_TODO.md` entry template:**
 ```
@@ -2375,7 +1884,7 @@ Tasks marked **[HUMAN]** below are the expected handoff points.
 - [x] `images/flake.nix`: NixOS + systemd image per §11.6 (raw `rootfs.img` + kernel + initrd); build in CI on arm64 Linux runner; publish OCI artifact (§11.5). **[HUMAN: Linux builder/CI + registry creds]** — agent writes the flake + CI workflow; human runs CI / provides registry credentials.
 - [x] `krayt image pull` + digest verification before first run.
 - [x] `DialControl` = `net.Dial("unix", socketURL)` to vfkit's vsock bridge + gRPC client wiring (§6.12).
-- [x] **Done when:** on a real Mac (with vfkit installed), `krayt` boots the published image and a `Hello` RPC round-trips host↔guest over the vfkit vsock socket. **[HUMAN: boot test on real hardware]**
+- [x] **Done when — Historical, describes the pre-msb design, superseded by Phase 11.** on a real Mac (with vfkit installed), `krayt` boots the published image and a `Hello` RPC round-trips host↔guest over the vfkit vsock socket. **[HUMAN: boot test on real hardware]** *(The vfkit provider and its `Hello` RPC are deleted by `run-tasks-on-microsandbox.md`; this criterion described a backend that no longer exists in the design.)*
 
 ### Phase 2 — End-to-end single run (happy path) ✅
 - [x] Host: pull user OCI image + export OCI archive; digest-keyed cache (`imagestore`).
@@ -2422,13 +1931,19 @@ Both items need a `.proto`/image change, so they share one guest image rebuild a
 - [x] `/dev/kvm` detection + graceful messaging in `doctor`. *(Checks read/write **access**, not just presence: being in the `kvm` group does nothing until a new login session, which is the failure everyone actually hits. Plus firecracker binary+version, `/dev/net/tun`, `CAP_NET_ADMIN`, and host NAT.)*
 - [x] Reuse guest-agent, protocol, patch, secrets, orchestrator unchanged. *(Not one line changed in any of them. The only edit outside `internal/provider/firecracker` + `internal/cli` (per-OS wiring) is the x86_64 image in `images/flake.nix` and a build-tagged `newTestProvider()` seam in the integration tests.)*
 - [x] x86_64 VM image. *(Same flake, both systems. ELF `vmlinux` + `virtio_mmio` + `systemd-network-generator` — see §11.6.)*
-- [x] **Done when:** the Phase 2 end-to-end test passes unmodified on a Linux host via the firecracker provider. ✅ **Verified on real hardware** (GCP VM, nested virt, Intel VT-x): `TestEndToEndRealVM` — the Phase 2 test, body and assertions byte-identical, with only the provider construction swapped — boots the x86_64 image under Firecracker v1.16.1, streams in the image + repo bundle, runs the agent container, and returns a `changes.patch` that `patch.Apply` lands cleanly on a fresh clone (exit 0). Also green: `TestBootHello` (`Hello` round-trips over the vsock handshake), `TestGuestNetwork`, and `TestConcurrentRealVMs` (3 simultaneous VMs, unique taps/CIDs, patches provably not crossed, every tap reaped on teardown).
+- [x] **Done when — Historical, describes the pre-msb design, superseded by Phase 11.** the Phase 2 end-to-end test passes unmodified on a Linux host via the firecracker provider. *(The firecracker provider is deleted by `run-tasks-on-microsandbox.md`; msb is one backend for both macOS and Linux, so this Linux-parity criterion no longer applies to the current design.)* ✅ **Verified on real hardware** (GCP VM, nested virt, Intel VT-x): `TestEndToEndRealVM` — the Phase 2 test, body and assertions byte-identical, with only the provider construction swapped — boots the x86_64 image under Firecracker v1.16.1, streams in the image + repo bundle, runs the agent container, and returns a `changes.patch` that `patch.Apply` lands cleanly on a fresh clone (exit 0). Also green: `TestBootHello` (`Hello` round-trips over the vsock handshake), `TestGuestNetwork`, and `TestConcurrentRealVMs` (3 simultaneous VMs, unique taps/CIDs, patches provably not crossed, every tap reaped on teardown).
 - [x] **The Phase 3 security suite also re-verified on Linux** (not required by the "Done when", but the claim worth having before anyone runs untrusted code on this backend): `TestEgressEnforcement`, `TestContainerHardening`, `TestRootImageFailsClosed`, `TestGuestGitConfigInjectionInert`, `TestSecretConfinementInArtifacts` — all green against firecracker. The two that matter: a non-allowlisted host is refused by the proxy **and** a raw socket that ignores the proxy is dropped by nftables (`1.1.1.1:443` → timeout), while `setuid(proxyd)` fails `EPERM` — so the finding-#1 egress bypass is closed on this backend too. This required writing `hack/netprobe`, which the spec assumed existed but which had never been committed.
 
 ### Phase 8 — Host-side egress proxy, step 1 (`move-egress-proxy-to-host.md`) ✅
 Step 1 of the three-step host-side-proxy arc (`docs/ai-tasks/README.md`). Moves the L7
 allowlist proxy off the guest entirely, behind a new guest-initiated vsock channel — a
 behavior-preserving, security-strictly-improving change for the container (§6.6).
+
+> **Historical — describes the pre-msb design, superseded by Phase 11.** `internal/proxy`,
+> `cmd/krayt-vsock-forward`, and the `EgressPort`/`ListenEgress` provider seam this phase built
+> are all deleted by `run-tasks-on-microsandbox.md`; msb's own policy engine and userspace network
+> stack replace the entire mechanism (§6.6). The record below stands as evidence of what was
+> built and verified at the time, not as a description of the code that runs today.
 
 > **Supersedes the Phase 3 "Done when" egress evidence.** `TestEgressEnforcement`,
 > `TestContainerHardening`'s `setuid(proxyd)` clause, and `TestConcurrentRealVMs`'s isolation
@@ -2496,6 +2011,13 @@ behavior-preserving, security-strictly-improving change for the container (§6.6
 Step 2 of the three-step host-side-proxy arc (`docs/ai-tasks/README.md`; depends on Phase 8,
 step 1). Opt-in TLS termination at the host proxy so an HTTP-shaped agent credential never
 enters the VM at all (§6.6.1, §6.8, §6.14).
+
+> **Historical — describes the pre-msb design, superseded by Phase 11.** The opt-in
+> `network.mitm` + host-proxy CA/injection machinery this phase built is deleted by
+> `run-tasks-on-microsandbox.md`: under msb, declaring any secret enables TLS interception
+> automatically (§6.6.1) — there is no separate opt-in left to test. The record below stands as
+> evidence of what was built and verified at the time, not as a description of the code that runs
+> today.
 
 > **Complete, offline and on hardware.** Phase 8's gate cleared first (both backends, image
 > `4fe2b0b7…`), then this phase was verified with live credentials across two providers: an
@@ -2630,10 +2152,179 @@ the shape the provider wants (§6.14, shape mirroring).
   **scrubs its credential from child-process environments** — `env` inside the agent cannot show it,
   which is why the entrypoint's own line and the proxy log are the evidence.
 
+### Phase 11 — Microsandbox migration (ADR option B1)
+
+Replaces krayt's own sandbox layer — `internal/{provider,guest,protocol,proxy,vmimage,
+controlclient}` and the Nix VM image — with [microsandbox](https://github.com/superradcompany/microsandbox)
+(`msb`), driven as a subprocess. Decided in `docs/adr-microsandbox-sandbox-layer.md`; split into
+eleven tasks under `docs/ai-tasks/README.md`'s "Microsandbox migration (ADR option B1)" section.
+Tasks 2–6 are additive (the vfkit/Firecracker path keeps working byte-for-byte until task 7 flips
+the switch and deletes it in the same change), so this phase's checkboxes below track real,
+independently-landed progress rather than a single big-bang "Done when".
+
+- [x] **Feasibility gate** (`probe-microsandbox-feasibility.md`) — five hardware-probe scripts
+  under `hack/msb-probes/`, **all run on msb 0.6.16, 2026-08-29/30, on an Apple-Silicon Mac**. The
+  two design-shaping questions are answered and nothing below is gated on them any more:
+  - **P1 — the dial works; the host must not close first.** A non-root guest process (`agent`,
+    uid 1000) opens `AF_VSOCK` to host CID 2 in the real agent image unmodified, and msb bridges
+    that dial to the host socket **as the invoking user** — `peer uid` is the caller's on every
+    accepted connection, against a `0600` socket inside a `0700` directory. `krayt-ask` dials the
+    host directly, the root-owned in-guest forwarder is dead (`dial-ask-channel-over-vsock.md`),
+    and decision 10's socket hardening stands as written.
+    **The reply, though, is dropped unless the host waits for the guest to close.** Measured
+    2026-09-02 on msb 0.6.16 (Apple-Silicon Mac), 25 round trips per shape against one sandbox:
+
+    | shape | who closes first | completed |
+    |---|---|---|
+    | bare `$TMPDIR` socket, as `agent` | host | 7/25 |
+    | `0600` in a `0700` dir, as `agent` | host | 5/25 |
+    | `0600` in a `0700` dir, as **root** | host | 9/25 |
+    | `0600` in a `0700` dir, as `agent` | **guest** | **25/25** |
+
+    Every loss is identical and silent from inside: the host logs the bytes it read *and* the echo
+    it wrote, and the guest's read returns EOF having received nothing. It is not a privilege
+    problem (root loses too), not the private directory (the bare shape loses at the same rate),
+    and not the peer uid. msb's relay discards the reply still in flight when the host end closes.
+    §6.13's channel therefore requires the host to wait for the sandbox to close
+    (`internal/askbridge.lingerUntilPeerCloses`, covered by
+    `TestServeDoesNotCloseBeforeTheSandboxDoes`). `hack/msb-probes/p1-vsock-nonroot.sh` passes or
+    fails on that shape — the one krayt ships — and reports the close-first rates beside it
+    without failing on them, so a re-run says whether msb still drops replies (expected) or has
+    fixed it (which would make the wait belt-and-braces rather than load-bearing).
+  - **P2** — `msb exec --user root` works under `--security restricted`: uid 0, and a root-created
+    0700 path stays unreadable to an `--user agent` exec. The guest helper takes the restricted
+    profile *and* its privilege separation (`add-krayt-guest-helper.md`); it is not a trade-off.
+  - **P3** — **answered against expectation**: `--secret` alone *does* enable TLS interception
+    (`SandboxBuilder::secret_entry` sets `network.tls.enabled = true`), so the ADR's correction 1
+    is withdrawn and `--tls-intercept` emission is explicit-over-implicit rather than required.
+    The consequence that follows: **under msb a secret cannot be declared without MITM**, so
+    §6.6.1's opt-in `network.mitm: false` has no B1 equivalent once any secret exists.
+  - **P4** — inconclusive on darwin *by construction*: a positive control shows `ps -Eww` cannot
+    read any same-uid child's environment on macOS, so the reading is uninformative rather than
+    negative. msb's source says the value reaches the long-lived runtime on an anonymous
+    `--config-fd`, never its environ, making the environ window only krayt's own `msb create`
+    call — **a Linux/KVM re-run would confirm that and is the one loose thread here**, though it
+    sizes an already-accepted residual and blocks nothing.
+  - **P5** — Claude Code accepts msb's default `$MSB_ANTHROPIC_API_KEY` placeholder: `claude -p`
+    reached the real API from a deny-default sandbox holding only the placeholder. This is also
+    the first end-to-end proof of the B1 credential path on hardware. `hand-secrets-to-msb.md`'s
+    `--secret-conf` contingency is dead and must not be built.
+- [ ] `add-msb-sandbox-driver.md` — new `internal/sandbox`, the `msb` CLI driver, plus `krayt
+  doctor` checks that delegate to `msb doctor`.
+- [ ] `translate-network-policy-to-msb.md` — pure-function translation of `krayt.yaml`'s network
+  vocabulary into a fully explicit msb policy, never an empty one.
+- [ ] `hand-secrets-to-msb.md` — the secret hand-off: `--secret NAME@HOST` on argv (names only),
+  values in the msb child's `cmd.Env`, msb's default placeholder.
+- [ ] `add-krayt-guest-helper.md` — `cmd/krayt-helper`, stateless, argv-in/JSON-out, run as root
+  via `msb exec --user`, a thin wrapper over the `internal/patch` functions krayt keeps.
+- [x] `dial-ask-channel-over-vsock.md` — `krayt-ask` dials `AF_VSOCK` to host CID 2 directly over
+  msb's `--vsock` route; retires `cmd/krayt-vsock-forward` at the cut-over. Additive:
+  `internal/askbridge` + `internal/sockroot` + the `vsock://cid:port` dialer are built and tested,
+  nothing calls them from `krayt run` yet. P1's measurement is baked into the channel — the host
+  waits for the sandbox to close (§6.13).
+- [x] `run-tasks-on-microsandbox.md` — **the cut-over.** `orchestrator.Run` was rewritten from
+  scratch to drive the msb lifecycle end to end (§7): `internal/{provider,guest,protocol,proxy,
+  controlclient,imagestore}`, `cmd/krayt-{agent,vsock-forward}`,
+  `internal/adapter/anthropic_wire.go` (+ golden tests), the `internal/cli/run_{darwin,linux,
+  other}.go`/`doctor_{darwin,linux,other}.go` OS-specific splits, `hack/linux-net-setup.sh`, `make
+  proto`/the protobuf devShell pins, and the CI `integration-linux` job are all **deleted** in the
+  same change. `internal/sandbox`, `internal/askbridge`, `internal/askclient`, `internal/sockroot`,
+  `cmd/krayt-helper`, and `internal/task/{netpolicy,secrets,container}_msb.go` — built additively by
+  tasks 2–6 — are now actually wired into `krayt run`; `krayt doctor`'s msb checks became mandatory
+  (§6.15); the test seam moved from `fakeProvider` to a scriptable fake `msb` binary (this section's
+  "Test strategy" paragraph, above, is rewritten accordingly). `internal/vmimage`/`images/`/`krayt
+  image` are **knowingly kept** for one more task (`retire-vm-image-pipeline.md`) — they build and
+  publish an artifact nothing consumes any more, dead weight rather than a second execution path;
+  `images/flake.nix` still references the now-deleted `cmd/krayt-agent`/`cmd/krayt-vsock-forward` in
+  its Nix build and will fail to build as-is until that follow-up lands. §3, §5, §6.3–§6.6,
+  §6.10–§6.12, §6.13, §7, §8.4, §9.1/§9.2, §10, §12, and §15 are amended accordingly.
+  **Done when (offline)**: met — `go build ./...` on darwin and linux, `go test -race ./...`, and
+  `golangci-lint run` are green; no `internal/provider`/`internal/guest`/`internal/protocol`/
+  `internal/proxy`/`internal/controlclient` import remains anywhere; teardown-on-every-path,
+  no-secret-on-argv, and orchestrator coverage are all asserted against the fake `msb` with no
+  regression from the pre-cutover suite. **Done when (hardware, `[HUMAN]`)**: met 2026-09-04 on an
+  Apple-Silicon Mac (msb 0.6.16, `ghcr.io/418-cloud/krayt-agent-claude-code:latest`, live
+  credential). `run_d25279fb` — plain run, `done`, `exit 0`, non-empty `changes.patch`, rendered
+  `report.md`. `run_aa23143e` — `--on-question=wait`, reached `waiting` with a real
+  `questions/q1.json`, resolved by `krayt answer` over the run control socket, resumed, and
+  finished `done` with the edit it had asked about; that is the `ask_human` round trip through
+  `krayt-ask` → `AF_VSOCK` → msb's `--vsock` bridge → `internal/askbridge`, plus the cross-process
+  `krayt answer` dial. **The pass found five defects the offline suite could not**, each fatal to
+  a real run: msb rejecting Go's composite duration on `--max-duration`; `msb copy` not creating
+  guest parent directories; `deny@private` shadowing `allow@dns` under first-match-wins (§6.6);
+  the ask socket overflowing macOS's `sun_path` limit (§6.13); and `on_timeout: abort` losing a
+  race with the agent's own exit. Two of the five were masked by test doubles more forgiving than
+  the real `msb`, one by a test that passed only because another bug failed every run — recorded
+  in `HUMAN_TODO.md` so the lesson outlives the fixes. Criterion 3 — the credential reaching nothing but `msb
+  create` — is met too (`run_63b9a3bf`, `hack/msb-probes/p6-credential-not-in-run.sh`): the guest
+  held msb's `$MSB_CLAUDE_CODE_OAUTH_TOKEN` placeholder, and the real value appeared in no msb
+  process's argv, no run artifact and not in `changes.patch`. That probe's environ reading is
+  inconclusive on darwin — macOS will not show another process's environment even at the same uid,
+  the limitation `hack/msb-probes/p4-environ-exposure-window.sh` already records — so the environ
+  window closes on the Linux/KVM re-run P4 is already waiting for, not here. `krayt apply` closes the loop: `run_b18ad67e`'s patch
+  applied cleanly to the scratch repo's working tree. **Every criterion of this phase's hardware
+  re-verification is met; the `HUMAN_TODO.md` entry is deleted accordingly**, and
+  `retire-vm-image-pipeline.md` is unblocked.
+- [x] `retire-vm-image-pipeline.md` — deleted `internal/vmimage`, `internal/imagecache`,
+  `images/{flake.nix,flake.lock}`, the three image workflows (`image.yml`, `vmimage-rc.yml`,
+  `vmimage-graduate.yml`), `hack/next-vmimage-tag.sh`, `docs/macos-linux-builder.md`, and the root
+  `flake.nix`/`flake.lock` (its only remaining use was `oras`, for the now-deleted pipeline) — the
+  Linux-builder requirement is gone with them. `krayt image` survives as a thin front-end over
+  msb's own store (`internal/sandbox.Client.{Images,ImageRefs,Rmi,ImagePrune}`): `pull`/`ls`/`rm`
+  map directly to `msb pull`/`msb images`/`msb rmi`; `prune` keeps its age/`--repo`/`--all`/
+  `--dry-run` retention, now sourced from `.krayt/runs/*/meta.json`'s `image_ref` instead of a
+  cache sentinel, before sweeping with `msb image prune`. `image rm` takes a reference, not a
+  digest (§13) — a CLI surface change, since msb's store is ref-keyed rather than content-addressed.
+  §6.11, §11, §13, and §15 are amended accordingly; `docs/ai-tasks/README.md`'s rows for
+  `automate-vmimage-releases.md`/`compress-vmimage-rootfs.md`/`prune-cached-images.md` now say what
+  replaced them. **Done when:** met — `go build ./...` (both `GOOS`), `go test -race ./...`, and
+  `golangci-lint run` are green; `grep -rn "vmimage\|imagecache\|rootfs.img\|PinnedDigest"` across
+  `.go`/`.yml`/`.nix` returns nothing; no workflow needs a Linux arm64 runner or a Nix builder;
+  `krayt image ls/rm/prune --dry-run` are unit-tested offline against a scriptable fake `msb`,
+  including all three retention outcomes (protected by a non-terminal run, protected by the age
+  window, pruned when neither applies); shell completion for `image rm` sources `msb images -q`.
+- [ ] `add-msb-extra-conf-escape-hatch.md` — opt-in `sandbox.extra_conf: <path>`, explicitly
+  unvalidated, subject to §8.3 containment.
+- [ ] `expand-platforms-under-msb.md` — linux/arm64 in the release matrix, plus a real Windows
+  port. Unblocked by `retire-vm-image-pipeline.md`: the old blocker (§15) was a krayt-owned image
+  index with an arch dimension but no backend dimension, and Windows had no path at all; with no
+  krayt-built image, neither obstacle exists any more — msb's own platform support is what gates
+  this now.
+- [ ] `warm-start-msb-sandboxes.md` — flat OCI rootfs + `--materialize` pre-pull, opt-in and
+  defaulting off until measured.
+- **Done when:** the gate's two blocking probes (P1, P2) have a real-hardware finding recorded in
+  `HUMAN_TODO.md` and folded back into this checklist (met); each subsequent task's own "Done when"
+  is met in turn as it lands (met through task 7's offline half); and task 7
+  (`run-tasks-on-microsandbox.md`) — the one that deletes the code Phases 0–10 verified — has its
+  own hardware re-verification pass, the same discipline Phase 8 applied when it superseded Phase
+  3's egress evidence. **The hardware half of task 7 is the one open item in this phase** — see its
+  entry above and `HUMAN_TODO.md`.
+
 ---
 
 ## 15. Open Questions / Future Work
 
+- **microsandbox as a fourth `Provider` — evaluated and rejected, 2026-08-29.** Forcing msb
+  *beneath* krayt's `Provider` interface (§6.3) failed on cgo (msb's Go SDK is a `dlopen` bridge
+  to an embedded Rust library — paying cgo would cost `CGO_ENABLED=0` and the single-Linux-runner
+  cross-build), on the absence of a host→guest channel matching `VM.DialControl` (msb offers no
+  such thing — the sandbox never listens for anything, it only dials out), on a `VMSpec` whose
+  kernel/initrd/cmdline fields msb cannot honour (msb has no kernel/rootfs of its own to point at),
+  and on running two overlapping security models at once. **This is a narrower question than
+  `docs/adr-microsandbox-sandbox-layer.md` asked, and does not mean msb was rejected outright** —
+  the ADR asks whether krayt should stop building a sandbox and consume one instead, dissolves
+  three of the four objections above by removing the constraint that msb sit under `Provider`
+  (cgo is avoidable by driving the `msb` CLI directly rather than its SDK; `DialControl` stops
+  mattering because krayt uses msb's own exec/copy API instead of a protocol of its own; there is
+  no third VM image because there is no krayt-built VM image at all), and answers **yes** — ADR
+  option B1, decided 2026-08-29 and implemented by `run-tasks-on-microsandbox.md`. See the ADR in
+  full for the reasoning the four-objection framing above doesn't capture.
+- **The `Provider` interface — superseded, 2026-08-29 (ADR option B1).** §3's original design
+  principle 1 ("the Provider interface is the only OS-specific seam") and §4's `macOS VM backend`
+  (vfkit v1, `Code-Hex/vz` fallback) / `Linux VM backend` (Firecracker) decisions are superseded:
+  `internal/sandbox` (§6.15) replaces `internal/provider` entirely, and `internal/provider`,
+  `internal/guest`, and `internal/protocol` are deleted by `run-tasks-on-microsandbox.md`. See §3,
+  §4, §5, and the §6.3–§6.5/§6.10–§6.12 stubs for the current text.
 - **VM boot time / warm-VM pool** on macOS — measure cold-boot latency first; if it hurts UX,
   add an optional **warm-VM pool** that pre-boots and parks idle VMs to amortize boot time.
   Deferred deliberately: it's a boot-time optimization that should be driven by real-world
@@ -2642,8 +2333,10 @@ the shape the provider wants (§6.14, shape mirroring).
   pooled VM counts against the same max-concurrency limit as an in-flight run.
 - **Container runtime choice** — *resolved:* **containerd** via its Go client (§6.10).
   `runc` vs `crun` left as a build-time toggle; either is acceptable.
-- **Image distribution** — *resolved:* **host pulls + pre-loads over vsock** (§6.11). The
-  VM never needs registry egress; the host is the only registry-facing component.
+- **Image distribution** — *superseded, ADR option B1 (`retire-vm-image-pipeline.md`).* The
+  original resolution (host pulls + pre-loads over vsock) governed krayt's own guest-agent image;
+  under msb there is no krayt-built image to distribute at all — `msb create --image` resolves and
+  pulls the user's agent image itself (§11, §6.15).
 - **Dirty-tree fidelity** — *resolved:* non-mutating temp-index capture folds uncommitted
   (non-ignored) changes into the inbound bundle, leaving the user's index/worktree/refs
   untouched (§6.7).

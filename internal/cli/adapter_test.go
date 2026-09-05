@@ -3,11 +3,11 @@ package cli
 import (
 	"bytes"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/418-cloud/krayt/internal/adapter"
-	"github.com/418-cloud/krayt/internal/guest"
+	"github.com/418-cloud/krayt/internal/sandbox"
 	"github.com/418-cloud/krayt/internal/task"
 )
 
@@ -22,14 +22,9 @@ func keySet(keys ...string) map[string]bool {
 }
 
 // TestApplyAdapterAuthGate proves the run's host-side pre-flight rejects an ambiguous
-// credential set before any VM boots (§6.14). Also covers inject-claude-oauth-token-at-proxy.md's
-// requirement that exactlyOne still fires when the credential would be host-only (delivered by
-// injection, never SecretsBundle) — the check runs on secretKeys regardless of network.mitm.
+// credential set before any sandbox is created (§6.14).
 func TestApplyAdapterAuthGate(t *testing.T) {
-	spec := &task.RunSpec{
-		Questions: task.QuestionsPolicy{Mode: task.QuestionFail},
-		Network:   task.NetworkPolicy{MITM: true},
-	}
+	spec := &task.RunSpec{Questions: task.QuestionsPolicy{Mode: task.QuestionFail}}
 	err := applyAdapter(io.Discard, spec, "claude-code", keySet("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"))
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {
 		t.Fatalf("expected exactly-one auth error; got %v", err)
@@ -37,7 +32,8 @@ func TestApplyAdapterAuthGate(t *testing.T) {
 }
 
 // TestApplyAdapterWiresAsk proves a valid single credential passes and, in wait mode, the
-// krayt-ask front-end is wired into the container env (§6.13), without clobbering user env.
+// krayt-ask front-end is wired into the container env with the msb vsock socket value (§6.13),
+// without clobbering user env.
 func TestApplyAdapterWiresAsk(t *testing.T) {
 	spec := &task.RunSpec{
 		Env:       map[string]string{"LOG_LEVEL": "debug"},
@@ -46,8 +42,8 @@ func TestApplyAdapterWiresAsk(t *testing.T) {
 	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("ANTHROPIC_API_KEY")); err != nil {
 		t.Fatalf("applyAdapter: %v", err)
 	}
-	if spec.Env["KRAYT_ASK_SOCKET"] != guest.ContainerAskSocket {
-		t.Errorf("KRAYT_ASK_SOCKET = %q, want %q", spec.Env["KRAYT_ASK_SOCKET"], guest.ContainerAskSocket)
+	if spec.Env["KRAYT_ASK_SOCKET"] != sandbox.AskSocketEnv {
+		t.Errorf("KRAYT_ASK_SOCKET = %q, want %q", spec.Env["KRAYT_ASK_SOCKET"], sandbox.AskSocketEnv)
 	}
 	if spec.Env["LOG_LEVEL"] != "debug" {
 		t.Errorf("adapter clobbered user env: %v", spec.Env)
@@ -63,169 +59,107 @@ func TestApplyAdapterWiresAsk(t *testing.T) {
 	}
 }
 
-// TestApplyAdapterMITMOff is the mitm:false regression (inject-claude-oauth-token-at-proxy.md
-// "Done when"): with network.mitm off, applyAdapter never touches spec.Network.Inject even though
-// the observed ANTHROPIC_API_KEY shape exists — byte-identical to a build with no shape-translation
-// feature at all.
-func TestApplyAdapterMITMOff(t *testing.T) {
-	spec := &task.RunSpec{Questions: task.QuestionsPolicy{Mode: task.QuestionFail}}
-	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("ANTHROPIC_API_KEY")); err != nil {
-		t.Fatalf("applyAdapter: %v", err)
-	}
-	if len(spec.Network.Inject) != 0 {
-		t.Errorf("mitm:false must not add an inject rule; got %+v", spec.Network.Inject)
-	}
-	if spec.Env["ANTHROPIC_API_KEY"] != "" {
-		t.Errorf("mitm:false must not set a placeholder into spec.Env; got %q", spec.Env["ANTHROPIC_API_KEY"])
-	}
-}
-
-// TestApplyAdapterMITMInjectsObservedShape proves the load-bearing behavior of
-// inject-claude-oauth-token-at-proxy.md: with mitm on and no user-written network.inject, the
-// claude-code adapter alone produces a complete, pre-flight-valid injection rule for the one
-// credential shape anthropic_wire.go actually has an observation for (ANTHROPIC_API_KEY) — "the
-// user configures nothing beyond mitm: true and the secret itself."
-func TestApplyAdapterMITMInjectsObservedShape(t *testing.T) {
+// TestApplyAdapterScopesCredential proves applyAdapter merges the adapter's msb secret scope
+// (hand-secrets-to-msb.md) into spec.Network.Secrets, and never sets the credential's value —
+// only its name — anywhere in spec.Env.
+func TestApplyAdapterScopesCredential(t *testing.T) {
 	spec := &task.RunSpec{
 		Questions: task.QuestionsPolicy{Mode: task.QuestionFail},
-		Network: task.NetworkPolicy{
-			Mode: task.NetworkAllowlist, Allow: []string{"api.anthropic.com"}, MITM: true,
-		},
+		Network:   task.NetworkPolicy{Mode: task.NetworkAllowlist, Allow: []string{"api.anthropic.com"}},
 	}
 	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("ANTHROPIC_API_KEY")); err != nil {
 		t.Fatalf("applyAdapter: %v", err)
 	}
-	if len(spec.Network.Inject) != 1 {
-		t.Fatalf("want exactly one inject rule, got %+v", spec.Network.Inject)
+	want := []task.SecretSpec{{Key: "ANTHROPIC_API_KEY", Hosts: []string{"api.anthropic.com"}}}
+	if !reflect.DeepEqual(spec.Network.Secrets, want) {
+		t.Errorf("Network.Secrets = %+v, want %+v", spec.Network.Secrets, want)
 	}
-	rule := spec.Network.Inject[0]
-	if rule.Host != "api.anthropic.com" || rule.Set["x-api-key"] != "ANTHROPIC_API_KEY" {
-		t.Errorf("unexpected inject rule: %+v", rule)
-	}
-	if err := task.ValidateNetworkPolicy(spec.Network, keySet("ANTHROPIC_API_KEY")); err != nil {
-		t.Errorf("adapter-produced rule failed re-validation: %v", err)
-	}
-	// The container-facing credential is the placeholder, delivered as plain env — never a real
-	// value, never routed through SecretsBundle (that's InjectedSecretKeys' job downstream).
-	if got := spec.Env["ANTHROPIC_API_KEY"]; got != adapter.AnthropicPlaceholderAPIKey {
-		t.Errorf("spec.Env[ANTHROPIC_API_KEY] = %q, want the placeholder %q", got, adapter.AnthropicPlaceholderAPIKey)
-	}
-	// Names the withheld credential for an entrypoint that predates the already-set-env-var branch
-	// (§8.2) — without it those images exit 78 before the agent starts.
-	if spec.Env["KRAYT_INJECTED_CREDENTIAL"] != "ANTHROPIC_API_KEY" {
-		t.Errorf("KRAYT_INJECTED_CREDENTIAL = %q, want ANTHROPIC_API_KEY; env = %v",
-			spec.Env["KRAYT_INJECTED_CREDENTIAL"], spec.Env)
+	if _, set := spec.Env["ANTHROPIC_API_KEY"]; set {
+		t.Errorf("applyAdapter must never put a credential's value in spec.Env; env = %v", spec.Env)
 	}
 }
 
-// TestApplyAdapterMITMSubscriptionTokenTranslatesShape is the end-to-end form of the 2026-08-17
-// probe result (internal/adapter/anthropic_wire.go's PROVENANCE): a CLAUDE_CODE_OAUTH_TOKEN secret
-// under mitm:true now produces the OAuth wire rule — Bearer on authorization, with the token forwarded
-// verbatim — while the CONTAINER sees an OAuth-shaped placeholder under CLAUDE_CODE_OAUTH_TOKEN, the
-// same variable the user supplied (SHAPE MIRRORING). That is the §6.14 claim this whole task exists
-// for: the real credential never rides SecretsBundle, and Claude Code runs its own OAuth code path.
-func TestApplyAdapterMITMSubscriptionTokenTranslatesShape(t *testing.T) {
-	spec := &task.RunSpec{
-		Questions: task.QuestionsPolicy{Mode: task.QuestionFail},
-		Network: task.NetworkPolicy{
-			Mode: task.NetworkAllowlist, Allow: []string{"api.anthropic.com"}, MITM: true,
-		},
-	}
-	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("CLAUDE_CODE_OAUTH_TOKEN")); err != nil {
-		t.Fatalf("applyAdapter: %v", err)
-	}
-	if len(spec.Network.Inject) != 1 {
-		t.Fatalf("want one adapter-produced inject rule, got %+v", spec.Network.Inject)
-	}
-	rule := spec.Network.Inject[0]
-	if rule.Set["authorization"] != "CLAUDE_CODE_OAUTH_TOKEN" || rule.SetPrefix["authorization"] != "Bearer " {
-		t.Errorf("unexpected auth translation: Set=%v SetPrefix=%v", rule.Set, rule.SetPrefix)
-	}
-	if err := task.ValidateNetworkPolicy(spec.Network, keySet("CLAUDE_CODE_OAUTH_TOKEN")); err != nil {
-		t.Errorf("adapter-produced rule failed re-validation: %v", err)
-	}
-	// The token is withheld from the guest bundle entirely, and the container is configured
-	// OAuth-shaped with the placeholder under its own env var (SHAPE MIRRORING, not API-key-shaped).
-	if !spec.Network.InjectedSecretKeys()["CLAUDE_CODE_OAUTH_TOKEN"] {
-		t.Error("the OAuth token must be withheld from SecretsBundle once it is injected host-side")
-	}
-	// Shape mirroring: the container is configured with the SAME variable the user supplied,
-	// carrying a placeholder — that is what makes Claude Code run its subscription code path.
-	if got := spec.Env["CLAUDE_CODE_OAUTH_TOKEN"]; got != "sk-ant-oat01-krayt-placeholder-do-not-use" {
-		t.Errorf("spec.Env[CLAUDE_CODE_OAUTH_TOKEN] = %q, want the OAuth placeholder", got)
-	}
-	if _, wrong := spec.Env["ANTHROPIC_API_KEY"]; wrong {
-		t.Errorf("an OAuth run must not configure ANTHROPIC_API_KEY; env = %v", spec.Env)
-	}
-	// Without this the published entrypoints find no /run/secrets file, conclude they have no
-	// credential, and exit 78 before the agent starts (§8.2).
-	if spec.Env["KRAYT_INJECTED_CREDENTIAL"] != "CLAUDE_CODE_OAUTH_TOKEN" {
-		t.Errorf("KRAYT_INJECTED_CREDENTIAL = %q, want CLAUDE_CODE_OAUTH_TOKEN; env = %v",
-			spec.Env["KRAYT_INJECTED_CREDENTIAL"], spec.Env)
-	}
-}
-
-// TestApplyAdapterNoMITMSubscriptionTokenUnchanged is the other half: with mitm off, the OAuth
-// token still rides SecretsBundle exactly as it did before shape translation existed. Every run
-// that does not opt into mitm must be byte-identical to the pre-task behavior.
-func TestApplyAdapterNoMITMSubscriptionTokenUnchanged(t *testing.T) {
-	spec := &task.RunSpec{
-		Questions: task.QuestionsPolicy{Mode: task.QuestionFail},
-		Network:   task.NetworkPolicy{Mode: task.NetworkAllowlist},
-	}
-	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("CLAUDE_CODE_OAUTH_TOKEN")); err != nil {
-		t.Fatalf("applyAdapter: %v", err)
-	}
-	if len(spec.Network.Inject) != 0 {
-		t.Errorf("mitm:false must produce no inject rule; got %+v", spec.Network.Inject)
-	}
-	if spec.Env["ANTHROPIC_API_KEY"] == adapter.AnthropicPlaceholderAPIKey {
-		t.Error("mitm:false must not configure the container with the injection placeholder")
-	}
-}
-
-// TestApplyAdapterMergePrecedenceUserWins proves §4's merge rule: a user-written network.inject
-// rule for the SAME host+header the adapter would also set wins, and the override is logged.
+// TestApplyAdapterMergePrecedenceUserWins proves the merge rule: a user-written network.inject
+// scope for the SAME credential the adapter would also scope wins outright, and the override is
+// logged (task.MergeSecretSpecs).
 func TestApplyAdapterMergePrecedenceUserWins(t *testing.T) {
 	spec := &task.RunSpec{
 		Questions: task.QuestionsPolicy{Mode: task.QuestionFail},
 		Network: task.NetworkPolicy{
-			Mode: task.NetworkAllowlist, Allow: []string{"api.anthropic.com"}, MITM: true,
-			Inject: []task.InjectRule{{
-				Host: "api.anthropic.com",
-				Set:  map[string]string{"x-api-key": "MY_OWN_KEY"},
-			}},
+			Mode: task.NetworkAllowlist, Allow: []string{"api.anthropic.com", "my-proxy.example.com"},
+			Secrets: []task.SecretSpec{{Key: "ANTHROPIC_API_KEY", Hosts: []string{"my-proxy.example.com"}}},
 		},
 	}
 	var logbuf bytes.Buffer
-	if err := applyAdapter(&logbuf, spec, "claude-code", keySet("ANTHROPIC_API_KEY", "MY_OWN_KEY")); err != nil {
+	if err := applyAdapter(&logbuf, spec, "claude-code", keySet("ANTHROPIC_API_KEY")); err != nil {
 		t.Fatalf("applyAdapter: %v", err)
 	}
-	if len(spec.Network.Inject) != 1 {
-		t.Fatalf("want the two host-matching rules merged into one, got %+v", spec.Network.Inject)
+	if len(spec.Network.Secrets) != 1 {
+		t.Fatalf("want the user's own scope to win outright, got %+v", spec.Network.Secrets)
 	}
-	if got := spec.Network.Inject[0].Set["x-api-key"]; got != "MY_OWN_KEY" {
-		t.Errorf("x-api-key = %q, want the user's own MY_OWN_KEY to win", got)
+	if got := spec.Network.Secrets[0].Hosts; len(got) != 1 || got[0] != "my-proxy.example.com" {
+		t.Errorf("hosts = %v, want the user's own my-proxy.example.com to win", got)
 	}
-	if !strings.Contains(logbuf.String(), "x-api-key") || !strings.Contains(logbuf.String(), "api.anthropic.com") {
+	if !strings.Contains(logbuf.String(), "ANTHROPIC_API_KEY") {
 		t.Errorf("override was not logged: %q", logbuf.String())
 	}
 }
 
-// TestApplyAdapterUnallowlistedHostFailsPreflight proves an adapter rule is held to exactly the
-// same pre-flight standard as a hand-written one (§4): if the user's `network.allow` doesn't name
-// the host the adapter wants to inject on, the merged set fails ValidateNetworkPolicy before any
-// VM work, the same way a typo'd hand-written rule would.
+// TestApplyAdapterUnallowlistedHostFailsPreflight proves an adapter-scoped credential is held to
+// exactly the same pre-flight standard as a hand-written one: if the user's `network.allow`
+// doesn't name the host the adapter wants to scope, the merged set fails
+// ValidateNetworkPolicyForMsb before any sandbox work, the same way a typo'd hand-written scope
+// would.
 func TestApplyAdapterUnallowlistedHostFailsPreflight(t *testing.T) {
 	spec := &task.RunSpec{
 		Questions: task.QuestionsPolicy{Mode: task.QuestionFail},
-		Network:   task.NetworkPolicy{Mode: task.NetworkAllowlist, Allow: []string{"example.com"}, MITM: true},
+		Network:   task.NetworkPolicy{Mode: task.NetworkAllowlist, Allow: []string{"example.com"}},
 	}
 	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("ANTHROPIC_API_KEY")); err != nil {
 		t.Fatalf("applyAdapter: %v", err)
 	}
-	err := task.ValidateNetworkPolicy(spec.Network, keySet("ANTHROPIC_API_KEY"))
+	err := task.ValidateNetworkPolicyForMsb(spec.Network, keySet("ANTHROPIC_API_KEY"), secretsToInjectRules(spec.Network.Secrets))
 	if err == nil || !strings.Contains(err.Error(), "must also be in allow") {
 		t.Fatalf("want a not-in-allow pre-flight error for the adapter's own host; got %v", err)
+	}
+}
+
+// TestApplyAdapterMITMIsHardErroredByValidation proves network.mitm — kept only so a config that
+// still sets it is caught rather than silently dropped — passes cleanly through applyAdapter (it
+// is not this function's job to reject it) but fails the subsequent msb pre-flight validation.
+func TestApplyAdapterMITMIsHardErroredByValidation(t *testing.T) {
+	spec := &task.RunSpec{
+		Questions: task.QuestionsPolicy{Mode: task.QuestionFail},
+		Network:   task.NetworkPolicy{Mode: task.NetworkAllowlist, Allow: []string{"api.anthropic.com"}, MITM: true},
+	}
+	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("ANTHROPIC_API_KEY")); err != nil {
+		t.Fatalf("applyAdapter: %v", err)
+	}
+	err := task.ValidateNetworkPolicyForMsb(spec.Network, keySet("ANTHROPIC_API_KEY"), secretsToInjectRules(spec.Network.Secrets))
+	if err == nil || !strings.Contains(err.Error(), "mitm") {
+		t.Fatalf("want network.mitm to be hard-errored; got %v", err)
+	}
+}
+
+// TestApplyAdapterRecordsTranscriptDir: the adapter owns the in-guest path (it is the only thing
+// that knows which agent runs), and applyAdapter is where it reaches the spec. Recorded
+// unconditionally here — the --transcript gate lives at the call site, so this must not
+// second-guess it.
+func TestApplyAdapterRecordsTranscriptDir(t *testing.T) {
+	spec := &task.RunSpec{}
+	if err := applyAdapter(io.Discard, spec, "claude-code", keySet("ANTHROPIC_API_KEY")); err != nil {
+		t.Fatalf("applyAdapter: %v", err)
+	}
+	if spec.TranscriptDir != ".claude/projects" {
+		t.Errorf("TranscriptDir = %q, want the claude-code adapter's path", spec.TranscriptDir)
+	}
+
+	// `none` declares no path, so a run with no adapter can never capture one.
+	bare := &task.RunSpec{}
+	if err := applyAdapter(io.Discard, bare, "none", keySet()); err != nil {
+		t.Fatalf("applyAdapter(none): %v", err)
+	}
+	if bare.TranscriptDir != "" {
+		t.Errorf("TranscriptDir = %q for adapter none, want empty", bare.TranscriptDir)
 	}
 }

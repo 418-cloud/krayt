@@ -1,308 +1,276 @@
 package cli
 
 import (
-	"os"
-	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/418-cloud/krayt/internal/imagecache"
 	"github.com/418-cloud/krayt/internal/orchestrator"
-	"github.com/418-cloud/krayt/internal/vmimage"
+	"github.com/418-cloud/krayt/internal/sandbox"
 )
 
-// 64-char sha256 hex names for seeded container cache entries.
-const (
-	digInUse  = "1111111111111111111111111111111111111111111111111111111111111111"
-	digOld    = "2222222222222222222222222222222222222222222222222222222222222222"
-	digRecent = "3333333333333333333333333333333333333333333333333333333333333333"
-)
-
-// seedCacheEntry writes a one-file cache directory <base>/krayt/<kind>/<hex> and returns it.
-func seedCacheEntry(t *testing.T, base, kind, hex string, size int) string {
+// setupFakeMsb points sandbox.NewClient() (via sandbox.BinEnv) at this test binary re-exec'd as
+// msb (fakemsb_test.go) and writes script to a fresh $HOME, returning it so a test can inspect
+// fakeCallsFile afterward.
+func setupFakeMsb(t *testing.T, script fakeScript) string {
 	t.Helper()
-	dir := filepath.Join(base, "krayt", kind, hex)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
+	if testBinPath == "" {
+		t.Fatal("testBinPath not set — TestMain did not run (are tests being invoked oddly?)")
 	}
-	name := "rootfs.img"
-	if kind == "imagestore" {
-		name = "index.json"
-	}
-	if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return dir
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(sandbox.BinEnv, testBinPath)
+	writeFakeScript(t, home, script)
+	return home
 }
 
-// ageDir backdates a cache dir's mtime so List (absent a sentinel) reads it as last-used then.
-func ageDir(t *testing.T, dir string, age time.Duration) {
+// callsFor returns every recorded call whose first argv token is verb.
+func callsFor(t *testing.T, home, verb string) []fakeCall {
 	t.Helper()
-	when := time.Now().Add(-age)
-	if err := os.Chtimes(dir, when, when); err != nil {
-		t.Fatal(err)
+	var out []fakeCall
+	for _, c := range readFakeCalls(t, home) {
+		if len(c.Args) > 0 && c.Args[0] == verb {
+			out = append(out, c)
+		}
 	}
-}
-
-// seedRunImage writes a minimal non-terminal run meta.json with a custom image_ref.
-func seedRunImage(t *testing.T, repo, id, state, imageRef string) {
-	t.Helper()
-	runDir := orchestrator.RunDir(filepath.Join(repo, ".krayt"), id)
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	meta := `{"id":"` + id + `","state":"` + state + `","exit_code":0,"image_ref":"` + imageRef + `","started_at":"2026-07-01T00:00:00Z","pid":0}`
-	write(t, filepath.Join(runDir, "meta.json"), meta)
-}
-
-func pinnedHex(t *testing.T) string {
-	t.Helper()
-	if vmimage.PinnedDigest == "" {
-		t.Skip("no pinned base image digest set")
-	}
-	return vmimage.PinnedDigest.Encoded()
+	return out
 }
 
 func TestImageLs(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
-	pinned := pinnedHex(t)
-	seedCacheEntry(t, base, "vmimage", pinned, 1024)
-	seedCacheEntry(t, base, "imagestore", digRecent, 2048)
+	setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"images --format json": {ExitCode: 0, Stdout: `[` +
+			`{"reference":"ghcr.io/x/agent:latest","size":1073741824},` +
+			`{"reference":"ghcr.io/x/other:v1","size":2048}` +
+			`]`},
+	}})
 
 	out := run(t, newImageLsCmd())
-	for _, want := range []string{"vmimage", "container", pinned[:12], digRecent[:12], "(pinned)", "2 images"} {
+	for _, want := range []string{"REF", "SIZE", "ghcr.io/x/agent:latest", "1.0GiB", "ghcr.io/x/other:v1", "2.0KiB", "2 images"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("ls output missing %q; got:\n%s", want, out)
 		}
 	}
-	// The pinned mark must sit on the vmimage row, not the container row.
-	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "(pinned)") && !strings.Contains(line, "vmimage") {
-			t.Errorf("(pinned) on a non-vmimage row: %q", line)
-		}
+}
+
+func TestImageLsEmpty(t *testing.T) {
+	setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"images --format json": {ExitCode: 0, Stdout: `[]`},
+	}})
+	out := run(t, newImageLsCmd())
+	if !strings.Contains(out, "0 images") {
+		t.Errorf("empty ls output = %q", out)
+	}
+}
+
+func TestImagePull(t *testing.T) {
+	setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"pull ghcr.io/x/agent:latest": {ExitCode: 0},
+	}})
+	out := run(t, newImagePullCmd(), "ghcr.io/x/agent:latest")
+	if !strings.Contains(out, "pulled ghcr.io/x/agent:latest") {
+		t.Errorf("pull output = %q", out)
+	}
+}
+
+func TestImageRm(t *testing.T) {
+	home := setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"rmi": {ExitCode: 0},
+	}})
+	out := run(t, newImageRmCmd(), "ghcr.io/x/agent:latest")
+	if !strings.Contains(out, "removed ghcr.io/x/agent:latest") {
+		t.Errorf("rm output = %q", out)
+	}
+	calls := callsFor(t, home, "rmi")
+	if len(calls) != 1 {
+		t.Fatalf("want 1 rmi call, got %d", len(calls))
+	}
+	want := []string{"rmi", "ghcr.io/x/agent:latest"}
+	if !reflect.DeepEqual(calls[0].Args, want) {
+		t.Errorf("rmi args = %v, want %v", calls[0].Args, want)
+	}
+}
+
+func TestImageRmForce(t *testing.T) {
+	home := setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"rmi": {ExitCode: 0},
+	}})
+	_ = run(t, newImageRmCmd(), "--force", "ghcr.io/x/agent:latest")
+	calls := callsFor(t, home, "rmi")
+	want := []string{"rmi", "--force", "ghcr.io/x/agent:latest"}
+	if len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, want) {
+		t.Errorf("rmi --force args = %v, want %v", calls, want)
+	}
+}
+
+func TestImageRmError(t *testing.T) {
+	setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"rmi": {ExitCode: 1, Stderr: "no such image"},
+	}})
+	if err := execErr(newImageRmCmd(), "ghcr.io/x/nope:latest"); err == nil {
+		t.Error("rm of a nonexistent ref should error")
 	}
 }
 
 func TestImageRmCompletion(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
-	pinned := pinnedHex(t)
-	seedCacheEntry(t, base, "vmimage", pinned, 1024)
-	seedCacheEntry(t, base, "imagestore", digRecent, 2048)
-
+	setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"images -q": {ExitCode: 0, Stdout: "ghcr.io/x/agent:latest\nghcr.io/x/other:v1\n"},
+	}})
 	cmd := newImageRmCmd()
 	comps, dir := cmd.ValidArgsFunction(cmd, nil, "")
 	if dir != cobra.ShellCompDirectiveNoFileComp {
 		t.Errorf("directive = %v, want NoFileComp", dir)
 	}
-
-	// The completion value is the full encoded digest, annotated with kind, size, and the
-	// pinned mark on the base image only.
-	want := map[string]string{
-		pinned:    "vmimage, 1.0KiB (pinned)",
-		digRecent: "container, 2.0KiB",
-	}
-	got := map[string]string{}
-	for _, c := range comps {
-		id, desc, _ := strings.Cut(c, "\t")
-		got[id] = desc
-	}
-	for id, desc := range want {
-		if got[id] != desc {
-			t.Errorf("completion for %s = %q, want %q", id[:12], got[id], desc)
-		}
-	}
-	if len(got) != len(want) {
-		t.Errorf("got %d completions, want %d: %v", len(got), len(want), comps)
+	want := []string{"ghcr.io/x/agent:latest", "ghcr.io/x/other:v1"}
+	if !reflect.DeepEqual(comps, want) {
+		t.Errorf("rm completion = %v, want %v", comps, want)
 	}
 
-	// Once the single positional arg is present, no further suggestions.
-	if comps, dir := cmd.ValidArgsFunction(cmd, []string{pinned}, ""); comps != nil || dir != cobra.ShellCompDirectiveNoFileComp {
+	if comps, dir := cmd.ValidArgsFunction(cmd, []string{"ghcr.io/x/agent:latest"}, ""); comps != nil || dir != cobra.ShellCompDirectiveNoFileComp {
 		t.Errorf("second-arg completion = (%v, %v), want (nil, NoFileComp)", comps, dir)
 	}
 }
 
-func TestImageRm(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
-	dir := seedCacheEntry(t, base, "imagestore", digRecent, 100)
-
-	// A no-match prefix errors and deletes nothing.
-	if err := execErr(newImageRmCmd(), "deadbeef"); err == nil {
-		t.Error("rm of a non-existent digest should error")
-	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Errorf("no-match rm should not have deleted anything: %v", err)
-	}
-
-	// An unambiguous prefix removes exactly that entry.
-	out := run(t, newImageRmCmd(), digRecent[:8])
-	if !strings.Contains(out, "reclaimed") {
-		t.Errorf("rm output = %q", out)
-	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Errorf("entry should be gone after rm: %v", err)
-	}
-}
-
-func TestImageRmAmbiguous(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
-	// Two container digests sharing a prefix.
-	a := "ab11111111111111111111111111111111111111111111111111111111111111"
-	b := "ab22222222222222222222222222222222222222222222222222222222222222"
-	dirA := seedCacheEntry(t, base, "imagestore", a, 10)
-	dirB := seedCacheEntry(t, base, "imagestore", b, 10)
-
-	if err := execErr(newImageRmCmd(), "ab"); err == nil {
-		t.Error("ambiguous prefix should error")
-	}
-	for _, d := range []string{dirA, dirB} {
-		if _, err := os.Stat(d); err != nil {
-			t.Errorf("ambiguous rm should not have deleted %s: %v", d, err)
-		}
-	}
-}
-
-func TestImageRmPinnedNeedsForce(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
-	pinned := pinnedHex(t)
-	dir := seedCacheEntry(t, base, "vmimage", pinned, 100)
-
-	// Without --force the pinned base image is refused, untouched.
-	if err := execErr(newImageRmCmd(), pinned[:12]); err == nil {
-		t.Error("rm of the pinned base image without --force should error")
-	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Errorf("pinned image should survive a --force-less rm: %v", err)
-	}
-
-	// With --force it is removed.
-	_ = run(t, newImageRmCmd(), "--force", pinned[:12])
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Errorf("pinned image should be gone after rm --force: %v", err)
-	}
-}
-
+// TestImagePruneRetention covers decision 3's full policy: an image protected by a non-terminal
+// run, one protected by the age window, one used but stale (beyond the window, no active run),
+// and one with no run record at all (neither protection) — the two must be removed, the two must
+// survive.
 func TestImagePruneRetention(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
+	home := setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"images --format json": {ExitCode: 0, Stdout: `[` +
+			`{"reference":"img:live","size":100},` +
+			`{"reference":"img:recent","size":200},` +
+			`{"reference":"img:stale","size":300},` +
+			`{"reference":"img:orphan","size":400}` +
+			`]`},
+		"rmi":   {ExitCode: 0},
+		"image": {ExitCode: 0},
+	}})
 	repo := t.TempDir()
-	pinned := pinnedHex(t)
+	now := time.Now().UTC()
 
-	pinnedDir := seedCacheEntry(t, base, "vmimage", pinned, 100)
-	// A stale, non-pinned vmimage entry — always removed.
-	staleVM := seedCacheEntry(t, base, "vmimage", digOld, 100)
-	inUseDir := seedCacheEntry(t, base, "imagestore", digInUse, 100)
-	oldDir := seedCacheEntry(t, base, "imagestore", digOld, 100)
-	ageDir(t, oldDir, 72*time.Hour) // beyond the default 24h window
-
-	// A running run pins digInUse by a digest ref → protected.
-	seedRunImage(t, repo, "run_live", "running", "ghcr.io/x/y@sha256:"+digInUse)
+	seedRunRecord(t, repo, orchestrator.RunRecord{
+		ID: "run_live", State: "running", ImageRef: "img:live",
+		StartedAt: now.Format(time.RFC3339),
+	})
+	seedRunRecord(t, repo, orchestrator.RunRecord{
+		ID: "run_recent", State: "done", ImageRef: "img:recent",
+		StartedAt: now.Add(-2 * time.Hour).Format(time.RFC3339),
+		EndedAt:   now.Add(-1 * time.Hour).Format(time.RFC3339),
+	})
+	seedRunRecord(t, repo, orchestrator.RunRecord{
+		ID: "run_stale", State: "done", ImageRef: "img:stale",
+		StartedAt: now.Add(-74 * time.Hour).Format(time.RFC3339),
+		EndedAt:   now.Add(-72 * time.Hour).Format(time.RFC3339),
+	})
+	// img:orphan has no run record at all.
 
 	out := run(t, newImagePruneCmd(), "--repo", repo)
-	// Kept: pinned base image + the in-use container. Removed: stale vmimage + old container.
-	if _, err := os.Stat(pinnedDir); err != nil {
-		t.Errorf("pinned base image must survive prune: %v", err)
+
+	if !strings.Contains(out, "kept img:live (in use by run_live)") {
+		t.Errorf("prune output missing the in-use keep; got:\n%s", out)
 	}
-	if _, err := os.Stat(inUseDir); err != nil {
-		t.Errorf("in-use container must survive prune: %v", err)
+	if !strings.Contains(out, "kept img:recent (used 1h ago)") {
+		t.Errorf("prune output missing the age-window keep; got:\n%s", out)
 	}
-	if _, err := os.Stat(staleVM); !os.IsNotExist(err) {
-		t.Errorf("stale non-pinned vmimage should be pruned: %v", err)
+	if !strings.Contains(out, "removed img:stale") {
+		t.Errorf("prune output should remove the stale, unreferenced-by-any-active-run image; got:\n%s", out)
 	}
-	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
-		t.Errorf("old unreferenced container should be pruned: %v", err)
+	if !strings.Contains(out, "removed img:orphan") {
+		t.Errorf("prune output should remove the never-run image (neither protection applies); got:\n%s", out)
 	}
-	if !strings.Contains(out, "in use by run_live") {
-		t.Errorf("prune summary should explain the in-use keep; got:\n%s", out)
+
+	rmiCalls := callsFor(t, home, "rmi")
+	if len(rmiCalls) != 2 {
+		t.Fatalf("want 2 rmi calls (stale + orphan), got %d: %v", len(rmiCalls), rmiCalls)
+	}
+	gotRefs := map[string]bool{}
+	for _, c := range rmiCalls {
+		gotRefs[c.Args[len(c.Args)-1]] = true
+	}
+	for _, ref := range []string{"img:stale", "img:orphan"} {
+		if !gotRefs[ref] {
+			t.Errorf("rmi was not called for %s", ref)
+		}
+	}
+	if calls := callsFor(t, home, "image"); len(calls) != 1 || !reflect.DeepEqual(calls[0].Args, []string{"image", "prune"}) {
+		t.Errorf("want exactly one `msb image prune` call, got %v", calls)
 	}
 }
 
 func TestImagePruneOlderThanZero(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
+	setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"images --format json": {ExitCode: 0, Stdout: `[` +
+			`{"reference":"img:live","size":100},` +
+			`{"reference":"img:recent","size":200}` +
+			`]`},
+		"rmi":   {ExitCode: 0},
+		"image": {ExitCode: 0},
+	}})
 	repo := t.TempDir()
-	pinned := pinnedHex(t)
+	now := time.Now().UTC()
+	seedRunRecord(t, repo, orchestrator.RunRecord{
+		ID: "run_live", State: "running", ImageRef: "img:live",
+		StartedAt: now.Format(time.RFC3339),
+	})
+	seedRunRecord(t, repo, orchestrator.RunRecord{
+		ID: "run_recent", State: "done", ImageRef: "img:recent",
+		StartedAt: now.Add(-2 * time.Minute).Format(time.RFC3339),
+		EndedAt:   now.Add(-1 * time.Minute).Format(time.RFC3339),
+	})
 
-	pinnedDir := seedCacheEntry(t, base, "vmimage", pinned, 100)
-	inUseDir := seedCacheEntry(t, base, "imagestore", digInUse, 100)
-	recentDir := seedCacheEntry(t, base, "imagestore", digRecent, 100) // touched now
-	seedRunImage(t, repo, "run_live", "running", "ghcr.io/x/y@sha256:"+digInUse)
-
-	_ = run(t, newImagePruneCmd(), "--repo", repo, "--older-than", "0s")
-	// Age protection is off, but pinned + in-use still hold; the recent one goes.
-	if _, err := os.Stat(pinnedDir); err != nil {
-		t.Errorf("pinned base image must survive --older-than 0s: %v", err)
+	out := run(t, newImagePruneCmd(), "--repo", repo, "--older-than", "0s")
+	if !strings.Contains(out, "kept img:live") {
+		t.Errorf("in-use image must survive --older-than 0s; got:\n%s", out)
 	}
-	if _, err := os.Stat(inUseDir); err != nil {
-		t.Errorf("in-use container must survive --older-than 0s: %v", err)
-	}
-	if _, err := os.Stat(recentDir); !os.IsNotExist(err) {
-		t.Errorf("recent unreferenced container should be pruned by --older-than 0s: %v", err)
+	if !strings.Contains(out, "removed img:recent") {
+		t.Errorf("recent-but-inactive image should be pruned by --older-than 0s; got:\n%s", out)
 	}
 }
 
 func TestImagePruneAll(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
+	home := setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"images --format json": {ExitCode: 0, Stdout: `[` +
+			`{"reference":"img:live","size":100},` +
+			`{"reference":"img:recent","size":200}` +
+			`]`},
+		"rmi":   {ExitCode: 0},
+		"image": {ExitCode: 0},
+	}})
 	repo := t.TempDir()
-	pinned := pinnedHex(t)
+	now := time.Now().UTC()
+	seedRunRecord(t, repo, orchestrator.RunRecord{
+		ID: "run_live", State: "running", ImageRef: "img:live",
+		StartedAt: now.Format(time.RFC3339),
+	})
 
-	pinnedDir := seedCacheEntry(t, base, "vmimage", pinned, 100)
-	inUseDir := seedCacheEntry(t, base, "imagestore", digInUse, 100)
-	recentDir := seedCacheEntry(t, base, "imagestore", digRecent, 100)
-	seedRunImage(t, repo, "run_live", "running", "ghcr.io/x/y@sha256:"+digInUse)
-
-	_ = run(t, newImagePruneCmd(), "--repo", repo, "--all")
-	// --all bypasses both container protections but never the pinned base image.
-	if _, err := os.Stat(pinnedDir); err != nil {
-		t.Errorf("pinned base image must survive --all: %v", err)
+	out := run(t, newImagePruneCmd(), "--repo", repo, "--all")
+	for _, want := range []string{"removed img:live", "removed img:recent"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--all output missing %q; got:\n%s", want, out)
+		}
 	}
-	if _, err := os.Stat(inUseDir); !os.IsNotExist(err) {
-		t.Errorf("--all should remove even an in-use container: %v", err)
-	}
-	if _, err := os.Stat(recentDir); !os.IsNotExist(err) {
-		t.Errorf("--all should remove even a recent container: %v", err)
+	if calls := callsFor(t, home, "rmi"); len(calls) != 2 {
+		t.Errorf("--all should call msb rmi for every image (even in-use), got %d calls: %v", len(calls), calls)
 	}
 }
 
 func TestImagePruneDryRun(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
+	home := setupFakeMsb(t, fakeScript{Responses: map[string]fakeResponse{
+		"images --format json": {ExitCode: 0, Stdout: `[{"reference":"img:orphan","size":100}]`},
+	}})
 	repo := t.TempDir()
 
-	oldDir := seedCacheEntry(t, base, "imagestore", digOld, 100)
-	ageDir(t, oldDir, 72*time.Hour)
-
 	out := run(t, newImagePruneCmd(), "--repo", repo, "--dry-run")
-	if _, err := os.Stat(oldDir); err != nil {
-		t.Errorf("--dry-run must not delete anything: %v", err)
+	if !strings.Contains(out, "would remove img:orphan") {
+		t.Errorf("--dry-run output = %q", out)
 	}
-	if !strings.Contains(out, "would remove") {
-		t.Errorf("--dry-run should say what it would remove; got:\n%s", out)
+	if calls := callsFor(t, home, "rmi"); len(calls) != 0 {
+		t.Errorf("--dry-run must not call msb rmi; got %v", calls)
 	}
-}
-
-// TestImageLsLastUsedSentinel checks the LAST USED column reads the sentinel mtime.
-func TestImageLsLastUsedSentinel(t *testing.T) {
-	base := t.TempDir()
-	t.Setenv("KRAYT_CACHE_DIR", base)
-	dir := seedCacheEntry(t, base, "imagestore", digRecent, 100)
-	if err := imagecache.Touch(dir); err != nil {
-		t.Fatal(err)
-	}
-	when := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)
-	if err := os.Chtimes(filepath.Join(dir, imagecache.SentinelName), when, when); err != nil {
-		t.Fatal(err)
-	}
-	out := run(t, newImageLsCmd())
-	if !strings.Contains(out, "2026-03-04") {
-		t.Errorf("ls LAST USED should reflect the sentinel mtime; got:\n%s", out)
+	if calls := callsFor(t, home, "image"); len(calls) != 0 {
+		t.Errorf("--dry-run must not call msb image prune; got %v", calls)
 	}
 }

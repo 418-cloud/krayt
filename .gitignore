@@ -15,6 +15,14 @@
 /krayt-ask
 /bin/
 
+# Embedded guest binaries (`make guest-bins`, add-krayt-guest-helper.md) — versioned with krayt
+# by construction, not committed; the directory itself is kept via a committed .gitkeep so
+# `//go:embed all:bin` has something to embed on a fresh clone.
+/internal/sandbox/guestbin/bin/krayt-helper-linux-amd64
+/internal/sandbox/guestbin/bin/krayt-helper-linux-arm64
+/internal/sandbox/guestbin/bin/krayt-ask-linux-amd64
+/internal/sandbox/guestbin/bin/krayt-ask-linux-arm64
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -38,11 +46,6 @@ secrets.env
 # Editor/IDE
 # .idea/
 # .vscode/
-
-# Nix build outputs / direnv
-result
-result-*
-.direnv/
 
 # krayt run state
 .krayt/

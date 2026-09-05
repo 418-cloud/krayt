@@ -35,9 +35,9 @@ prefer otherwise) once it's public.
 
 In scope:
 - Anything that breaks the isolation boundaries described in `KRAYT_SPEC.md` §10 — e.g. a
-  container escaping to the guest VM, a guest-VM escape to the host, egress-allowlist bypass,
-  secret leakage into a host artifact, or privilege escalation via a krayt-controlled path
-  (the vfkit socket root, the control protocol, patch generation, etc.).
+  container escaping the sandbox, a sandbox escape to the host, egress-allowlist bypass, secret
+  leakage into a host artifact, or privilege escalation via a krayt-controlled path (the ask
+  bridge's socket root, the msb driver, patch generation, etc.).
 - Supply-chain concerns in this repo's own build/release pipeline (CI workflows, Nix image build).
 
 Out of scope (already tracked, not new reports):

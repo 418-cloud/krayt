@@ -5,9 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/418-cloud/krayt/internal/controlclient"
 	"github.com/418-cloud/krayt/internal/orchestrator"
-	"github.com/418-cloud/krayt/internal/protocol/pb"
 )
 
 func newAnswerCmd() *cobra.Command {
@@ -37,22 +35,11 @@ func newAnswerCmd() *cobra.Command {
 				return err
 			}
 			if rec.CtrlSocket == "" {
-				return fmt.Errorf("run %q has no recorded control socket; cannot reach its guest", runID)
+				return fmt.Errorf("run %q has no recorded control socket; cannot reach its supervisor", runID)
 			}
 
-			client, err := controlclient.DialSocket(rec.CtrlSocket)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = client.Close() }()
-			ack, err := client.Agent.Answer(cmd.Context(), &pb.AnswerRequest{
-				QuestionId: qid, Response: response, NoAnswer: noAnswer,
-			})
-			if err != nil {
+			if err := orchestrator.DialRunControl(rec.CtrlSocket, qid, response, noAnswer); err != nil {
 				return fmt.Errorf("deliver answer: %w", err)
-			}
-			if !ack.GetOk() {
-				return fmt.Errorf("no pending question %q on run %q (already answered or timed out)", qid, runID)
 			}
 			// Complete the on-disk Q&A history (§6.13). Best-effort: the answer already reached
 			// the agent, so a history-write failure warns rather than fails the command.

@@ -204,7 +204,7 @@ func unionHeaders(a, b []string) []string {
 // One §1 rule is deliberately NOT checked here: "injection targets HTTPS only". Whether a given
 // request to a rule's host arrives over plain HTTP or HTTPS is a runtime property of what the
 // agent does, not something a static host name can encode — so it is enforced at request time
-// instead, in internal/proxy's plain-HTTP handler path (a request to an injection-configured
+// instead, in the pre-msb host proxy's plain-HTTP handler path (a request to an injection-configured
 // host over plain HTTP is refused with 400, never forwarded uninjected or injected in cleartext).
 func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 	if len(np.Inject) > 0 && !np.MITM {
@@ -401,10 +401,10 @@ func isTokenChar(r rune) bool {
 // so the failure is a pre-flight config error naming the entry instead of a silent difference
 // between the policy the user wrote and the one the run enforces.
 //
-// It is the pre-flight half of internal/proxy's normalizeHost (proxy.go). The invariant is
-// one-directional: everything this function ACCEPTS, normalizeHost must also accept and fold to
-// the same bare form. It may be stricter — pre-flight strictness can only fail a run before it
-// starts, never let through something the proxy would drop — and it is, for bracketed IPv6:
+// It was the pre-flight half of the pre-msb host proxy's normalizeHost, a one-directional
+// invariant: everything this function ACCEPTS, that proxy also accepted and folded to the same
+// bare form. It could be stricter — pre-flight strictness can only fail a run before it starts,
+// never let through something the proxy would drop — and it was, for bracketed IPv6:
 // normalizeHost unwraps "[::1]" to "::1", but this package's own cross-checks (passthrough ⊆
 // allow, inject.host ∈ allow) key on lower(), which does not, so "[::1]" in one list and "::1" in
 // another would fail to cross-match here. One spelling, demanded up front.
@@ -487,10 +487,8 @@ func validateHostEntry(h string) error {
 // lower folds a host/header name byte-wise over ASCII only — deliberately NOT strings.ToLower,
 // whose Unicode simple case folding maps U+0130 ('İ') onto ASCII 'i'. It only FOLDS, though; what
 // is acceptable as a host at all is validateHostEntry's job, and every host rule goes through
-// both. Together they are the pre-flight counterpart of internal/proxy's normalizeHost
-// (proxy.go), which enforces the same ASCII-only rule at the running proxy's choke point. The two
-// sides must stay in agreement: if either starts accepting or mapping a byte the other does not,
-// pre-flight validation and the proxy stop agreeing on what host a rule names.
+// both. Together they were the pre-flight counterpart of the pre-msb host proxy's normalizeHost,
+// which enforced the same ASCII-only rule at the running proxy's choke point.
 func lower(s string) string {
 	s = strings.TrimSpace(s)
 	b := []byte(s)

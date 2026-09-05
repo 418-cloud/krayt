@@ -5,8 +5,8 @@ name: Release Please
 # and uploaded in the same run (gated on release_created), so no PAT is needed — the default
 # GITHUB_TOKEN can't trigger a *separate* tag-driven workflow, but this runs in-workflow.
 #
-# The VM image releases on its own `vmimage-v*` tags (see .github/workflows/image.yml); the CLI
-# pins its digest via internal/vmimage/pinned.go. See RELEASING.md.
+# krayt ships no VM image (retire-vm-image-pipeline.md) — msb owns the sandbox image entirely
+# (docs/adr-microsandbox-sandbox-layer.md). See RELEASING.md.
 
 on:
   push:
@@ -49,14 +49,19 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Embed the guest binaries (add-krayt-guest-helper.md) before the cross-build loop below,
+      # so the released krayt binary embeds real krayt-helper binaries rather than an empty
+      # bin/ (.gitkeep only). This runner is already Linux with Go installed, so it's one line
+      # and no new runner; CGO stays off for this too (guest-bins itself sets CGO_ENABLED=0).
+      - run: make guest-bins
+
       # Pure-Go (CGO off): one Linux runner cross-builds every target. darwin/arm64 is the
       # supported macOS target; darwin/amd64 builds but is untested (see README). linux/amd64 is
-      # the supported Linux target — the only host arch the Firecracker backend has been verified
-      # on (Phase 7, real hardware). No linux/arm64: the base VM image isn't just arch-tagged, it's
-      # backend-tagged (images/flake.nix builds a PE `Image` for vfkit vs. an uncompressed ELF
-      # vmlinux for Firecracker), and the only published linux/arm64 image variant is the
-      # vfkit-formatted one — a linux/arm64 krayt would resolve to it via vmimage.selectPlatform
-      # and fail to boot under Firecracker. Add it once a Firecracker-compatible arm64 image exists.
+      # the supported Linux target. No linux/arm64 yet — msb itself supports it, but krayt hasn't
+      # verified a run on that host arch; tracked by expand-platforms-under-msb.md, not blocked by
+      # anything image-related any more (the old blocker — a krayt-owned, backend-tagged VM image
+      # with no arm64 Firecracker variant — went with the rest of the image pipeline;
+      # retire-vm-image-pipeline.md).
       - name: Build krayt (darwin/arm64, darwin/amd64, linux/amd64)
         run: |
           set -euo pipefail

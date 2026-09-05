@@ -7,6 +7,7 @@ image: my-agent:latest          # user OCI image (required, via flag or file)
 task: ./task.md                 # path to the task prompt
 repo: .                         # repo to snapshot (default: cwd)
 include_dirty: false            # include uncommitted working-tree changes (§6.7)
+transcript: false               # capture the agent's session transcript into logs/transcript/ (§8.4)
 bundle_depth: 1                 # forward-bundle shallow depth; 0 = full history (§6.7)
 
 network:

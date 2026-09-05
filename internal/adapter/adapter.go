@@ -5,9 +5,8 @@
 // wiring the krayt-ask question front-end when a run pauses for human input (§6.13).
 //
 // It is host-side and pre-flight: Prepare validates and returns environment additions before
-// the VM boots, so a misconfigured run fails fast (before the image is pulled). The in-VM
-// export of the credential is the container entrypoint's job (§8.2); MCP-server registration
-// is Phase 6.
+// the sandbox is created, so a misconfigured run fails fast (before the image is even resolved).
+// The in-container export of the credential is the entrypoint's job (§8.2).
 package adapter
 
 import (
@@ -22,26 +21,36 @@ import (
 // the values — of the per-task secrets, so the adapter can select/validate the auth credential
 // without touching secret material.
 type Input struct {
-	SecretKeys    []string        // names of the per-task secrets
-	QuestionsWait bool            // --on-question=wait: wire the krayt-ask front-end (§6.13)
-	AskSocket     string          // container path to the ask-bridge socket (§6.13)
-	InjectedKeys  map[string]bool // secrets-file keys withheld from SecretsBundle by network.inject (§6.6.1)
-	MITM          bool            // network.mitm is on (inject-claude-oauth-token-at-proxy.md): the
-	// adapter may respond by translating its selected credential's shape instead of shipping it
-	// via SecretsBundle at all. False for every existing caller/test unless set explicitly, so an
-	// adapter that doesn't check it keeps today's behavior byte for byte.
+	SecretKeys    []string // names of the per-task secrets
+	QuestionsWait bool     // --on-question=wait: wire the krayt-ask front-end (§6.13)
+	AskSocket     string   // KRAYT_ASK_SOCKET value the container should dial (§6.13, §8.2)
 }
 
 // Plan is an adapter's host-side contribution to a run: non-secret env additions for the
 // container, the secret key it selected as the model credential (for the report — the value
-// stays in the secrets bundle, never here), host-side injection rules the run should merge into
-// network.inject (inject-claude-oauth-token-at-proxy.md §2), and non-secret placeholder env vars
-// standing in for a credential delivered that way instead of via SecretsBundle.
+// itself never appears here), and the network-scoped secret declarations
+// (hand-secrets-to-msb.md) the run should merge into its own — msb substitutes the credential's
+// value at the host TLS boundary for exactly these hosts; it never rides the container's env or
+// filesystem as a real value.
 type Plan struct {
-	Env          map[string]string
-	Credential   string
-	Inject       []task.InjectRule // host-side injection the orchestrator applies; requires MITM
-	Placeholders map[string]string // container env standing in for a host-only secret; never a real value
+	Env        map[string]string
+	Credential string
+	Secrets    []task.SecretSpec
+
+	// TranscriptDir is where this agent writes its own session transcript, as a path RELATIVE to
+	// the container user's $HOME. Empty means the adapter has no transcript to collect, which is
+	// also what `none` returns — the run then captures nothing.
+	//
+	// Relative, not absolute, because the images disagree on the home directory: claude-code and
+	// krayt-dev run as `agent` out of /home/agent, gemini-cli as `node` out of /home/node. The
+	// orchestrator resolves $HOME inside the guest at capture time and joins it to this, so a
+	// future image that moves its user does not silently capture nothing.
+	//
+	// Only claude-code's value is verified (documented, and no image sets CLAUDE_CONFIG_DIR or any
+	// XDG override). The other two are inferred from each CLI's conventions and unexercised — which
+	// is safe by construction: a wrong path makes the copy fail and the run carries on without a
+	// transcript, exactly as it does today.
+	TranscriptDir string
 }
 
 // Adapter is one agent integration. Name is the config/flag value (§8.1 `agent.adapter`).
@@ -80,24 +89,6 @@ func askEnv(in Input) map[string]string {
 		return nil
 	}
 	return map[string]string{"KRAYT_ASK_SOCKET": in.AskSocket}
-}
-
-// credentialEnv is askEnv's env plus, when the adapter's selected credential is delivered by
-// host-side proxy injection rather than SecretsBundle (network.mitm + inject, §6.6.1),
-// KRAYT_INJECTED_CREDENTIAL naming it. The value never enters the VM either way; this only tells
-// the container entrypoint which recognized key to treat as satisfied without a /run/secrets
-// file that will never arrive, so it can export a placeholder for it and start — the real header
-// is attached to outgoing requests by the host proxy regardless of what the container sends.
-func credentialEnv(in Input, cred string) map[string]string {
-	env := askEnv(in)
-	if !in.InjectedKeys[cred] {
-		return env
-	}
-	if env == nil {
-		env = map[string]string{}
-	}
-	env["KRAYT_INJECTED_CREDENTIAL"] = cred
-	return env
 }
 
 // exactlyOne selects the single credential key present among the recognized set, erroring on
