@@ -129,6 +129,18 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	sort.Strings(secretKeyNames)
 	hasSecrets := len(specs) > 0
 
+	// sandbox.extra_conf (§8.1): digest the file up front, before any VM work, so an unreadable
+	// path fails fast the same way a bad secrets file does, and so the digest recorded in
+	// meta.json (decision 5) is of exactly the bytes this run used, not a later edit.
+	var extraConfMeta *ExtraConfMeta
+	if spec.ExtraConf != "" {
+		d, derr := digestFile(spec.ExtraConf)
+		if derr != nil {
+			return nil, fmt.Errorf("orchestrator: read sandbox.extra_conf: %w", derr)
+		}
+		extraConfMeta = &ExtraConfMeta{Path: spec.ExtraConf, Digest: d.String()}
+	}
+
 	name := sandboxName(spec.ID)
 	rec := RunRecord{
 		ID: spec.ID, ImageRef: spec.ImageRef, RepoPath: spec.RepoPath,
@@ -145,6 +157,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		QuestionMode: string(spec.Questions.Mode),
 		State:        StateStarting, StartedAt: nowStamp(), PID: os.Getpid(),
 		SandboxName: name,
+		ExtraConf:   extraConfMeta,
 	}
 	// recMu guards every read/mutation of rec and every writeRecord(runDir, rec) call below: rec is
 	// also touched from the ask-bridge and run-control goroutines (setState, and the connection
@@ -306,6 +319,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		Vsock:       vsockRoutes,
 		Secrets:     secretRefs,
 		Security:    sandboxSecurity,
+		ExtraConf:   spec.ExtraConf,
 		ExtraArgs:   netArgs,
 	}
 	if err := deps.Sandbox.Create(ctx, createSpec, secretEnv); err != nil {

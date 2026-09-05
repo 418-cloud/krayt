@@ -267,6 +267,20 @@ func TestApplyConfigAutoLoadedSecurityFields(t *testing.T) {
 				t.Error("readonly_rootfs = false, want true from the file")
 			}
 		},
+	}, {
+		// sandbox.extra_conf joins network.mitm/inject/passthrough: an unvalidated msb config can
+		// mount host paths into the guest or widen a declared secret's allowed hosts (§8.1, §10), so
+		// a repo the operator did not write must not be able to name it.
+		name:    "sandbox extra_conf",
+		yaml:    "sandbox:\n  extra_conf: extra.yaml\n",
+		wantErr: "sandbox.extra_conf",
+		check: func(t *testing.T, f *runFlags) {
+			// Resolved relative to the directory holding the config file that named it (this
+			// helper always writes it as <dir>/krayt.yaml), not the repo root or the cwd.
+			if base := filepath.Base(f.extraConf); base != "extra.yaml" {
+				t.Errorf("extraConf = %q, want it to resolve to extra.yaml", f.extraConf)
+			}
+		},
 	}}
 
 	for _, tc := range cases {
@@ -384,6 +398,7 @@ type configFieldCase struct {
 //	Container.Capabilities   REFUSED
 //	Container.Seccomp        REFUSED for "unconfined" only
 //	Container.ReadonlyRootfs SAFE — it only tightens
+//	Sandbox.ExtraConf        REFUSED — unvalidated msb config; can mount host paths or widen a secret's scope
 func TestConfigFieldsAccountedFor(t *testing.T) {
 	claimed := map[string]bool{} // yaml paths the buckets below account for
 
@@ -402,6 +417,9 @@ func TestConfigFieldsAccountedFor(t *testing.T) {
 		}},
 		{"container.seccomp: unconfined", []string{"container.seccomp"}, func(c *task.Config) {
 			c.Container.Seccomp = "unconfined"
+		}},
+		{"sandbox.extra_conf", []string{"sandbox.extra_conf"}, func(c *task.Config) {
+			c.Sandbox.ExtraConf = "extra.yaml"
 		}},
 	}
 	for _, r := range refused {

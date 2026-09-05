@@ -1,6 +1,6 @@
 # msb-probes — the feasibility gate for the microsandbox (B1) migration
 
-**All six of P1–P6 have run — P1–P5 on msb 0.6.16, 2026-08-29/30; P6 and P7 on 2026-09-04, same machine.** The outcomes live in
+**All eight probes have now run — P1–P5 on msb 0.6.16, 2026-08-29/30; P6 and P7 on 2026-09-04; P8 on 2026-09-05, same machine.** The outcomes live in
 `KRAYT_SPEC.md` §14 Phase 11's feasibility-gate item and `docs/ai-tasks/README.md`'s row 1, not
 here; what follows is what each probe asks and how to re-run it. The one thread left is P4 on
 Linux/KVM — see its row below. **P1's 2026-09-02 re-runs found a real defect**: msb 0.6.16's vsock
@@ -9,13 +9,16 @@ completed that way, against 25 of 25 when the host waits for the guest. `interna
 waits (`lingerUntilPeerCloses`, `KRAYT_SPEC.md` §6.13), and P1 is the regression check that would
 catch msb changing this back.
 
-Seven scripts that answered the questions
+Seven scripts (P1–P7) answered the questions
 [`docs/adr-microsandbox-sandbox-layer.md`](../../docs/adr-microsandbox-sandbox-layer.md) had left
-unverified against real hardware. They are **not** part of `hack/run-integration-tests.sh` and do
-not run in CI — microsandbox (`msb`) is not installed on any CI runner, and these exercise a
-third-party binary against real hardware, not krayt code. Each prints exactly one line,
-`PASS: <probe> — <finding>` or `FAIL: <probe> — <finding>`, and exits 0/1 to match — that line is
-the whole reporting protocol.
+unverified against real hardware; the feasibility gate they formed is closed. `p8` is a different
+kind of probe living in the same directory for the same reasons (real `msb` on real hardware, not
+CI-able): it hardware-checks `add-msb-extra-conf-escape-hatch.md`'s claims about `sandbox.extra_conf`
+after that feature had already landed, not a pre-migration feasibility question. None of these are
+part of `hack/run-integration-tests.sh` and none run in CI — microsandbox (`msb`) is not installed
+on any CI runner, and these exercise a third-party binary against real hardware, not krayt code.
+Each prints exactly one line, `PASS: <probe> — <finding>` or `FAIL: <probe> — <finding>`, and exits
+0/1 to match — that line is the whole reporting protocol.
 
 See `docs/ai-tasks/probe-microsandbox-feasibility.md` for the full background on each question and
 why it matters.
@@ -43,6 +46,7 @@ re-checkable. These were written against **0.6.16**.
 | `p6-credential-not-in-run.sh` | During a **real `krayt run`**, does the credential stay out of every live msb process's argv and environ, out of the guest's own environment, and out of every artifact including `changes.patch`? **✅ PASS 2026-09-04** on three authoritative readings; the environ reading is ⚪ inconclusive on darwin, same as p4. | No — needs a **live credential**; closed criterion 3 of `HUMAN_TODO.md`'s `run-tasks-on-microsandbox.md` hardware entry. |
 
 | `p7-passthrough-semantics.sh` | Does `--on-secret-violation passthrough` forward the placeholder unchanged to an out-of-scope host, or substitute the real value there? Measured against a `block-and-log` control and an in-scope regression guard. **✅ PASS 2026-09-04**: the placeholder is forwarded unchanged out of scope, the identical request blocks under `block-and-log`, and in-scope substitution still works. | **Was** blocking the decision; krayt now emits `passthrough` on the strength of it. |
+| `p8-extra-conf-precedence.sh` | Does `sandbox.extra_conf` (`add-msb-extra-conf-escape-hatch.md`) behave the way its decisions 1–3 say? **Two arms**: three synthetic sandboxes with controls ask what *msb* does with krayt-shaped argv; a fourth measurement drives a real `krayt run` carrying a real `sandbox.extra_conf:` and measures the sandbox *krayt's own argv* built — which is what §8.1 actually claims. **✅ PASS 2026-09-05** on msb 0.6.16, all four: krayt's flags fully replace an `extra_conf`'s network policy (control proves the file was live, merely outranked); the secret-scope-widening escalation is real and attributable to the hatch (control without it saw only the placeholder); and both reproduce through a real `krayt run`. Measurement 2 came back **REJECTED**, confirming this script's own source read and **overturning decision 2** — per-secret `on_violation` is unreachable from any `msb` CLI surface, and `deny_unknown_fields` makes msb refuse the sandbox outright rather than ignore the field. `KRAYT_SPEC.md` §8.1/§10 and the task doc are corrected. | No — sized `add-msb-extra-conf-escape-hatch.md`'s hardware bullet, which is now closed. |
 
 `p7` **passed on 2026-09-04** and `internal/task/netpolicy_msb.go` now emits
 `--on-secret-violation passthrough` as a result. It is the only probe written to decide a change to
@@ -59,6 +63,52 @@ silently stopped substituting altogether would look like a pass and break every 
 `p1` and `p2` are the two that *shape the design* of downstream tasks rather than merely sizing a
 residual — both must be answered before `run-tasks-on-microsandbox.md` and
 `dial-ask-channel-over-vsock.md` are implemented.
+
+`p8` has **two arms, and the second is the one that tests krayt**. Measurements 1–3 build `msb
+create` argv by hand, which establishes only a conditional: *given* argv A, msb resolves `--conf`
+against flags thus. That krayt actually emits argv A is asserted by `internal/sandbox/msb_test.go`
+against the fake `msb`, whose expected argv is itself hand-written — so both sides of the join are
+transcriptions with nothing mechanically comparing them, and they can drift together and still both
+pass. They had: every `msb create` in this script once emitted `--conf` **last**, the opposite of
+`CreateSpec.Args()`, on the very axis measurement 1 measures. §8.1's claim ("krayt's own flags
+outrank an `extra_conf`, so it cannot relax the run's network policy") is a claim about *krayt*, and
+a conditional plus a transcription does not test it. So measurement 4 drives a real `krayt run`
+whose `krayt.yaml` carries a real `sandbox.extra_conf:`, parks it at `--on-question=wait` for an
+observation window (p6's trick), asserts `meta.json` recorded the file's digest, and then reads that
+sandbox — the one krayt's own argv built — with the same curl probes. It needs `KRAYT_SECRETS`
+pointing at a live agent credential, for p6's reason (someone has to authenticate to hold the
+sandbox open); the secret *under test* is still an invented canary, since krayt's msb-era secrets
+are `network.inject[]` keys resolved from the secrets file. Without `KRAYT_SECRETS` the arm is
+skipped and the run prints a `NOTE:` saying §8.1's claim was not closed.
+
+The arms are complementary. The synthetic one answers a question about msb that is true regardless
+of krayt, and is the only way to ask measurement 2 at all — a config msb *rejects* cannot be
+delivered through a krayt run, because `msb create` fails and no sandbox survives to read. The krayt
+one answers whether krayt's shipped argv gets that resolution. When they disagree the pair localises
+the fault: synthetic PASS + krayt FAIL means krayt builds different argv than documented; both
+failing means msb changed. Either alone leaves that ambiguous. The synthetic controls do double
+duty — they use the same generated config content the krayt arm hands to `sandbox.extra_conf`, so
+the krayt arm needs no controls of its own.
+
+Within the synthetic arm, `p8` bundles three measurements, each with its own control, into one run (five sandboxes total) —
+the same "any one measurement alone is unreadable" discipline `p7` established. Precedence: a
+sandbox given krayt's own `--net-default deny`/`--net-rule` flags *and* a `--conf` whose
+`network.allow` names a different host must still refuse that host, checked against a control
+sandbox where the *same* `--conf` runs with none of krayt's flags present (so the file's own
+directive is confirmed live, not silently ignored — otherwise a BLOCKED result proves nothing).
+Widening: a krayt-declared secret's `allowed_hosts` widened by a `--conf` entry for the same
+env-var name gets the **real credential**, not a placeholder, substituted at the newly-allowed
+host — checked against an identical sandbox with no `--conf`, which must show only the placeholder
+there (otherwise "the real value arrived" is equally consistent with msb ignoring per-secret scope
+entirely once a host is network-allowed, a much larger and unrelated defect). Per-secret
+`on_violation` tightening is the one measurement this script's own header comment predicts will
+fail before the hardware run happens: reading `crates/cli/lib/sandbox_config.rs`'s `SecretInput`
+(the type backing both a root `--conf`'s `secrets:` map and `--secret-conf`) shows no `on_violation`
+field, `deny_unknown_fields` set, and `materialize_secrets` hard-coding `on_violation: None` on
+every entry built from a config file — so the field the internal `SecretEntry` struct carries
+(cited in `add-msb-extra-conf-escape-hatch.md` decision 2) looks unreachable from any `msb` CLI
+surface, config file or flag. The script still attempts it and classifies whichever way it comes
+out; if it's rejected, decision 2 and the matching KRAYT_SPEC.md §8.1 paragraph need correcting.
 
 `p6` **passed on 2026-09-04** (`run_63b9a3bf`): the guest's own `$CLAUDE_CODE_OAUTH_TOKEN` held
 `$MSB_CLAUDE_CODE_OAUTH_TOKEN` — msb's placeholder — and the real value appeared in no msb argv, no
@@ -171,6 +221,9 @@ trap) on every exit path — a leaked sandbox on your machine is a defect, pleas
 ./hack/msb-probes/p3-secret-tls-intercept.sh          # optional $1: a header-echoing HTTPS endpoint you trust
 ./hack/msb-probes/p4-environ-exposure-window.sh       # authoritative on Linux/KVM; best-effort on macOS
 ANTHROPIC_API_KEY=sk-ant-... ./hack/msb-probes/p5-placeholder-accepted.sh
+./hack/msb-probes/p8-extra-conf-precedence.sh         # optional $1/$2: two header-echoing HTTPS endpoints on different hosts
+# …and with the krayt-driven arm, which needs a live agent credential and makes a real, billed call:
+KRAYT_SECRETS=./secrets.env ./hack/msb-probes/p8-extra-conf-precedence.sh
 ```
 
 `p1`, `p2`, and `p5` default to pulling `ghcr.io/418-cloud/krayt-agent-claude-code` — override with
