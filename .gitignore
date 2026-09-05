@@ -47,10 +47,5 @@ secrets.env
 # .idea/
 # .vscode/
 
-# Nix build outputs / direnv
-result
-result-*
-.direnv/
-
 # krayt run state
 .krayt/

@@ -12,7 +12,6 @@
   "vulnerabilityAlerts": {
     "minimumReleaseAge": "0 days"
   },
-  "nix": { "enabled": true },
   "customManagers": [
     {
       "customType": "regex",
@@ -126,7 +125,7 @@
   ],
   "packageRules": [
     {
-      "matchManagers": ["gomod", "dockerfile", "github-actions", "nix"],
+      "matchManagers": ["gomod", "dockerfile", "github-actions"],
       "groupName": "{{manager}} non-major dependencies",
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "groupSlug": "{{manager}}-non-major"
@@ -142,7 +141,7 @@
       "groupSlug": "go-version"
     },
     {
-      "matchManagers": ["github-actions", "dockerfile", "nix"],
+      "matchManagers": ["github-actions", "dockerfile"],
       "semanticCommitType": "chore"
     },
     {

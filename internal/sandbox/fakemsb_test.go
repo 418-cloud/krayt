@@ -10,8 +10,8 @@ package sandbox
 // marker set on the outer `go test` process's own environment before m.Run() would never reach
 // the re-exec'd child — exactly the reasoning egressproxy's tests give for using egressHelperArg
 // instead of an env flag. Every msb verb this driver ever issues (--version, context, create,
-// exec, copy, logs, stop, rm, pull, doctor) is a token `go test`'s own flags never produce, so
-// os.Args[1] unambiguously tells the two apart.
+// exec, copy, logs, stop, rm, pull, doctor, images, rmi, image) is a token `go test`'s own flags
+// never produce, so os.Args[1] unambiguously tells the two apart.
 //
 // HOME doubles as the fixture directory: it is already in childEnv's allowlist (msb genuinely
 // resolves state under it), so tests set HOME to a temp dir holding a small JSON "script" keyed
@@ -44,6 +44,9 @@ var fakeMsbVerbs = map[string]bool{
 	"rm":        true,
 	"pull":      true,
 	"doctor":    true,
+	"images":    true,
+	"rmi":       true,
+	"image":     true,
 }
 
 // testBinPath is this test binary's own path, captured once before m.Run() so tests can point

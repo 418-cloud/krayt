@@ -579,8 +579,8 @@ security-critical `changes.patch`).
 
 **Integrity.** The bundle is a single artifact, hashable and checkable (`git bundle verify`
 plus a digest). The host digests the exact bundle bytes it streams to the guest — via
-`opencontainers/go-digest` (the `sha256:<hex>` convention already used for the OCI artifact
-(§6.11) and secrets (§6.8)) — and records it as `provenance.bundle_digest` in `meta.json`
+`opencontainers/go-digest` (the same `sha256:<hex>` convention secrets already use, §6.8) — and
+records it as `provenance.bundle_digest` in `meta.json`
 alongside the run's commit provenance (§8.4).
 
 **Provenance.** Because the imported HEAD is usually *not* the user's real HEAD (a snapshot's
@@ -704,12 +704,6 @@ Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
 OCI image itself (libkrun, `agentd` as PID 1); krayt drives no container runtime of its own any
 more, and the container-hardening knobs this section used to specify are replaced by msb's
 `--security default|restricted` (§6.6, §8.1). See git history for the pre-msb text.
-
-### 6.11 Image acquisition — host pull + vsock pre-load (`internal/imagestore`)
-Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
-(`docs/adr-microsandbox-sandbox-layer.md`, `run-tasks-on-microsandbox.md`). `msb create --image`
-resolves and pulls the user's image itself; krayt no longer maintains its own digest-keyed image
-cache or vsock pre-load path. See git history for the pre-msb text.
 
 ### 6.12 vsock transport & gRPC wiring (the host/guest asymmetry)
 Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
@@ -1542,12 +1536,14 @@ ls` reads `meta.json`; `krayt patch`/`apply` read `changes.patch`.
 
 ## 9. Project Structure
 
-> **Amended by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11).** `internal/
-> {provider,guest,protocol,proxy,controlclient,imagestore}` and `cmd/krayt-{agent,vsock-forward}`
-> are deleted; `internal/sandbox` (+ `internal/sandbox/guestbin`), `internal/askbridge`,
+> **Amended by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11) and
+> `retire-vm-image-pipeline.md` (§14 Phase 11).** `internal/
+> {provider,guest,protocol,proxy,controlclient,imagestore,vmimage,imagecache}` and
+> `cmd/krayt-{agent,vsock-forward}` are all deleted, along with `images/{flake.nix,flake.lock}` and
+> the root `flake.nix`; `internal/sandbox` (+ `internal/sandbox/guestbin`), `internal/askbridge`,
 > `internal/askclient`, `internal/sockroot`, and `cmd/krayt-helper` are the packages that replace
-> them (§6.15, §6.13, §6.7). `internal/vmimage` and `images/` are unchanged by this task (kept for
-> `retire-vm-image-pipeline.md`, §14) — listed here as-is.
+> them (§6.15, §6.13, §6.7). `images/agents/` (the published agent images, unrelated to the deleted
+> VM image pipeline) is untouched.
 
 ```
 krayt/
@@ -1559,7 +1555,7 @@ krayt/
 │   ├── cli/                 # cobra commands, flag/config merge (OS-agnostic; the run_{darwin,linux,other}.go
 │   │                         #   split collapsed into one run.go — msb is the only backend now)
 │   ├── orchestrator/        # run lifecycle, concurrency, teardown, state (§7); drives internal/sandbox only
-│   ├── sandbox/             # the msb CLI driver: Client, CreateSpec.Args(), Secret{Args,Env}, DoctorChecks (§6.15)
+│   ├── sandbox/             # the msb CLI driver: Client, CreateSpec.Args(), Secret{Args,Env}, Images/Rmi/ImagePrune, DoctorChecks (§6.15)
 │   │   └── guestbin/        # go:embed of the krayt-helper/krayt-ask static linux binaries; GuestRoot = "/.krayt"
 │   ├── askbridge/           # host-side ask_human bridge: Bridge, Listen, Serve (§6.13)
 │   ├── askclient/           # in-sandbox client half of the ask_human channel: OverSocket, vsock dialer (§6.13)
@@ -1567,12 +1563,11 @@ krayt/
 │   ├── adapter/             # optional per-agent adapters (claude-code, gemini-cli, opencode); MCP/CLI wiring (§6.13, §6.14)
 │   ├── task/                # config schema + parsing, incl. netpolicy_msb.go / secrets_msb.go / container_msb.go
 │   ├── patch/               # git bundle create/verify/clone/diff (+ optional reverse bundle); non-mutating dirty capture; host-side apply helpers (§6.7)
-│   ├── vmimage/             # unchanged by this task — kept for retire-vm-image-pipeline.md (§14)
 │   └── secrets/             # secrets loading + redaction
-├── images/                  # unchanged by this task — Nix-based VM image build, kept for retire-vm-image-pipeline.md (§14)
+├── images/
+│   └── agents/               # published, ready-to-run agent images (CI-built) — the base sandbox image is msb's concern (§11), not built here
 ├── configs/                 # example krayt.yaml, default allowlist
-├── flake.nix                # dev shell (oras pinned — still used by internal/vmimage; no protobuf/protoc-gen-go/buf pins any more)
-├── Makefile                 # build, test, `make guest-bins` targets (no `make proto`)
+├── Makefile                 # build, test, `make guest-bins` targets (no `make proto`, no Nix)
 ├── docs/
 └── README.md
 ```
@@ -1581,18 +1576,18 @@ krayt/
 Use these exact modules so the agent doesn't guess. (Pin concrete versions in `go.mod`
 at implementation time; major versions shown where they matter.)
 
-> **Amended by `run-tasks-on-microsandbox.md`.** The macOS/Linux VM-backend rows, the gRPC/
-> protobuf/proto-codegen rows, the guest vsock listener, the containerd client, and the
-> hand-rolled/`goproxy` egress-proxy row are all **dropped** — nothing in krayt links any of them
-> once `internal/{provider,guest,protocol,proxy}` are deleted. `oras.land/oras-go/v2` stays: it is
-> still used by `internal/vmimage`, unchanged by this task. See git history for the dropped rows'
-> original text.
+> **Amended by `run-tasks-on-microsandbox.md` and `retire-vm-image-pipeline.md`.** The macOS/Linux
+> VM-backend rows, the gRPC/protobuf/proto-codegen rows, the guest vsock listener, the containerd
+> client, and the hand-rolled/`goproxy` egress-proxy row are all **dropped** — nothing in krayt
+> links any of them once `internal/{provider,guest,protocol,proxy}` are deleted.
+> `oras.land/oras-go/v2` and `github.com/opencontainers/image-spec` are dropped too:
+> `internal/vmimage`, their only caller, is deleted along with the rest of the image pipeline —
+> `krayt image` now shells out to `msb` (§6.15) instead of pulling OCI artifacts itself. See git
+> history for the dropped rows' original text.
 
 | Concern | Module | Notes |
 |---|---|---|
 | Sandbox runtime | *none — `msb` is driven as a subprocess, not a Go dependency* | `internal/sandbox` shells out to the `msb` binary and parses its `--format json`/`--stream` output; no SDK, no cgo (§6.15) |
-| OCI registry / image pull+export | `oras.land/oras-go/v2` | host-side `internal/vmimage` only (§11) — unrelated to `krayt run`'s sandbox path since this cutover |
-| OCI types/layout | `github.com/opencontainers/image-spec` | media types, `oci-layout`, `internal/vmimage` |
 | CLI | `github.com/spf13/cobra` (+ `spf13/pflag`) | command surface (§13) |
 | Config | `gopkg.in/yaml.v3` | task config file (§8.1) |
 | `ask_human` MCP server | `github.com/modelcontextprotocol/go-sdk` (v1.2.0, `/mcp`) | stdio MCP server for `krayt-ask --mcp` (§6.13); pulled only by `cmd/krayt-ask` |
@@ -1707,208 +1702,24 @@ never exposed.
 
 ---
 
-## 11. The Minimal VM Image (Nix-based)
+## 11. The Sandbox Image
 
-A small Linux image whose only job is to run the guest-agent + a container runtime.
-The image is **defined declaratively with Nix** and built reproducibly. This is the
-isolation boundary, so we want to know exactly what is in it and be able to rebuild it
-bit-for-bit.
+Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
+(`docs/adr-microsandbox-sandbox-layer.md`, `retire-vm-image-pipeline.md`). krayt built and shipped
+its own Nix-defined micro-VM image (kernel + initrd + rootfs, a NixOS closure running the
+guest-agent over containerd) through Phase 10; `run-tasks-on-microsandbox.md` (§14 Phase 11)
+stopped anything from consuming it, and this task deleted the pipeline itself — the flake under
+`images/`, the arm64-Linux-runner CI that built it, the OCI publish/pull/zstd path, and the
+RC/graduate tagging workflows (`RELEASING.md`).
 
-> Scope note: Nix governs **only** this base micro-VM image. The user's Docker image
-> (the AI + tools) is supplied at run time and is explicitly **not** Nix-built. Keep the
-> two separate.
-
-> **Known-stale pending `retire-vm-image-pipeline.md`.** `run-tasks-on-microsandbox.md` deleted
-> `cmd/krayt-agent` and `cmd/krayt-vsock-forward`, which `images/flake.nix`'s guest-agent
-> `buildGoModule` target still references — this whole pipeline builds an artifact nothing
-> consumes any more (§14 Phase 11), and its Nix build will fail as-is until the follow-up task
-> removes it. Left unfixed here deliberately; not attempted in this task.
-
-### 11.1 What the image contains
-- **Kernel:** a minimal Linux kernel (pinned via nixpkgs) with virtio, vsock, overlayfs,
-  and nftables enabled.
-- **Userland:** minimal NixOS closure — **containerd** as the container runtime (driven
-  by the guest-agent's Go client; see §6.10) with `runc` or `crun` as the OCI runtime,
-  nftables, and the embedded **guest-agent** binary, started as a systemd service.
-- **guest-agent build:** built with `buildGoModule` so the Go toolchain is pinned too —
-  the whole artifact is reproducible end to end.
-- **Boot:** vz supports Linux kernel boot and EFI on macOS 13+. Standardize on one
-  (kernel + initrd/rootfs is the simpler path for vz).
-
-### 11.2 Why Nix
-- **Reproducible:** every input pinned via `flake.lock`; a given `krayt` version maps
-  to a known image hash.
-- **Declarative:** the entire system (packages, kernel version + config, services,
-  nftables rules, runtime) lives in one expression — no imperative Dockerfile/rootfs drift.
-- **Read-only by design:** the `/nix/store` is immutable, matching the "minimal,
-  untampered VM" philosophy.
-- **Cheap updates:** bumping the kernel or any package is a one-line input/lock change —
-  important because the guest kernel is the security boundary and needs timely patching.
-- **Linux backend bonus:** `microvm.nix` is purpose-built for minimal NixOS microVMs on
-  firecracker / cloud-hypervisor / qemu — nearly turnkey for the Phase 7 Linux provider.
-
-### 11.3 The macOS build caveat (settled: build in CI)
-Apple's Virtualization.framework is **not** a `microvm.nix` backend, and building
-Linux/NixOS images **on a Mac requires a Linux builder**. Resolution:
-- On macOS, Nix is the **builder** that produces the `vmlinuz` + rootfs artifacts the
-  `vz` provider boots — not an integrated hypervisor layer.
-- **Canonical build path = GitHub Actions on an arm64 Linux runner** (see §11.5). On a
-  Linux runner this is effectively a no-op, so the "Mac needs a Linux builder" caveat
-  disappears for the build path.
-- A local `nix-darwin` `linux-builder` VM is **optional** — only worth setting up if you
-  want fast local image iteration without round-tripping through CI.
-
-### 11.4 Specify, distribute, update
-- **Specify:** the flake under `images/` is the single source of truth for the base image.
-- **Build:** CI on an **arm64 Linux runner** builds the kernel + rootfs natively for
-  `aarch64-linux` (no emulation) and emits a versioned, content-addressed artifact.
-- **Distribute:** the artifact is packaged as a standard **OCI artifact** and pushed to
-  an OCI registry (the `rootfs.img` layer is zstd-compressed in transit, to shrink the
-  ~2 GiB cold-pull download — see below). The OCI **digest is the content address** —
-  `krayt` pins its version → digest and **verifies the digest** on `krayt image pull`
-  (and `doctor`) before first use. The registry is interchangeable (ghcr.io is the
-  convenient default, but any OCI-compliant registry works — **no hard dependency on
-  ghcr.io**).
-- **Run:** each run gets a **copy-on-write clone** of the verified base image so runs
-  never share state.
-- **Update:** bump the flake input/lock → CI rebuilds → push new OCI artifact → bump the
-  pinned digest in `krayt`. Fully auditable in git.
-- **Reclaim:** the base image is cached per digest under `<user-cache-dir>/krayt/vmimage/<digest>/`
-  (from `os.UserCacheDir()`; typically `~/.cache/krayt/...` on Linux and `~/Library/Caches/krayt/...` on macOS) and, like the user-image cache (§6.11), never cleaned up on its own. `krayt image ls/rm/prune`
-  manage both caches together (§6.11); the base-image side of the retention policy is simply
-  *keep the pinned digest, drop the rest* — `krayt run` only ever reads the pinned digest's
-  directory, so any other vmimage entry (an old pin, or a stale sanitized-ref dir) is dead
-  weight and pruned unconditionally.
-
-**Retention policy (`krayt image prune`).** Removes everything outside these keeps, deleting
-by default (no `--dry-run` needed to take effect):
-- **base VM image:** keep **only** the entry matching the pinned digest; every other vmimage
-  entry is removed unconditionally. `--all` never removes the pinned entry — use
-  `krayt image rm --force <digest>` for that one specifically.
-- **container image:** keep it if **either** (a) it was last used within `--older-than`
-  (default `24h`), **or** (b) its digest matches the image of a **non-terminal** run under
-  `--repo` (default `.`) whose recorded `image_ref` is *itself* a digest reference
-  (`…@sha256:<hex>`, direct string match — a tag-based ref can't be resolved to a cache digest
-  offline and relies on the age floor instead; a known, documented gap).
-- `--all` bypasses **both** container-kind protections (age + in-use). `--dry-run` reports
-  exactly what would be removed/kept and why, and the reclaimable total, without deleting.
-`krayt image rm <digest>` accepts a full digest or an unambiguous hex prefix (docker-rmi
-style) and errors — without deleting anything — on no match, an ambiguous prefix, or the
-pinned base image without `--force`.
-
-> Fallback if Nix ever becomes friction: `mkosi` (systemd's image builder) is the
-> next-best declarative option — gentler, reasonably reproducible — at the cost of
-> Nix's strict reproducibility and the `microvm.nix` integration. Not needed for a
-> single-trusted-owner setup.
-
-### 11.5 CI / build pipeline (GitHub Actions)
-The canonical build path. Clean and simple: build natively on arm64, publish as an
-OCI artifact.
-
-- **Runner:** an **arm64 Linux runner** (e.g. `ubuntu-24.04-arm`). Building natively for
-  `aarch64-linux` keeps the toolchain clean — no `binfmt`/QEMU cross-emulation, and the
-  artifact arch matches the vz VM (arm64) exactly.
-- **Nix:** install via `DeterminateSystems/nix-installer-action` (or
-  `cachix/install-nix-action`); optional binary cache to speed rebuilds.
-- **Build:** `nix build .#vmImage` → versioned kernel + rootfs artifacts.
-- **Package & push:** wrap the artifacts as an **OCI artifact** (e.g. via `oras push`)
-  with a descriptive media type; the registry returns/records the **digest**.
-- **Pin:** the build records `version → digest`; `krayt` consumes that mapping and
-  verifies the digest at pull time.
-- **Trigger:** on tag / release (and on `images/flake.lock` changes, to catch kernel and
-  package bumps automatically).
-
-Sketch:
-```yaml
-jobs:
-  build-image:
-    runs-on: ubuntu-24.04-arm        # native aarch64-linux, no emulation
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - run: nix build .#vmImage      # -> ./result (kernel + rootfs)
-      - run: |
-          zstd -19 -T0 -o rootfs.img.zst ./result/rootfs.img
-          oras push <registry>/krayt-vmimage:${GITHUB_REF_NAME} \
-            ./result/vmlinuz:application/vnd.krayt.kernel \
-            ./rootfs.img.zst:application/vnd.krayt.rootfs+zstd
-      # capture the pushed digest -> record as the pinned image reference
-```
-`rootfs.img` is the only layer compressed (`vmlinuz`/`initrd` are too small for it to be worth
-the complexity) — the client (`vmimage.Pull`) decompresses it back to plain raw bytes
-immediately after download, so nothing past `Pull` ever sees the compressed form.
-
-Consumer side: `krayt image pull` resolves its pinned digest, pulls the OCI artifact
-from whichever registry is configured, verifies the digest, and caches the base image
-locally for CoW cloning. Because it is a plain OCI artifact addressed by digest, the
-registry is swappable and the image is portable across hosts.
-
-### 11.6 Image internals & boot contract (sub-spec)
-This is the riskiest deliverable and the one Claude Code cannot fully verify locally
-(building/boot-testing needs a Linux builder — own it in CI; see §11.3). What the flake
-must produce and guarantee:
-
-- **Init:** NixOS with **systemd** (decision settled — consistent with `microvm.nix` on
-  the Linux backend; systemd owns mounts, ordering, and network bring-up). No hand-rolled
-  PID 1.
-- **Services (systemd units), ordered:**
-  1. `containerd.service` — containerd daemon, socket at `/run/containerd/containerd.sock`.
-  2. `krayt-agent.service` — the guest-agent, `Type=notify`,
-     `After=containerd.service network-online.target`, `Wants=network-online.target`.
-- **Filesystems:** kernel built with `virtio`, `vsock` (`CONFIG_VSOCKETS`,
-  `CONFIG_VIRTIO_VSOCKETS`), `overlayfs`, `nftables`. Rootfs as the boot disk vz mounts;
-  `/run`, `/tmp` on tmpfs; containerd state under `/var/lib/containerd`.
-- **Networking:** one NAT NIC up via `systemd-networkd`; nftables ruleset from §6.6 applied
-  by the guest-agent at run start (not baked statically — it depends on per-task policy).
-- **Closure contents (and nothing else):** kernel, systemd, containerd + `runc`/`crun`,
-  nftables, the static guest-agent binary, CA certificates, busybox-equivalent coreutils, and
-  the pieces the run pipeline shells out to: **`gitMinimal`** for the §6.7 bundle
-  ingest/diff, **`e2fsprogs` + `util-linux`** to format + mount the per-run scratch disk
-  (§6.10), and — since `move-egress-proxy-to-host.md` replaced the in-guest L7 proxy with a
-  host process — the **`krayt-vsock-forward`** binary (a dumb TCP<->vsock pipe, not a proxy)
-  run as the dedicated **`proxyd`** user, kept as defense in depth though no longer load-bearing
-  for the L3 lock (§6.6). No editors, no shells beyond what systemd needs, no package manager.
-- **Output artifacts:** `vmlinuz` + `initrd` + `rootfs.img` (**raw** format — neither backend
-  takes qcow2), built for **both** `aarch64-linux` and `x86_64-linux` from one flake and one
-  NixOS config, and published as a **single multi-arch OCI index** (§11.5). `rootfs.img` is
-  compressed (`+zstd`) for the registry transfer only; `krayt image pull` decompresses it back
-  to the same raw format before anything touches it, so the raw-on-disk / CoW-clone contract
-  stated here is unchanged. krayt pins the
-  *index* digest — one `PinnedRef`, one `PinnedDigest`, no architecture anywhere in the pin —
-  and resolves it to the arch it can boot at pull time (`vmimage.selectPlatform`): arm64 for
-  vfkit, amd64 for firecracker.
-  - **The per-arch artifacts must carry an OCI image config declaring `{"architecture":…,
-    "os":"linux"}`** (`oras push --config`). This is easy to miss and fails in an ugly way:
-    these are *artifacts* with custom media types, not container images, so nothing else carries
-    an architecture. Without the config, `oras manifest index create` cannot infer a platform,
-    the index entries get a null `platform`, and selection then matches **nothing on any host** —
-    a broken pull for everyone, from an index that published perfectly cleanly. CI asserts the
-    platforms are present rather than trusting it.
-- **The x86_64 (firecracker) boot contract differs from the aarch64 (vfkit) one** in three ways
-  that are easy to get wrong and fail obscurely:
-  1. **The kernel must be an uncompressed ELF `vmlinux`.** Firecracker's x86_64 loader cannot
-     boot the `bzImage` that `system.boot.loader.kernelFile` names — upstream's own CI kernels
-     are `vmlinux-*` ELF binaries for this reason. nixpkgs ships the ELF as `vmlinux` in the
-     kernel's **`dev` output**; the flake strips it (379 MiB → ~55 MiB, debug info only) and
-     publishes it as `vmlinuz`. The kernel has `CONFIG_PVH=y`, so Firecracker finds the PVH
-     entry note.
-  2. **virtio-MMIO, not virtio-PCI.** Firecracker has no PCI bus, so `virtio_mmio` must be in
-     `boot.initrd.availableKernelModules` or root will not mount. (Both transports are listed;
-     the unused one simply never matches a device.)
-  3. **Console is `ttyS0`** (8250 serial), not vfkit's `hvc0` virtio-console. The provider
-     normalises this itself, so a `VMSpec` written for either backend boots on both.
-- **`systemd-network-generator` must be enabled** (it ships with systemd but is off by default).
-  It is what turns the firecracker provider's cmdline `ip=`/`ifname=` into networkd config; see
-  §6.6. Without it the guest boots fine and answers `Hello` with **no network address at all** —
-  a silent failure, so it has its own on-hardware regression test.
-- **Boot contract (what the host relies on):** within N seconds of `VM.Start` (vfkit
-  process up + VM booted), the guest-agent is listening on vsock port `1024` (bridged to the
-  host `socketURL`) and answers `Hello`. The host treats a successful `Hello` as "VM ready";
-  failure within a timeout → abort + `Destroy`.
-
-> Practical ownership: have Claude Code author `flake.nix` and the systemd units, but make
-> the boot-test (vfkit boots the image → `Hello` round-trips) a human/CI checkpoint, since
-> the agent's sandbox can't build or boot the Linux image.
+The sandbox image is entirely **msb's concern now**: `msb create --image <ref>` resolves and pulls
+the user's own agent image itself, the same way `docker run` would, and msb's libkrun VM boots
+under that image directly — there is no separate krayt-built base image underneath it to version,
+build, or pin. krayt ships no VM image of its own, has no Nix build, and needs no Linux builder for
+anything (§11.3's old caveat, and `docs/macos-linux-builder.md`, are gone with it). See
+`docs/adr-microsandbox-sandbox-layer.md` for the full rationale, and §6.15 for the driver. `krayt
+image` (§13) survives as a thin front-end over msb's own image store, not a reimplementation of
+one — see git history for the pre-msb text if the old Nix-based design is ever useful again.
 
 ---
 
@@ -1959,11 +1770,11 @@ krayt patch   <run-id>         # print/locate the run's changes.patch
 krayt apply   <run-id>         # helper: git apply the patch onto the host (after review)
 krayt stop    <run-id>         # stop + destroy a run's VM
 krayt rm      <run-id>         # remove run artifacts
-krayt image pull  [--ref] [--digest]                 # pull + verify the base VM image (§11.4)
-krayt image ls                                       # list cached base-VM + container images with size/last-used
-krayt image rm    <digest> [--force]                 # remove one cached image by digest/prefix (--force for the pinned base)
-krayt image prune [--repo] [--older-than DUR] [--all] [--dry-run]   # bulk-reclaim cache disk under the retention policy
-krayt doctor                   # check host prereqs (vfkit installed+runnable on macOS; /dev/kvm on linux)
+krayt image pull  <ref>                              # pre-warm msb's own image store (`msb pull`, §11)
+krayt image ls                                       # list images in msb's own store (`msb images --format json`)
+krayt image rm    <ref> [--force]                    # remove one image by reference (`msb rmi`; --force for one a sandbox still references)
+krayt image prune [--repo] [--older-than DUR] [--all] [--dry-run]   # bulk-reclaim under krayt's own age/in-use retention, then `msb image prune`
+krayt doctor                   # check host prereqs (msb installed+healthy, version floor, local backend — §6.15)
 krayt upgrade [--version vX.Y.Z] [--yes|-y] [--check]   # update krayt in place from a GitHub release
 ```
 
@@ -1985,9 +1796,8 @@ completes command and flag names. On top of that, the run-scoped commands (`appl
 `attach`, `stop`, `rm`, `patch`, `questions`, `answer`) dynamically complete `<run-id>` from
 `.krayt/` state under `--repo`, each filtered to the runs it can act on (`stop`/`attach` → live
 runs, `rm` → finished unless `--force`, `answer` → `waiting`), and `answer` also completes the
-run's pending `<question-id>`. `image rm` completes `<digest>` from the cached images in both
-cache roots (offering the full digest so a pick is unambiguously removable), annotated with each
-image's kind and size and `(pinned)` for the base image. `run`'s enum flags (`--net`, `--on-question`, `--on-question-timeout`,
+run's pending `<question-id>`. `image rm` completes `<ref>` from msb's own store (`msb images -q`)
+— krayt keeps no image cache of its own to read completions from any more (§11). `run`'s enum flags (`--net`, `--on-question`, `--on-question-timeout`,
 `--agent`) and `questions --sort` complete their fixed value sets from the same constants that
 validate them; `run`'s `--image`/`--allow` complete from this repo's run history. Untrusted
 agent-originated text (question prompts) is sanitized (§6.13) before appearing in a completion
@@ -2033,12 +1843,11 @@ image digests, no "boot succeeded" without a real boot. An honestly-blocked step
 correct; a faked one is a defect.
 
 **Categories that require a human:**
-- Apple Developer signing identity / notarization — **only if** you switch to the direct
-  `vz` provider; the v1 vfkit path needs no krayt signing (§12). vfkit install is trivial.
-- A Linux builder or CI run to build/boot the Nix image (§11.3, §11.6).
-- Registry or other credentials/secrets (publishing the OCI artifact, §11.5).
-- Real-hardware checks: vz boot on a Mac, `/dev/kvm` on Linux (Phase 1 / 6 "Done when").
+- Real-hardware checks: a real `msb`-backed sandbox boot on an Apple-Silicon Mac or a KVM-capable
+  Linux host (§6.15, §12) — krayt ships no VM image of its own to build or sign (§11).
 - Live API keys / secrets needed to exercise a real agent image (Phase 5).
+- Registry credentials for publishing an agent image (`images/agents/`), unrelated to the (now
+  deleted) VM image pipeline.
 
 **`HUMAN_TODO.md` entry template:**
 ```
@@ -2456,12 +2265,31 @@ independently-landed progress rather than a single big-bang "Done when".
   applied cleanly to the scratch repo's working tree. **Every criterion of this phase's hardware
   re-verification is met; the `HUMAN_TODO.md` entry is deleted accordingly**, and
   `retire-vm-image-pipeline.md` is unblocked.
-- [ ] `retire-vm-image-pipeline.md` — deletes `internal/vmimage`, `images/`, the three image
-  workflows, and the Linux-builder requirement.
+- [x] `retire-vm-image-pipeline.md` — deleted `internal/vmimage`, `internal/imagecache`,
+  `images/{flake.nix,flake.lock}`, the three image workflows (`image.yml`, `vmimage-rc.yml`,
+  `vmimage-graduate.yml`), `hack/next-vmimage-tag.sh`, `docs/macos-linux-builder.md`, and the root
+  `flake.nix`/`flake.lock` (its only remaining use was `oras`, for the now-deleted pipeline) — the
+  Linux-builder requirement is gone with them. `krayt image` survives as a thin front-end over
+  msb's own store (`internal/sandbox.Client.{Images,ImageRefs,Rmi,ImagePrune}`): `pull`/`ls`/`rm`
+  map directly to `msb pull`/`msb images`/`msb rmi`; `prune` keeps its age/`--repo`/`--all`/
+  `--dry-run` retention, now sourced from `.krayt/runs/*/meta.json`'s `image_ref` instead of a
+  cache sentinel, before sweeping with `msb image prune`. `image rm` takes a reference, not a
+  digest (§13) — a CLI surface change, since msb's store is ref-keyed rather than content-addressed.
+  §6.11, §11, §13, and §15 are amended accordingly; `docs/ai-tasks/README.md`'s rows for
+  `automate-vmimage-releases.md`/`compress-vmimage-rootfs.md`/`prune-cached-images.md` now say what
+  replaced them. **Done when:** met — `go build ./...` (both `GOOS`), `go test -race ./...`, and
+  `golangci-lint run` are green; `grep -rn "vmimage\|imagecache\|rootfs.img\|PinnedDigest"` across
+  `.go`/`.yml`/`.nix` returns nothing; no workflow needs a Linux arm64 runner or a Nix builder;
+  `krayt image ls/rm/prune --dry-run` are unit-tested offline against a scriptable fake `msb`,
+  including all three retention outcomes (protected by a non-terminal run, protected by the age
+  window, pruned when neither applies); shell completion for `image rm` sources `msb images -q`.
 - [ ] `add-msb-extra-conf-escape-hatch.md` — opt-in `sandbox.extra_conf: <path>`, explicitly
   unvalidated, subject to §8.3 containment.
 - [ ] `expand-platforms-under-msb.md` — linux/arm64 in the release matrix, plus a real Windows
-  port.
+  port. Unblocked by `retire-vm-image-pipeline.md`: the old blocker (§15) was a krayt-owned image
+  index with an arch dimension but no backend dimension, and Windows had no path at all; with no
+  krayt-built image, neither obstacle exists any more — msb's own platform support is what gates
+  this now.
 - [ ] `warm-start-msb-sandboxes.md` — flat OCI rootfs + `--materialize` pre-pull, opt-in and
   defaulting off until measured.
 - **Done when:** the gate's two blocking probes (P1, P2) have a real-hardware finding recorded in
@@ -2505,8 +2333,10 @@ independently-landed progress rather than a single big-bang "Done when".
   pooled VM counts against the same max-concurrency limit as an in-flight run.
 - **Container runtime choice** — *resolved:* **containerd** via its Go client (§6.10).
   `runc` vs `crun` left as a build-time toggle; either is acceptable.
-- **Image distribution** — *resolved:* **host pulls + pre-loads over vsock** (§6.11). The
-  VM never needs registry egress; the host is the only registry-facing component.
+- **Image distribution** — *superseded, ADR option B1 (`retire-vm-image-pipeline.md`).* The
+  original resolution (host pulls + pre-loads over vsock) governed krayt's own guest-agent image;
+  under msb there is no krayt-built image to distribute at all — `msb create --image` resolves and
+  pulls the user's agent image itself (§11, §6.15).
 - **Dirty-tree fidelity** — *resolved:* non-mutating temp-index capture folds uncommitted
   (non-ignored) changes into the inbound bundle, leaving the user's index/worktree/refs
   untouched (§6.7).

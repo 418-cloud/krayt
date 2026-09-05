@@ -1,158 +1,40 @@
 package cli
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
-	"github.com/opencontainers/go-digest"
+	"github.com/spf13/cobra"
 
-	"github.com/418-cloud/krayt/internal/imagecache"
-	"github.com/418-cloud/krayt/internal/vmimage"
+	"github.com/418-cloud/krayt/internal/sandbox"
 )
 
-// Cache kinds shown in the `krayt image ls` KIND column.
-const (
-	kindVMImage   = "vmimage"
-	kindContainer = "container"
-)
-
-// cachedImage pairs an imagecache.Entry with the cache it came from — the unit `image
-// ls/rm/prune` reason about.
-type cachedImage struct {
-	kind   string // kindVMImage | kindContainer
-	pinned bool   // vmimage entry matching vmimage.PinnedDigest (never auto-removed)
-	entry  imagecache.Entry
-}
-
-// listCachedImages enumerates both cache roots into one list: every base VM image, then
-// every user/container image. The pinned base image (if any) is flagged.
-func listCachedImages() ([]cachedImage, error) {
-	vmRoot, storeRoot, err := imageCacheRoots()
+// completeImageRefs completes args[0] of `image rm <ref>` from msb's own store (`msb images -q`,
+// retire-vm-image-pipeline.md decision 4/Done-when) — krayt keeps no cache of its own to read
+// completions from any more.
+func completeImageRefs(cmd *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if len(args) >= 1 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	sb, err := sandbox.NewClient()
 	if err != nil {
-		return nil, err
+		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	var out []cachedImage
-	vms, err := imagecache.List(vmRoot)
+	// cmd.Context() is nil unless the command has gone through cobra's Execute() (never true for
+	// completion invoked directly, e.g. by tests) — fall back rather than pass nil to exec.CommandContext.
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	refs, err := sb.ImageRefs(ctx)
 	if err != nil {
-		return nil, err
+		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	for _, e := range vms {
-		out = append(out, cachedImage{kind: kindVMImage, pinned: isPinnedVMImage(e), entry: e})
-	}
-	conts, err := imagecache.List(storeRoot)
-	if err != nil {
-		return nil, err
-	}
-	for _, e := range conts {
-		out = append(out, cachedImage{kind: kindContainer, entry: e})
-	}
-	return out, nil
-}
-
-// isPinnedVMImage reports whether a vmimage entry is the currently-pinned base image.
-func isPinnedVMImage(e imagecache.Entry) bool {
-	return vmimage.PinnedDigest != "" && e.Digest == vmimage.PinnedDigest.String()
-}
-
-// resolveCachedImage finds the single cached image whose digest equals or is prefixed by
-// prefix (docker-rmi style), across both roots. Non-digest-named entries are not addressable
-// by digest and are skipped. It errors — without touching anything — on no match or an
-// ambiguous prefix.
-func resolveCachedImage(prefix string) (cachedImage, error) {
-	all, err := listCachedImages()
-	if err != nil {
-		return cachedImage{}, err
-	}
-	var matches []cachedImage
-	for _, ci := range all {
-		if ci.entry.Digest == "" {
-			continue
-		}
-		enc := digestEncoded(ci.entry.Digest)
-		if ci.entry.Digest == prefix || strings.HasPrefix(enc, prefix) {
-			matches = append(matches, ci)
-		}
-	}
-	switch len(matches) {
-	case 0:
-		return cachedImage{}, fmt.Errorf("no cached image matches %q", prefix)
-	case 1:
-		return matches[0], nil
-	default:
-		var shorts []string
-		for _, m := range matches {
-			shorts = append(shorts, shortDigest(m.entry.Digest))
-		}
-		return cachedImage{}, fmt.Errorf("%q is ambiguous: matches %d images (%s)", prefix, len(matches), strings.Join(shorts, ", "))
-	}
-}
-
-// refFor returns a best-effort human-readable reference for a cache entry, or "-" when none
-// is recoverable. The pinned base image reports its pinned ref; a container reports the
-// ref-name annotation oras recorded in the layout's index.json, if present.
-func refFor(ci cachedImage) string {
-	if ci.pinned {
-		return vmimage.PinnedRef
-	}
-	if ci.kind == kindContainer {
-		if ref := indexRefName(ci.entry.Dir); ref != "" {
-			return ref
-		}
-	}
-	return "-"
-}
-
-// indexRefName reads the org.opencontainers.image.ref.name annotation oras writes into an
-// OCI layout's index.json (the tag the image was acquired under). Best-effort: any read/parse
-// failure yields "".
-func indexRefName(dir string) string {
-	b, err := os.ReadFile(filepath.Join(dir, "index.json"))
-	if err != nil {
-		return ""
-	}
-	var idx struct {
-		Manifests []struct {
-			Annotations map[string]string `json:"annotations"`
-		} `json:"manifests"`
-	}
-	if json.Unmarshal(b, &idx) != nil {
-		return ""
-	}
-	for _, m := range idx.Manifests {
-		if ref := m.Annotations["org.opencontainers.image.ref.name"]; ref != "" {
-			return ref
-		}
-	}
-	return ""
-}
-
-// digestEncoded returns the bare hex of a "sha256:<hex>" digest (the part cache dirs are
-// named by), or the string unchanged if it isn't a well-formed digest.
-func digestEncoded(d string) string {
-	dig := digest.Digest(d)
-	if dig.Validate() != nil {
-		return d
-	}
-	return dig.Encoded()
-}
-
-// shortDigest is the 12-hex-char display form of a digest, or "-" for a non-digest entry.
-func shortDigest(d string) string {
-	enc := digestEncoded(d)
-	if enc == "" {
-		return "-"
-	}
-	if len(enc) > 12 {
-		return enc[:12]
-	}
-	return enc
+	return refs, cobra.ShellCompDirectiveNoFileComp
 }
 
 // humanSize renders a byte count as a compact IEC size (e.g. 412MiB, 1.8GiB) — one decimal
-// place under 10 units, none above, matching how the `ls` example reads.
+// place under 10 units, none above.
 func humanSize(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -169,4 +51,12 @@ func humanSize(b int64) string {
 		return fmt.Sprintf("%.1f%s", val, units[exp])
 	}
 	return fmt.Sprintf("%.0f%s", val, units[exp])
+}
+
+// plural returns "s" unless n == 1.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }

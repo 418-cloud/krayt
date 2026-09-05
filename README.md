@@ -48,14 +48,9 @@ downgrades, or reinstalls a specific release instead of latest.
 
 ## Prerequisites
 
-There are **two tiers**. Most contributors only need the first. Tier 2 is
-provided by a Nix dev shell, so in practice you install **Go, msb, and (optionally) Nix**
-— everything else comes from `nix develop`.
-
-### 1. Build & run krayt (everyone)
-
-Common to both platforms — **no more per-OS split**: krayt needs the same tools on macOS and
-Linux alike.
+Just **Go and msb** — the same on macOS and Linux, no per-OS split and no Nix dev shell. krayt
+ships no VM image of its own to build (`docs/adr-microsandbox-sandbox-layer.md`), so there is no
+second tier of tooling.
 
 - **Go** — current stable _(verify current)_
 - **git**
@@ -86,21 +81,6 @@ outright, since `krayt run` cannot do anything without one.
 > same on macOS or Linux. A plain `go build ./...` still compiles on a fresh clone (the embed
 > directory ships a `.gitkeep`), it just won't have real guest binaries to copy into a sandbox.
 
-### 2. Build the VM image (legacy — CI / image maintainers only)
-`krayt run` no longer needs this: msb pulls the agent's own OCI image directly, so there is no
-krayt-built base VM image in the loop any more. What's left is legacy, kept only for the
-`krayt image` cache subcommands until it's retired: the minimal Linux micro-VM image is a Nix
-flake under `images/`, built and published as an OCI artifact (see `KRAYT_SPEC.md` §11). This is
-**owned by CI (or a human), not by Claude Code** — building/boot-testing needs a Linux builder and
-real hardware.
-- **arm64 Linux runner** (GitHub Actions)
-- **Nix** (CI uses the Determinate Systems action; see links)
-- **`oras`** — provided by the dev shell
-- **Registry credentials** for publishing the image artifact
-
-> **You do NOT need** `containerd`, `runc`/`crun`, or `nftables` on your Mac — those live
-> *inside* the Nix-built VM image, not on the dev machine. Don't `brew install` them.
-
 ### Installing the tools
 Links are canonical landing pages (they rarely move); prefer the command where given.
 All marked _(verify current)_ — confirm against the linked page, since names/versions drift.
@@ -109,12 +89,7 @@ All marked _(verify current)_ — confirm against the linked page, since names/v
 |---|---|---|
 | Go | platform installer | https://go.dev/doc/install |
 | msb (microsandbox) | `curl -fsSL https://install.microsandbox.dev \| sh` | https://github.com/superradcompany/microsandbox |
-| Nix | `curl -fsSL https://install.determinate.systems/nix \| sh -s -- install` | https://determinate.systems/nix-installer/ — or the community installer at https://nixos.org/download |
 | Claude Code | per docs | https://docs.claude.com/en/docs/claude-code/overview |
-| oras (legacy VM image pipeline only) | via `nix develop`, else manual | https://oras.land |
-
-> CI Nix install uses the GitHub Action `DeterminateSystems/determinate-nix-action`
-> (or `nix-installer-action`) — see https://github.com/DeterminateSystems/nix-installer.
 
 ---
 
@@ -122,13 +97,10 @@ All marked _(verify current)_ — confirm against the linked page, since names/v
 
 ```bash
 git clone <your-fork> krayt && cd krayt
-# tier-1 prereqs installed? confirm:
+# prereqs installed? confirm:
 make build             # cross-builds the embedded guest binaries, then builds krayt — same on macOS and Linux
 make test              # unit tests via a scriptable fake msb binary (no real sandbox needed)
 go run ./cmd/krayt doctor
-
-# only if you need the legacy VM image pipeline (tier 2, CI/image maintainers only):
-nix develop             # drops you into a shell with oras pinned
 ```
 
 That's it — no base VM image to pull. `krayt run` hands your agent image straight to `msb create`,
@@ -175,11 +147,10 @@ nothing about which AI or tools are inside.
   Pass `--skip-resource-check` to bypass.
 - Flags can live in a `krayt.yaml` instead (see `configs/`); each run leaves a self-contained
   `.krayt/runs/<id>/` with `changes.patch`, `report.md`, `meta.json`, and logs.
-- **Disk cache.** Agent images are pulled and cached by **msb itself** now — krayt hands `msb
-  create` the image reference and lets it manage that cache, rather than pulling and storing it
-  itself. `krayt image ls/rm/prune` still exist and still see krayt's own legacy `vmimage/` cache
-  under `<user-cache-dir>/krayt/` (a leftover of the pre-msb base VM image, no longer used by
-  `krayt run`); `imagestore/` is no longer populated for the same reason. Sandboxes themselves are
+- **Disk cache.** Agent images are pulled and cached by **msb itself** — krayt hands `msb create`
+  the image reference and lets it manage that cache; krayt keeps no image cache of its own
+  (`docs/ai-tasks/retire-vm-image-pipeline.md`). `krayt image ls/rm/prune` are a thin front-end over msb's own
+  store (`msb images`/`msb rmi`/`msb image prune`), not a second cache. Sandboxes themselves are
   fully ephemeral either way.
 
 Reproducible, ready-to-run examples live under `hack/` — most notably `hack/claude-code/`
@@ -357,7 +328,7 @@ the results with `krayt ls`/`attach`/`answer` as the script's own output describ
 | `HUMAN_TODO.md` | Handoff log the agent maintains for steps a human must do (created during development). |
 | `SECURITY.md` | Threat model pointer + how to privately report a vulnerability. |
 | `CONTRIBUTING.md` | How to get set up, code/commit conventions, and what a PR should include. |
-| `images/` | Legacy Nix flake for krayt's old base micro-VM image (no longer used by `krayt run`, kept only for the `krayt image` cache subcommands until retired); `images/agents/` holds the published, ready-to-run agent images (CI-built) and is very much still live. |
+| `images/` | `images/agents/` holds the published, ready-to-run agent images (CI-built). There is no krayt-built VM image any more — the sandbox image is msb's concern (`docs/adr-microsandbox-sandbox-layer.md`). |
 | `internal/` | The implementation (see §9 of the spec for package layout). |
 | `cmd/` | Binaries: `krayt` (the CLI), `krayt-helper` (stateless, linux-only, root-run guest binary invoked via `msb exec` that builds the patch — clones the bundle, tags a baseline, diffs, bundles commits), `krayt-ask` (question front-end + MCP server; dials `AF_VSOCK` to the host directly). |
 | `configs/` | Example `krayt.yaml` + default allowlist. |

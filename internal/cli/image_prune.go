@@ -2,21 +2,28 @@ package cli
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/opencontainers/go-digest"
 	"github.com/spf13/cobra"
 
-	"github.com/418-cloud/krayt/internal/imagecache"
 	"github.com/418-cloud/krayt/internal/orchestrator"
+	"github.com/418-cloud/krayt/internal/sandbox"
 )
 
-// pruneDecision records what prune chose to do with one cached image and why.
+// pruneDecision records what prune chose to do with one of msb's images and why.
 type pruneDecision struct {
-	img    cachedImage
+	img    sandbox.ImageInfo
 	keep   bool
 	reason string // human-readable, shown in the summary
+}
+
+// imageUse summarizes what krayt's own run records know about one image ref: whether a
+// non-terminal run is currently using it, and the most recent time any run (terminal or not)
+// used it — the two facts krayt's age/in-use retention needs (retire-vm-image-pipeline.md
+// decision 3), now that msb's own store carries no age policy or krayt-visible last-used time.
+type imageUse struct {
+	runID    string // non-empty: a non-terminal run's ID currently using this ref
+	lastUsed time.Time
 }
 
 func newImagePruneCmd() *cobra.Command {
@@ -25,72 +32,74 @@ func newImagePruneCmd() *cobra.Command {
 	var all, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "prune",
-		Short: "Remove cached images outside the retention policy",
-		Long: "Reclaims cache disk by removing images that are not protected. Always kept: the " +
-			"pinned base VM image. Container images are kept when used within --older-than (default " +
-			"24h) or referenced by a non-terminal run under --repo whose image is a digest ref. Every " +
-			"non-pinned base VM image is removed. --all bypasses the container protections (never the " +
-			"pinned base image); --dry-run reports without deleting.",
+		Short: "Remove images outside the retention policy",
+		Long: "Reclaims msb's store by removing images that are not protected. An image is " +
+			"protected when a non-terminal run under --repo references it, or when some run " +
+			"(terminal or not) used it within --older-than (default 24h) — krayt's own retention " +
+			"policy, layered on top of msb's own `image prune` sweep of dangling artifacts (" +
+			"retire-vm-image-pipeline.md decision 3). --all bypasses both protections. --dry-run " +
+			"reports what would happen without removing or pruning anything, though it still lists " +
+			"msb's images to compute the report.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runImagePrune(cmd, repo, olderThan, all, dryRun)
 		},
 	}
-	cmd.Flags().StringVar(&repo, "repo", ".", "repo whose non-terminal runs protect in-use images")
-	cmd.Flags().DurationVar(&olderThan, "older-than", 24*time.Hour, "keep container images used within this window")
-	cmd.Flags().BoolVar(&all, "all", false, "ignore age and in-use protections (still keeps the pinned base image)")
+	cmd.Flags().StringVar(&repo, "repo", ".", "repo whose runs protect in-use/recently-used images")
+	cmd.Flags().DurationVar(&olderThan, "older-than", 24*time.Hour, "keep images used within this window")
+	cmd.Flags().BoolVar(&all, "all", false, "ignore age and in-use protections")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "report what would be removed/kept without deleting")
 	return cmd
 }
 
 func runImagePrune(cmd *cobra.Command, repo string, olderThan time.Duration, all, dryRun bool) error {
-	imgs, err := listCachedImages()
+	sb, err := sandbox.NewClient()
 	if err != nil {
 		return err
 	}
-	inUse, err := inUseDigests(repo)
+	imgs, err := sb.Images(cmd.Context())
+	if err != nil {
+		return err
+	}
+	uses, err := imageUses(repo)
 	if err != nil {
 		return err
 	}
 
 	now := time.Now()
 	decisions := make([]pruneDecision, 0, len(imgs))
-	for _, ci := range imgs {
-		keep, reason := pruneDecide(ci, all, now, olderThan, inUse)
-		decisions = append(decisions, pruneDecision{img: ci, keep: keep, reason: reason})
+	for _, img := range imgs {
+		keep, reason := pruneDecide(img, all, now, olderThan, uses)
+		decisions = append(decisions, pruneDecision{img: img, keep: keep, reason: reason})
 	}
 
-	return reportPrune(cmd, decisions, dryRun)
+	return reportPrune(cmd, sb, decisions, all, dryRun)
 }
 
-// pruneDecide applies the retention policy (task §prune) to one cached image.
-func pruneDecide(ci cachedImage, all bool, now time.Time, olderThan time.Duration, inUse map[string]string) (keep bool, reason string) {
-	if ci.kind == kindVMImage {
-		// Keep only the pinned base image; every other vmimage entry is unreachable by `krayt
-		// run` and removed unconditionally — even under --all the pinned one stays.
-		if ci.pinned {
-			return true, "pinned base image"
-		}
-		return false, ""
-	}
-	// container kind
+// pruneDecide applies the retention policy (decision 3) to one of msb's images.
+func pruneDecide(img sandbox.ImageInfo, all bool, now time.Time, olderThan time.Duration, uses map[string]imageUse) (keep bool, reason string) {
 	if all {
 		return false, ""
 	}
-	if runID, ok := inUse[ci.entry.Digest]; ok {
-		return true, "in use by " + runID
+	u, ok := uses[img.Ref]
+	if !ok {
+		return false, ""
 	}
-	if age := now.Sub(ci.entry.LastUsed); age <= olderThan {
+	if u.runID != "" {
+		return true, "in use by " + u.runID
+	}
+	if age := now.Sub(u.lastUsed); age <= olderThan {
 		return true, "used " + humanDuration(age) + " ago"
 	}
 	return false, ""
 }
 
-// inUseDigests maps the resolved digest of every non-terminal run under repo to its run ID,
-// but only for runs whose image_ref is itself a digest reference (…@sha256:<hex>) — a
-// tag-based ref can't be resolved to a cache digest offline (a documented gap; age protects
-// those). A missing/empty .krayt is not an error.
-func inUseDigests(repo string) (map[string]string, error) {
+// imageUses maps every image_ref recorded by any run under repo (`.krayt/runs/*/meta.json`,
+// which already records it — decision 3) to what krayt knows about its use: a non-terminal run's
+// ID, if any currently reference it, and the most recent used-at time (EndedAt, falling back to
+// StartedAt for a still-running run) across every run that referenced it. A missing/empty .krayt
+// is not an error.
+func imageUses(repo string) (map[string]imageUse, error) {
 	sd, err := stateDir(repo)
 	if err != nil {
 		return nil, err
@@ -99,33 +108,42 @@ func inUseDigests(repo string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]string{}
+	out := map[string]imageUse{}
 	for _, r := range recs {
-		if r.Terminal() {
+		if r.ImageRef == "" {
 			continue
 		}
-		if d, ok := digestFromRef(r.ImageRef); ok {
-			out[d] = r.ID
+		u := out[r.ImageRef]
+		if !r.Terminal() && u.runID == "" {
+			u.runID = r.ID
 		}
+		if t := recordUsedAt(r); t.After(u.lastUsed) {
+			u.lastUsed = t
+		}
+		out[r.ImageRef] = u
 	}
 	return out, nil
 }
 
-// digestFromRef extracts the "sha256:<hex>" digest from a digest reference (…@sha256:<hex>),
-// or reports false for a tag-based ref. Matched by direct comparison, no registry resolution.
-func digestFromRef(ref string) (string, bool) {
-	d := ref
-	if i := strings.LastIndex(ref, "@"); i >= 0 {
-		d = ref[i+1:]
+// recordUsedAt is the best single timestamp for when a run last used its image: EndedAt once the
+// run is terminal, else StartedAt for a run still in flight. An unparsable/absent timestamp
+// yields the zero time, which never satisfies an age window.
+func recordUsedAt(r orchestrator.RunRecord) time.Time {
+	ts := r.EndedAt
+	if ts == "" {
+		ts = r.StartedAt
 	}
-	if digest.Digest(d).Validate() != nil {
-		return "", false
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return time.Time{}
 	}
-	return d, true
+	return t
 }
 
-// reportPrune prints the decisions and, unless dryRun, removes the entries marked for removal.
-func reportPrune(cmd *cobra.Command, decisions []pruneDecision, dryRun bool) error {
+// reportPrune prints the decisions and, unless dryRun, removes the entries marked for removal via
+// `msb rmi`, then sweeps whatever msb's own store still considers dangling via `msb image prune`.
+// dryRun calls neither.
+func reportPrune(cmd *cobra.Command, sb *sandbox.Client, decisions []pruneDecision, all, dryRun bool) error {
 	w := cmd.OutOrStdout()
 	var removed, kept []pruneDecision
 	var reclaim int64
@@ -134,7 +152,7 @@ func reportPrune(cmd *cobra.Command, decisions []pruneDecision, dryRun bool) err
 			kept = append(kept, d)
 		} else {
 			removed = append(removed, d)
-			reclaim += d.img.entry.SizeB
+			reclaim += d.img.SizeB
 		}
 	}
 
@@ -144,11 +162,16 @@ func reportPrune(cmd *cobra.Command, decisions []pruneDecision, dryRun bool) err
 	}
 	for _, d := range removed {
 		if !dryRun {
-			if err := imagecache.Remove(d.img.entry); err != nil {
+			if err := sb.Rmi(cmd.Context(), d.img.Ref, all); err != nil {
 				return err
 			}
 		}
-		if _, err := fmt.Fprintf(w, "%s %s %s (%s)\n", verb, d.img.kind, shortDigest(d.img.entry.Digest), humanSize(d.img.entry.SizeB)); err != nil {
+		if _, err := fmt.Fprintf(w, "%s %s (%s)\n", verb, d.img.Ref, humanSize(d.img.SizeB)); err != nil {
+			return err
+		}
+	}
+	if !dryRun {
+		if err := sb.ImagePrune(cmd.Context()); err != nil {
 			return err
 		}
 	}
@@ -162,7 +185,7 @@ func reportPrune(cmd *cobra.Command, decisions []pruneDecision, dryRun bool) err
 		return err
 	}
 	for _, d := range kept {
-		if _, err := fmt.Fprintf(w, "kept %s %s (%s)\n", d.img.kind, shortDigest(d.img.entry.Digest), d.reason); err != nil {
+		if _, err := fmt.Fprintf(w, "kept %s (%s)\n", d.img.Ref, d.reason); err != nil {
 			return err
 		}
 	}

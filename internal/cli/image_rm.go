@@ -5,36 +5,32 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/418-cloud/krayt/internal/imagecache"
+	"github.com/418-cloud/krayt/internal/sandbox"
 )
 
 func newImageRmCmd() *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
-		Use:   "rm <digest>",
-		Short: "Remove a cached image by digest (or unambiguous prefix)",
-		Long: "Removes one cached image identified by its full digest or an unambiguous hex " +
-			"prefix (docker-rmi style), searching both cache roots. Refuses the pinned base VM " +
-			"image unless --force (removing it just makes the next `krayt run` ask you to " +
-			"`krayt image pull` again).",
+		Use:   "rm <ref>",
+		Short: "Remove an image from msb's store",
+		Long: "Removes one image by reference (`msb rmi`) — krayt's image store is msb's own, " +
+			"ref-keyed, not a krayt-owned digest cache (retire-vm-image-pipeline.md decision 4). " +
+			"--force maps to msb's own --force, which allows removing an image a sandbox still " +
+			"references.",
 		Args:              cobra.ExactArgs(1),
-		ValidArgsFunction: completeCachedImageDigests,
+		ValidArgsFunction: completeImageRefs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ci, err := resolveCachedImage(args[0])
+			sb, err := sandbox.NewClient()
 			if err != nil {
 				return err
 			}
-			if ci.pinned && !force {
-				return fmt.Errorf("%s is the pinned base VM image; refusing without --force", shortDigest(ci.entry.Digest))
-			}
-			size := ci.entry.SizeB
-			if err := imagecache.Remove(ci.entry); err != nil {
+			if err := sb.Rmi(cmd.Context(), args[0], force); err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "removed %s (%s reclaimed)\n", shortDigest(ci.entry.Digest), humanSize(size))
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "removed %s\n", args[0])
 			return err
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "remove even the pinned base VM image")
+	cmd.Flags().BoolVar(&force, "force", false, "remove even an image a sandbox still references")
 	return cmd
 }
