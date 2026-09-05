@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.10.0](https://github.com/418-cloud/krayt/compare/v0.9.0...v0.10.0) (2026-09-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire the VM image pipeline in favour of msb images ([#156](https://github.com/418-cloud/krayt/issues/156))
+* msb must be installed on the host; the vfkit and Firecracker backends, the VM image, and the krayt-agent/krayt-vsock-forward binaries are gone.
+
+### Features
+
+* add krayt-helper guest binary for msb sandboxes ([#150](https://github.com/418-cloud/krayt/issues/150)) ([8533dc0](https://github.com/418-cloud/krayt/commit/8533dc086e9f8d2a20edacf34e83fae3842cbbc7))
+* add msb sandbox driver ([#147](https://github.com/418-cloud/krayt/issues/147)) ([88dc257](https://github.com/418-cloud/krayt/commit/88dc2576d41a9efb328f968c29729fd7aba23ea2))
+* dial the ask channel over vsock, host-side ([#153](https://github.com/418-cloud/krayt/issues/153)) ([7440fdf](https://github.com/418-cloud/krayt/commit/7440fdfa4745d6f9ed2c4c1fc4f2670b14b8628d))
+* hand secrets to msb ([#4](https://github.com/418-cloud/krayt/issues/4)) ([3ce89e7](https://github.com/418-cloud/krayt/commit/3ce89e765788eb2b95a8eb6823f5f8ea308bdbfc))
+* hand secrets to msb via --secret argv and child env ([#149](https://github.com/418-cloud/krayt/issues/149)) ([3ce89e7](https://github.com/418-cloud/krayt/commit/3ce89e765788eb2b95a8eb6823f5f8ea308bdbfc))
+* introduce ADR for replacing krayt's sandbox layer with microsandbox ([#142](https://github.com/418-cloud/krayt/issues/142)) ([7272577](https://github.com/418-cloud/krayt/commit/72725772cfc954a80216337f4f7de841bdb02cd2))
+* replace the in-tree VM stack with msb sandboxes ([#154](https://github.com/418-cloud/krayt/issues/154)) ([dfa31b1](https://github.com/418-cloud/krayt/commit/dfa31b1202f3f54456898cc24b9168ccbc496862))
+* retire the VM image pipeline in favour of msb images ([#156](https://github.com/418-cloud/krayt/issues/156)) ([47ecb1f](https://github.com/418-cloud/krayt/commit/47ecb1fef4dad420e7e4e85b6f428a3f11b11ee9))
+* translate network policy to msb network policies ([#148](https://github.com/418-cloud/krayt/issues/148)) ([cac9381](https://github.com/418-cloud/krayt/commit/cac9381090f8ba19044c2a08505516385db8a807))
+
 ## [0.9.0](https://github.com/418-cloud/krayt/compare/v0.8.0...v0.9.0) (2026-08-22)
 
 
