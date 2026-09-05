@@ -1180,7 +1180,88 @@ container:
     - net_bind_service          # e.g. bind :80/:443 as non-root
   seccomp: default              # default (containerd profile) | unconfined (drop the filter)
   readonly_rootfs: false        # opt-in read-only rootfs (default false; see §8.2 caveat)
+
+# optional, bounded escape hatch into msb's OWN schema (add-msb-extra-conf-escape-hatch.md).
+# Config-file only, explicit --config only (§8.3) — see the paragraph below the block.
+sandbox:
+  extra_conf: ./msb-extra.yaml  # path to one msb config file, resolved relative to THIS file
 ```
+
+**`sandbox.extra_conf` — a bounded, explicitly unvalidated escape hatch
+(add-msb-extra-conf-escape-hatch.md).** krayt translates its own vocabulary into msb flags rather
+than forwarding msb's schema (`docs/adr-microsandbox-sandbox-layer.md`, "Recommendation:
+translate, don't forward") — splicing a vendor's beta schema into a *task* config would make
+`krayt.yaml` bi-vocabulary, and §8.3's containment rule only works over the closed set of keys
+krayt itself models. The cost is that anything msb can do and krayt does not model — DNS policy,
+published ports, rlimits, CPU placement, bandwidth limits, idle timeouts, mount tuning — is
+otherwise unreachable. `sandbox.extra_conf: <path>` names one msb configuration file passed to
+`msb create` as an additional root `--conf`, emitted **before** every krayt-owned flag (§8.3 —
+`--net-rule`/`--net`/`--net-default-egress`/`--net-default-ingress` all carry clap's
+`conflicts_with = "net_conf"`, so a *scoped* `--net-conf` beside krayt's own network flags would be
+a hard runtime error; a root `--conf` has no such conflict).
+
+krayt's own configuration still wins — a property of **msb's own precedence**, not a choice krayt
+makes: msb resolves lower to higher (built-in defaults, then every `--conf`/scoped file left to
+right, then explicit non-config CLI flags, `docs/cli/configuration.mdx:93-97`), and krayt passes
+its security-relevant policy as flags, so it sits above any `extra_conf` regardless of argv order.
+Concretely: an `extra_conf` carrying `network.policy`/`allow`/`deny` is fully replaced by krayt's
+`--net-default*` flags, not merged (msb's `build_network_policy` takes the
+`replaces_configured_policy` branch the moment krayt passes any `--net-default*`); and
+`--on-secret-violation passthrough`, which krayt emits unconditionally (§6.6), can never be
+overridden at the top level by an `extra_conf`'s `on_violation` for the same reason.
+
+**Confirmed on hardware, 2026-09-05, msb 0.6.16** (`hack/msb-probes/p8-extra-conf-precedence.sh`),
+and confirmed *through krayt* rather than through a transcription of its argv: an `extra_conf`
+whose `network.allow` named a host the run's own allowlist did not could not reach that host, in a
+sandbox built by a real `krayt run` from a real `sandbox.extra_conf:` — while a control sandbox
+running the same file with none of krayt's network flags reached it freely, so the file's directive
+was live and merely outranked. The probe's synthetic arm reproduces the same result from hand-built
+argv; the pair is what distinguishes "krayt's flags win" from "krayt emits argv nobody documented".
+
+**krayt never parses this file** — it does not know msb's schema and makes no promise about what
+it can express. That is said here, in the config's own comment, and at run start: a stderr line
+names the resolved path before any VM boots, exactly like the pre-boot network policy summary
+(§8.3), because two of msb's own merge rules make this file able to widen a boundary krayt
+otherwise guarantees, and an operator opting into it must be told, not just allowed:
+- **`mounts`** can mount host paths into the guest, dissolving the filesystem boundary §10 depends
+  on (no live host mount is otherwise possible under krayt).
+- **Secret entries append rather than replace** (`SandboxBuilder::secret_entry` pushes with no
+  dedupe on `env_var`): an `extra_conf` entry naming a secret krayt already declared does not
+  replace krayt's, it is evaluated alongside it. That makes one thing reachable that no
+  `krayt.yaml` key exposes, and it is the escalation that belongs beside `mounts`: **widening a
+  krayt-declared secret's `allowed_hosts`**. Because that secret's real value is already in the msb
+  child's environment (krayt put it there for its own `--secret`), a widened scope gets the **real
+  credential** substituted at the newly named host — see §10. Measured on hardware, 2026-09-05, msb
+  0.6.16: through a real `krayt run`, a secret krayt had scoped to one host was substituted in full
+  at a second host named only by the `extra_conf`, while the identical run without the `extra_conf`
+  saw only msb's placeholder there.
+
+  **This bullet previously also claimed an `extra_conf` could *tighten* one secret's `on_violation`
+  to `Block`. That is wrong, and the same hardware run disproved it.** The internal `SecretEntry`
+  struct does carry a per-entry `on_violation` (`domain.rs`), and `effective_violation_action`
+  would honour it — but no `msb` CLI surface can populate it. The config-file schema behind both a
+  root `--conf`'s `secrets:` map and `--secret-conf` is `SecretInput` (`crates/cli/lib/
+  sandbox_config.rs`), which is `#[serde(default, deny_unknown_fields)]` over exactly four fields —
+  `value`, `allow`, `inject`, `require_tls_identity` — and `materialize_secrets` hard-codes
+  `on_violation: None` on every entry it builds from a file. `--secret ENV@HOST[,HOST...]` has no
+  violation-action component in its grammar, and `--on-secret-violation` sets the *global*
+  `SecretsConfig.on_violation`, not any one entry's. So the field is unreachable, and
+  `deny_unknown_fields` means naming it does not degrade quietly: msb 0.6.16 refuses the whole
+  sandbox with `unknown field \`on_violation\`, expected one of \`value\`, \`allow\`, \`inject\`,
+  \`require_tls_identity\``. The only per-secret lever `sandbox.extra_conf` actually reaches is
+  scope. If the per-host violation signal is ever wanted back, it needs a change in msb, not a
+  krayt config.
+- An `extra_conf` naming a secret krayt does **not** declare adds no environment variable —
+  krayt's child env is a closed allowlist of only what krayt itself declared — so it resolves to an
+  unset host variable and cannot exfiltrate anything.
+
+Contained the same way `network.mitm`/`network.inject`/`network.passthrough` are (§8.3): refused
+outright from an auto-loaded `<repo>/krayt.yaml`, naming the key, and accepted only from an
+explicit `--config`. Resolved relative to the directory containing the config file that declares
+it (not the repo root, not the working directory) — the msb config travels with whichever
+`krayt.yaml` names it. Recorded in `meta.json`/`report.md` (§8.4): the resolved path and a digest
+of the file's bytes, so a reviewer can see from the artifacts alone that a run's posture may have
+been altered by an unvalidated vendor config.
 
 **Two tracked files, two purposes.** `configs/krayt.yaml` is the generic, fully-annotated
 template above — copy it as a starting point for any task. The repo-root `krayt.yaml` is a
@@ -1361,6 +1442,7 @@ treatment is stated in one place rather than discovered one field at a time. A f
 | `repo:` | **error** | honored | redirects **which host directory is bundled into the VM** — and is also the run-artifact root `.krayt/` is written under |
 | `container.capabilities` (non-empty) | **error** | honored | re-grants Linux capabilities the run drops by default (§8.1) |
 | `container.seccomp: unconfined` | **error** | honored | disables the seccomp profile (§8.1) |
+| `sandbox.extra_conf` (non-empty) | **error** | honored | names an unvalidated msb config file that can mount host paths into the guest or widen a declared secret's allowed hosts (§8.1, §10) |
 | `secrets:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read; its values are loaded host-side and, per key, substituted by msb into the sandbox's requests (§6.8) |
 | `task:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read, shipped into the guest as the run's prompt |
 | everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `questions`, `include_dirty`, `bundle_depth`, `transcript`, `container.readonly_rootfs`) | honored | honored | configures the run without redirecting what krayt reads/writes on the host or relaxing the container's confinement |
@@ -1630,7 +1712,7 @@ never exposed.
 | Container privileges | msb's own `--security restricted` profile (§6.6, §8.1), fixed and not user-configurable. krayt's pre-msb OCI-spec hardening (dropped Linux capabilities, containerd seccomp, enforced non-root, opt-in read-only rootfs) is **superseded, not layered on top** — `container.capabilities`, `container.seccomp: unconfined`, and `container.readonly_rootfs` are removed keys that hard-error, naming `--security` as the only, coarser replacement (`task.ValidateContainerPolicyForMsb`) |
 | Secrets | A declared secret's real value travels only in the `msb create` child's env — never on disk, never on argv (§6.6.1, §6.8). **Redacted host-side** (there is no guest process left to redact in — the sandbox never holds a value) from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted**; a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
 | Secret substitution at the host | Declaring any secret **automatically** enables TLS interception (§6.6.1) — there is no "secret without MITM" under msb, unlike the pre-msb opt-in `network.mitm`. msb substitutes the placeholder string the workload already sent, wherever it appears, but **never strips a pre-existing auth header first** the way krayt's own deleted proxy did. **The one real regression against krayt's pre-msb design**: a credential the agent obtained elsewhere and placed in a header addressed to an allowed host goes out **untouched**. Bounded by the allowlist — the agent can only send it somewhere already permitted — not eliminated |
-| Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3, whose table is the full field-by-field boundary): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy, redirect what krayt reads or writes on the host, or relax the container's confinement**. Refused with an error: `network.mitm` (now a hard error everywhere, not just here — §6.6), `network.inject`, `network.passthrough`, `network.mode: full`, `repo:`, `container.capabilities`, `container.seccomp: unconfined` (likewise hard errors everywhere — §6.6, §8.1). Contained to the repo root (no absolute path, no `..` escape, no symlink resolving out): `secrets:`, `task:`. Without this split a poisoned repo could name the operator's own secrets-file key as scoped to an attacker-controlled host (`network.inject`), bundle a *different*, private repo into the VM for the agent to read, or read an arbitrary host file in as the run's prompt — with every consistency check passing, because the file is only ever compared against itself |
+| Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3, whose table is the full field-by-field boundary): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy, redirect what krayt reads or writes on the host, or relax the container's confinement**. Refused with an error: `network.mitm` (now a hard error everywhere, not just here — §6.6), `network.inject`, `network.passthrough`, `network.mode: full`, `repo:`, `container.capabilities`, `container.seccomp: unconfined` (likewise hard errors everywhere — §6.6, §8.1), `sandbox.extra_conf` (§8.1 — an unvalidated msb config that can mount host paths or widen a declared secret's scope). Contained to the repo root (no absolute path, no `..` escape, no symlink resolving out): `secrets:`, `task:`. Without this split a poisoned repo could name the operator's own secrets-file key as scoped to an attacker-controlled host (`network.inject`), bundle a *different*, private repo into the VM for the agent to read, or read an arbitrary host file in as the run's prompt — with every consistency check passing, because the file is only ever compared against itself |
 | Persistence | msb sandbox stopped and removed on teardown; fresh sandbox per run |
 | Patch application | Always manual; human reviews diff before `git apply` |
 
@@ -1643,6 +1725,31 @@ never exposed.
   responsible for is narrower and different: emitting a **complete, correct** `msb create` policy
   every time (the never-empty-policy rule, §6.6) — a translation bug there is a config error, not
   a runtime bypass a compromised agent can trigger.
+- **`sandbox.extra_conf` dissolves two boundaries krayt otherwise guarantees, by design, behind an
+  explicit `--config` (§8.1).** Full contract in §8.1; the two security claims themselves belong
+  here, together, because both are the same shape — an unvalidated msb config reaching past what
+  krayt's own schema would ever let it do:
+  - **Filesystem.** `mounts` can mount host paths into the guest. Under krayt alone there is no
+    live host mount at all (Host filesystem row, above); an `extra_conf` is the one way to add one,
+    and it is the user's explicit choice to make, not a default.
+  - **Secrets.** msb's secret entries append rather than replace (`SandboxBuilder::secret_entry`
+    has no dedupe on `env_var`), so an `extra_conf` entry for a secret krayt **already** declared is
+    evaluated alongside krayt's, not overridden by it. That entry can carry a wider `allowed_hosts`
+    than krayt scoped that secret to — and because the secret's real value is already sitting in
+    the msb child's environment (krayt put it there for its own `--secret`), msb substitutes the
+    **real credential**, not a placeholder, at the newly named host. This is the secrets analogue
+    of `mounts`: a boundary (§6.6.1's per-secret host scoping) that holds for every `krayt.yaml` key
+    but not for this hatch. An entry for a secret krayt did **not** declare is harmless — krayt's
+    child env is a closed allowlist, so the reference resolves to nothing and there is no value to
+    exfiltrate. **Measured, not merely read**: `hack/msb-probes/p8-extra-conf-precedence.sh` on msb
+    0.6.16, 2026-09-05, through a real `krayt run` — the real credential arrived at the widened
+    host, and the identical run without the `extra_conf` saw only msb's placeholder there, which is
+    what attributes the escalation to this hatch rather than to msb ignoring secret scope generally.
+    This property has no compensating useful case: an earlier draft of this bullet claimed it also
+    let an operator *tighten* one secret's `on_violation` to `Block`, but no `msb` CLI surface can
+    populate a per-entry `on_violation` at all, and naming it makes msb refuse the sandbox outright
+    (§8.1 has the full finding). The append-not-replace behavior is a liability here and nothing
+    else.
 - Container-runtime / guest-kernel bugs — blast radius minimized by libkrun's own VM boundary plus
   msb's `--security restricted` profile (§6.6), which is msb's to maintain, not krayt's.
 - Malicious patch content (e.g. `.git/hooks`, build scripts) applied on the **host** — the
@@ -2283,8 +2390,15 @@ independently-landed progress rather than a single big-bang "Done when".
   `krayt image ls/rm/prune --dry-run` are unit-tested offline against a scriptable fake `msb`,
   including all three retention outcomes (protected by a non-terminal run, protected by the age
   window, pruned when neither applies); shell completion for `image rm` sources `msb images -q`.
-- [ ] `add-msb-extra-conf-escape-hatch.md` — opt-in `sandbox.extra_conf: <path>`, explicitly
-  unvalidated, subject to §8.3 containment.
+- [x] `add-msb-extra-conf-escape-hatch.md` — opt-in `sandbox.extra_conf: <path>`, explicitly
+  unvalidated, subject to §8.3 containment. **Hardware-verified 2026-09-05 on msb 0.6.16**
+  (`hack/msb-probes/p8-extra-conf-precedence.sh`, PASS, all four measurements). Both security
+  claims hold *through a real `krayt run`*, not only through hand-built argv: krayt's own flags
+  fully replace an `extra_conf`'s network policy (control sandbox proves the file was live, merely
+  outranked), and the secret-scope-widening escalation of §10 is real and attributable to the hatch
+  (control sandbox without it saw only the placeholder). The run also **overturned decision 2**:
+  per-secret `on_violation` tightening is not a capability of this hatch on any `msb` CLI surface —
+  `deny_unknown_fields` makes msb refuse the sandbox — and §8.1/§10 are corrected accordingly.
 - [ ] `expand-platforms-under-msb.md` — linux/arm64 in the release matrix, plus a real Windows
   port. Unblocked by `retire-vm-image-pipeline.md`: the old blocker (§15) was a krayt-owned image
   index with an arch dimension but no backend dimension, and Windows had no path at all; with no

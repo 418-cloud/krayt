@@ -30,6 +30,11 @@ type RunSpec struct {
 	Questions     QuestionsPolicy   // mode + per-question timeout + on-timeout (§6.13)
 	Container     ContainerPolicy   // least-privilege OCI overrides applied by the guest runner (§6.10, §10)
 	Detach        bool              // headless vs stream-to-terminal
+
+	// ExtraConf is the resolved, absolute path to an msb configuration file supplied via
+	// sandbox.extra_conf (§8.1); empty means none. Passed to `msb create` as a root --conf, before
+	// every krayt-owned flag (add-msb-extra-conf-escape-hatch.md decision 1). krayt never parses it.
+	ExtraConf string
 }
 
 // ContainerPolicy is the resolved per-task container hardening policy the guest runner turns

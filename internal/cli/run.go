@@ -95,6 +95,11 @@ type runFlags struct {
 	passthrough []string
 	secrets     []task.SecretSpec
 
+	// extraConf is sandbox.extra_conf (§8.1), resolved to an absolute path relative to the config
+	// file that declared it; config-file only, no CLI flag, and only ever non-empty from an
+	// explicit --config — applyConfig refuses it outright from an auto-loaded one (§8.3).
+	extraConf string
+
 	// configPath is the krayt.yaml actually loaded (explicit or auto-discovered), or "" when the
 	// run is flags-only; it names the provenance of the policy in the pre-boot summary.
 	configPath string
@@ -302,6 +307,7 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 		},
 		Questions: task.QuestionsPolicy{Mode: qMode, Timeout: f.questionTimeout, OnTimeout: qOnTimeout},
 		Container: f.container,
+		ExtraConf: f.extraConf,
 	}
 
 	// Optional per-agent adapter (§6.14): validate auth (exactly-one, fail fast before any
@@ -348,6 +354,18 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	}
 	if err := printNetworkPolicy(cmd.ErrOrStderr(), spec.Network, policySource); err != nil {
 		return err
+	}
+	// sandbox.extra_conf (§8.1 decision 4): named loudly, not just accepted — krayt never parses
+	// this file, so it can't tell the operator what it does. `mounts` dissolves the filesystem
+	// boundary §10 depends on, and a network.secrets entry can widen a krayt-declared secret's
+	// allowed_hosts onto the real credential already in the child's env; both are the operator's
+	// choice to make behind an explicit --config, not one to make unknowingly.
+	if spec.ExtraConf != "" {
+		if _, err := fmt.Fprintf(cmd.ErrOrStderr(),
+			"extra msb config (unvalidated, not parsed by krayt — may add mounts or widen secret scoping, §10): %s\n",
+			spec.ExtraConf); err != nil {
+			return err
+		}
 	}
 
 	// Refuse to boot a VM the host can't actually afford (2026-07-11 incident: two concurrent
@@ -707,6 +725,14 @@ func applyConfig(cmd *cobra.Command, f *runFlags) error {
 	if err != nil {
 		return fmt.Errorf("config %s: %w", path, err)
 	}
+	// sandbox.extra_conf is config-file only, like mitm/passthrough/secrets above, and reaching a
+	// non-empty value here means the operator named the file with --config: rejectAutoLoadedPolicy
+	// has already refused it for an auto-loaded config (§8.3). Resolved relative to the directory
+	// containing the config file that declared it, not the repo root or the working directory —
+	// this file travels with the krayt.yaml naming it, wherever that config lives.
+	if cfg.Sandbox.ExtraConf != "" {
+		f.extraConf = resolveAgainstDir(filepath.Dir(path), cfg.Sandbox.ExtraConf)
+	}
 	if !changed("include-dirty") && cfg.IncludeDirty != nil {
 		f.includeDirty = *cfg.IncludeDirty
 	}
@@ -803,6 +829,12 @@ func rejectAutoLoadedPolicy(path string, cfg *task.Config) error {
 		field, why = "container.capabilities", "re-grant Linux capabilities the run drops by default"
 	case cfg.Container.Seccomp == string(task.SeccompUnconfined):
 		field, why = "container.seccomp: unconfined", "disable the seccomp profile"
+	case cfg.Sandbox.ExtraConf != "":
+		// Joins network.mitm/inject/passthrough above for exactly the same reason (§8.1,
+		// add-msb-extra-conf-escape-hatch.md decision 3): the file it names can mount host paths
+		// into the guest or widen a secret's allowed hosts (§10), so a repo the operator did not
+		// write must not be able to name it.
+		field, why = "sandbox.extra_conf", "name an additional, unvalidated msb configuration file"
 	default:
 		return nil
 	}
@@ -861,6 +893,17 @@ func checkSymlinkContained(root, target string) error {
 		return fmt.Errorf("resolves through a symlink to %s, outside the repo root", realTarget)
 	}
 	return nil
+}
+
+// resolveAgainstDir resolves p — a path read from a config file — against dir when p is relative,
+// leaving an absolute p untouched. Used for sandbox.extra_conf (§8.1), which is anchored to the
+// directory of the config file that named it rather than the repo root or the working directory,
+// since the msb config travels with that krayt.yaml wherever it lives.
+func resolveAgainstDir(dir, p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(dir, p)
 }
 
 // resolveAbs returns path with every symlink resolved and made absolute, in that order: the repo

@@ -60,3 +60,13 @@ container:
   # Opt-in read-only rootfs (default false). Incompatible with images that write to their own
   # rootfs / $HOME (the reference agent images do). When true, only /tmp and /run are writable.
   readonly_rootfs: false
+
+# Bounded, EXPLICITLY UNVALIDATED escape hatch into msb's own config schema (§8.1,
+# add-msb-extra-conf-escape-hatch.md) — for msb features krayt does not model (DNS policy,
+# published ports, rlimits, CPU placement, bandwidth limits, idle timeouts, mount tuning). krayt
+# never parses this file. Refused from an auto-loaded <repo>/krayt.yaml (§8.3) — only an explicit
+# --config may set it. `mounts` here can mount host paths into the guest, and a `network.secrets`
+# entry can widen a krayt-declared secret's allowed hosts onto the real credential value already in
+# the sandbox's env (§10) — know what the file does before pointing this at it.
+# sandbox:
+#   extra_conf: ./msb-extra.yaml   # resolved relative to THIS file's directory

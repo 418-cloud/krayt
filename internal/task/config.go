@@ -50,6 +50,20 @@ type Config struct {
 		Seccomp        string   `yaml:"seccomp"`         // ""/"default" (default profile) | "unconfined"
 		ReadonlyRootfs *bool    `yaml:"readonly_rootfs"` // opt-in; pointer distinguishes unset from explicit false
 	} `yaml:"container"`
+	Sandbox struct {
+		// ExtraConf names one msb configuration file passed to `msb create` as an additional root
+		// --conf, before every krayt-owned flag (§8.1, add-msb-extra-conf-escape-hatch.md) — the
+		// bounded escape hatch for msb features krayt does not model (DNS policy, published ports,
+		// rlimits, CPU placement, bandwidth limits, idle timeouts, mount tuning). krayt never parses
+		// this file: it does not know msb's schema and makes no promise about what it can express.
+		// Because krayt's own security-relevant policy travels as CLI flags, which outrank every
+		// --conf, this file cannot override krayt's network/secret-violation defaults — but its
+		// `mounts` key can still mount host paths into the guest, and a `network.secrets` entry can
+		// widen a krayt-declared secret's allowed_hosts, both of which dissolve a boundary krayt
+		// otherwise guarantees (§10). Refused from an auto-loaded <repo>/krayt.yaml (§8.3) for the
+		// same reason network.mitm/inject/passthrough are: only an explicit --config may set it.
+		ExtraConf string `yaml:"extra_conf"`
+	} `yaml:"sandbox"`
 }
 
 // ConfigInjectRule mirrors one `network.inject[]` entry (§8.1,

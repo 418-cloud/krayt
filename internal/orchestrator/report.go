@@ -30,6 +30,10 @@ func writeReport(runDir string, rec RunRecord, agentNotes string, metaDigest dig
 	fmt.Fprintf(&b, "- Image: %s   Task: %s\n", Sanitize(rec.ImageRef), rec.TaskSummary)
 	fmt.Fprintf(&b, "- Result: %s   Exit: %d   Duration: %s\n", resultWord(rec), rec.ExitCode, hms(rec.DurationSecs))
 	fmt.Fprintf(&b, "- Network: %s\n", Sanitize(networkLine(rec.Network)))
+	if rec.ExtraConf != nil {
+		fmt.Fprintf(&b, "- Extra msb config (unvalidated, §8.1): %s (%s)\n",
+			Sanitize(rec.ExtraConf.Path), rec.ExtraConf.Digest)
+	}
 	if rec.Error != "" {
 		fmt.Fprintf(&b, "- Error: %s\n", Sanitize(rec.Error))
 	}

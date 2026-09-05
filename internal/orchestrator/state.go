@@ -51,6 +51,17 @@ type RunRecord struct {
 	PID          int             `json:"pid,omitempty"`          // supervising process (for `krayt stop`)
 	CtrlSocket   string          `json:"ctrl_socket,omitempty"`  // run control socket (for `krayt answer`, §6.13)
 	SandboxName  string          `json:"sandbox_name,omitempty"` // the msb sandbox this run created ("krayt-<id>")
+	ExtraConf    *ExtraConfMeta  `json:"extra_conf,omitempty"`   // nil unless sandbox.extra_conf was used (§8.1)
+}
+
+// ExtraConfMeta records an msb `--conf` file supplied via sandbox.extra_conf (§8.1,
+// add-msb-extra-conf-escape-hatch.md decision 5): the resolved path and a digest of its bytes, so
+// a reviewer can see from the artifacts alone that a run's posture may have been altered by a
+// file krayt neither parsed nor validated — Digest is what lets them notice the file changed
+// between the run and their review, not a guarantee about its contents.
+type ExtraConfMeta struct {
+	Path   string `json:"path"`
+	Digest string `json:"digest"`
 }
 
 // NetworkMeta is the run's egress policy as recorded in meta.json (§8.4). MITM/InjectedKeys are

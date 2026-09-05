@@ -294,4 +294,3 @@ The only agent image never published or exercised. **The publish itself may alre
   evidence: `krayt ls` reaching `done`/`EXIT 0`, `changes.patch` applying cleanly, the collected
   `/output/opencode-report.md`, and `proxy.log`.
 - **Blocking:** no.
-

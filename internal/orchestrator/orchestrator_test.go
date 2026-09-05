@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/opencontainers/go-digest"
+
 	"github.com/418-cloud/krayt/internal/orchestrator"
 	"github.com/418-cloud/krayt/internal/patch"
 	"github.com/418-cloud/krayt/internal/task"
@@ -379,6 +381,109 @@ func TestPatchSecretScanWiredIntoRun(t *testing.T) {
 	}
 	if !hit(m.Safety) {
 		t.Errorf("meta.json safety should flag the secret key; got %v", m.Safety)
+	}
+}
+
+// TestExtraConfRecordedInMetaAndReport is add-msb-extra-conf-escape-hatch.md decision 5: a
+// reviewer must be able to see, from the artifacts alone, that a run's posture may have been
+// altered by an unvalidated vendor config — meta.json carries the resolved path and a digest of
+// its bytes, and report.md's Run section shows the same line.
+func TestExtraConfRecordedInMetaAndReport(t *testing.T) {
+	extraConf := filepath.Join(t.TempDir(), "extra.yaml")
+	extraConfBytes := []byte("mounts:\n  - host: /tmp\n    guest: /mnt/tmp\n")
+	if err := os.WriteFile(extraConf, extraConfBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := digest.FromBytes(extraConfBytes).String()
+
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{ExitCode: 0}})
+
+	spec := task.RunSpec{
+		ID: "run_extra_conf_meta", ImageRef: "img", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"), Network: allowlistAll,
+		ExtraConf: extraConf,
+	}
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var m orchestrator.RunRecord
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(runDir, "meta.json"))), &m); err != nil {
+		t.Fatalf("parse meta.json: %v", err)
+	}
+	if m.ExtraConf == nil {
+		t.Fatal("meta.json extra_conf is nil, want it populated")
+	}
+	if m.ExtraConf.Path != extraConf {
+		t.Errorf("meta.json extra_conf.path = %q, want %q", m.ExtraConf.Path, extraConf)
+	}
+	if m.ExtraConf.Digest != wantDigest {
+		t.Errorf("meta.json extra_conf.digest = %q, want %q", m.ExtraConf.Digest, wantDigest)
+	}
+
+	report := readFile(t, filepath.Join(runDir, "report.md"))
+	if !strings.Contains(report, extraConf) || !strings.Contains(report, wantDigest) {
+		t.Errorf("report.md should render the extra_conf path and digest; got:\n%s", report)
+	}
+}
+
+// TestExtraConfMissingFileFailsFast proves sandbox.extra_conf is read before any VM work, the same
+// fail-fast treatment an unreadable secrets file gets — an operator typo should not silently reach
+// `msb create` and fail opaquely there.
+func TestExtraConfMissingFileFailsFast(t *testing.T) {
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	sb := newFakeSandbox(t, t.TempDir(), fakeMsbScript{Agent: fakeAgentScript{ExitCode: 0}})
+
+	spec := task.RunSpec{
+		ID: "run_extra_conf_missing", ImageRef: "img", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"), Network: allowlistAll,
+		ExtraConf: filepath.Join(t.TempDir(), "does-not-exist.yaml"),
+	}
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir); err == nil {
+		t.Fatal("Run succeeded with a missing sandbox.extra_conf file, want an error")
+	}
+}
+
+// TestExtraConfDoesNotAddChildEnv is the Done-when's other extra_conf proof: krayt never parses
+// sandbox.extra_conf (§8.1), so its presence must not change what reaches the msb child's
+// environment — in particular, a secret named only inside that file (never in krayt's own
+// SecretsPath/network.inject) must add no environment variable, because krayt's child env is a
+// closed allowlist built from what krayt itself declared (add-msb-sandbox-driver.md decision 5;
+// hand-secrets-to-msb.md).
+func TestExtraConfDoesNotAddChildEnv(t *testing.T) {
+	// A secret this file "declares" that krayt itself never does. If krayt ever read this file's
+	// contents, GH_TOKEN would leak into the create call's env; it must not, because krayt only
+	// hands msb a path, never the bytes behind it.
+	extraConf := filepath.Join(t.TempDir(), "extra.yaml")
+	extraConfContents := "network:\n  secrets:\n    secrets:\n      - env_var: GH_TOKEN\n" +
+		"        source: {env: GH_TOKEN}\n        allowed_hosts: [github.com]\n"
+	if err := os.WriteFile(extraConf, []byte(extraConfContents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GH_TOKEN", "leaked-if-krayt-ever-reads-extra-conf")
+
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	home := t.TempDir()
+	sb := newFakeSandbox(t, home, fakeMsbScript{Agent: fakeAgentScript{ExitCode: 0}})
+
+	spec := task.RunSpec{
+		ID: "run_extra_conf_env", ImageRef: "img", RepoPath: src, BundleDepth: 1,
+		TaskPrompt: []byte("task"), Network: allowlistAll,
+		ExtraConf: extraConf,
+	}
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	for _, c := range readFakeMsbCalls(t, home) {
+		if _, leaked := c.Env["GH_TOKEN"]; leaked {
+			t.Errorf("%q call's env carries GH_TOKEN, a key declared only in sandbox.extra_conf — "+
+				"krayt must never read that file's contents", c.Args[0])
+		}
 	}
 }
 

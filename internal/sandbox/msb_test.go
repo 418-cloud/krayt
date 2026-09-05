@@ -24,6 +24,7 @@ func newFakeClient(t *testing.T, home string, script fakeScript) *Client {
 func TestCreateSpecArgsStableOrderAndQuoting(t *testing.T) {
 	spec := CreateSpec{
 		Image:     "agent-image:latest",
+		ExtraConf: "/repo/msb-extra.yaml",
 		Name:      "krayt-run-1",
 		User:      "agent",
 		CPUs:      4,
@@ -57,6 +58,7 @@ func TestCreateSpecArgsStableOrderAndQuoting(t *testing.T) {
 	got := spec.Args()
 	want := []string{
 		"create", "agent-image:latest",
+		"--conf", "/repo/msb-extra.yaml",
 		"--name", "krayt-run-1",
 		"--user", "agent",
 		"--cpus", "4",
@@ -89,6 +91,39 @@ func TestCreateSpecArgsStableOrderAndQuoting(t *testing.T) {
 			if strings.Contains(next, " ") {
 				t.Fatalf("token %q looks shell-joined, want a single argv element", next)
 			}
+		}
+	}
+}
+
+// TestCreateSpecArgsExtraConfPrecedesEveryFlag pins add-msb-extra-conf-escape-hatch.md decision
+// 1/2: sandbox.extra_conf is rendered as a root --conf, and it must come before every
+// krayt-emitted flag in the rendered argv — not just before the ones this test happens to set —
+// so a reader (and msb's own --conf-vs-flag precedence) never has to wonder whether some later
+// krayt flag was accidentally placed ahead of it.
+func TestCreateSpecArgsExtraConfPrecedesEveryFlag(t *testing.T) {
+	spec := CreateSpec{
+		Image:     "agent-image:latest",
+		ExtraConf: "/repo/msb-extra.yaml",
+		Name:      "krayt-run-1",
+		User:      "agent",
+		CPUs:      4,
+		MemoryMiB: 2048,
+		Env:       []EnvVar{{Name: "FOO", Value: "bar"}},
+		NetRules:  []string{"allow@api.anthropic.com"},
+		Secrets:   []SecretRef{{Name: "ANTHROPIC_API_KEY", Hosts: []string{"api.anthropic.com"}}},
+		Security:  "restricted",
+		ExtraArgs: []string{"--future-flag", "value"},
+	}
+	args := spec.Args()
+	if len(args) < 4 || args[0] != "create" || args[1] != spec.Image {
+		t.Fatalf("Args() = %q, want it to start with create <image>", args)
+	}
+	if args[2] != "--conf" || args[3] != spec.ExtraConf {
+		t.Fatalf("Args() = %q, want --conf %q immediately after create <image>", args, spec.ExtraConf)
+	}
+	for i, tok := range args[4:] {
+		if tok == "--conf" {
+			t.Fatalf("Args() = %q, want exactly one --conf, found a second at index %d", args, i+4)
 		}
 	}
 }

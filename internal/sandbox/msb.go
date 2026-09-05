@@ -351,8 +351,15 @@ type CreateSpec struct {
 
 	Security string // --security value (e.g. "restricted"); empty means omit
 
-	// ExtraArgs is the one open escape hatch (add-msb-extra-conf-escape-hatch.md), appended
-	// verbatim after everything else this function renders.
+	// ExtraConf is sandbox.extra_conf (§8.1, add-msb-extra-conf-escape-hatch.md): an msb config
+	// file rendered as a root `--conf <path>`, emitted before every other flag below so krayt's own
+	// flags — which msb resolves with higher precedence than any --conf — remain the ones that
+	// decide the run's security posture (decision 2). Empty means omit.
+	ExtraConf string
+
+	// ExtraArgs is a second, generic escape hatch — appended verbatim after everything else this
+	// function renders — currently used to carry pre-built --net-rule/--net-default* tokens
+	// (task.NetworkArgs) rather than the typed NetRules/NetDefault* fields above.
 	ExtraArgs []string
 }
 
@@ -361,6 +368,14 @@ type CreateSpec struct {
 // exhaustively without spawning anything.
 func (s CreateSpec) Args() []string {
 	args := []string{"create", s.Image}
+	if s.ExtraConf != "" {
+		// Emitted first, before any krayt-owned flag: msb resolves lower to higher (built-in
+		// defaults, then every --conf left to right, then explicit CLI flags), so this file's
+		// settings are already the ones krayt's own flags below will override — the argv order
+		// itself doesn't change msb's precedence, but it documents the intent inline (§8.1 decision
+		// 1 and 2, add-msb-extra-conf-escape-hatch.md).
+		args = append(args, "--conf", s.ExtraConf)
+	}
 	if s.Name != "" {
 		args = append(args, "--name", s.Name)
 	}
