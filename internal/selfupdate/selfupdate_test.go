@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -293,7 +294,9 @@ func TestExtractBinary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat extracted binary: %v", err)
 		}
-		if info.Mode().Perm() != 0o755 {
+		// Windows has no POSIX permission bits: Chmod there only ever toggles the read-only
+		// attribute, so Stat reports 0666/0444, never 0755.
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
 			t.Errorf("mode = %v, want 0755", info.Mode().Perm())
 		}
 	})
@@ -321,7 +324,9 @@ func TestExtractBinary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat extracted binary: %v", err)
 		}
-		if info.Mode().Perm() != 0o755 {
+		// Windows has no POSIX permission bits: Chmod there only ever toggles the read-only
+		// attribute, so Stat reports 0666/0444, never 0755.
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
 			t.Errorf("mode = %v, want 0755", info.Mode().Perm())
 		}
 	})
@@ -476,7 +481,8 @@ func TestApply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat current: %v", err)
 		}
-		if info.Mode().Perm() != 0o755 {
+		// Windows has no POSIX permission bits: Stat reports 0666/0444, never 0755.
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
 			t.Errorf("mode = %v, want 0755", info.Mode().Perm())
 		}
 		backup, err := os.ReadFile(backupPath)
@@ -489,6 +495,11 @@ func TestApply(t *testing.T) {
 	})
 
 	t.Run("non-writable dir", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("windows: Chmod only toggles the read-only attribute, which NTFS does not " +
+				"enforce against creating new files in a directory, so this can't be reproduced " +
+				"the way the unix case is")
+		}
 		if os.Geteuid() == 0 {
 			t.Skip("running as root: permission bits don't block writes")
 		}
