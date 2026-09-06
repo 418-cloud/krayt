@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -200,6 +201,12 @@ func TestChildEnvAllowlistExact(t *testing.T) {
 	}
 
 	allowed := map[string]bool{"PATH": true, "HOME": true, "MSB_HOME": true, "SSL_CERT_FILE": true, "SSL_CERT_DIR": true, "MSB_BACKEND": true}
+	if runtime.GOOS == "windows" {
+		// Not krayt's doing and not closable: os/exec's own doc says "As a special case on
+		// Windows, SYSTEMROOT is always added if missing" — the stdlib injects it into every
+		// child's environment regardless of what Cmd.Env (i.e. childEnv()) set.
+		allowed["SYSTEMROOT"] = true
+	}
 	for k := range env {
 		if !allowed[k] {
 			t.Fatalf("child env carried unexpected key %q — allowlist is not closed", k)

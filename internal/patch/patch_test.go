@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/418-cloud/krayt/internal/patch"
@@ -65,9 +66,7 @@ func TestRoundTrip(t *testing.T) {
 
 	// Apply onto a fresh checkout of the source repo and assert the edit landed.
 	target := filepath.Join(t.TempDir(), "target")
-	if _, err := exec.Command("git", "clone", "--quiet", src, target).CombinedOutput(); err != nil {
-		t.Fatalf("clone target: %v", err)
-	}
+	cloneRepo(t, src, target)
 	patchFile := filepath.Join(t.TempDir(), "changes.patch")
 	writeFile(t, patchFile, string(patchBytes))
 	if err := patch.Apply(ctx, target, patchFile, false); err != nil {
@@ -113,7 +112,18 @@ func TestSetupPatchGitRejectsExistingDir(t *testing.T) {
 // workspace symlink pointing outside the tree must NOT get its target chmod'd (§10). Real files in
 // the tree are still relaxed. Moved here from the pre-msb guest agent when the function was shared with
 // cmd/krayt-helper (add-krayt-guest-helper.md).
+//
+// Unix-only: the assertions below hinge on comparing exact owner/group/other permission bits, which
+// Windows cannot represent — os.Chmod there only toggles a single read-only attribute, so any
+// non-read-only file reports 0666 regardless of the mode requested at creation, making a hardcoded
+// 0o600 comparison unwinnable whether or not the symlink was followed. That's moot in practice:
+// MakeContainerWritable's only caller is cmd/krayt-helper, which is `//go:build linux` (it runs
+// inside the guest, never against a real Windows filesystem), so there is nothing Windows-specific
+// to regress here.
 func TestMakeContainerWritableSkipsSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-bit assertions below aren't meaningful on Windows (see doc comment); MakeContainerWritable only ever runs in the linux guest")
+	}
 	// A file OUTSIDE the workspace whose perms must remain untouched.
 	outsideDir := t.TempDir()
 	outside := filepath.Join(outsideDir, "outside.txt")
@@ -531,9 +541,7 @@ func TestRoundTripMultiCommitMerge(t *testing.T) {
 				t.Fatalf("Diff: err=%v len=%d", err, len(patchBytes))
 			}
 			target := filepath.Join(t.TempDir(), "target")
-			if out, err := exec.Command("git", "clone", "--quiet", src, target).CombinedOutput(); err != nil {
-				t.Fatalf("clone target: %v\n%s", err, out)
-			}
+			cloneRepo(t, src, target)
 			patchFile := filepath.Join(t.TempDir(), "changes.patch")
 			writeFile(t, patchFile, string(patchBytes))
 			if err := patch.Apply(ctx, target, patchFile, false); err != nil {
@@ -621,9 +629,7 @@ func TestDiffConfigInjectionInert(t *testing.T) {
 		t.Errorf("diff missing the real edit:\n%s", patchBytes)
 	}
 	target := filepath.Join(t.TempDir(), "target")
-	if out, err := exec.Command("git", "clone", "--quiet", src, target).CombinedOutput(); err != nil {
-		t.Fatalf("clone target: %v\n%s", err, out)
-	}
+	cloneRepo(t, src, target)
 	patchFile := filepath.Join(t.TempDir(), "changes.patch")
 	writeFile(t, patchFile, string(patchBytes))
 	if err := patch.Apply(ctx, target, patchFile, false); err != nil {
@@ -720,6 +726,11 @@ func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	// Isolate from the host's global/system gitconfig, the same way patch.go's own runGit does —
+	// otherwise a runner whose global config sets core.autocrlf=true (Windows' own default)
+	// silently rewrites these test fixtures' line endings on checkout, which is not what any of
+	// these tests are trying to exercise.
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -727,6 +738,15 @@ func git(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %v\n%s", args, err, errb.String())
 	}
 	return trim(out.String())
+}
+
+// cloneRepo clones src into dst with the same gitconfig isolation as git() above, for the tests
+// that stand in for a reviewer's own "fresh checkout of the host repo" — that checkout must be
+// deterministic across CI runners, not a proxy for whatever the runner's global config happens
+// to be.
+func cloneRepo(t *testing.T, src, dst string) {
+	t.Helper()
+	git(t, "", "clone", "--quiet", src, dst)
 }
 
 func writeFile(t *testing.T, path, content string) {

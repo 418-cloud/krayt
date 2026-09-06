@@ -853,7 +853,7 @@ func rejectAutoLoadedPolicy(path string, cfg *task.Config) error {
 // `secrets: secrets.env` in a repo run from its own directory resolves exactly as it did before
 // this containment existed.
 func containedRepoPath(root, p string) (string, error) {
-	if filepath.IsAbs(p) {
+	if pathLooksAbsolute(p) {
 		return "", fmt.Errorf("%q is an absolute path; an auto-loaded repo config may only name a file inside the repo", p)
 	}
 	clean := filepath.Clean(p)
@@ -896,6 +896,15 @@ func checkSymlinkContained(root, target string) error {
 		return fmt.Errorf("resolves through a symlink to %s, outside the repo root", realTarget)
 	}
 	return nil
+}
+
+// pathLooksAbsolute reports whether p is an absolute path, either by the host OS's own convention
+// (filepath.IsAbs) or by a POSIX-style leading slash. Windows' filepath.IsAbs does not treat
+// "/etc/passwd" as absolute — it is drive-relative there, not rooted at a fixed location — but a
+// krayt.yaml is portable data, and a leading slash is exactly the shape an attacker would use to
+// name a host file; containment must reject it the same way on every platform.
+func pathLooksAbsolute(p string) bool {
+	return filepath.IsAbs(p) || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\")
 }
 
 // resolveAgainstDir resolves p — a path read from a config file — against dir when p is relative,

@@ -10,21 +10,6 @@ import (
 	"github.com/418-cloud/krayt/internal/sockroot"
 )
 
-// maxUnixSocketPath is the longest path bind(2) will accept for a unix socket, taken as the
-// SHORTEST limit krayt has to run under rather than the local one: macOS's sockaddr_un.sun_path
-// is 104 bytes including the NUL, so 103 characters. Linux allows 107. Using the smaller number
-// everywhere means a run that works on Linux works on macOS, and costs nothing — no krayt socket
-// is anywhere near either limit by itself.
-//
-// Exceeding it does not fail politely. bind returns EINVAL, which surfaces as the thoroughly
-// unhelpful "bind: invalid argument" with no mention of length at all.
-const maxUnixSocketPath = 103
-
-// runSocketNames is every basename bound inside a run's socket directory. The budget check below
-// has to clear the LONGEST of them, not just the one being bound at that moment, or a run would
-// bind ask.sock successfully and then fail three statements later on control.sock.
-var runSocketNames = []string{"ask.sock", "control.sock"}
-
 // runSocketDir picks and prepares the directory holding a run's unix control sockets, preferring
 // the run's own private state directory and falling back to a short shared root only when that
 // path cannot fit under maxUnixSocketPath.
@@ -88,17 +73,4 @@ func shortSocketRoots() []string {
 		roots = append(roots, fixed)
 	}
 	return roots
-}
-
-// socketDirFits reports whether every socket krayt binds in dir stays under the limit.
-func socketDirFits(dir string) bool { return longestSocketPathLen(dir) <= maxUnixSocketPath }
-
-func longestSocketPathLen(dir string) int {
-	longest := 0
-	for _, n := range runSocketNames {
-		if l := len(filepath.Join(dir, n)); l > longest {
-			longest = l
-		}
-	}
-	return longest
 }
