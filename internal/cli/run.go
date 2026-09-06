@@ -131,7 +131,10 @@ func bindRunFlags(cmd *cobra.Command, f *runFlags) {
 	fl.BoolVar(&f.includeDirty, "include-dirty", false, "include uncommitted working-tree changes in the bundle")
 	fl.BoolVar(&f.transcript, "transcript", false, "copy the agent's own session transcript out of the sandbox into .krayt/runs/<id>/logs/transcript/ before teardown — records the tool calls and results the agent log does not (§8.4)")
 	fl.StringVar(&f.netMode, "net", "allowlist", "egress policy: allowlist | full | none")
-	fl.StringArrayVar(&f.allow, "allow", nil, "allowlisted egress domain (repeatable); only with --net allowlist")
+	fl.StringArrayVar(&f.allow, "allow", nil, "allowlisted egress domain (repeatable); only with --net allowlist. "+
+		"A leading '*.' allows a whole domain suffix — '*.example.com' covers example.com and every "+
+		"subdomain of it, which for a shared suffix like '*.github.io' means every tenant under it. "+
+		"QUOTE IT: unquoted, zsh fails the whole command with 'no matches found' before krayt ever runs")
 	fl.IntVar(&f.bundleDepth, "bundle-depth", 1, "forward bundle: 1 = single-commit snapshot, 0 = full history")
 	fl.IntVar(&f.cpus, "cpus", 2, "vCPUs")
 	fl.Uint64Var(&f.memory, "memory", 4096, "memory (MiB)")
@@ -929,6 +932,16 @@ func printNetworkPolicy(w io.Writer, p task.NetworkPolicy, source string) error 
 		fmt.Fprintf(&b, " allow=%s", strings.Join(p.Allow, ","))
 	}
 	fmt.Fprintf(&b, " secrets-scoped=%t\n", len(p.Secrets) > 0)
+	// Wildcard entries get their own line, and only when there are any. §8.3 calls this print the
+	// operator's last chance to notice a host they did not choose, and a `*.suffix` entry is exactly
+	// the one whose printed width understates its breadth: `*.github.io` is thirteen characters and
+	// every GitHub Pages tenant. Neither krayt nor msb keeps a public-suffix list
+	// (support-wildcard-network-hosts.md decision 3), so calling the entry out here is the
+	// mitigation — the entry is repeated rather than merely flagged, because the point is to make
+	// the operator read that particular line again.
+	if w := wildcardEntries(p); len(w) > 0 {
+		fmt.Fprintf(&b, "  wildcard suffixes (every subdomain): %s\n", strings.Join(w, ","))
+	}
 	if len(p.Passthrough) > 0 {
 		fmt.Fprintf(&b, "  passthrough (not intercepted): %s\n", strings.Join(p.Passthrough, ","))
 	}
@@ -937,6 +950,34 @@ func printNetworkPolicy(w io.Writer, p task.NetworkPolicy, source string) error 
 	}
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// wildcardEntries returns every `*.suffix` entry in p — allow, passthrough, and each secret's
+// scope — in that order, deduplicated, preserving the spelling the config used. Order is the
+// policy's own, never sorted: the operator reads this line against the lists printed beside it.
+func wildcardEntries(p task.NetworkPolicy) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(hosts []string) {
+		for _, h := range hosts {
+			trimmed := strings.TrimSpace(h)
+			if !strings.HasPrefix(trimmed, "*.") {
+				continue
+			}
+			key := strings.ToLower(trimmed)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, h)
+		}
+	}
+	add(p.Allow)
+	add(p.Passthrough)
+	for _, s := range p.Secrets {
+		add(s.Hosts)
+	}
+	return out
 }
 
 // sortedCopy returns a sorted copy of s, leaving the caller's slice alone.

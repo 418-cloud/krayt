@@ -15,12 +15,26 @@ network:
   allow:                        # hosts the agent may reach through the egress proxy (§6.6)
     - api.anthropic.com
     - registry.npmjs.org
+    # One leading `*.` allows a whole domain suffix: `*.example.com` covers example.com AND every
+    # subdomain of it. It is the only way to name a per-tenant host — <account>.blob.core.windows.net,
+    # <bucket>.s3.amazonaws.com — since those have no fixed spelling to list in advance.
+    # CAVEAT: krayt keeps no public-suffix list and neither does msb, so a shared suffix is exactly
+    # as wide as it looks: `*.github.io` allows every GitHub Pages tenant, `*.s3.amazonaws.com`
+    # every bucket. Bare `*` and single-label suffixes (`*.com`) are refused everywhere.
+    # QUOTE IT in YAML, and quote it on the command line too — `krayt run --allow '*.example.com'`;
+    # unquoted, zsh fails the whole command with "no matches found" before krayt ever runs.
+    # - '*.blob.core.windows.net'
   mitm: false                   # opt-in: terminate TLS at the host proxy and inject headers, so
                                  # an HTTP-shaped credential never enters the VM at all (§6.6).
                                  # Default off — a user who doesn't set this sees zero behavior
                                  # change. See README's "Credential injection" section.
   # passthrough:                 # hosts tunneled (never MITM'd) even when mitm is on — pinned
   #   - github.com                # clients / non-HTTP-over-TLS; subset of allow in mode: allowlist
+  #   - '*.blob.core.windows.net' # wildcards work here too, and a wildcard-allowed host usually
+  #                               # wants one: `allow` must be at least as WIDE as `passthrough`,
+  #                               # so `*.x.com` in passthrough needs `*.x.com` (not one subdomain)
+  #                               # in allow. A secret can never be scoped to a passthrough host —
+  #                               # it is tunneled un-MITM'd, so nothing could substitute it.
   # inject:                      # per-host header injection; requires mitm: true
   #   - host: api.anthropic.com
   #     strip: [x-api-key, authorization]   # remove these from the guest's request first

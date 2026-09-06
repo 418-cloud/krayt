@@ -51,6 +51,12 @@ msb default.** "No network policy computed" is a pre-flight error, not a valid s
    rule 5 below), so the key has no meaning — and quietly dropping a security key is how a policy
    regression ships. Same treatment for `inject[].set`, `inject[].set_prefix` and `inject[].strip`,
    handled in `hand-secrets-to-msb.md`.
+> **Superseded by `support-wildcard-network-hosts.md`** — both halves of decision 3's premise have
+> expired: `internal/proxy`, whose exact folded-ASCII map this decision names as *the* matcher, was
+> deleted by `run-tasks-on-microsandbox.md` (msb's own engine is the matcher now, and it supports
+> domain suffixes natively), and "not what this task is for" was a scoping statement about this
+> task, not a judgement that wildcards are wrong. Original text left intact below.
+
 3. **krayt's allow list stays exact-host-only.** `internal/proxy`'s matcher is an exact folded-ASCII
    map lookup (`internal/proxy/proxy.go:515-521`) and `validateHostEntry` already rejects anything
    else. msb supports `*.example.com` suffix rules; do **not** expose that. Adding a wildcard

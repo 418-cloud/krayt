@@ -275,8 +275,13 @@ func TestNetworkArgsPassthroughEmitsTLSBypass(t *testing.T) {
 // oddly.
 func TestNetworkArgsHostsAreOwnArgvElements(t *testing.T) {
 	np := NetworkPolicy{
-		Mode:  NetworkAllowlist,
-		Allow: []string{"a.example", "b.example"},
+		Mode: NetworkAllowlist,
+		// A wildcard on BOTH flags: '*' is shell-significant, and the whole point of krayt exec'ing
+		// msb with an argv slice and no shell is that it needs no quoting or escaping — so the token
+		// that reaches msb must be byte-identical to the krayt.yaml entry, on --net-rule and
+		// --tls-bypass alike.
+		Allow:       []string{"a.example", "b.example", "*.wild.example"},
+		Passthrough: []string{"*.wild.example"},
 	}
 	got, err := NetworkArgs(np, false)
 	if err != nil {
@@ -295,6 +300,45 @@ func TestNetworkArgsHostsAreOwnArgvElements(t *testing.T) {
 	}
 	if !containsPair(got, "--net-rule", "allow@b.example") {
 		t.Errorf("allow@b.example not its own pair of argv elements: %v", got)
+	}
+	if !containsPair(got, "--net-rule", "allow@*.wild.example") {
+		t.Errorf("the wildcard allow entry was quoted, escaped or joined on the way to msb: %v", got)
+	}
+	if !containsPair(got, "--tls-bypass", "*.wild.example") {
+		t.Errorf("the wildcard passthrough entry was quoted, escaped or joined on the way to msb: %v", got)
+	}
+}
+
+// TestNetworkArgsWildcardGolden pins the wildcard translation byte-for-byte and in order: a `*.`
+// entry is passed through verbatim and becomes msb's own Destination::DomainSuffix (--net-rule) and
+// wildcard bypass pattern (--tls-bypass), with no krayt-side rewriting of any kind.
+func TestNetworkArgsWildcardGolden(t *testing.T) {
+	np := NetworkPolicy{
+		Mode:        NetworkAllowlist,
+		Allow:       []string{"api.github.com", "*.blob.core.windows.net"},
+		Passthrough: []string{"*.blob.core.windows.net"},
+	}
+	want := []string{
+		"--net-default", "deny",
+		"--net-rule", "allow@dns",
+		"--net-rule", "deny@private",
+		"--net-rule", "deny@loopback",
+		"--net-rule", "deny@link-local",
+		"--net-rule", "deny@meta",
+		"--net-rule", "deny@multicast",
+		"--net-rule", "deny@host",
+		"--net-rule", "allow@api.github.com",
+		"--net-rule", "allow@*.blob.core.windows.net",
+		"--tls-bypass", "*.blob.core.windows.net",
+		"--tls-intercept",
+		"--on-secret-violation", "passthrough",
+	}
+	got, err := NetworkArgs(np, true)
+	if err != nil {
+		t.Fatalf("NetworkArgs: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("argv mismatch:\n got  %#v\n want %#v", got, want)
 	}
 }
 

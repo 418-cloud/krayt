@@ -164,9 +164,28 @@ opens egress to the whole public internet (explicit opt-in); `--net none` denies
 access outright. krayt still enforces default-deny/allowlist egress, but the mechanism is now
 msb's own: krayt translates `krayt.yaml`'s `network:` block into a fully explicit
 `--net-rule`/`--net-default`/`--tls-intercept`/`--tls-bypass` policy handed to `msb create` —
-there is no more krayt-run egress-proxy subprocess or in-guest firewall table. Two behavior notes
+there is no more krayt-run egress-proxy subprocess or in-guest firewall table. Three behavior notes
 worth knowing:
 
+- **A host may be an exact name or a `*.suffix` wildcard.** `allow: ['*.example.com']` covers
+  `example.com` *and* every subdomain of it (`api.example.com`, `a.b.example.com`) — but never
+  `evilexample.com`; the match is label-aligned. It is the only way to name a per-tenant host, since
+  `<account>.blob.core.windows.net` or `<bucket>.s3.amazonaws.com` have no fixed spelling to list in
+  advance — and an exact entry for the bare apex would match nothing at all, silently. The same
+  spelling works in `passthrough` and in a secret's `host`, because msb uses one wildcard convention
+  across all three flags.
+
+  **Quote it.** `krayt run --allow '*.example.com'` — unquoted, zsh fails the whole command with
+  `no matches found` before krayt ever starts, which reads like a krayt bug and is not one.
+
+  **A wildcard is exactly as wide as it looks, and krayt will not pretend otherwise.** Neither krayt
+  nor msb keeps a public-suffix list, so `*.github.io` allows every GitHub Pages tenant and
+  `*.s3.amazonaws.com` every bucket — there is no threshold that could block those without also
+  blocking `*.blob.core.windows.net`, which is the case the feature exists for. What krayt does
+  instead is refuse the shapes that are never justifiable (a bare `*`, and single-label suffixes like
+  `*.com`) on *every* field including secret scoping — msb itself does not validate that one — and
+  print any wildcard entry on its own line in the pre-boot policy summary, so breadth is something
+  you review rather than something you discover.
 - **DNS resolves through msb's own gateway**, not your host's resolver — msb polices it with
   DNS-rebind protection. This is a change from krayt's own former proxy, which used your host's
   system resolver directly.
@@ -209,8 +228,15 @@ network:
   allow: [api.github.com]
   inject:
     - key: GH_TOKEN              # secrets-file key name
-      host: api.github.com       # or `hosts: [...]` for more than one
+      host: api.github.com       # or `hosts: [...]` for more than one; `'*.example.com'` also works,
+                                 # and scopes the credential to every subdomain of it
 ```
+
+A secret's hosts must be covered by `allow`, and must **not** be covered by `passthrough` — a
+passthrough host is tunneled without interception, so nothing is there to substitute the credential
+and the container's request would go out carrying only the placeholder. krayt refuses both at
+pre-flight, wildcards included: if a `*.example.com` passthrough entry swallows a secret scoped to
+`api.example.com`, the error names the passthrough line that did it.
 
 No header name, no strip list, no literal prefix — the tool inside the sandbox is expected to emit
 its own placeholder-bearing header (`gh` does this itself), and msb matches the placeholder string
