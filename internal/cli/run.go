@@ -960,10 +960,15 @@ func wildcardEntries(p task.NetworkPolicy) []string {
 	seen := map[string]bool{}
 	add := func(hosts []string) {
 		for _, h := range hosts {
-			if !strings.HasPrefix(strings.TrimSpace(h), "*.") || seen[h] {
+			trimmed := strings.TrimSpace(h)
+			if !strings.HasPrefix(trimmed, "*.") {
 				continue
 			}
-			seen[h] = true
+			key := strings.ToLower(trimmed)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
 			out = append(out, h)
 		}
 	}

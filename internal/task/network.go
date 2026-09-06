@@ -428,16 +428,21 @@ func isTokenChar(r rune) bool {
 // surfaced in the pre-boot policy print (internal/cli.printNetworkPolicy) instead of pretended
 // away.
 func validateHostPattern(h string) error {
-	s := strings.TrimSpace(h)
-	suffix, isWildcard := strings.CutPrefix(s, "*.")
+	if strings.TrimSpace(h) != h {
+		return fmt.Errorf("host %q has leading or trailing whitespace: msb's --net-rule, --secret and "+
+			"--tls-bypass parsers test the value verbatim for a leading \"*.\" rather than trimming it "+
+			"first, so a padded wildcard is rejected or silently treated as an exact host that never "+
+			"matches — remove the whitespace", h)
+	}
+	suffix, isWildcard := strings.CutPrefix(h, "*.")
 	if !isWildcard {
-		if s == "*" {
+		if h == "*" {
 			return fmt.Errorf("host %q is not a valid wildcard: krayt has no \"any host\" spelling. "+
 				"msb reads `--secret NAME@*` as HostPattern::Any — \"any host (dangerous — secret can "+
 				"be exfiltrated)\" in msb's own words — and krayt must never emit it; name a domain "+
 				"suffix instead, as \"*.example.com\"", h)
 		}
-		if strings.Contains(s, "*") {
+		if strings.Contains(h, "*") {
 			return fmt.Errorf("host %q has a '*' that is not a leading \"*.\": krayt accepts one "+
 				"wildcard, only as the whole leftmost label, as \"*.example.com\" — msb matches a "+
 				"suffix, never a partial label, so %q could only ever match nothing", h, h)
@@ -504,10 +509,15 @@ func validateHostPattern(h string) error {
 // own separator there — without an `allow: ["a.example,evil.example"]` entry silently becoming two
 // scoped hosts.
 func validateHostEntry(h string) error {
-	s := strings.TrimSpace(h)
-	if s == "" {
+	if h == "" {
 		return fmt.Errorf("host is empty")
 	}
+	if strings.TrimSpace(h) != h {
+		return fmt.Errorf("host %q has leading or trailing whitespace: msb's --net-rule, --secret and "+
+			"--tls-bypass parsers all match the value verbatim rather than trimming it, so a padded "+
+			"entry is a spelling nothing can ever match — remove the whitespace", h)
+	}
+	s := h
 	// A wildcard reaching here came from a caller that is exact-only (a refresh block's host), or
 	// from validateHostPattern's own delegation of a pattern carrying a second '*'. Either way the
 	// generic "not a bare hostname" byte-class error below would name the wrong problem.

@@ -125,7 +125,6 @@ func TestValidateHostPatternAccepts(t *testing.T) {
 	good := []string{
 		"*.example.com",
 		"*.blob.core.windows.net", // the motivating case: <account>.blob.core.windows.net
-		"  *.EXAMPLE.com  ",       // trimmed and ASCII-folded like any other entry
 		"*.xn--80ak6aa92e.com",    // punycode is ordinary ASCII LDH
 		"*.host-1.sub.example",
 		// DELIBERATE, not an oversight — support-wildcard-network-hosts.md decision 3. msb has no
@@ -169,6 +168,12 @@ func TestValidateHostPatternRejectionsAreDiagnostic(t *testing.T) {
 		{"interior wildcard label", "api.*.example.com", "leftmost label"},
 		{"IPv4 suffix", "*.1.2.3.4", "no subdomains"},
 		{"IPv6 suffix", "*.::1", "no subdomains"},
+		// Padding is rejected rather than silently trimmed: msb's own parsers test the raw value
+		// for a leading "*." rather than trimming it first, so a padded entry that validated clean
+		// here would be emitted verbatim (NetworkArgs/SecretArgs) and either rejected by msb or
+		// matched as an exact host that never fires.
+		{"leading/trailing whitespace, wildcard", "  *.example.com  ", "whitespace"},
+		{"leading/trailing whitespace, exact", "  api.example.com  ", "whitespace"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -362,21 +362,34 @@ pre-flight exists to refuse.
   `Domain` and `DomainSuffix` go through one function. Only which spellings pre-flight passes
   through to msb changed.
 
-**Confirmed on hardware, 2026-09-06, msb 0.6.16** (`hack/msb-probes/p9-wildcard-suffix-rules.sh`,
-PASS) — every claim above was read out of msb's source first, and all five measurements came back
-as read. Under one `--net-rule allow@*.github.com`: the subdomain `api.github.com` was **reached**,
-the apex `github.com` was **reached** under that same rule, and the non-aligned neighbour
-`evilgithub.com` was **denied**. So the deferred DNS-cache binding does fire for `DomainSuffix`
-exactly as it does for `Domain` — a wildcard allow entry is not inert — the `hostname == suffix`
-branch really is covered, and label alignment holds where the security of every `*.` entry rests on
-it. `--tls-bypass *.github.com` served the **real upstream chain** (`issuer=C=GB, O=Sectigo Limited,
-CN=Sectigo Public Server Authentication CA DV E36`) rather than msb's own interception CA, measured
-in a sandbox that had a secret declared and therefore had interception on for everything it did not
-bypass — so a wildcard passthrough genuinely exempts its whole subtree, which is what makes
-`passthrough ⊆ allow` worth enforcing over wildcards. And `msb create --net-rule allow@*.com` was
-**rejected by msb itself**, pinning krayt's own single-label refusal as *aligned* with msb's
-`SuffixTooBroad` guard rather than merely additive: a future msb relaxation surfaces as a p9 failure
-instead of being silently inherited.
+**Confirmed on hardware, 2026-09-06, msb 0.6.16** (`hack/msb-probes/p9-wildcard-suffix-rules.sh`) —
+**all five measurements**, run against the default `github.com` family. Under one `--net-rule
+allow@*.github.com`: the subdomain `api.github.com` was **reached**, and the apex `github.com` was
+**reached** under that same rule. So the deferred DNS-cache binding does fire for `DomainSuffix`
+exactly as it does for `Domain` — a wildcard allow entry is not inert — and the `hostname == suffix`
+branch really is covered. `--tls-bypass *.github.com` served the **real upstream chain**
+(`issuer=C=GB, O=Sectigo Limited, CN=Sectigo Public Server Authentication CA DV E36`) rather than
+msb's own interception CA, measured in a sandbox that had a secret declared and therefore had
+interception on for everything it did not bypass — so a wildcard passthrough genuinely exempts its
+whole subtree, which is what makes `passthrough ⊆ allow` worth enforcing over wildcards. And `msb
+create --net-rule allow@*.com` was **rejected by msb itself**, pinning krayt's own single-label
+refusal as *aligned* with msb's `SuffixTooBroad` guard rather than merely additive: a future msb
+relaxation surfaces as a p9 failure instead of being silently inherited.
+
+**Label alignment — the property every `*.` entry's security rests on — is confirmed too, and it
+took three runs to get an answer worth having.** Under the same `allow@*.github.com`, the
+non-aligned neighbour `wwwgithub.com` — an unrelated registrant's host that ends in `github.com`
+with no label boundary, exactly what a bare `strings.HasSuffix` matcher would wrongly accept — was
+**denied**, while a second sandbox allowing that same host *by name* reached it **LIVE**. The
+control is the whole point: `reach()` cannot tell a correctly-enforced suffix mismatch from a name
+nothing answers at, so the denial only means something once the neighbour is known reachable in
+general. The first run (2026-09-06) shipped with no control at all and its DENIED proved nothing; a
+same-day fix added one (`ce58d4f`) and it came back DEAD, because the templated default neighbour
+`evil<suffix>` → `evilgithub.com` is NXDOMAIN. Replacing that guess with a verified-live literal
+(`wwwgithub.com`, now the script's `$4` default) produced the measurement above. `matches_suffix`
+(`crates/network/lib/policy/types.rs:997-1013`) is therefore a measured claim, not just a source
+read: `*.x.com` does not match `evilx.com`, and every wildcard in every `krayt.yaml` is as narrow
+as it reads.
 
 **The guest regains DNS — a genuine capability gain, stated plainly.** Under the pre-msb design
 the guest had no usable network at all in `allowlist`/`none` — everything rode vsock to a host

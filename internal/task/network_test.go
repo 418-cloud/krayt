@@ -213,19 +213,20 @@ func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 		// Written as escapes on purpose: these three are the runes that look like ASCII (or fold
 		// onto it), so a literal is exactly the thing an editor or a copy-paste can silently
 		// normalize away, leaving a test that passes while testing nothing.
-		"non-ASCII lookalike":   "api.anthrop\u0130c.com", // U+0130 'İ': ToLower folds it onto "api.anthropic.com"
-		"Kelvin sign":           "\u212Aey.example.com",   // U+212A KELVIN SIGN, indistinguishable from 'K'
-		"Cyrillic homoglyph":    "\u0430pi.anthropic.com", // U+0430 CYRILLIC SMALL A, indistinguishable from 'a'
-		"a URL, not a host":     "https://api.example.com",
-		"path":                  "api.example.com/v1",
-		"userinfo":              "user@api.example.com",
-		"percent-escape":        "api.anthrop%C4%B0c.com",
-		"CRLF":                  "api.example.com\r\nX: y",
-		"bracketed IPv6":        "[2606:4700:4700::1111]", // must be written bare, so both lists key alike
-		"bracketed non-literal": "[api.example.com]",
-		"unbalanced bracket":    "[2606:4700:4700::1111",
-		"whitespace-only":       "   ",
-		"empty allow entry":     "",
+		"non-ASCII lookalike":    "api.anthrop\u0130c.com", // U+0130 'İ': ToLower folds it onto "api.anthropic.com"
+		"Kelvin sign":            "\u212Aey.example.com",   // U+212A KELVIN SIGN, indistinguishable from 'K'
+		"Cyrillic homoglyph":     "\u0430pi.anthropic.com", // U+0430 CYRILLIC SMALL A, indistinguishable from 'a'
+		"a URL, not a host":      "https://api.example.com",
+		"path":                   "api.example.com/v1",
+		"userinfo":               "user@api.example.com",
+		"percent-escape":         "api.anthrop%C4%B0c.com",
+		"CRLF":                   "api.example.com\r\nX: y",
+		"bracketed IPv6":         "[2606:4700:4700::1111]", // must be written bare, so both lists key alike
+		"bracketed non-literal":  "[api.example.com]",
+		"unbalanced bracket":     "[2606:4700:4700::1111",
+		"whitespace-only":        "   ",
+		"leading/trailing space": "  api.example.com  ",
+		"empty allow entry":      "",
 		// A comma would survive internal/orchestrator's comma-joined --allow argv and come back
 		// out of internal/cli's split as TWO allowlisted hosts, so it must never validate.
 		"comma":             "a.example,evil.example",
@@ -306,7 +307,7 @@ func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 	}
 
 	good := []string{
-		"api.anthropic.com", "API.Anthropic.COM", "  api.example.com  ",
+		"api.anthropic.com", "API.Anthropic.COM",
 		"xn--80ak6aa92e.com", // punycode is ordinary ASCII LDH
 		"host-1.sub.example", "1.2.3.4",
 		"sub.domain.example", "10.0.0.1",
