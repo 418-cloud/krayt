@@ -301,7 +301,12 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 			defer deps.OnClient(spec.ID, nil)
 		}
 
-		vsockRoutes = []sandbox.VsockRoute{{HostPath: filepath.Join(askDir, "ask.sock"), Port: sandbox.AskPort}}
+		// The route's host endpoint is whatever askbridge.Listen actually bound, asked of the
+		// listener rather than reconstructed from askDir: the two only coincide on unix, where
+		// Listen binds askDir/ask.sock. On Windows it binds a named pipe in the kernel's own
+		// namespace (listen_windows.go), so a filepath.Join(askDir, "ask.sock") here named a
+		// path nothing was ever listening on and msb had nothing to bridge the guest's dial to.
+		vsockRoutes = []sandbox.VsockRoute{{HostPath: lis.Addr().String(), Port: sandbox.AskPort}}
 		mergeEnv(&spec, map[string]string{"KRAYT_ASK_SOCKET": sandbox.AskSocketEnv})
 	}
 	persistRec()

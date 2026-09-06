@@ -333,6 +333,11 @@ detached-supervisor process attributes, and the RAM/disk preflight probe
 runner — but that runner has no WHP available (nested virtualization isn't exposed there), so it
 proves the port compiles and the OS-agnostic suite passes, not that a real sandbox boots.
 
+**The native Windows `go test ./...` job is currently the one red check on this branch, and the
+fixes for it have not themselves been run on Windows.** See the `--on-question=wait` bullet below
+for the `--vsock`/named-pipe defect it exposed. Whoever picks this up should confirm the job goes
+green before treating the rest of this entry as the only outstanding Windows work.
+
 - **Needed:**
   1. `krayt doctor` on a real Windows 11 host with WHP enabled and `msb` installed — all msb
      checks pass, including `msb doctor`'s own WHP report.
@@ -347,6 +352,15 @@ proves the port compiles and the OS-agnostic suite passes, not that a real sandb
      listener round-trips a connection, but only real msb vsock-to-pipe bridging proves the wiring
      end to end (the same gap `hack/msb-probes/p1-vsock-nonroot.sh` closed for macOS's unix-socket
      path in §14 Phase 11).
+
+     Note that the host end of this route was wrong until now and is worth re-reading before the
+     run: `orchestrator.go` hardcoded the `--vsock` route's `HostPath` to
+     `filepath.Join(askDir, "ask.sock")`, which on Windows named a file nothing ever bound — the
+     ask channel is the named pipe `askbridge.Listen` created. It now passes `lis.Addr().String()`
+     (identical on unix, where `Listen` binds exactly that path), and `internal/askclient` grew a
+     `dialLocal` seam so a `\\.\pipe\` address is dialed through `winio.DialPipe` rather than
+     `net.Dial("unix", ...)`. Both are **compile- and unit-test-verified only**; this run is what
+     proves them against real msb.
   4. **A `krayt stop` on a live run**, to confirm the documented residual (§12): it should
      hard-terminate the supervisor (no graceful msb teardown), so check afterward whether `msb ls`
      still shows the sandbox running — expected, and the point of recording this here rather than
