@@ -292,7 +292,8 @@ create` call can reach:
 - **`allowlist` (default)** → `--net-default deny`, `allow@dns`, explicit `deny@<group>` rules for
   every private destination group (below), then one `allow@<host>` per `network.allow`
   entry, in the order given — deterministic, so the same config always renders byte-identical
-  argv (pinned by golden tests against this repo's own `krayt.yaml`).
+  argv (pinned by golden tests against this repo's own `krayt.yaml`). An entry is an exact host or
+  a `*.suffix` wildcard (below); both are passed through verbatim.
 - **`full`** → `--net-default-egress allow --net-default-ingress deny`, plus the *same*
   `allow@dns` and explicit `deny@<group>` rules: `full`'s allow must not mean "and also the
   host's LAN" — the
@@ -307,6 +308,88 @@ create` call can reach:
   deny-default modes need no separate ingress flag). krayt publishes no ports today, so this is
   inert — but msb's own ingress default is `allow`, and closing it costs one flag now rather than
   becoming a live gap the moment krayt publishes anything.
+
+**Wildcard suffix entries (`support-wildcard-network-hosts.md`).** `network.allow`,
+`network.passthrough` and a secret's scope (`network.inject[].host`) each accept one leading `*.`
+naming a domain suffix — `allow: ['*.blob.core.windows.net']`. This exists because a per-tenant host
+cannot be enumerated in advance: `<account>.blob.core.windows.net`, `<bucket>.s3.amazonaws.com` and
+`<project>.storage.googleapis.com` have no fixed spelling to write down, and an exact entry naming
+the bare apex is a rule no request ever matches — the silently-ineffective allowlist entry
+pre-flight exists to refuse.
+
+- **Semantics: apex-inclusive and label-aligned.** `*.example.com` matches `example.com`,
+  `api.example.com` and `a.b.example.com`; it does **not** match `evilexample.com`. That is msb's
+  rule, not krayt's invention, and krayt mirrors it byte-wise over ASCII
+  (`task.hostCovers`) against msb's three independent implementations of it — `matches_suffix`
+  (net rules), `HostPattern::matches` (secrets), `DomainPattern::matches_normalized` (TLS bypass).
+- **One convention across all three flags, by msb's own design** ("Mirrors the syntax already used
+  by `--tls-bypass` and `--secret` so users see one wildcard convention across the CLI",
+  `crates/cli/lib/net_rule.rs`): `--net-rule allow@*.example.com` → `Destination::DomainSuffix`,
+  `--tls-bypass *.example.com` → a wildcard bypass pattern, `--secret NAME@*.example.com` →
+  `HostPattern::Wildcard`. krayt therefore accepts the wildcard on all three of its own fields
+  rather than allow-only: `passthrough ⊆ allow`, so a wildcard-allowed host without a matching
+  wildcard passthrough would be MITM'd by msb's interception CA the moment any secret is declared
+  anywhere in the run, breaking every client that pins or uses its own trust store.
+- **The floor: bare `*` and single-label suffixes are refused, on every field.** krayt runs one
+  identical validator (`task.validateHostPattern`) over allow, passthrough and secret scopes, and it
+  mirrors msb's *strictest* surface rather than each surface's own. msb's `--net-rule` guard refuses
+  `*` and `*.com` (`SuffixTooBroad`), but its secret surface has no validation at all —
+  `HostPattern::parse` turns `*` into `HostPattern::Any`, "any host (dangerous — secret can be
+  exfiltrated)" in msb's own words, and `*.*.example.com` into a `Wildcard` that matches nothing, so
+  a credential silently never substitutes. **krayt's pre-flight is the only guard on that surface.**
+- **The public-suffix gap, stated rather than pretended away.** msb accepts any two-label suffix and
+  keeps no PSL, and neither does krayt: `*.co.uk`, `*.github.io`, `*.pages.dev` and
+  `*.s3.amazonaws.com` are all accepted, so `*.github.io` really does allow every GitHub Pages
+  tenant and `*.s3.amazonaws.com` every bucket. No label-count threshold can separate
+  `*.blob.core.windows.net` (four labels, multi-tenant, the motivating case) from `*.example.com`
+  (two labels, single-owner); a curated denylist is stale by construction and buys false confidence;
+  and a real PSL would be a vendored, expiring data file inside a tool whose containment story is
+  provenance (§8.3). The mitigation is review, not validation: the pre-boot policy summary (§8.3)
+  prints a dedicated `wildcard suffixes (every subdomain):` line whenever a policy carries one,
+  because a `*.` entry is precisely the one whose printed width understates its breadth.
+- **The cross-checks are where the work is.** `passthrough ⊆ allow` and "a secret host is not also a
+  passthrough host" stop being exact map lookups and become two different questions with two
+  different shapes: coverage (**directional** — a wildcard allow entry covers an exact passthrough
+  or secret host, but an exact allow entry does not cover a wildcard passthrough, which would exempt
+  a whole subtree from interception that the allowlist never granted) and overlap (**symmetric** —
+  a wildcard passthrough swallowing an exact secret host means that credential can never be
+  substituted, and the guest sends only msb's placeholder; the error names the passthrough entry,
+  since the secret's own host appears nowhere in that list literally).
+- **No new enforcement mechanism.** An allow-side domain rule still requires a DNS-cache binding
+  tying the connected IP to a matching hostname before it allows anything (`deferred_domain_match`
+  — the allow side is deliberately stricter than the deny side so a guest cannot declare an
+  arbitrary SNI on an unresolved IP), exactly as krayt's existing exact-host rules already do:
+  `Domain` and `DomainSuffix` go through one function. Only which spellings pre-flight passes
+  through to msb changed.
+
+**Confirmed on hardware, 2026-09-06, msb 0.6.16** (`hack/msb-probes/p9-wildcard-suffix-rules.sh`) —
+**all five measurements**, run against the default `github.com` family. Under one `--net-rule
+allow@*.github.com`: the subdomain `api.github.com` was **reached**, and the apex `github.com` was
+**reached** under that same rule. So the deferred DNS-cache binding does fire for `DomainSuffix`
+exactly as it does for `Domain` — a wildcard allow entry is not inert — and the `hostname == suffix`
+branch really is covered. `--tls-bypass *.github.com` served the **real upstream chain**
+(`issuer=C=GB, O=Sectigo Limited, CN=Sectigo Public Server Authentication CA DV E36`) rather than
+msb's own interception CA, measured in a sandbox that had a secret declared and therefore had
+interception on for everything it did not bypass — so a wildcard passthrough genuinely exempts its
+whole subtree, which is what makes `passthrough ⊆ allow` worth enforcing over wildcards. And `msb
+create --net-rule allow@*.com` was **rejected by msb itself**, pinning krayt's own single-label
+refusal as *aligned* with msb's `SuffixTooBroad` guard rather than merely additive: a future msb
+relaxation surfaces as a p9 failure instead of being silently inherited.
+
+**Label alignment — the property every `*.` entry's security rests on — is confirmed too, and it
+took three runs to get an answer worth having.** Under the same `allow@*.github.com`, the
+non-aligned neighbour `wwwgithub.com` — an unrelated registrant's host that ends in `github.com`
+with no label boundary, exactly what a bare `strings.HasSuffix` matcher would wrongly accept — was
+**denied**, while a second sandbox allowing that same host *by name* reached it **LIVE**. The
+control is the whole point: `reach()` cannot tell a correctly-enforced suffix mismatch from a name
+nothing answers at, so the denial only means something once the neighbour is known reachable in
+general. The first run (2026-09-06) shipped with no control at all and its DENIED proved nothing; a
+same-day fix added one (`ce58d4f`) and it came back DEAD, because the templated default neighbour
+`evil<suffix>` → `evilgithub.com` is NXDOMAIN. Replacing that guess with a verified-live literal
+(`wwwgithub.com`, now the script's `$4` default) produced the measurement above. `matches_suffix`
+(`crates/network/lib/policy/types.rs:997-1013`) is therefore a measured claim, not just a source
+read: `*.x.com` does not match `evilx.com`, and every wildcard in every `krayt.yaml` is as narrow
+as it reads.
 
 **The guest regains DNS — a genuine capability gain, stated plainly.** Under the pre-msb design
 the guest had no usable network at all in `allowlist`/`none` — everything rode vsock to a host
@@ -1139,6 +1222,11 @@ network:
     - api.anthropic.com
     - generativelanguage.googleapis.com
     - registry.npmjs.org
+    - '*.blob.core.windows.net'   # one leading `*.` = this domain and every subdomain of it (§6.6).
+                                   # For a per-tenant host (<account>.blob.core.windows.net) it is
+                                   # the only spelling that can match anything. krayt keeps no
+                                   # public-suffix list, so `*.github.io` really is every tenant —
+                                   # the pre-boot summary prints wildcard entries on their own line
   mitm: true                      # opt-in TLS termination + header injection at the host proxy;
                                    # default false — a run that doesn't set this is byte-identical
                                    # to one without the feature at all (§6.6.1)
@@ -1445,7 +1533,7 @@ treatment is stated in one place rather than discovered one field at a time. A f
 | `sandbox.extra_conf` (non-empty) | **error** | honored | names an unvalidated msb config file that can mount host paths into the guest or widen a declared secret's allowed hosts (§8.1, §10) |
 | `secrets:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read; its values are loaded host-side and, per key, substituted by msb into the sandbox's requests (§6.8) |
 | `task:` | contained: honored only if the resolved path stays inside the repo root | honored | host file read, shipped into the guest as the run's prompt |
-| everything else (`image`, `network.mode: allowlist\|none`, `network.allow`, `agent`, `env`, `resources`, `questions`, `include_dirty`, `bundle_depth`, `transcript`, `container.readonly_rootfs`) | honored | honored | configures the run without redirecting what krayt reads/writes on the host or relaxing the container's confinement |
+| everything else (`image`, `network.mode: allowlist\|none`, `network.allow` *(including `*.suffix` wildcard entries, §6.6)*, `agent`, `env`, `resources`, `questions`, `include_dirty`, `bundle_depth`, `transcript`, `container.readonly_rootfs`) | honored | honored | configures the run without redirecting what krayt reads/writes on the host or relaxing the container's confinement |
 
 A refused field is an **error, not a warning and not a silent ignore** — the run stops, naming the
 field, the file, and the `krayt run --config <path>` opt-in. Silently dropping it would leave the
@@ -1457,6 +1545,22 @@ containment check. Untreated, `repo: ../sibling` makes krayt bundle a **differen
 git history** into the VM for an attacker-influenced agent to read, and writes that run's `.krayt/`
 artifacts into whatever directory the poisoned file named, at the operator's uid.
 `container.readonly_rootfs` is *not* refused — it only tightens, so a repo asking for it is harmless.
+
+**A wildcard `network.allow` entry is honored from an auto-loaded config, deliberately** — a stated
+decision, not an omission (`support-wildcard-network-hosts.md` decision 4). A wildcard adds breadth,
+not a capability class: an auto-loaded config can already name `evil.attacker.example` as an exact
+allow entry, so the exfiltration destination is already grantable and the wildcard only makes it
+shorter to write. It cannot reach the credential boundary — secret substitution hosts come from
+`network.inject`, which this table **refuses** from an auto-loaded file, and allow is a gate, never a
+widener (`ValidateNetworkPolicyForMsb` requires secret hosts ⊆ allow, never the reverse, so widening
+allow adds zero substitution hosts). It cannot turn interception off either, since
+`network.passthrough` is likewise refused. And the private/loopback/link-local/metadata denies
+precede every allow in every mode, with msb's DNS-rebind protection on, so a wildcard suffix
+resolving into RFC1918 still cannot reach the host LAN. Refusing wildcards while honoring exact
+hosts would be an incoherent boundary — it blocks `*.example.com` while permitting the same repo to
+list the twenty subdomains it wanted. The residual is a one-line repo diff that widens egress more
+than it reads, which is a **review** problem: the pre-boot summary below prints wildcard entries on
+their own line for exactly that reason.
 
 `secrets:` and `task:` are contained rather than refused, because a repo's own tracked config
 legitimately names its gitignored secrets file and its checked-in task prompt. The value is resolved
@@ -1470,8 +1574,10 @@ exist is not an escape — there is nothing to follow, and the missing file is r
 is read.
 
 **Pre-boot policy summary.** Every run prints its resolved egress policy to stderr before the VM
-boots — mode, allowlist, MITM on/off, passthrough list, and each inject rule's host and header
-**names** (never a value, never a secrets-file key's contents). It is printed after adapter merging
+boots — mode, allowlist, MITM on/off, passthrough list, any `*.suffix` wildcard entries on a line of
+their own (§6.6 — the entry whose printed width most understates its breadth, and the one krayt
+keeps no public-suffix list to narrow), and each inject rule's host and header **names** (never a
+value, never a secrets-file key's contents). It is printed after adapter merging
 and `ValidateNetworkPolicy`, so it is the final policy, and before any VM or image work, so it is
 the operator's last chance to notice a host they did not choose. `meta.json`/`report.md` (§8.4)
 only record the policy after the fact.
@@ -1721,7 +1827,7 @@ never exposed.
 | Host kernel | Not shared — full VM boundary (§2, §6.15) |
 | Host filesystem | No live mount; input via git bundle, output via reviewed patch |
 | Repo ingest | git bundle cloned in the sandbox by `cmd/krayt-helper` (§6.7) — source `.git/hooks` are never executed or imported, and the sandbox commits under a throwaway krayt bot identity. The workspace `.git` is left agent-writable (so the agent can commit) but is **never trusted by the root-run helper's git**: patch generation runs against a root-only `patchgit` snapshot with `core.fsmonitor`/`core.hooksPath` force-cleared and `--no-textconv`, so agent-written `.git/config`/hooks/attributes cannot execute as root (§6.7, finding #2) |
-| Network egress | Default-deny, translated to a **fully explicit** `msb create` policy (`task.NetworkArgs`, §6.6) — enforced entirely by msb's own userspace network stack, not by anything krayt runs. The guest now has a real, policed network interface (including DNS in `allowlist` mode) rather than none at all — a genuine capability gain over the pre-msb design, policed by msb's own gateway with DNS-rebind protection on by default |
+| Network egress | Default-deny, translated to a **fully explicit** `msb create` policy (`task.NetworkArgs`, §6.6) — enforced entirely by msb's own userspace network stack, not by anything krayt runs. The guest now has a real, policed network interface (including DNS in `allowlist` mode) rather than none at all — a genuine capability gain over the pre-msb design, policed by msb's own gateway with DNS-rebind protection on by default. An allow/passthrough/secret-scope entry may be a `*.suffix` wildcard (§6.6), which grants a whole DNS subtree — apex included — and **neither krayt nor msb can tell a registry suffix from an organization suffix**: `*.github.io` allows every GitHub Pages tenant exactly as `*.mycorp.com` allows one company's hosts. Neither keeps a public-suffix list; breadth is the operator's to review, and the pre-boot summary prints wildcard entries on their own line (§8.3) |
 | `ask_human` bridge | A host-side process reading sandbox-authored input: `krayt-ask` dials the host directly over vsock — no guest listener, ever. `internal/askbridge.Serve` decodes the question with a byte cap, a decode-only read deadline, and a cap on in-flight questions (§6.13). Unauthenticated by construction — any sandbox process can dial it — but bounded to one question/answer exchange per connection (residual below) |
 | Container privileges | msb's own `--security restricted` profile (§6.6, §8.1), fixed and not user-configurable. krayt's pre-msb OCI-spec hardening (dropped Linux capabilities, containerd seccomp, enforced non-root, opt-in read-only rootfs) is **superseded, not layered on top** — `container.capabilities`, `container.seccomp: unconfined`, and `container.readonly_rootfs` are removed keys that hard-error, naming `--security` as the only, coarser replacement (`task.ValidateContainerPolicyForMsb`) |
 | Secrets | A declared secret's real value travels only in the `msb create` child's env — never on disk, never on argv (§6.6.1, §6.8) — **on macOS/Linux**; Windows has a documented exception (residual below, §12). **Redacted host-side** (there is no guest process left to redact in — the sandbox never holds a value) from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted**; a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |

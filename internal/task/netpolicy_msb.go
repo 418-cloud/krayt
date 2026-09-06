@@ -27,6 +27,14 @@ var msbDenyGroups = []string{"private", "loopback", "link-local", "meta", "multi
 // there is no per-host header vocabulary to translate (hand-secrets-to-msb.md owns the
 // secret-delivery flags this task deliberately leaves alone).
 //
+// A `*.`-prefixed entry in np.Allow or np.Passthrough is passed through verbatim and becomes msb's
+// own domain-suffix form — Destination::DomainSuffix for `--net-rule allow@*.example.com`, a
+// wildcard bypass pattern for `--tls-bypass`, HostPattern::Wildcard for `--secret` (rendered by
+// internal/sandbox.SecretArgs) — one convention msb applies identically across all three flags, by
+// its own design. It is apex-inclusive: `*.example.com` covers example.com too. Nothing here quotes
+// or escapes the `*`: krayt exec's msb with an argv slice and no shell, and each host is already its
+// own argv element (asserted by TestNetworkArgsHostsAreOwnArgvElements).
+//
 // hasSecrets controls only whether --tls-intercept is emitted. It is not load-bearing: msb turns
 // on interception for a sandbox the moment any --secret is declared, regardless of this flag
 // (SandboxBuilder::secret_entry, sdk/rust/lib/sandbox/builder.rs:834-843, confirmed on hardware by
@@ -187,26 +195,41 @@ func ValidateNetworkPolicyForMsb(np NetworkPolicy, secretKeys map[string]bool, i
 			"network.inject or add a secrets file", len(specs))
 	}
 
-	allow := lowerSet(np.Allow)
-	passthrough := lowerSet(np.Passthrough)
 	specKeys := make(map[string]bool, len(specs))
 	for _, s := range specs {
 		specKeys[s.Key] = true
 		for _, h := range s.Hosts {
-			if err := validateHostEntry(h); err != nil {
+			// The SAME strict validator the allow and passthrough lists get, wildcards included
+			// (support-wildcard-network-hosts.md decision 1). This is the surface msb does not guard
+			// at all — HostPattern::parse turns `*` into HostPattern::Any, "any host (dangerous —
+			// secret can be exfiltrated)" — so krayt's pre-flight is the only check between a
+			// krayt.yaml and an unscoped credential.
+			if err := validateHostPattern(h); err != nil {
 				return fmt.Errorf("network: inject (%s): %w", s.Key, err)
 			}
-			if np.Mode == NetworkAllowlist && !allow[lower(h)] {
+			// COVERAGE, directional: a wildcard allow entry legitimately covers an exact secret
+			// host. Adapter-supplied scopes are always exact (internal/adapter/claudecode.go's
+			// api.anthropic.com), so `allow: ["*.anthropic.com"]` has to validate or every
+			// claude-code run fails pre-flight on an obviously correct config.
+			if np.Mode == NetworkAllowlist && !anyCovers(np.Allow, h) {
 				return fmt.Errorf("network: inject (%s): host %q must also be in allow (mode: allowlist)", s.Key, h)
 			}
-			// A passthrough host is tunneled un-MITM'd (NetworkArgs: --tls-bypass skips both the
-			// substitution and blocking lists), so a secret scoped there can never be substituted —
-			// the guest would send only the placeholder. ValidateNetworkPolicy's own inject/passthrough
-			// check below cannot catch this: it walks np.Inject, which is always empty here (this
-			// function rejects a populated one above), so msb secret scopes need their own check.
-			if passthrough[lower(h)] {
-				return fmt.Errorf("network: inject (%s): host %q is also in passthrough — a passthrough "+
-					"host is tunneled un-MITM'd and can never receive secret substitution", s.Key, h)
+			// OVERLAP, not coverage, and symmetric — the direction that matters here is the opposite
+			// one. A passthrough host is tunneled un-MITM'd (NetworkArgs: --tls-bypass skips both
+			// msb's substitution and blocking lists), so a secret scoped anywhere a passthrough entry
+			// can reach is a secret that can never be substituted: the guest sends only the
+			// placeholder. A WIDER passthrough (`*.example.com`) swallowing a narrower secret host
+			// (`api.example.com`) is the silent case an exact map lookup missed entirely, and the
+			// error must name the passthrough entry — the operator's secret host appears nowhere in
+			// that list literally.
+			//
+			// ValidateNetworkPolicy's own inject/passthrough check cannot catch any of this: it walks
+			// np.Inject, which is always empty here (this function rejects a populated one above), so
+			// msb secret scopes need their own.
+			if entry, ok := anyOverlaps(np.Passthrough, h); ok {
+				return fmt.Errorf("network: inject (%s): host %q is covered by passthrough entry %q — a "+
+					"passthrough host is tunneled un-MITM'd and can never receive secret substitution; "+
+					"the guest would send only the placeholder", s.Key, h, entry)
 			}
 		}
 		if secretKeys != nil && !secretKeys[s.Key] {

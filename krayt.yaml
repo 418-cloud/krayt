@@ -60,6 +60,13 @@ network:
     - registry.hub.docker.com
     - registry-1.docker.io
     - index.docker.io
+    # Azure Blob storage is per-ACCOUNT: every request goes to <account>.blob.core.windows.net and
+    # nothing ever carries the bare apex, so an exact entry would be a rule no request can match —
+    # the silently-ineffective allowlist entry pre-flight exists to refuse. Only a suffix rule can
+    # name this host family at all (support-wildcard-network-hosts.md). It covers every tenant
+    # account, which is the documented cost of a wildcard: krayt keeps no public-suffix list, so
+    # breadth is the operator's to review — the pre-boot policy print calls the entry out by name.
+    - '*.blob.core.windows.net' # container-registry blob layers served out of Azure storage
 
   # Every host krayt substitutes a credential into is intercepted by construction the moment any
   # secret is declared (msb turns on TLS interception for the whole sandbox); everything else stays
@@ -76,6 +83,11 @@ network:
     - registry.hub.docker.com
     - registry-1.docker.io
     - index.docker.io
+    # Wildcards work identically on --tls-bypass, so per-account storage traffic stays tunneled
+    # rather than intercepted, like every other non-credential host in this list. Without it, any
+    # secret declared anywhere in the run would put msb's interception CA in front of these
+    # requests and break any client that uses its own trust store.
+    - '*.blob.core.windows.net'
 
   # api.anthropic.com deliberately has NO rule here. With `agent.adapter: claude-code`, the adapter
   # scopes its selected credential (whichever one secrets.env actually holds) to that host itself.
