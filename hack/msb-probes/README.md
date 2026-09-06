@@ -1,6 +1,6 @@
 # msb-probes — the feasibility gate for the microsandbox (B1) migration
 
-**All eight probes have now run — P1–P5 on msb 0.6.16, 2026-08-29/30; P6 and P7 on 2026-09-04; P8 on 2026-09-05, same machine.** The outcomes live in
+**P1–P9 have all run — P1–P5 on msb 0.6.16, 2026-08-29/30; P6 and P7 on 2026-09-04; P8 on 2026-09-05; P9 on 2026-09-06, same machine.** The outcomes live in
 `KRAYT_SPEC.md` §14 Phase 11's feasibility-gate item and `docs/ai-tasks/README.md`'s row 1, not
 here; what follows is what each probe asks and how to re-run it. The one thread left is P4 on
 Linux/KVM — see its row below. **P1's 2026-09-02 re-runs found a real defect**: msb 0.6.16's vsock
@@ -8,6 +8,10 @@ relay drops the reply when the host closes the bridged socket first — 21 of 75
 completed that way, against 25 of 25 when the host waits for the guest. `internal/askbridge` now
 waits (`lingerUntilPeerCloses`, `KRAYT_SPEC.md` §6.13), and P1 is the regression check that would
 catch msb changing this back.
+
+**P9 passed on 2026-09-06** (msb 0.6.16) — msb enforces `*.<suffix>` exactly as
+`support-wildcard-network-hosts.md` read it out of 0.6.16's source, so `KRAYT_SPEC.md` §6.6's
+wildcard paragraph now records a measurement rather than a source read. See its row below.
 
 Seven scripts (P1–P7) answered the questions
 [`docs/adr-microsandbox-sandbox-layer.md`](../../docs/adr-microsandbox-sandbox-layer.md) had left
@@ -47,6 +51,7 @@ re-checkable. These were written against **0.6.16**.
 
 | `p7-passthrough-semantics.sh` | Does `--on-secret-violation passthrough` forward the placeholder unchanged to an out-of-scope host, or substitute the real value there? Measured against a `block-and-log` control and an in-scope regression guard. **✅ PASS 2026-09-04**: the placeholder is forwarded unchanged out of scope, the identical request blocks under `block-and-log`, and in-scope substitution still works. | **Was** blocking the decision; krayt now emits `passthrough` on the strength of it. |
 | `p8-extra-conf-precedence.sh` | Does `sandbox.extra_conf` (`add-msb-extra-conf-escape-hatch.md`) behave the way its decisions 1–3 say? **Two arms**: three synthetic sandboxes with controls ask what *msb* does with krayt-shaped argv; a fourth measurement drives a real `krayt run` carrying a real `sandbox.extra_conf:` and measures the sandbox *krayt's own argv* built — which is what §8.1 actually claims. **✅ PASS 2026-09-05** on msb 0.6.16, all four: krayt's flags fully replace an `extra_conf`'s network policy (control proves the file was live, merely outranked); the secret-scope-widening escalation is real and attributable to the hatch (control without it saw only the placeholder); and both reproduce through a real `krayt run`. Measurement 2 came back **REJECTED**, confirming this script's own source read and **overturning decision 2** — per-secret `on_violation` is unreachable from any `msb` CLI surface, and `deny_unknown_fields` makes msb refuse the sandbox outright rather than ignore the field. `KRAYT_SPEC.md` §8.1/§10 and the task doc are corrected. | No — sized `add-msb-extra-conf-escape-hatch.md`'s hardware bullet, which is now closed. |
+| `p9-wildcard-suffix-rules.sh` | Does msb enforce `*.<suffix>` the way `support-wildcard-network-hosts.md` reads it out of 0.6.16's source? Five measurements in three sandboxes: a **subdomain** reachable under `--net-rule allow@*.<suffix>` (does the deferred DNS-cache binding fire for `DomainSuffix` as it does for `Domain`, or is a wildcard allow entry inert?), the **apex** reachable under the same rule (`hostname == suffix` — the branch a subdomain-only test misses and that krayt documents as covered), the **non-aligned neighbour** `evil<suffix>` still **denied** (label alignment — the security property; this one must fail to connect), `--tls-bypass *.<suffix>` serving the **real upstream chain** rather than msb's own CA (read off the certificate issuer, p7's method), and `msb create --net-rule allow@*.com` **rejected** by msb itself (pins krayt's floor as *aligned* with msb's `SuffixTooBroad` guard rather than merely additive). **✅ PASS 2026-09-06** on msb 0.6.16, all five, run against the default `github.com` family: `api.github.com` REACHED and `github.com` REACHED under one `allow@*.github.com`, `evilgithub.com` DENIED, `--tls-bypass *.github.com` serving GitHub's real chain (`C=GB, O=Sectigo Limited, CN=Sectigo Public Server Authentication CA DV E36`) in a sandbox that had a secret declared and interception otherwise on, and `allow@*.com` REJECTED by msb. Nothing was corrected: the source read this task shipped on holds as written. | No — krayt's pre-flight and its cross-checks are enforced entirely offline and unit-tested; this closed `support-wildcard-network-hosts.md`'s hardware bullet and is what let `KRAYT_SPEC.md` §6.6's wildcard paragraph stop saying "read from source, not measured". |
 
 `p7` **passed on 2026-09-04** and `internal/task/netpolicy_msb.go` now emits
 `--on-secret-violation passthrough` as a result. It is the only probe written to decide a change to

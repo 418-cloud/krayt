@@ -249,6 +249,35 @@ func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 		"colon, not an address": "a:b",
 		"IPv4 with a port":      "10.0.0.1:8080",
 		"truncated IPv6":        "2606:4700:4700::gggg",
+		// Wildcards: krayt accepts exactly `*.` + a two-label-or-longer domain suffix
+		// (validateHostPattern), and every other spelling must be refused HERE, by a branch that
+		// names the wildcard rule — never by the generic "not a bare hostname" byte-class branch,
+		// whose message never mentions wildcards at all. krayt mirrors msb's STRICTEST acceptance
+		// set on every field, including the secret surface msb does not guard at all: bare `*`
+		// becomes HostPattern::Any ("any host (dangerous — secret can be exfiltrated)") and
+		// `*.*.example.com` a Wildcard matching nothing, both silently.
+		"bare star":                  "*",
+		"star with no suffix":        "*.",
+		"single-label suffix":        "*.com",
+		"single-label suffix, local": "*.local",
+		"two wildcards":              "*.*.example.com",
+		"double star":                "**.example.com",
+		"star inside a label":        "api*.example.com",
+		"star prefixing a label":     "*api.example.com",
+		"interior wildcard label":    "api.*.example.com",
+		"wildcarded IPv4":            "*.1.2.3.4",
+		"wildcarded IPv6":            "*.::1",
+		// The delegated rules still apply to whatever follows the "*." — one copy of them, reached
+		// from both spellings.
+		"wildcard, trailing dot":  "*.example.com.",
+		"wildcard, non-ASCII":     "*.examp\u0130e.com", // U+0130, behind the wildcard this time
+		"wildcard, with a port":   "*.example.com:443",
+		"wildcard, with a path":   "*.example.com/v1",
+		"wildcard, with a comma":  "*.a.example,evil.example",
+		"msb's suffix= spelling":  "suffix=example.com",
+		"msb's domain= spelling":  "domain=example.com",
+		"msb's bare * net-rule":   "allow@*",
+		"msb's rule token, whole": "allow@*.example.com",
 	}
 	for name, host := range bad {
 		t.Run("allow: "+name, func(t *testing.T) {
@@ -286,6 +315,9 @@ func TestValidateNetworkPolicyHostEntries(t *testing.T) {
 		// must keep validating.
 		"proxy.golang.org", "sum.golang.org", "storage.googleapis.com",
 		"cache.nixos.org", "github.com", "codeload.github.com", "api.github.com",
+		// ...including its one wildcard entry: Azure Blob is per-account, so no request ever
+		// carries the bare apex and only a suffix rule can name it at all.
+		"*.blob.core.windows.net",
 	}
 	for _, host := range good {
 		t.Run("allow: "+host, func(t *testing.T) {

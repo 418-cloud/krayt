@@ -210,27 +210,27 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 	if len(np.Inject) > 0 && !np.MITM {
 		return fmt.Errorf("network: inject requires mitm: true")
 	}
-	// Host entries are checked for shape BEFORE any cross-referencing, so a name the proxy could
-	// never honor fails the run here rather than vanishing from the effective policy later (see
-	// validateHostEntry).
+	// Host entries are checked for shape BEFORE any cross-referencing, so a name msb could never
+	// match fails the run here rather than vanishing from the effective policy later (see
+	// validateHostPattern/validateHostEntry).
 	for i, h := range np.Allow {
-		if err := validateHostEntry(h); err != nil {
+		if err := validateHostPattern(h); err != nil {
 			return fmt.Errorf("network: allow[%d]: %w", i, err)
 		}
 	}
 	for i, h := range np.Passthrough {
-		if err := validateHostEntry(h); err != nil {
+		if err := validateHostPattern(h); err != nil {
 			return fmt.Errorf("network: passthrough[%d]: %w", i, err)
 		}
 	}
 
-	allow := lowerSet(np.Allow)
-	passthrough := lowerSet(np.Passthrough)
-
 	if np.Mode == NetworkAllowlist {
+		// COVERAGE, not overlap, and directional: allow must subsume everything the passthrough
+		// entry could ever match. `allow: ["*.example.com"] + passthrough: ["api.example.com"]` is
+		// valid; the reverse is not. See coversPattern.
 		for _, h := range np.Passthrough {
-			if !allow[lower(h)] {
-				return fmt.Errorf("network: passthrough host %q must also be in allow (mode: allowlist)", h)
+			if !anyCovers(np.Allow, h) {
+				return passthroughNotCoveredError(h, np.Allow)
 			}
 		}
 	}
@@ -241,19 +241,24 @@ func ValidateNetworkPolicy(np NetworkPolicy, secretKeys map[string]bool) error {
 		if host == "" {
 			return fmt.Errorf("network: inject[%d]: host is required", i)
 		}
-		if err := validateHostEntry(rule.Host); err != nil {
+		if err := validateHostPattern(rule.Host); err != nil {
 			return fmt.Errorf("network: inject[%d]: %w", i, err)
 		}
+		// Deliberately EXACT-string, not coverage: "*.example.com" and "api.example.com" are two
+		// legitimately distinct rules, not a duplicate of each other.
 		if seenHost[host] {
 			return fmt.Errorf("network: inject: host %q has more than one rule", host)
 		}
 		seenHost[host] = true
 
-		if passthrough[host] {
-			return fmt.Errorf("network: inject[%d]: host %q is also in passthrough — a passthrough "+
-				"host is tunneled un-MITM'd and can never receive injection", i, host)
+		// OVERLAP, not coverage, and symmetric: a wildcard passthrough swallowing an exact inject
+		// host is the silent case — the host appears nowhere in the passthrough list literally, so
+		// the error has to name the entry that shadowed it.
+		if entry, ok := anyOverlaps(np.Passthrough, rule.Host); ok {
+			return fmt.Errorf("network: inject[%d]: host %q is covered by passthrough entry %q — a "+
+				"passthrough host is tunneled un-MITM'd and can never receive injection", i, host, entry)
 		}
-		if np.Mode == NetworkAllowlist && !allow[host] {
+		if np.Mode == NetworkAllowlist && !anyCovers(np.Allow, rule.Host) {
 			return fmt.Errorf("network: inject[%d]: host %q must also be in allow (mode: allowlist)", i, host)
 		}
 		if len(rule.Set) == 0 && len(rule.SetLiteral) == 0 {
@@ -397,38 +402,119 @@ func isTokenChar(r rune) bool {
 	return false
 }
 
-// validateHostEntry rejects an allow/passthrough/inject host the running proxy could never match,
-// so the failure is a pre-flight config error naming the entry instead of a silent difference
-// between the policy the user wrote and the one the run enforces.
+// validateHostPattern is the entry point for every host list krayt hands msb — `network.allow`,
+// `network.passthrough`, and a secret's scope (`network.inject[].host`). It accepts an exact host,
+// or one leading `*.` wildcard naming a domain suffix, and delegates everything after that prefix
+// to validateHostEntry so there is exactly one copy of the byte-class, label, IPv6 and port rules.
 //
-// It was the pre-flight half of the pre-msb host proxy's normalizeHost, a one-directional
-// invariant: everything this function ACCEPTS, that proxy also accepted and folded to the same
-// bare form. It could be stricter — pre-flight strictness can only fail a run before it starts,
-// never let through something the proxy would drop — and it was, for bracketed IPv6:
-// normalizeHost unwraps "[::1]" to "::1", but this package's own cross-checks (passthrough ⊆
-// allow, inject.host ∈ allow) key on lower(), which does not, so "[::1]" in one list and "::1" in
-// another would fail to cross-match here. One spelling, demanded up front.
+// The `*.` spelling and its semantics are msb's, on all three flags by msb's own design
+// ("Mirrors the syntax already used by --tls-bypass and --secret so users see one wildcard
+// convention across the CLI", crates/cli/lib/net_rule.rs): `*.example.com` covers example.com
+// itself plus any label-aligned subdomain. See hostCovers for the Go mirror.
 //
-// lower() alone is not enough — it only case-folds ASCII bytes and passes everything else
-// through, so without this check an `allow: ["api.examplİ.com"]` (or a URL, or a host with a
-// stray '/') validated clean while newHandler dropped it, and the run started with an allowlist
-// quietly missing an entry. See normalizeHost's comment for why refusing beats translating.
+// It mirrors msb's STRICTEST acceptance set, on every surface — including where msb itself would
+// not. `--net-rule` is guarded (bare `*` refused; a single-label suffix refused as SuffixTooBroad,
+// crates/network/lib/policy/name.rs), but the secret surface has no validation at all:
+// HostPattern::parse (packages/microsandbox-types/rust/lib/domain.rs) is three lines that turn `*`
+// into HostPattern::Any — msb's own doc for that variant reads "Any host (dangerous — secret can be
+// exfiltrated)" — and `*.*.example.com` into a Wildcard matching nothing, a credential that
+// mysteriously never substitutes. krayt's pre-flight is the only guard there, so it runs the same
+// strict check on all three fields and is never more permissive than msb's guarded surface.
 //
-// The shape rules at the end are the second place this function is deliberately stricter than
-// normalizeHost: ".example", "example." and "a..example" all fold to a perfectly usable map key,
-// as do "api.example.com:443" and "a:b", they just name a host no request can ever carry — the
-// proxy matches on the port-stripped host — so the proxy would store a rule nothing matches while
-// the config reads as though egress were permitted. Pre-flight is where that is cheap to say out
-// loud.
+// What it deliberately does NOT do is keep a public-suffix list: `*.co.uk`, `*.github.io` and
+// `*.s3.amazonaws.com` are accepted (KRAYT_SPEC.md §6.6, §10). No label-count threshold can
+// separate `*.blob.core.windows.net` — four labels, multi-tenant, the case this exists for — from
+// `*.example.com`, and a curated denylist is stale by construction. The gap is documented and
+// surfaced in the pre-boot policy print (internal/cli.printNetworkPolicy) instead of pretended
+// away.
+func validateHostPattern(h string) error {
+	s := strings.TrimSpace(h)
+	suffix, isWildcard := strings.CutPrefix(s, "*.")
+	if !isWildcard {
+		if s == "*" {
+			return fmt.Errorf("host %q is not a valid wildcard: krayt has no \"any host\" spelling. "+
+				"msb reads `--secret NAME@*` as HostPattern::Any — \"any host (dangerous — secret can "+
+				"be exfiltrated)\" in msb's own words — and krayt must never emit it; name a domain "+
+				"suffix instead, as \"*.example.com\"", h)
+		}
+		if strings.Contains(s, "*") {
+			return fmt.Errorf("host %q has a '*' that is not a leading \"*.\": krayt accepts one "+
+				"wildcard, only as the whole leftmost label, as \"*.example.com\" — msb matches a "+
+				"suffix, never a partial label, so %q could only ever match nothing", h, h)
+		}
+		return validateHostEntry(h)
+	}
+	if suffix == "" {
+		return fmt.Errorf("host %q names no suffix: a wildcard must say what it covers, as "+
+			"\"*.example.com\"", h)
+	}
+	if strings.Contains(suffix, "*") {
+		return fmt.Errorf("host %q has more than one '*': krayt accepts exactly one wildcard, and only "+
+			"as the leftmost label. msb's secret surface would take this as a Wildcard pattern that "+
+			"matches nothing at all (HostPattern::parse), so the credential would silently never "+
+			"substitute", h)
+	}
+	if err := validateHostEntry(suffix); err != nil {
+		return fmt.Errorf("wildcard host %q: %w", h, err)
+	}
+	if _, err := netip.ParseAddr(suffix); err == nil {
+		return fmt.Errorf("host %q wildcards an IP literal: a wildcard names a DNS suffix and an "+
+			"address has no subdomains — write the address itself, without the \"*.\"", h)
+	}
+	if !strings.Contains(suffix, ".") {
+		return fmt.Errorf("host %q is too broad: %q is a single label, so this would match every "+
+			"domain under that TLD. msb refuses the same shape on --net-rule (SuffixTooBroad) and "+
+			"krayt refuses it on every field — name at least two labels, as \"*.example.com\"", h, suffix)
+	}
+	return nil
+}
+
+// validateHostEntry rejects an EXACT allow/passthrough/secret-scope host msb's matcher could never
+// match, so the failure is a pre-flight config error naming the entry instead of a silent
+// difference between the policy the user wrote and the one the run enforces. Callers that also
+// accept a wildcard go through validateHostPattern, which strips one leading `*.` and delegates the
+// rest here — so every rule below is enforced exactly once, on both spellings.
 //
-// One consequence of validating every host string is load-bearing elsewhere: because a comma is
-// refused here, internal/orchestrator can keep passing the allowlist to the egress proxy as a
-// comma-joined argv value (egressproxy.go, the KRAYT_EGRESS_PROXY_BIN swap seam, §6.6) without
-// an `allow: ["a.example,evil.example"]` entry silently becoming two allowlisted hosts.
+// What msb does with an accepted entry, and why the rules below are the right ones: `--net-rule
+// allow@<host>` becomes a Destination::Domain matched against the DNS-cache binding for the
+// connected IP (crates/network/lib/policy/types.rs, deferred_domain_match); `--tls-bypass <host>`
+// and `--secret NAME@<host>` are matched by their own independent matchers
+// (crates/network/lib/tls/state.rs; packages/microsandbox-types/rust/lib/domain.rs,
+// HostPattern::matches). All three compare folded host strings. None of them parses a URL, strips a
+// port, or translates an internationalized name — so a spelling that is not the bare host is not a
+// near-miss, it is a rule nothing can ever match, in a config that reads as though egress were
+// permitted.
+//
+// It is deliberately stricter than those matchers, which is only ever safe in this direction:
+// pre-flight strictness can fail a run before it starts, never let through something msb would
+// drop.
+//   - Bracketed IPv6 ("[::1]") is refused rather than unwrapped, because this package's own
+//     cross-checks (passthrough ⊆ allow, secret host ⊆ allow) compare lower()ed strings, which does
+//     not unwrap — so "[::1]" in one list and "::1" in another would fail to cross-match. One
+//     spelling, demanded up front.
+//   - lower() alone is not enough: it case-folds ASCII bytes and passes everything else through, so
+//     without the byte-class check an `allow: ["api.examplİ.com"]` (or a URL, or a host with a stray
+//     '/') validates clean and then names a host no request carries.
+//   - The label rules at the end refuse shapes that fold to a usable string but can never match a
+//     real request host: ".example", "example." and "a..example", and likewise
+//     "api.example.com:443" and "a:b" — msb matches the host alone, with no port.
+//
+// One consequence is load-bearing elsewhere: because a comma is refused here,
+// internal/sandbox.SecretArgs can keep rendering `--secret NAME@HOST[,HOST...]` — a comma is msb's
+// own separator there — without an `allow: ["a.example,evil.example"]` entry silently becoming two
+// scoped hosts.
 func validateHostEntry(h string) error {
 	s := strings.TrimSpace(h)
 	if s == "" {
 		return fmt.Errorf("host is empty")
+	}
+	// A wildcard reaching here came from a caller that is exact-only (a refresh block's host), or
+	// from validateHostPattern's own delegation of a pattern carrying a second '*'. Either way the
+	// generic "not a bare hostname" byte-class error below would name the wrong problem.
+	if strings.Contains(s, "*") {
+		return fmt.Errorf("host %q is a wildcard, which this field does not accept: only "+
+			"network.allow, network.passthrough and a secret's hosts take the \"*.suffix\" form; "+
+			"this entry must name one exact host", h)
 	}
 	if inner, ok := strings.CutPrefix(s, "["); ok {
 		if inner, ok := strings.CutSuffix(inner, "]"); ok {
@@ -457,16 +543,16 @@ func validateHostEntry(h string) error {
 	// would fail every rule below for no reason. The colon has to earn that exemption, though:
 	// "api.example.com:443", "a:b" and "example.com:" are not addresses, and skipping the label
 	// rules for them merely on the strength of a ':' let them validate clean. They can never match
-	// anything — requestHost (proxy.go) runs net.SplitHostPort over every request host and matches
-	// on the bare host, so no request ever presents a key with a port in it — which is precisely the
-	// silently-ineffective allow/passthrough/inject entry this function exists to refuse.
+	// anything — msb matches the host alone, with no port, on all three of the matchers named above
+	// — which is precisely the silently-ineffective allow/passthrough/secret-scope entry this
+	// function exists to refuse.
 	//
 	// An Is4 check like the bracketed branch's would be dead here: a string containing ':' never
 	// parses as an IPv4 address, so ParseAddr succeeding already means an IPv6 literal.
 	if strings.Contains(s, ":") {
 		if _, err := netip.ParseAddr(s); err != nil {
 			return fmt.Errorf("host %q is neither a bare hostname nor an IPv6 literal: a host rule "+
-				"names the host alone and the proxy matches request hosts with the port stripped, so "+
+				"names the host alone and msb matches request hosts with the port stripped, so "+
 				"a ':' here can only be part of an IPv6 address — drop the port", h)
 		}
 		return nil
@@ -500,10 +586,106 @@ func lower(s string) string {
 	return string(b)
 }
 
-func lowerSet(ss []string) map[string]bool {
-	out := make(map[string]bool, len(ss))
-	for _, s := range ss {
-		out[lower(s)] = true
+// hostCovers reports whether pattern — an exact host, or "*.suffix" — matches the concrete host.
+// It is the Go mirror of msb's three independent implementations of the same rule, all of which
+// agree and all of which krayt has to agree with, since a krayt host list can reach any of them:
+//
+//   - matches_suffix — crates/network/lib/policy/types.rs (net rules, `allow@*.example.com`)
+//   - HostPattern::matches — packages/microsandbox-types/rust/lib/domain.rs (secrets, `--secret`)
+//   - DomainPattern::matches_normalized — crates/network/lib/tls/state.rs (`--tls-bypass`)
+//
+// The rule is apex-inclusive and label-aligned: "*.example.com" matches "example.com",
+// "api.example.com" and "a.b.example.com", and does NOT match "evilexample.com". That alignment is
+// the whole security property, so the check is `host == suffix` or `host` ending in "." + suffix —
+// never a bare strings.HasSuffix. Folding is ASCII-only lower(), not strings.ToLower, for the U+0130
+// reason lower()'s own comment gives.
+func hostCovers(pattern, host string) bool {
+	p, h := lower(pattern), lower(host)
+	if suffix, ok := strings.CutPrefix(p, "*."); ok {
+		return h == suffix || strings.HasSuffix(h, "."+suffix)
 	}
-	return out
+	return p == h
+}
+
+// coversPattern reports whether pattern a subsumes EVERY host pattern b could match. It is
+// DIRECTIONAL, and the direction is the point: `allow: ["*.example.com"]` covers
+// `passthrough: ["api.example.com"]`, but `allow: ["api.example.com"]` does not cover
+// `passthrough: ["*.example.com"]` — the second exempts a whole subtree from TLS interception that
+// the allowlist never granted. Use it for the ⊆ checks (passthrough ⊆ allow, secret host ⊆ allow),
+// never for conflicts.
+//
+// An exact host can never cover a wildcard: a wildcard's match set is infinite and an exact host's
+// is one member of it.
+func coversPattern(a, b string) bool {
+	if suffix, ok := strings.CutPrefix(lower(b), "*."); ok {
+		if !strings.HasPrefix(lower(a), "*.") {
+			return false
+		}
+		// b covers exactly {suffix} ∪ subdomains(suffix); a covers all of it iff a covers suffix.
+		return hostCovers(a, suffix)
+	}
+	return hostCovers(a, b)
+}
+
+// patternsOverlap reports whether any single host could match both a and b. It is SYMMETRIC — use
+// it for conflict checks, where either pattern shadowing the other is equally a problem. The case
+// it exists for is silent otherwise: a wildcard `passthrough` entry swallowing an exact secret host
+// means that secret can never be substituted (a passthrough host is tunneled un-MITM'd), and the
+// secret host appears nowhere in the passthrough list literally.
+func patternsOverlap(a, b string) bool {
+	return coversPattern(a, b) || coversPattern(b, a)
+}
+
+// anyCovers reports whether any entry in patterns subsumes p (coversPattern, directional).
+func anyCovers(patterns []string, p string) bool {
+	for _, entry := range patterns {
+		if coversPattern(entry, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyOverlaps returns the first entry in patterns that overlaps p (patternsOverlap, symmetric), and
+// whether there was one. The entry itself is returned because the error that reports it must name
+// the offending line: with a wildcard, p may not appear in patterns at all.
+func anyOverlaps(patterns []string, p string) (string, bool) {
+	for _, entry := range patterns {
+		if patternsOverlap(entry, p) {
+			return entry, true
+		}
+	}
+	return "", false
+}
+
+// passthroughNotCoveredError renders the `passthrough ⊄ allow` diagnostic. A wildcard passthrough
+// gets its own wording because the generic "must also be in allow" reads as a spelling complaint,
+// when the actual problem is breadth: --tls-bypass is emitted verbatim (netpolicy_msb.go) and msb's
+// bypass matcher is independent of its net-rule matcher, so a bypass wider than the allowlist is a
+// real mismatch between the policy krayt printed and the one msb enforces.
+func passthroughNotCoveredError(h string, allow []string) error {
+	if suffix, ok := strings.CutPrefix(strings.TrimSpace(h), "*."); ok {
+		return fmt.Errorf("network: passthrough host %q is not covered by allow: allow names %s, but "+
+			"this passthrough exempts every subdomain of %s from TLS interception. The allowlist must "+
+			"be at least as wide as anything exempted from it — write %q in allow, or narrow "+
+			"passthrough to a host allow already covers (mode: allowlist)",
+			h, quotedList(allow), suffix, h)
+	}
+	return fmt.Errorf("network: passthrough host %q must also be in allow (mode: allowlist)", h)
+}
+
+// quotedList renders ss for an error message: `nothing at all` when empty, the single host quoted
+// when there is one, a comma-separated list otherwise.
+func quotedList(ss []string) string {
+	switch len(ss) {
+	case 0:
+		return "no hosts at all"
+	case 1:
+		return fmt.Sprintf("the single host %q", ss[0])
+	}
+	quoted := make([]string, len(ss))
+	for i, s := range ss {
+		quoted[i] = fmt.Sprintf("%q", s)
+	}
+	return strings.Join(quoted, ", ")
 }

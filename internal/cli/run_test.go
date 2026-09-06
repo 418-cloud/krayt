@@ -341,4 +341,33 @@ func TestPrintNetworkPolicyFlagsOnly(t *testing.T) {
 	if want := "network policy (from flags): mode=none secrets-scoped=false"; out != want {
 		t.Errorf("summary = %q, want %q", out, want)
 	}
+	if strings.Contains(out, "wildcard") {
+		t.Errorf("a wildcard-free policy printed a wildcard line: %q", out)
+	}
+}
+
+// TestPrintNetworkPolicyWildcardLine: a `*.suffix` entry is the one whose printed width most
+// understates its breadth, and krayt keeps no public-suffix list to narrow it
+// (support-wildcard-network-hosts.md decision 3) — so the pre-boot print, which §8.3 calls the
+// operator's last chance to notice a host they did not choose, calls it out on its own line. The
+// line is conditional: a policy with no wildcard must print exactly what it printed before.
+func TestPrintNetworkPolicyWildcardLine(t *testing.T) {
+	p := task.NetworkPolicy{
+		Mode:        task.NetworkAllowlist,
+		Allow:       []string{"api.github.com", "*.blob.core.windows.net"},
+		Passthrough: []string{"*.blob.core.windows.net"},
+		Secrets:     []task.SecretSpec{{Key: "AZURE_TOKEN", Hosts: []string{"*.blob.core.windows.net"}}},
+	}
+	var b strings.Builder
+	if err := printNetworkPolicy(&b, p, "flags"); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	if want := "  wildcard suffixes (every subdomain): *.blob.core.windows.net\n"; !strings.Contains(out, want) {
+		t.Errorf("summary missing %q:\n%s", want, out)
+	}
+	// Named once, not once per list it appears in.
+	if n := strings.Count(out, "wildcard suffixes"); n != 1 {
+		t.Errorf("wildcard line printed %d times, want 1:\n%s", n, out)
+	}
 }
