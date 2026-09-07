@@ -2,6 +2,7 @@ package cli
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
@@ -44,6 +45,37 @@ func buildFixtureTarGz(t *testing.T, content []byte) []byte {
 	return buf.Bytes()
 }
 
+// buildFixtureZip builds a single-file zip named "krayt.exe" containing content, mirroring
+// exactly what release-please.yml's windows/amd64 `zip` build step produces — and what
+// selfupdate.ExtractBinary expects to unzip.
+func buildFixtureZip(t *testing.T, content []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("krayt.exe")
+	if err != nil {
+		t.Fatalf("create zip entry: %v", err)
+	}
+	if _, err := w.Write(content); err != nil {
+		t.Fatalf("write zip content: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// buildFixtureArchive builds whichever archive format the current build platform's asset name
+// requires (a .zip on windows/amd64, a .tar.gz everywhere else) — mirroring AssetName's own
+// dispatch so the fixture server always serves bytes that match the extension its URL promises.
+func buildFixtureArchive(t *testing.T, content []byte) []byte {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return buildFixtureZip(t, content)
+	}
+	return buildFixtureTarGz(t, content)
+}
+
 // upgradeFixture describes the single GitHub release an upgradeFixtureServer serves, both from
 // its "latest" endpoint and from its "tags/<tag>" endpoint.
 type upgradeFixture struct {
@@ -65,7 +97,7 @@ func newUpgradeFixtureServer(t *testing.T, rf upgradeFixture) *httptest.Server {
 	if err != nil {
 		name = fmt.Sprintf("krayt_%s_%s_%s.tar.gz", rf.tag, runtime.GOOS, runtime.GOARCH)
 	}
-	tarball := buildFixtureTarGz(t, rf.content)
+	tarball := buildFixtureArchive(t, rf.content)
 	sum := sha256.Sum256(tarball)
 	digest := hex.EncodeToString(sum[:])
 	if rf.badChecksum {
