@@ -2,6 +2,7 @@ package selfupdate
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -40,6 +42,25 @@ func buildFixtureTarGz(t *testing.T, content []byte) ([]byte, string) {
 	}
 	sum := sha256.Sum256(content)
 	return buf.Bytes(), hex.EncodeToString(sum[:])
+}
+
+// buildFixtureZip builds a single-file zip named "krayt.exe" containing content, mirroring
+// release-please.yml's windows/amd64 `zip` build step.
+func buildFixtureZip(t *testing.T, content []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("krayt.exe")
+	if err != nil {
+		t.Fatalf("create zip entry: %v", err)
+	}
+	if _, err := w.Write(content); err != nil {
+		t.Fatalf("write zip content: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // newFixtureServer serves a single release tagged tag with one tarball asset (tarballName /
@@ -143,8 +164,9 @@ func TestAssetName(t *testing.T) {
 		{"darwin", "arm64", false, "krayt_v0.6.1_darwin_arm64.tar.gz"},
 		{"darwin", "amd64", false, "krayt_v0.6.1_darwin_amd64.tar.gz"},
 		{"linux", "amd64", false, "krayt_v0.6.1_linux_amd64.tar.gz"},
-		{"linux", "arm64", true, ""},
-		{"windows", "amd64", true, ""},
+		{"linux", "arm64", false, "krayt_v0.6.1_linux_arm64.tar.gz"},
+		{"windows", "amd64", false, "krayt_v0.6.1_windows_amd64.zip"},
+		{"windows", "arm64", true, ""},
 		{"plan9", "386", true, ""},
 	}
 	for _, c := range cases {
@@ -246,6 +268,44 @@ func TestDownloadAndVerify(t *testing.T) {
 	})
 }
 
+// TestDownloadAndVerify_ThenExtractZip covers the handoff TestExtractBinary's direct-file
+// round-trip misses: ExtractBinary tells a zip from a tar.gz by the archive path's own suffix, so
+// a regression where DownloadAndVerify saved every asset under a generic ".tmp" name would pass
+// TestExtractBinary (which writes the fixture with the right extension itself) while still
+// breaking a real `krayt upgrade` on windows/amd64.
+func TestDownloadAndVerify_ThenExtractZip(t *testing.T) {
+	content := []byte("fake-krayt-binary-contents")
+	zipBytes := buildFixtureZip(t, content)
+	sum := sha256.Sum256(zipBytes)
+	digest := hex.EncodeToString(sum[:])
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/krayt_v0.6.1_windows_amd64.zip", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(zipBytes)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	destDir := t.TempDir()
+	tmpPath, err := DownloadAndVerify(context.Background(), srv.Client(), srv.URL+"/krayt_v0.6.1_windows_amd64.zip", digest, destDir)
+	if err != nil {
+		t.Fatalf("DownloadAndVerify: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	binPath, err := ExtractBinary(tmpPath, destDir)
+	if err != nil {
+		t.Fatalf("ExtractBinary(%s): %v", tmpPath, err)
+	}
+	got, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatalf("read extracted binary: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("content mismatch: got %q, want %q", got, content)
+	}
+}
+
 func TestExtractBinary(t *testing.T) {
 	content := []byte("fake-krayt-binary-contents")
 	tarball, _ := buildFixtureTarGz(t, content)
@@ -272,8 +332,63 @@ func TestExtractBinary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat extracted binary: %v", err)
 		}
-		if info.Mode().Perm() != 0o755 {
+		// Windows has no POSIX permission bits: Chmod there only ever toggles the read-only
+		// attribute, so Stat reports 0666/0444, never 0755.
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
 			t.Errorf("mode = %v, want 0755", info.Mode().Perm())
+		}
+	})
+
+	t.Run("zip round-trip", func(t *testing.T) {
+		zipBytes := buildFixtureZip(t, content)
+		srcDir := t.TempDir()
+		zipPath := filepath.Join(srcDir, "krayt.zip")
+		if err := os.WriteFile(zipPath, zipBytes, 0o644); err != nil {
+			t.Fatalf("write fixture zip: %v", err)
+		}
+		destDir := t.TempDir()
+		binPath, err := ExtractBinary(zipPath, destDir)
+		if err != nil {
+			t.Fatalf("ExtractBinary: %v", err)
+		}
+		got, err := os.ReadFile(binPath)
+		if err != nil {
+			t.Fatalf("read extracted binary: %v", err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Errorf("content mismatch: got %q, want %q", got, content)
+		}
+		info, err := os.Stat(binPath)
+		if err != nil {
+			t.Fatalf("stat extracted binary: %v", err)
+		}
+		// Windows has no POSIX permission bits: Chmod there only ever toggles the read-only
+		// attribute, so Stat reports 0666/0444, never 0755.
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
+			t.Errorf("mode = %v, want 0755", info.Mode().Perm())
+		}
+	})
+
+	t.Run("zip wrong name", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		w, err := zw.Create("not-krayt.exe")
+		if err != nil {
+			t.Fatalf("create zip entry: %v", err)
+		}
+		if _, err := w.Write(content); err != nil {
+			t.Fatalf("write zip content: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("close zip writer: %v", err)
+		}
+		srcDir := t.TempDir()
+		zipPath := filepath.Join(srcDir, "wrongname.zip")
+		if err := os.WriteFile(zipPath, buf.Bytes(), 0o644); err != nil {
+			t.Fatalf("write wrong-name zip: %v", err)
+		}
+		if _, err := ExtractBinary(zipPath, t.TempDir()); err == nil {
+			t.Fatal("ExtractBinary(zip wrong name): want error, got nil")
 		}
 	})
 
@@ -404,7 +519,8 @@ func TestApply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat current: %v", err)
 		}
-		if info.Mode().Perm() != 0o755 {
+		// Windows has no POSIX permission bits: Stat reports 0666/0444, never 0755.
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
 			t.Errorf("mode = %v, want 0755", info.Mode().Perm())
 		}
 		backup, err := os.ReadFile(backupPath)
@@ -417,6 +533,11 @@ func TestApply(t *testing.T) {
 	})
 
 	t.Run("non-writable dir", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("windows: Chmod only toggles the read-only attribute, which NTFS does not " +
+				"enforce against creating new files in a directory, so this can't be reproduced " +
+				"the way the unix case is")
+		}
 		if os.Geteuid() == 0 {
 			t.Skip("running as root: permission bits don't block writes")
 		}

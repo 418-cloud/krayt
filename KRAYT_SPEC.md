@@ -1779,13 +1779,27 @@ at implementation time; major versions shown where they matter.)
 | CLI | `github.com/spf13/cobra` (+ `spf13/pflag`) | command surface (§13) |
 | Config | `gopkg.in/yaml.v3` | task config file (§8.1) |
 | `ask_human` MCP server | `github.com/modelcontextprotocol/go-sdk` (v1.2.0, `/mcp`) | stdio MCP server for `krayt-ask --mcp` (§6.13); pulled only by `cmd/krayt-ask` |
+| Windows named pipes | `github.com/Microsoft/go-winio` (v0.6.2) | `internal/askbridge`'s Windows ask-channel listener only (`listen_windows.go`, `expand-platforms-under-msb.md`) — the stdlib has no named-pipe support; go-winio is the library Docker/containerd/Moby use for the same job. `internal/orchestrator`'s Windows file lock (`climit_windows.go`) and RAM/disk probe (`internal/cli/resources_windows.go`) need no new dependency: `golang.org/x/sys/windows` (already pinned) wraps `LockFileEx`/`GetDiskFreeSpaceEx` directly, and `GlobalMemoryStatusEx` is called raw off `windows.NewLazySystemDLL` since x/sys ships no wrapper for it. |
+
+> **Amended by `expand-platforms-under-msb.md`.** Windows reopens a small OS-specific seam the
+> line below used to claim didn't exist: `internal/orchestrator/climit_{unix,windows}.go` (the
+> cross-process concurrency lock), `internal/orchestrator/socketdir_{unix,windows}.go` (where the
+> ask/control sockets live), `internal/askbridge/listen_{unix,windows}.go` (the ask channel's
+> listener — a unix socket vs. a named pipe), and `internal/cli/proc_{unix,windows}.go` (signalling
+> and detaching the supervisor process) join `cmd/krayt-helper`, `cmd/krayt-ask`'s vsock dialer,
+> and `internal/cli/resources_*.go` as OS-tagged. Every pair shares one exported surface (same
+> function names/signatures on both sides of the tag), so nothing outside these files is
+> OS-specific — Windows is a second implementation of a handful of narrow seams, not a parallel
+> code path through the orchestrator.
 
 Build constraints: `cmd/krayt-helper` is `//go:build linux` (the guest is always Linux under
-libkrun); `cmd/krayt-ask`'s vsock dialer and `internal/cli/resources_*.go` are the only other
-OS-tagged files in the repo (`run-tasks-on-microsandbox.md`'s Done-when explicitly checks this —
-the OS-specific seam is gone because the OS-specific work is msb's now). Everything else,
-including `internal/sandbox` itself, is OS-agnostic. Runtime: `krayt run` requires the `msb`
-binary installed; `krayt doctor` checks for it and its version floor (§6.15, §12).
+libkrun) — that one has no Windows/other counterpart since the guest is never anything but Linux.
+`cmd/krayt-ask`'s vsock dialer, `internal/cli/resources_*.go`, and the four `_unix.go`/`_windows.go`
+pairs above are the only other OS-tagged files in the repo (`run-tasks-on-microsandbox.md`'s
+Done-when originally checked for none of these existing at all; `expand-platforms-under-msb.md`
+added them back, deliberately, for Windows). Everything else, including `internal/sandbox` itself,
+is OS-agnostic. Runtime: `krayt run` requires the `msb` binary installed; `krayt doctor` checks for
+it and its version floor (§6.15, §12).
 
 ### 9.2 Code generation
 Deleted — superseded by `internal/sandbox` (§6.15) under ADR option B1
@@ -1816,7 +1830,7 @@ never exposed.
 | Network egress | Default-deny, translated to a **fully explicit** `msb create` policy (`task.NetworkArgs`, §6.6) — enforced entirely by msb's own userspace network stack, not by anything krayt runs. The guest now has a real, policed network interface (including DNS in `allowlist` mode) rather than none at all — a genuine capability gain over the pre-msb design, policed by msb's own gateway with DNS-rebind protection on by default. An allow/passthrough/secret-scope entry may be a `*.suffix` wildcard (§6.6), which grants a whole DNS subtree — apex included — and **neither krayt nor msb can tell a registry suffix from an organization suffix**: `*.github.io` allows every GitHub Pages tenant exactly as `*.mycorp.com` allows one company's hosts. Neither keeps a public-suffix list; breadth is the operator's to review, and the pre-boot summary prints wildcard entries on their own line (§8.3) |
 | `ask_human` bridge | A host-side process reading sandbox-authored input: `krayt-ask` dials the host directly over vsock — no guest listener, ever. `internal/askbridge.Serve` decodes the question with a byte cap, a decode-only read deadline, and a cap on in-flight questions (§6.13). Unauthenticated by construction — any sandbox process can dial it — but bounded to one question/answer exchange per connection (residual below) |
 | Container privileges | msb's own `--security restricted` profile (§6.6, §8.1), fixed and not user-configurable. krayt's pre-msb OCI-spec hardening (dropped Linux capabilities, containerd seccomp, enforced non-root, opt-in read-only rootfs) is **superseded, not layered on top** — `container.capabilities`, `container.seccomp: unconfined`, and `container.readonly_rootfs` are removed keys that hard-error, naming `--security` as the only, coarser replacement (`task.ValidateContainerPolicyForMsb`) |
-| Secrets | A declared secret's real value travels only in the `msb create` child's env — never on disk, never on argv (§6.6.1, §6.8). **Redacted host-side** (there is no guest process left to redact in — the sandbox never holds a value) from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted**; a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
+| Secrets | A declared secret's real value travels only in the `msb create` child's env — never on disk, never on argv (§6.6.1, §6.8) — **on macOS/Linux**; Windows has a documented exception (residual below, §12). **Redacted host-side** (there is no guest process left to redact in — the sandbox never holds a value) from live logs, `report.md`, and `ask_human` prompt/choices. `changes.patch` is **scanned, not redacted**; a hit surfaces as a Safety warning naming the key only (§6.8, §8.4) |
 | Secret substitution at the host | Declaring any secret **automatically** enables TLS interception (§6.6.1) — there is no "secret without MITM" under msb, unlike the pre-msb opt-in `network.mitm`. msb substitutes the placeholder string the workload already sent, wherever it appears, but **never strips a pre-existing auth header first** the way krayt's own deleted proxy did. **The one real regression against krayt's pre-msb design**: a credential the agent obtained elsewhere and placed in a header addressed to an allowed host goes out **untouched**. Bounded by the allowlist — the agent can only send it somewhere already permitted — not eliminated |
 | Run configuration (`krayt.yaml`) | **Split by provenance** (§8.3, whose table is the full field-by-field boundary): an `--config <path>` the operator named is honored in full; a `<repo>/krayt.yaml` auto-loaded from the repo under test is untrusted input and may configure a run but **not write its security policy, redirect what krayt reads or writes on the host, or relax the container's confinement**. Refused with an error: `network.mitm` (now a hard error everywhere, not just here — §6.6), `network.inject`, `network.passthrough`, `network.mode: full`, `repo:`, `container.capabilities`, `container.seccomp: unconfined` (likewise hard errors everywhere — §6.6, §8.1), `sandbox.extra_conf` (§8.1 — an unvalidated msb config that can mount host paths or widen a declared secret's scope). Contained to the repo root (no absolute path, no `..` escape, no symlink resolving out): `secrets:`, `task:`. Without this split a poisoned repo could name the operator's own secrets-file key as scoped to an attacker-controlled host (`network.inject`), bundle a *different*, private repo into the VM for the agent to read, or read an arbitrary host file in as the run's prompt — with every consistency check passing, because the file is only ever compared against itself |
 | Persistence | msb sandbox stopped and removed on teardown; fresh sandbox per run |
@@ -1904,6 +1918,17 @@ never exposed.
   "injected" no longer exists. What is unchanged: a compromised agent can still spend the
   credential's quota and rate budget against every allowed host for the run's duration, so
   "prefer a scoped API key for untrusted code" still stands.
+- **On Windows, the resolved secret value reaches disk with a process-listing-visible path
+  (`expand-platforms-under-msb.md`, found while reading msb 0.6.16 for
+  `probe-microsandbox-feasibility.md` P4, 2026-08-30).** The unix `--config-fd` handoff (Secrets
+  row, above) has no Windows equivalent: msb's `write_launch_config_file` writes the same launch
+  config, resolved secret included, to a `NamedTempFile` under the sandbox's own runtime directory
+  and passes its **path on argv** instead of an anonymous fd. It is short-lived — dropped once the
+  child reports startup — but for that window the secret sits on disk at a path any process in the
+  same session listing can read, on a platform where krayt cannot rely on unix file modes to guard
+  it. This is **msb's gap to close, not krayt's**; it ships as a documented residual rather than a
+  reason to withhold Windows support, and is the one asymmetry between platforms in this table's
+  Secrets row. See §12's Windows section.
 - **Placeholder shape.** msb's own default placeholder is `$MSB_<NAME>`; krayt may supply a
   credential-shaped custom placeholder via msb's `placeholder` field instead (see §6.14, §6.15).
   P5 (`probe-microsandbox-feasibility.md`, 2026-08-29) confirmed Claude Code accepts msb's default
@@ -1936,7 +1961,7 @@ one — see git history for the pre-msb text if the old Nix-based design is ever
 
 ---
 
-## 12. macOS Specifics & Gotchas
+## 12. macOS & Windows Specifics & Gotchas
 
 > **Amended by `run-tasks-on-microsandbox.md` (the cut-over, §14 Phase 11).** `vfkit` is no
 > longer a prerequisite — the vfkit provider is deleted along with the rest of
@@ -1957,12 +1982,69 @@ one — see git history for the pre-msb text if the old Nix-based design is ever
   krayt ships no guest-agent (§6.4 stub). `guestbin.Binary(name, runtime.GOARCH)` (§6.15, §7 step
   5) picks the matching `krayt-helper`/`krayt-ask` binary for the host's own arch.
 - **vsock:** the one remaining vsock use is `ask_human` — `krayt-ask` inside the sandbox dials
-  `AF_VSOCK` to host CID 2, which msb's own `--vsock HOST_PATH:PORT` route bridges to a host unix
-  socket `internal/askbridge` listens on (§6.13). There is no host/guest asymmetry left for krayt
-  to hide behind an interface (§6.12 stub) — msb owns the vsock plumbing on both sides.
+  `AF_VSOCK` to host CID 2, which msb's own `--vsock HOST_PATH:PORT` route bridges to a host-side
+  listener `internal/askbridge` binds (§6.13): a unix socket on macOS/Linux, a named pipe on
+  Windows (below) — the form msb itself expects there. There is no host/guest asymmetry left for
+  krayt to hide behind an interface (§6.12 stub) — msb owns the vsock plumbing on both sides.
 - **Networking:** msb owns network policy entirely (§6.6); domain filtering, TLS interception, and
   the private/loopback/metadata denylist are all msb's userspace network stack, not anything
   krayt runs on the host or in the guest.
+
+### Windows (`expand-platforms-under-msb.md`)
+
+Before this task krayt had no path to Windows at all — its two providers were one Apple-only
+(vfkit) and one KVM-only (Firecracker). msb supports Windows 11 via the Windows Hypervisor
+Platform (WHP), which made the remaining work a port of krayt's own small OS-specific seam rather
+than a new backend.
+
+- **Runtime dependency: WHP.** Same `msb` prerequisite as macOS/Linux (above), plus WHP enabled.
+  `krayt doctor` does not reimplement this check — it delegates entirely to `msb doctor`
+  (`internal/sandbox.DoctorChecks`, unchanged by this task), which already reports WHP availability
+  and offers `--fix` (opens an elevated PowerShell prompt to enable it).
+- **The guest never changes.** The sandbox is Linux under libkrun on every host msb supports,
+  Windows included. Nothing in `cmd/krayt-helper`, `cmd/krayt-ask`, or the agent images is
+  platform-dependent; `guestbin.Binary(name, runtime.GOARCH)` still just needs the host's arch.
+- **The ask_human channel is a named pipe, not a unix socket.** msb's `--vsock HOST_PATH:PORT`
+  route takes a `\\.\pipe\name` path on Windows instead of a filesystem-bound unix socket, so
+  `internal/askbridge.Listen` has a `listen_windows.go` implementation over
+  `github.com/Microsoft/go-winio` (§9.1) alongside `listen_unix.go`'s. The guest-side
+  `vsock://cid:port` URL `krayt-ask` dials is unchanged — the guest is Linux either way, which is
+  the reason this port is tractable at all. `internal/orchestrator`'s run-control socket
+  (`runctl.go`, the host-only IPC behind `krayt answer`) needs no Windows variant: it is a plain
+  unix-domain socket, and Windows has supported `AF_UNIX` natively since Windows 10 1803 / Go 1.16
+  — well below the Windows 11 floor WHP itself already requires.
+- **The cross-process concurrency lock is `LockFileEx`, not `flock`.** `orchestrator.AcquireSlot`
+  (`climit_windows.go`) takes a non-blocking whole-file exclusive lock via
+  `golang.org/x/sys/windows.LockFileEx` (`LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK`),
+  released automatically when the holding handle closes — including on crash — the same property
+  the unix `flock` implementation guarantees, so run slots never leak on either platform.
+- **`krayt stop` cannot ask the supervisor to shut down gracefully.** The unix implementation
+  SIGTERMs the supervising `krayt run` process, whose signal handler cancels the run context and
+  guarantees msb `stop`/`rm` teardown. Windows has no SIGTERM equivalent Go can deliver to an
+  arbitrary process (`os.Process.Signal` only supports `os.Kill` there), so
+  `internal/cli/proc_windows.go`'s `killSupervisor` hard-terminates it via `TerminateProcess`
+  instead — the supervisor's deferred teardown never runs. A stopped run's sandbox can be left
+  running on Windows until msb's own cleanup reclaims it or the operator runs `msb stop`/`msb rm`
+  by hand. **This is a known, documented residual**, not a bug masked as one; closing it would mean
+  giving the supervisor its own listener for a stop request (e.g. over the run-control socket
+  above) and is out of scope for this task.
+- **Secret handling is weaker than on Unix (§10 decision 4).** On unix the resolved secret value
+  reaches the `msb sandbox` process over an anonymous temp file passed as `--config-fd` — no
+  filesystem path, nothing on argv. Windows has no such handoff: msb's `write_launch_config_file`
+  writes the same launch config, resolved secret included, to a `NamedTempFile` under the sandbox's
+  runtime directory and passes its **path on argv**. It is short-lived — dropped once the child
+  reports startup — but it is a real on-disk write of secret material with a process-listing-visible
+  path, on a platform where krayt cannot rely on unix file modes to protect it. See §10's threat
+  table for the full entry; this is msb's gap to close, not krayt's, and ships as a documented
+  residual rather than blocking Windows support entirely.
+- **Published ports and Windows Defender Firewall.** msb's docs note that opening a published port
+  on Windows can trigger a Defender Firewall prompt for `msb.exe`. krayt publishes no ports today
+  (§13 has no such flag), so this is inert — recorded here so the first person who adds one does
+  not discover it in a support thread instead.
+- **Release artifact.** The Windows build ships as `krayt_<tag>_windows_amd64.zip`, not a
+  `.tar.gz` — the native convention there; `internal/selfupdate` extracts a zip-packaged
+  `krayt.exe` on that platform (`ExtractBinary`, dispatched on file extension) the same way it
+  untars a `krayt` binary on every Unix target.
 
 ---
 
@@ -2505,11 +2587,31 @@ independently-landed progress rather than a single big-bang "Done when".
   (control sandbox without it saw only the placeholder). The run also **overturned decision 2**:
   per-secret `on_violation` tightening is not a capability of this hatch on any `msb` CLI surface —
   `deny_unknown_fields` makes msb refuse the sandbox — and §8.1/§10 are corrected accordingly.
-- [ ] `expand-platforms-under-msb.md` — linux/arm64 in the release matrix, plus a real Windows
-  port. Unblocked by `retire-vm-image-pipeline.md`: the old blocker (§15) was a krayt-owned image
-  index with an arch dimension but no backend dimension, and Windows had no path at all; with no
-  krayt-built image, neither obstacle exists any more — msb's own platform support is what gates
-  this now.
+- [x] `expand-platforms-under-msb.md` — **Part A (linux/arm64) done in full:** in the release
+  matrix (`release-please.yml`), `internal/selfupdate` resolves the new asset (unit-tested against
+  an `httptest` fixture), `README.md` lists it, and CI runs `go build`/`go test -race` natively on
+  a hosted `ubuntu-24.04-arm` runner rather than only cross-compiling it. §15's linux/arm64 entry
+  is closed. **Part B (Windows) done for everything short of real hardware:** `GOOS=windows
+  GOARCH=amd64 go build ./...`/`go vet ./...` are green, and CI adds both a cheap cross-compile
+  check and a native `windows-latest` job running `go build`/`go test ./...` (no `-race` — CGO on
+  hosted Windows runners is not a given). The four OS-specific seams this needed are each a
+  `_unix.go`/`_windows.go` pair with the same exported surface on both sides (§9.1): the
+  concurrency lock (`LockFileEx` vs. `flock`), the ask-channel listener (a named pipe via the new
+  `github.com/Microsoft/go-winio` pin vs. a unix socket), where the ask/control sockets live (no
+  `sockaddr_un`-length fallback needed on Windows), and the detached-supervisor process attributes
+  plus its stop signal (`TerminateProcess` vs. `SIGTERM` — see the `krayt stop` residual below).
+  `internal/cli/resources_windows.go` measures real RAM/disk via `GlobalMemoryStatusEx`/
+  `GetDiskFreeSpaceEx` rather than falling through to the "no backend" stub. `krayt doctor` needed
+  no changes at all — it already delegated unconditionally to `msb doctor`, which reports WHP the
+  same way it reports KVM. §9.1, §10 (the Windows secret-on-disk residual), §12 (a new Windows
+  section), and §15 are updated; `internal/patch` was reviewed and needed no changes (it is
+  `filepath`/`git`-only, no unix-specific assumptions). **One known, documented residual**: `krayt
+  stop` on Windows hard-kills the supervisor rather than signalling it to tear down gracefully, so
+  a stopped run's sandbox can outlive the `krayt stop` call until msb's own cleanup reclaims it or
+  the operator runs `msb stop`/`msb rm` by hand (§12) — closing it is future work (a supervisor
+  listener for a stop request), out of scope here. **Left for hardware**: a real `krayt run` on a
+  linux/arm64 KVM host and on Windows 11 with WHP (including a `--on-question=wait` run over the
+  named-pipe channel) — both tracked in `HUMAN_TODO.md`, neither achievable in this environment.
 - [ ] `warm-start-msb-sandboxes.md` — flat OCI rootfs + `--materialize` pre-pull, opt-in and
   defaulting off until measured.
 - **Done when:** the gate's two blocking probes (P1, P2) have a real-hardware finding recorded in
@@ -2545,6 +2647,20 @@ independently-landed progress rather than a single big-bang "Done when".
   `internal/sandbox` (§6.15) replaces `internal/provider` entirely, and `internal/provider`,
   `internal/guest`, and `internal/protocol` are deleted by `run-tasks-on-microsandbox.md`. See §3,
   §4, §5, and the §6.3–§6.5/§6.10–§6.12 stubs for the current text.
+- **linux/arm64 — closed, `expand-platforms-under-msb.md`.** Blocked before B1 by krayt's own VM
+  image, not by krayt's code: the image index carried an arch dimension but no *backend*
+  dimension (`images/flake.nix` built a PE `Image` for vfkit and an uncompressed ELF `vmlinux` for
+  Firecracker), and the only published arm64 variant was the vfkit one, so a linux/arm64 krayt
+  would have resolved to it via `vmimage.selectPlatform` and failed to boot under Firecracker. With
+  no krayt-built VM image (`retire-vm-image-pipeline.md`) there is no index, no backend dimension,
+  and no conflict — linux/arm64 is now in the release matrix and CI runs `go build`/`go test`
+  natively on an arm64 Linux runner (`.github/workflows/{release-please,ci}.yml`).
+- **Windows — closed, `expand-platforms-under-msb.md`.** Before B1 krayt had no path to Windows at
+  all: its two providers were one Apple-only (vfkit) and one KVM-only (Firecracker). msb supports
+  Windows 11 via the Windows Hypervisor Platform, so the only work left was porting krayt's own
+  small OS-specific seam (§9.1, §12) — `orchestrator.AcquireSlot`'s file lock and the ask_human
+  host listener — plus documenting the residual secret-handling gap `--config-fd` closes on Unix
+  but msb has no equivalent for on Windows (§10).
 - **VM boot time / warm-VM pool** on macOS — measure cold-boot latency first; if it hurts UX,
   add an optional **warm-VM pool** that pre-boots and parks idle VMs to amortize boot time.
   Deferred deliberately: it's a boot-time optimization that should be driven by real-world

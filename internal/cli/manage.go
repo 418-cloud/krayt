@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -141,9 +140,10 @@ func newStopCmd() *cobra.Command {
 			if rec.PID <= 0 {
 				return fmt.Errorf("run %q has no recorded supervisor pid", args[0])
 			}
-			// SIGTERM the supervising `krayt run`; its signal handler cancels the run
-			// context, which guarantees VM teardown (§6.2, §7).
-			if err := syscall.Kill(rec.PID, syscall.SIGTERM); err != nil {
+			// Signal the supervising `krayt run` to stop (proc_unix.go/proc_windows.go); on
+			// unix its SIGTERM handler cancels the run context, which guarantees VM teardown
+			// (§6.2, §7) — Windows has no such graceful path (proc_windows.go).
+			if err := killSupervisor(rec.PID); err != nil {
 				return fmt.Errorf("signal run %q (pid %d): %w", args[0], rec.PID, err)
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "stopping %s (pid %d)\n", args[0], rec.PID)

@@ -3,6 +3,7 @@ module github.com/418-cloud/krayt
 go 1.26.3
 
 require (
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/mdlayher/vsock v1.3.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/opencontainers/go-digest v1.0.0

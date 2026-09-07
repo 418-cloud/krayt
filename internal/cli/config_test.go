@@ -184,7 +184,10 @@ func TestApplyConfigAutoLoadedSecurityFields(t *testing.T) {
 		name: "secrets nested inside the repo",
 		yaml: "secrets: config/secrets.env\n",
 		check: func(t *testing.T, f *runFlags) {
-			if !strings.HasSuffix(f.secretsFile, filepath.Join("config", "secrets.env")) {
+			// The explicit half keeps the YAML value verbatim (forward slashes, as typed); the
+			// auto half runs it through containedRepoPath, which rebuilds it with native
+			// separators. Compare on ToSlash so both forms match the same suffix.
+			if !strings.HasSuffix(filepath.ToSlash(f.secretsFile), "config/secrets.env") {
 				t.Errorf("secrets = %q, want config/secrets.env under the repo", f.secretsFile)
 			}
 		},

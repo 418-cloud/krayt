@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 )
 
@@ -16,11 +15,13 @@ const slotPoll = 100 * time.Millisecond
 func slotsDir(stateDir string) string { return filepath.Join(stateDir, "slots") }
 
 // AcquireSlot blocks until one of limit concurrency slots is free, then returns a release func
-// to call when the run ends. Concurrency is enforced with advisory file locks (flock) on limit
-// slot files under stateDir/slots/, so the cap holds across independent processes sharing one
-// .krayt — several foreground `krayt run`s and detached supervisors alike — not merely within a
-// process (§6.2). Because the OS drops a flock when the holder's fd closes (including on crash),
-// slots never leak. limit <= 0 means unbounded (a no-op release). ctx cancellation aborts the wait.
+// to call when the run ends. Concurrency is enforced with advisory whole-file locks on limit
+// slot files under stateDir/slots/ — flock on Unix (climit_unix.go), LockFileEx on Windows
+// (climit_windows.go) — so the cap holds across independent processes sharing one .krayt —
+// several foreground `krayt run`s and detached supervisors alike — not merely within a process
+// (§6.2). Both platforms release the lock when the holder's fd/handle closes, including on
+// crash, so slots never leak. limit <= 0 means unbounded (a no-op release). ctx cancellation
+// aborts the wait.
 func AcquireSlot(ctx context.Context, stateDir string, limit int) (func(), error) {
 	if limit <= 0 {
 		return func() {}, nil
@@ -35,19 +36,20 @@ func AcquireSlot(ctx context.Context, stateDir string, limit int) (func(), error
 			if err != nil {
 				return nil, fmt.Errorf("orchestrator: open slot: %w", err)
 			}
-			// Non-blocking exclusive lock: a held slot returns EWOULDBLOCK/EAGAIN, so we move on to
-			// the next; separate open()s contend even within one process, so this bounds same-process
-			// concurrency too. Any OTHER flock error (e.g. a filesystem that doesn't support flock)
-			// is persistent — polling won't clear it — so fail fast with a clear error instead of
-			// spinning until ctx expires and reporting a misleading deadline.
-			lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-			if lerr == nil {
-				return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, nil
-			}
-			_ = f.Close()
-			if lerr != syscall.EWOULDBLOCK && lerr != syscall.EAGAIN {
+			// Non-blocking exclusive lock: a held slot reports "not acquired" here, so we move on
+			// to the next; separate open()s contend even within one process, so this bounds
+			// same-process concurrency too. Any OTHER lock error (e.g. a filesystem that doesn't
+			// support advisory locks) is persistent — polling won't clear it — so fail fast with a
+			// clear error instead of spinning until ctx expires and reporting a misleading deadline.
+			locked, lerr := tryLockSlot(f)
+			if lerr != nil {
+				_ = f.Close()
 				return nil, fmt.Errorf("orchestrator: lock slot %d in %s: %w", i, dir, lerr)
 			}
+			if locked {
+				return func() { _ = unlockSlot(f); _ = f.Close() }, nil
+			}
+			_ = f.Close()
 		}
 		select {
 		case <-ctx.Done():

@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -607,8 +606,9 @@ func spawnDetachedRun(cmd *cobra.Command, stateDir, id, spooledTaskFile string) 
 }
 
 // spawnDetached starts exe (args, env) as a new-session background process whose stdio is
-// redirected to logPath (stdin from /dev/null), returning its pid. Setsid puts it in its own
-// session so it detaches from the controlling terminal and outlives the launching shell (§6.2).
+// redirected to logPath (stdin from /dev/null), returning its pid. detachSysProcAttr
+// (proc_unix.go/proc_windows.go) puts it in its own session/process group so it detaches from
+// the controlling terminal and outlives the launching shell (§6.2).
 func spawnDetached(exe string, args, env []string, logPath string) (int, error) {
 	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -626,7 +626,7 @@ func spawnDetached(exe string, args, env []string, logPath string) (int, error) 
 	c.Stdin = devnull
 	c.Stdout = logf
 	c.Stderr = logf
-	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	c.SysProcAttr = detachSysProcAttr()
 	if err := c.Start(); err != nil {
 		return 0, err
 	}
@@ -853,7 +853,7 @@ func rejectAutoLoadedPolicy(path string, cfg *task.Config) error {
 // `secrets: secrets.env` in a repo run from its own directory resolves exactly as it did before
 // this containment existed.
 func containedRepoPath(root, p string) (string, error) {
-	if filepath.IsAbs(p) {
+	if pathLooksAbsolute(p) {
 		return "", fmt.Errorf("%q is an absolute path; an auto-loaded repo config may only name a file inside the repo", p)
 	}
 	clean := filepath.Clean(p)
@@ -896,6 +896,15 @@ func checkSymlinkContained(root, target string) error {
 		return fmt.Errorf("resolves through a symlink to %s, outside the repo root", realTarget)
 	}
 	return nil
+}
+
+// pathLooksAbsolute reports whether p is an absolute path, either by the host OS's own convention
+// (filepath.IsAbs) or by a POSIX-style leading slash. Windows' filepath.IsAbs does not treat
+// "/etc/passwd" as absolute — it is drive-relative there, not rooted at a fixed location — but a
+// krayt.yaml is portable data, and a leading slash is exactly the shape an attacker would use to
+// name a host file; containment must reject it the same way on every platform.
+func pathLooksAbsolute(p string) bool {
+	return filepath.IsAbs(p) || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\")
 }
 
 // resolveAgainstDir resolves p — a path read from a config file — against dir when p is relative,

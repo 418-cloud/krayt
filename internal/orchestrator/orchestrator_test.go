@@ -577,6 +577,11 @@ func run(t *testing.T, dir, name string, args ...string) {
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	// Isolate from the host's global/system gitconfig, the same way patch.go's own runGit does —
+	// otherwise a runner whose global config sets core.autocrlf=true (Windows' own default)
+	// silently rewrites these fixtures' and clones' line endings, which desyncs the checked-out
+	// working tree from the production-code-generated (already isolated) patch it's applied to.
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
 	}

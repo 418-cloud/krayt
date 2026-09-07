@@ -43,6 +43,10 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && fakeMsbVerbs[os.Args[1]] {
 		os.Exit(runFakeMsb())
 	}
+	// The same re-exec dispatch, for TestSpawnDetached's detached child (detach_test.go).
+	if len(os.Args) > 1 && os.Args[1] == detachChildArg {
+		os.Exit(runDetachChild())
+	}
 	if self, err := os.Executable(); err == nil {
 		testBinPath = self
 	}

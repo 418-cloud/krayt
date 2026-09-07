@@ -275,8 +275,11 @@ func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 
 // parseRemote splits a docker-cp-style token into (sandboxName, path, isRemote). A remote token
 // looks like "name:/abs/path"; a local one is a plain (always-absolute, in these tests) host path.
+// filepath.IsAbs catches a Windows host path here too ("C:\Users\...") — without it, the drive
+// letter's colon looks exactly like a "name:path" remote token and both sides of a host->guest
+// copy parse as remote.
 func parseRemote(s string) (name, path string, remote bool) {
-	if strings.HasPrefix(s, "/") {
+	if strings.HasPrefix(s, "/") || filepath.IsAbs(s) {
 		return "", s, false
 	}
 	n, p, ok := strings.Cut(s, ":")

@@ -55,18 +55,17 @@ jobs:
       # and no new runner; CGO stays off for this too (guest-bins itself sets CGO_ENABLED=0).
       - run: make guest-bins
 
-      # Pure-Go (CGO off): one Linux runner cross-builds every target. darwin/arm64 is the
-      # supported macOS target; darwin/amd64 builds but is untested (see README). linux/amd64 is
-      # the supported Linux target. No linux/arm64 yet — msb itself supports it, but krayt hasn't
-      # verified a run on that host arch; tracked by expand-platforms-under-msb.md, not blocked by
-      # anything image-related any more (the old blocker — a krayt-owned, backend-tagged VM image
-      # with no arm64 Firecracker variant — went with the rest of the image pipeline;
-      # retire-vm-image-pipeline.md).
-      - name: Build krayt (darwin/arm64, darwin/amd64, linux/amd64)
+      # Pure-Go (CGO off): one Linux runner cross-builds every Unix target. darwin/arm64 is the
+      # supported macOS target; darwin/amd64 builds but is untested (see README). linux/amd64 and
+      # linux/arm64 are both supported Linux targets — msb's own platform support is what gated
+      # linux/arm64, and the old blocker (a krayt-owned, backend-tagged VM image with no arm64
+      # Firecracker variant) went with the rest of the image pipeline (retire-vm-image-pipeline.md,
+      # expand-platforms-under-msb.md).
+      - name: Build krayt (darwin/arm64, darwin/amd64, linux/amd64, linux/arm64)
         run: |
           set -euo pipefail
           mkdir -p dist
-          for target in darwin/arm64 darwin/amd64 linux/amd64; do
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
             os="${target%/*}"
             arch="${target#*/}"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
@@ -74,7 +73,20 @@ jobs:
             tar -C dist -czf "dist/krayt_${TAG}_${os}_${arch}.tar.gz" krayt
             rm dist/krayt
           done
-          (cd dist && sha256sum *.tar.gz > checksums.txt)
+
+      # Windows gets a .zip, not a .tar.gz — the native convention there (Explorer opens .zip
+      # without extra tooling; tar.gz needs a third-party unpacker on stock Windows).
+      - name: Build krayt (windows/amd64)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o dist/krayt.exe ./cmd/krayt
+          (cd dist && zip "krayt_${TAG}_windows_amd64.zip" krayt.exe)
+          rm dist/krayt.exe
+
+      - name: Checksums
+        run: (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
 
       - name: Upload binaries to the release
-        run: gh release upload "$TAG" dist/krayt_*.tar.gz dist/checksums.txt --clobber
+        run: gh release upload "$TAG" dist/krayt_*.tar.gz dist/krayt_*.zip dist/checksums.txt --clobber

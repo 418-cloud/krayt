@@ -1,10 +1,14 @@
 // Package askbridge is the host-side half of the agent → human question channel under msb
 // (dial-ask-channel-over-vsock.md, §6.13), running in the krayt host process rather than inside
 // a guest. krayt-ask (or its --mcp front-end) inside the sandbox dials AF_VSOCK straight to the
-// host; msb bridges that to a host unix socket (Listen); Serve accepts connections on it and
-// answers each with one question/answer exchange against a Bridge — a newline-delimited JSON
-// wire protocol shared with the client half in internal/askclient (the same shape a pre-msb
-// in-guest bridge used, before run-tasks-on-microsandbox.md's cut-over deleted it).
+// host; msb bridges that to a host-side listener (Listen) — a unix socket on macOS/Linux
+// (listen_unix.go), a named pipe on Windows (listen_windows.go, expand-platforms-under-msb.md),
+// since that is the local address form msb's own `--vsock HOST_PATH:PORT` route expects there.
+// Serve accepts connections on it and answers each with one question/answer exchange against a
+// Bridge — a newline-delimited JSON wire protocol shared with the client half in
+// internal/askclient (the same shape a pre-msb in-guest bridge used, before
+// run-tasks-on-microsandbox.md's cut-over deleted it). Serve/Bridge are OS-agnostic: they operate
+// on the net.Listener/net.Conn interfaces, not the platform underneath them.
 //
 // The redaction a caller applies before push moves with the caller, not into this package: the
 // host already holds every secret value, so whatever constructs a Bridge here can redact in its
@@ -24,12 +28,8 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/418-cloud/krayt/internal/sockroot"
 )
 
 // wireRequest / wireResponse are the newline-delimited JSON protocol spoken over the socket: the
@@ -232,41 +232,4 @@ func lingerUntilPeerCloses(conn net.Conn, timeout time.Duration) {
 		return
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(conn, maxAskRequestBytes))
-}
-
-// Listen creates dir if necessary, binds ask.sock in it, and hardens both. Which directory that
-// is belongs to the caller: orchestrator.runSocketDir prefers the run's own private state
-// directory (decision 4) and falls back to the per-uid `<tmp>/krayt-<uid>` root when the run
-// directory's path would push the socket past macOS's sockaddr_un limit — decision 4's claim that
-// the socket could be kept "short by construction" does not survive an unbounded repo path in
-// front of it. This function treats both the same way, reusing sockroot.Ensure's
-// hostile-pre-existing-directory refusal (decision 12) rather than a second copy of that check,
-// then binds a unix socket at dir/ask.sock and chmods it 0600 (decision 10) — narrower than the
-// in-guest bridge's 0777, which existed only so a non-root container could reach a root-owned
-// directory; here the socket lives in a 0700 directory owned by the invoking user either way, so
-// there is no non-root party to widen it for. net.Listen itself never unlinks a
-// pre-existing path at that name, so a socket already present here is a fail-closed error, not an
-// unlink-then-bind (decision 12).
-//
-// The premise 0600 rests on — that msb's local backend bridges the guest's vsock dial as the
-// invoking user, not as root or a system daemon under some other uid — is confirmed on hardware,
-// not assumed: hack/msb-probes/p1-vsock-nonroot.sh dials a 0600 socket inside a 0700 directory
-// from a non-root guest process and logs the accepted connection's peer uid, which came back as
-// the invoking user's on msb 0.6.16 (2026-09-02, KRAYT_SPEC.md §14 Phase 11's P1 bullet). Had it
-// come back as anything else, this socket would have been unreachable and the tempting fix would
-// have been exactly the 0777 above.
-func Listen(dir string) (net.Listener, error) {
-	if err := sockroot.Ensure(dir); err != nil {
-		return nil, err
-	}
-	path := filepath.Join(dir, "ask.sock")
-	lis, err := net.Listen("unix", path)
-	if err != nil {
-		return nil, fmt.Errorf("askbridge: listen %s: %w", path, err)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		_ = lis.Close()
-		return nil, fmt.Errorf("askbridge: chmod ask socket: %w", err)
-	}
-	return lis, nil
 }

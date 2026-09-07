@@ -506,9 +506,13 @@ func runGitRaw(ctx context.Context, dir string, args ...string) ([]byte, error) 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	// Keep git non-interactive and independent of the user's global/system config so a
-	// stray credential helper or hook config can't perturb the sandboxed run.
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
+	// Keep git non-interactive and independent of the user's global/system config so a stray
+	// credential helper or hook config can't perturb the sandboxed run. GIT_CONFIG_NOSYSTEM alone
+	// only drops the system config, not ~/.gitconfig — a real windows-latest run proved the gap:
+	// its global core.autocrlf=true (the platform's own default) silently rewrote Ingest's clone
+	// and CreateBundle's checked-out working tree to CRLF, corrupting content the round-trip
+	// depends on being byte-identical to what was bundled. GIT_CONFIG_GLOBAL=/dev/null closes it.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
@@ -533,7 +537,10 @@ func runGitRawEnv(ctx context.Context, extraEnv []string, args ...string) ([]byt
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
+	// Same global-config isolation as runGitRaw (see its comment) — extraEnv is appended after,
+	// so patchGenEnv's own GIT_CONFIG_GLOBAL still wins for its callers; this just extends the
+	// same guarantee to callers (captureWorkTree, commitTree) that pass a narrower extraEnv.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	cmd.Env = append(cmd.Env, extraEnv...)
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderr.String())

@@ -52,11 +52,12 @@ func OverSocket(socket, prompt string, choices []string) (string, bool, error) {
 	return resp.Response, resp.NoAnswer, nil
 }
 
-// dial connects to addr, dispatching to a unix dial (OS-agnostic) or the platform's vsock dial
-// (dialVsock, confined to a build-tagged file — see dial_vsock_linux.go / dial_vsock_other.go).
+// dial connects to addr, dispatching to the platform's local dial (dialLocal — see
+// dial_local_other.go / dial_local_windows.go) or the platform's vsock dial (dialVsock, confined
+// to a build-tagged file — see dial_vsock_linux.go / dial_vsock_other.go).
 func dial(addr dialAddr) (net.Conn, error) {
 	if addr.unix {
-		return net.Dial("unix", addr.path)
+		return dialLocal(addr.path)
 	}
 	return dialVsock(addr.cid, addr.port)
 }
