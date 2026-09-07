@@ -333,10 +333,10 @@ detached-supervisor process attributes, and the RAM/disk preflight probe
 runner — but that runner has no WHP available (nested virtualization isn't exposed there), so it
 proves the port compiles and the OS-agnostic suite passes, not that a real sandbox boots.
 
-**The native Windows `go test ./...` job is currently the one red check on this branch, and the
-fixes for it have not themselves been run on Windows.** See the `--on-question=wait` bullet below
-for the `--vsock`/named-pipe defect it exposed. Whoever picks this up should confirm the job goes
-green before treating the rest of this entry as the only outstanding Windows work.
+The native Windows `go test ./...` job (`build + test (windows/amd64, native)`) is green as of
+`e13af71` — all 12 of this PR's CI checks pass (`gh pr checks`). That confirms the OS-agnostic
+suite and the fixes below compile and pass on a real Windows runner; it does not touch WHP, which
+that hosted runner doesn't expose (see the intro above), so the hardware needs below still stand.
 
 - **Needed:**
   1. `krayt doctor` on a real Windows 11 host with WHP enabled and `msb` installed — all msb
@@ -366,9 +366,10 @@ green before treating the rest of this entry as the only outstanding Windows wor
      still shows the sandbox running — expected, and the point of recording this here rather than
      letting it surprise someone as a "stop doesn't work" bug report.
   5. Optionally, exercise `krayt upgrade` on Windows once a real release exists — confirm the `.zip`
-     asset resolves and that replacing the running `krayt.exe` via rename succeeds (`selfupdate.Apply`'s
-     doc comment records this as an assumption based on how Windows self-updaters generally work,
-     not something verified on real hardware).
+     asset resolves and that `selfupdate.installBinary`'s Windows path (rename the running
+     `krayt.exe` out of the way, then rename the new binary into place) actually succeeds against a
+     mapped executable. This is the standard Windows self-update technique, but — like the rest of
+     this entry — it is unverified on real hardware.
 - **Why the agent can't:** no Windows host with WHP available in this environment (or any Windows
   host at all); the hosted CI runner above only proves the binary builds and unit-tests correctly,
   not that WHP boots a real sandbox or that msb's vsock-to-named-pipe bridge behaves the way

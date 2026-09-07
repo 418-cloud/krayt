@@ -33,7 +33,11 @@ func runSocketDir(runDir, runID string) (dir string, cleanup func(), err error) 
 		return preferred, noop, nil
 	}
 
-	fallback := filepath.Join(os.TempDir(), "krayt-ask", runID)
+	// Shaped as <root>/<runID>/ask, not <root>/<runID>: askbridge.Listen derives its pipe name
+	// from filepath.Base(filepath.Dir(dir)), so dir's parent's basename must be runID, the same
+	// shape the preferred runDir/ask path has. A bare <root>/<runID> would make every fallback
+	// run resolve to the same constant pipe name and collide.
+	fallback := filepath.Join(os.TempDir(), "krayt-ask", runID, "ask")
 	if !socketDirFits(fallback) {
 		return "", noop, fmt.Errorf("orchestrator: no unix socket path short enough for run %s: "+
 			"%q needs %d bytes, over the %d-byte limit, and the fallback %q does not fit either",

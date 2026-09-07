@@ -268,6 +268,44 @@ func TestDownloadAndVerify(t *testing.T) {
 	})
 }
 
+// TestDownloadAndVerify_ThenExtractZip covers the handoff TestExtractBinary's direct-file
+// round-trip misses: ExtractBinary tells a zip from a tar.gz by the archive path's own suffix, so
+// a regression where DownloadAndVerify saved every asset under a generic ".tmp" name would pass
+// TestExtractBinary (which writes the fixture with the right extension itself) while still
+// breaking a real `krayt upgrade` on windows/amd64.
+func TestDownloadAndVerify_ThenExtractZip(t *testing.T) {
+	content := []byte("fake-krayt-binary-contents")
+	zipBytes := buildFixtureZip(t, content)
+	sum := sha256.Sum256(zipBytes)
+	digest := hex.EncodeToString(sum[:])
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/krayt_v0.6.1_windows_amd64.zip", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(zipBytes)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	destDir := t.TempDir()
+	tmpPath, err := DownloadAndVerify(context.Background(), srv.Client(), srv.URL+"/krayt_v0.6.1_windows_amd64.zip", digest, destDir)
+	if err != nil {
+		t.Fatalf("DownloadAndVerify: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	binPath, err := ExtractBinary(tmpPath, destDir)
+	if err != nil {
+		t.Fatalf("ExtractBinary(%s): %v", tmpPath, err)
+	}
+	got, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatalf("read extracted binary: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("content mismatch: got %q, want %q", got, content)
+	}
+}
+
 func TestExtractBinary(t *testing.T) {
 	content := []byte("fake-krayt-binary-contents")
 	tarball, _ := buildFixtureTarGz(t, content)

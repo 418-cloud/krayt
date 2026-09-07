@@ -187,7 +187,15 @@ func DownloadAndVerify(ctx context.Context, client *http.Client, url, wantSHA256
 		return "", fmt.Errorf("download %s: unexpected status %s", url, resp.Status)
 	}
 
-	tmp, err := os.CreateTemp(destDir, ".krayt-upgrade-*.tmp")
+	// ExtractBinary tells a .zip apart from a .tar.gz by this temp file's own suffix (there's no
+	// other signal left once the asset is on disk), so that suffix has to be the real one rather
+	// than a generic ".tmp" — otherwise every windows/amd64 .zip gets fed to the gzip reader and
+	// fails before installation.
+	suffix := ".tar.gz"
+	if strings.HasSuffix(url, ".zip") {
+		suffix = ".zip"
+	}
+	tmp, err := os.CreateTemp(destDir, ".krayt-upgrade-*"+suffix)
 	if err != nil {
 		return "", fmt.Errorf("create temp file in %s: %w", destDir, err)
 	}
@@ -376,14 +384,19 @@ func parseVersion(v string) ([3]int, error) {
 }
 
 // Apply installs newBinaryPath over currentPath: it verifies currentPath's directory is
-// writable, backs up currentPath to currentPath+".bak" (overwriting any prior backup), then
-// atomically renames newBinaryPath into place. Replacing an open, currently-executing file this
-// way is well-defined on Unix — the running process keeps its already-mapped inode until it
-// exits. On Windows, replacing a running executable's directory entry via rename (as opposed to
-// deleting it) is the standard self-update technique and is expected to work the same way — the
-// image loader opens the running .exe with share-delete, not an exclusive lock — but this is
-// unverified on real hardware; see HUMAN_TODO.md's Windows `krayt run`/`krayt upgrade` entry.
-// Never attempts privilege escalation: an unwritable directory is a plain error.
+// writable, backs up currentPath to currentPath+".bak" (overwriting any prior backup), then puts
+// newBinaryPath in currentPath's place. Never attempts privilege escalation: an unwritable
+// directory is a plain error.
+//
+// On Unix, that last step is a single atomic rename: replacing an open, currently-executing file
+// this way is well-defined — the running process keeps its already-mapped inode until it exits.
+// On Windows a rename that replaces an existing destination (MOVEFILE_REPLACE_EXISTING, what
+// os.Rename uses there) can fail against a destination that is still mapped as the running
+// executable image, so installBinary instead moves currentPath out of the way under a fresh name
+// first — a plain, non-replacing rename, which Windows does allow on an in-use file — and only
+// then moves newBinaryPath into the now-vacant name. This is the standard Windows self-update
+// technique, but it is unverified on real hardware; see HUMAN_TODO.md's Windows
+// `krayt run`/`krayt upgrade` entry.
 func Apply(currentPath, newBinaryPath string) (string, error) {
 	dir := filepath.Dir(currentPath)
 
@@ -402,11 +415,36 @@ func Apply(currentPath, newBinaryPath string) (string, error) {
 		return "", fmt.Errorf("back up %s to %s: %w", currentPath, backupPath, err)
 	}
 
-	if err := os.Rename(newBinaryPath, currentPath); err != nil {
-		return "", fmt.Errorf("install new binary over %s: %w", currentPath, err)
+	if err := installBinary(currentPath, newBinaryPath); err != nil {
+		return "", err
 	}
 
 	return backupPath, nil
+}
+
+// installBinary moves newBinaryPath into currentPath's place, which currentPath's own
+// documentation on Apply already explains is not the same operation on every OS.
+func installBinary(currentPath, newBinaryPath string) error {
+	if runtime.GOOS != "windows" {
+		if err := os.Rename(newBinaryPath, currentPath); err != nil {
+			return fmt.Errorf("install new binary over %s: %w", currentPath, err)
+		}
+		return nil
+	}
+
+	vacated := currentPath + ".running"
+	_ = os.Remove(vacated) // best effort: a leftover from a prior interrupted upgrade
+	if err := os.Rename(currentPath, vacated); err != nil {
+		return fmt.Errorf("move running binary %s out of the way: %w", currentPath, err)
+	}
+	if err := os.Rename(newBinaryPath, currentPath); err != nil {
+		if rerr := os.Rename(vacated, currentPath); rerr != nil {
+			return fmt.Errorf("install new binary over %s: %w (and rollback failed: %v)", currentPath, err, rerr)
+		}
+		return fmt.Errorf("install new binary over %s: %w", currentPath, err)
+	}
+	_ = os.Remove(vacated)
+	return nil
 }
 
 // copyFile copies src's content and mode to dst, writing through a same-directory temp file and

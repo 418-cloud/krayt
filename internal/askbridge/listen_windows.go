@@ -19,15 +19,23 @@ import (
 // runSocketDir (socketdir_windows.go) always hands this filepath.Join(runDir, "ask"), so its
 // parent directory's basename is the run ID (KRAYT_SPEC.md §12).
 //
-// go-winio's default security descriptor (a nil PipeConfig) restricts the pipe to the creating
-// user's token plus the usual SYSTEM/Administrators grants — narrower than "everyone", the same
-// intent as the unix implementation's 0600 socket/0700 directory — though this is unverified on
-// real hardware; see HUMAN_TODO.md's Windows `krayt run` entry.
+// go-winio's default security descriptor (a nil PipeConfig) is NOT creator-only: it builds the
+// pipe's ACL via RtlDefaultNpAcl, which Microsoft documents as granting read access to the
+// Everyone and Anonymous groups on top of the creating user/SYSTEM/Administrators — the opposite
+// of the unix implementation's 0600 socket/0700 directory boundary. pipeSDDL below is supplied
+// explicitly so only the creating user, SYSTEM, and Administrators can open the pipe, matching
+// that intent — though this is unverified on real hardware; see HUMAN_TODO.md's Windows
+// `krayt run` entry.
 func Listen(dir string) (net.Listener, error) {
 	name := `\\.\pipe\krayt-ask-` + filepath.Base(filepath.Dir(dir))
-	lis, err := winio.ListenPipe(name, nil)
+	lis, err := winio.ListenPipe(name, &winio.PipeConfig{SecurityDescriptor: pipeSDDL})
 	if err != nil {
 		return nil, fmt.Errorf("askbridge: listen %s: %w", name, err)
 	}
 	return lis, nil
 }
+
+// pipeSDDL grants Generic All only to the pipe's creator-owner, SYSTEM, and the built-in
+// Administrators group — the named-pipe analogue of a 0600 unix socket owned by the invoking
+// user.
+const pipeSDDL = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)"
