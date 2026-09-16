@@ -24,16 +24,29 @@ const (
 	StateTimedOut = "timed_out"
 )
 
+// Run kinds (§8.4, add-interactive-shell-session.md decision 7): what a RunRecord describes.
+// KindRun is the headless autonomous path (§7); KindShell is a human-driven `krayt shell`
+// session. A record written before this task carries no `kind` field at all — EffectiveKind
+// treats that absence as KindRun, so `krayt ls`/`patch`/the doctor orphan check keep working on
+// every pre-existing run dir with no migration.
+const (
+	KindRun   = "run"
+	KindShell = "shell"
+)
+
 // RunRecord is the on-disk record of a run at `.krayt/runs/<id>/meta.json` — the source of
 // truth every management command reads, so runs are observable without any in-process handle
 // or daemon (§6.2, §8.4). It is the full §8.4 schema (task summary, network, resources, patch
 // stats, questions) plus the operational fields the daemon-less model needs (state, pid,
 // control socket) that the review schema omits.
 type RunRecord struct {
-	ID           string          `json:"id"`
-	ImageRef     string          `json:"image_ref"`
-	RepoPath     string          `json:"repo_path,omitempty"`
-	TaskSummary  string          `json:"task_summary,omitempty"`
+	ID          string `json:"id"`
+	ImageRef    string `json:"image_ref"`
+	RepoPath    string `json:"repo_path,omitempty"`
+	TaskSummary string `json:"task_summary,omitempty"`
+	// Kind distinguishes a `krayt shell` session (KindShell) from an ordinary run; omitted (==
+	// KindRun via EffectiveKind) for every record this task did not write.
+	Kind         string          `json:"kind,omitempty"`
 	Network      NetworkMeta     `json:"network"`
 	Resources    ResourceMeta    `json:"resources"`
 	QuestionMode string          `json:"questions_mode,omitempty"`
@@ -120,6 +133,15 @@ func (r RunRecord) Terminal() bool {
 	return r.State == StateDone || r.State == StateFailed || r.State == StateTimedOut
 }
 
+// EffectiveKind returns r.Kind, defaulting to KindRun for a record written before this field
+// existed (decision 7: "absent means run for records written before this task").
+func (r RunRecord) EffectiveKind() string {
+	if r.Kind == "" {
+		return KindRun
+	}
+	return r.Kind
+}
+
 // runsDir is `<stateDir>/runs`.
 func runsDir(stateDir string) string { return filepath.Join(stateDir, "runs") }
 
@@ -149,6 +171,16 @@ func writeRecord(runDir string, rec RunRecord) (digest.Digest, error) {
 		return "", fmt.Errorf("orchestrator: commit record: %w", err)
 	}
 	return digest.FromBytes(b), nil
+}
+
+// WriteRecord persists rec to runDir/meta.json — the exported form of writeRecord, for a
+// management command (outside this package) that needs to mutate a record directly rather than
+// through a live Run/Shell/AttachShell call. Its first user is `krayt stop` on a kept `krayt
+// shell` session (add-interactive-shell-session.md decision 3): nothing supervises that sandbox
+// any more, so there is no in-process call to route the state change through.
+func WriteRecord(runDir string, rec RunRecord) error {
+	_, err := writeRecord(runDir, rec)
+	return err
 }
 
 // ReadRecord reads a run's meta.json.

@@ -1,0 +1,33 @@
+# krayt-agent-shellenv (krayt-agent-claude-code) — sourced, never executed directly. Shared setup
+# between krayt-agent-entrypoint's headless run path and an interactive `krayt shell` session
+# (§8.2, add-interactive-shell-session.md decision 14): the entrypoint sources this instead of
+# duplicating it, so the two stay in lock-step the way this repo already learned the hard way not
+# to skip (this entrypoint's own header: "the entrypoint's own header warns that a second copy is
+# exactly what caused a past bug").
+#
+# Deliberately NOT `set -e`/`set -u`: this file is SOURCED into the caller's own shell — the
+# entrypoint's own subshell for a headless run, or a human's interactive login shell for `krayt
+# shell` — so turning those options on here would silently change that shell's behavior out from
+# under it. Every step below is written to be safe to fail silently instead, and the entrypoint
+# keeps its own `set -euo pipefail` around the `.` that sources this file.
+#
+# Scoped deliberately narrow (§8.2 "Verify first" #4, add-interactive-shell-session.md): the
+# credential materialization from /run/secrets and the KRAYT_CA_CERT / CA-bundle blocks below in
+# this image's entrypoint are DEAD CODE under msb ("There is no /run/secrets under msb", §8.2) and
+# are NOT ported here — re-exporting what msb's own placeholder-substitution mechanism already set
+# in the sandbox's create-time environment would be noise that rots, not a safety net. The one gap
+# confirmed without real hardware is `safe.directory` below (an exec'd non-root shell hits the
+# same "dubious ownership" refusal a headless run's agent process does). Whether an exec'd shell
+# genuinely needs anything more — in particular, whether it already inherits the create-time
+# credential env var, per "Verify first" #2 — is UNVERIFIED in this environment; see
+# HUMAN_TODO.md. If hardware verification finds a real gap, it belongs here, scoped just as
+# narrowly as this one line is.
+
+# The workspace's .git is owned by root (the guest ingests it as root, then makes the tree
+# writable), so the non-root agent's/human's own git commands refuse it with "dubious ownership"
+# otherwise. Best-effort: a shell with no git installed, or a $HOME that isn't writable yet,
+# must still start. KRAYT_WORKSPACE keeps the entrypoint's existing hack/test-entrypoint-
+# credentials.sh override working unchanged; an interactive `krayt shell` never sets it and gets
+# the real default.
+git config --global --add safe.directory "${KRAYT_WORKSPACE:-/workspace}" 2>/dev/null || true
+git config --global --add safe.directory '*' 2>/dev/null || true

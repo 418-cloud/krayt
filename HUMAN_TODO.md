@@ -379,3 +379,109 @@ that hosted runner doesn't expose (see the intro above), so the hardware needs b
 - **Blocking:** no — Part B's non-hardware criteria (build, vet, unit tests, CI) are all met and
   shippable without this; it closes the loop the way §14 Phase 11's hardware pass did for the msb
   cutover, and the way the linux/arm64 entry above closes it for that platform.
+
+---
+
+## [HUMAN] `krayt shell` — every "Verify first" check and every hardware Done-when criterion (`add-interactive-shell-session.md`, `KRAYT_SPEC.md` §14 Phase 12)
+
+`krayt shell` (host code, `orchestrator.Shell`/`AttachShell`/`PatchLiveShell`, `krayt-agent-shellenv`
+in all three published agent images, the spec/README amendments) is done and offline-verified —
+`go build`/`go vet`/`go test`/`golangci-lint` are all green, and the `Shell`/`AttachShell`
+teardown-on-error-with-`--keep` matrix is unit-tested against the fake `msb`
+(`internal/orchestrator/shell_test.go`). **Nothing in it has run against a real sandbox.** The
+task requires four numbered "Verify first" checks *before* trusting the design at all, plus its
+own seven-point Done-when — none of which this environment can run.
+
+- **Needed:** a real Apple-Silicon Mac with `msb` (≥ `0.6.16`) installed and a live model-provider
+  credential (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`), to run the following in order —
+  each decides how much of the next one even applies, so don't skip ahead:
+  1. **"Verify first" #1 — is `msb exec -t` a usable terminal when krayt inherits stdio?** Boot
+     `ghcr.io/418-cloud/krayt-agent-claude-code` by hand
+     (`krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code --repo <some-repo>`) and check:
+     window resize reflows (`SIGWINCH` — resize your terminal mid-session and run `stty size`
+     inside), `Ctrl-C` interrupts the foreground command (`sleep 100` then Ctrl-C — you should stay
+     in the shell, not lose the session) rather than killing the session, a full-screen TUI
+     (`top`, `vim`) renders and exits cleanly, and 256-colour (`echo -e '\e[38;5;196mred\e[0m'`)
+     survives. This is decision 10's whole premise — if it fails, the fallback is hand-rolled raw
+     mode via `golang.org/x/sys` (already pinned) and needs a redesign of `sandbox.ExecTTY`, not
+     just a note.
+  2. **"Verify first" #2 — does `msb exec` inherit the sandbox's create-time environment?**
+     `CreateSpec.Env` sets it at `msb create`; `TTYExecSpec` (deliberately) carries no `Env` field
+     at all. Inside the shell, `echo $SOME_TEST_VAR` after `krayt shell --image ... --repo ...`
+     where the image sets a test env var, or more directly: does the model-provider credential env
+     var (`ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`) already show up in `env` inside the shell
+     with no help from `krayt-agent-shellenv`? If yes, `krayt-agent-shellenv`'s scope (currently
+     just `safe.directory`) is confirmed complete. If no, find out what's actually missing and add
+     it there, scoped as narrowly as `safe.directory` is.
+  3. **"Verify first" #3 — what does the `--secret` placeholder look like inside an exec'd shell,
+     and does `claude` started by hand actually authenticate?** Inside the shell:
+     `claude -p "say hello"` (with `--secrets` naming a real `ANTHROPIC_API_KEY` and `--allow
+     api.anthropic.com` on the `krayt shell` invocation) should reach the real API — confirms §8.2's
+     placeholder-substitution contract holds for an interactively-started agent, not just the
+     headless entrypoint's `claude -p`. Note (2026-09-16): under msb, `--allow api.anthropic.com`
+     alone is not enough — the credential also needs a `network.inject` scope, or
+     `ValidateNetworkPolicyForMsb` rejects the run before it boots. As of this date that scope is
+     resolved automatically whenever `krayt.yaml` sets `agent.adapter: claude-code` (`shell` now
+     calls the same adapter secret-scoping `run` does, KRAYT_SPEC.md §13's 2026-09-16 amendment) —
+     so the simplest repro is `krayt shell --image ... --config krayt.yaml --secrets <file>` with
+     `agent: { adapter: claude-code }` in that config, no hand-written `network.inject` needed. A
+     bare `--allow api.anthropic.com` with no `agent.adapter` and no hand-written
+     `network.inject` should still fail pre-flight, the same way `krayt run` would.
+  4. **Answered, 2026-09-16, by the first real attempt (`krayt shell --image
+     ghcr.io/418-cloud/krayt-agent-claude-code --config krayt.yaml --skip-resource-check`, no
+     `--task`): with no `Command`, `msb exec --tty` re-execs the image's `ENTRYPOINT`
+     (`krayt-agent-entrypoint`), not a shell.** The session showed
+     `[claude-code] authenticated via CLAUDE_CODE_OAUTH_TOKEN` immediately followed by
+     `[claude-code] task file /task/prompt.md not found` and ended with exit 66 — the headless
+     entrypoint running and failing because `krayt shell` (no `--task`) never copies in
+     `/task/prompt.md`, not a shell prompt with `krayt-agent-shellenv` sourced. **Fixed**:
+     `internal/orchestrator/shell.go` no longer leaves `TTYExecSpec.Command` empty —
+     `ttyCommand`/`defaultShellCommand` resolve `$SHELL`, else `/bin/bash`, else `/bin/sh`
+     explicitly (`KRAYT_SPEC.md` §6.15 and Phase 12 updated with the finding and the fix). **Still
+     needs a hardware re-run** to confirm the fix actually lands at a shell prompt this time, and
+     then: `echo $0` and `git config --global --get-all safe.directory` (should show `/workspace`
+     and `*`, proving `krayt-agent-shellenv` ran) — if neither hook fires even now, that's a
+     separate real bug in `images/agents/*/Dockerfile`'s two `RUN printf ... /etc/...` lines.
+  5. **Done-when 1-2:** `krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code --repo .`
+     drops you at a shell with the repo present; edit a file, `exit`; confirm
+     `.krayt/runs/<id>/changes.patch` (and `meta.json` with `"kind": "shell"`) contains the edit,
+     and `krayt apply <run-id>` lands it on the host repo cleanly.
+  6. **Done-when 3-4:** `krayt shell --keep`, edit a file, `exit` — confirm the sandbox is still
+     listed by `msb ls`. `krayt shell --attach <run-id>` from a second terminal — confirm the edit
+     from step 5 is still there, make a second edit, exit again — confirm both edits are now in
+     `changes.patch`. `krayt stop <run-id>` — confirm `msb ls` no longer lists the sandbox and
+     `krayt ls` shows the record as `done`. Separately, repeat the ephemeral (no `--keep`) case and
+     kill the `krayt shell` process (`kill` its pid, or close the terminal) mid-session, plus once
+     with a deliberately bad `--image` (to force a failed `krayt-helper setup`) — confirm `msb ls`
+     shows no leaked sandbox in either case (this is the one part the fake-`msb` unit tests
+     *cannot* prove — they prove krayt calls `msb stop`/`msb rm`, not that a real `msb` actually
+     tears the VM down when asked).
+  7. **Done-when 5:** from a second terminal while a `krayt shell` session (no `--keep` needed) is
+     live, run `krayt patch <run-id>` — confirm it prints a fresh `changes.patch` reflecting
+     whatever's currently in `/workspace`, without ending the session; run it again after another
+     edit — confirm the patch updates.
+  8. **Done-when 6:** manually create an orphan (`msb create --name krayt-test-orphan <image>`,
+     no matching `.krayt/runs/` entry) and run `krayt doctor --repo .` — confirm it reports a
+     `[warn]` naming `krayt-test-orphan` and the `msb stop`/`msb rm` command to remove it, and does
+     **not** remove it itself. Then `krayt doctor --repo .` again with no orphan present — confirm
+     it stays silent (no `[warn]` line at all).
+  9. **Done-when 7:** confirmed by step 3 above, if `claude -p` authenticates and reaches
+     `api.anthropic.com` under the run's allowlist.
+- **Why the agent can't:** no real hardware — no Apple-Silicon Mac (or Linux/KVM host) with `msb`
+  installed anywhere in this environment, and every one of the nine checks above needs a real
+  sandbox boot, a real pty, or a real credential reaching a real API.
+- **Verify success by:** each numbered item above has its own inline check. Record the outcome of
+  each "Verify first" check explicitly in `KRAYT_SPEC.md` §14 Phase 12 (the phase currently says
+  "not met; every criterion below needs a real Apple-Silicon Mac") and in this file's history —
+  if any of them turns up a real gap (most likely #2/#3, whether `krayt-agent-shellenv` needs more
+  than `safe.directory`, or #4, which hook actually fires), fix it and re-verify before checking
+  the phase done, per `CLAUDE.md`'s "never fabricate a result" rule.
+- **Windows:** genuinely untested and **not claimed to work** — inherited stdio is the same code
+  path as macOS, but nobody in this environment can confirm ConPTY through msb without a Windows
+  box at all (a lesser bar than the WHP entry above even needs, since `krayt shell` needs a real
+  interactive terminal, not just a boot). Track this as a separate follow-up once the macOS pass
+  above lands; don't fold it into this entry.
+- **Blocking:** no for shipping the code (it's additive, off by default in the sense that nobody
+  who doesn't run `krayt shell` is affected, and every non-hardware Done-when criterion is met) —
+  but yes for closing `KRAYT_SPEC.md` §14 Phase 12 and for trusting `krayt shell` in anger. Until
+  this lands, treat `krayt shell` as "compiles, passes its offline tests, never run for real."

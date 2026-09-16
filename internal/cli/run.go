@@ -477,17 +477,12 @@ func loadSecretKeySet(secretsPath string) (map[string]bool, error) {
 // a user who scoped the same credential themselves can see their own hosts won. Called before the
 // sandbox is created (and before task.ValidateNetworkPolicyForMsb, which re-checks the merged
 // set) so a bad credential set or a bad merged scope fails fast.
+//
+// `krayt run` is the only caller that wants the FULL plan (env, transcript dir, secrets) — see
+// applyAdapterSecrets for the secrets-only subset `krayt shell` needs (2026-09-16 amendment,
+// KRAYT_SPEC.md §13).
 func applyAdapter(out io.Writer, spec *task.RunSpec, name string, secretKeys map[string]bool) error {
-	ad, err := adapter.Get(name)
-	if err != nil {
-		return err
-	}
-	keys := make([]string, 0, len(secretKeys))
-	for k := range secretKeys {
-		keys = append(keys, k)
-	}
-	plan, err := ad.Prepare(adapter.Input{
-		SecretKeys:    keys,
+	plan, err := resolveAdapterPlan(name, secretKeys, adapter.Input{
 		QuestionsWait: spec.Questions.Mode == task.QuestionWait,
 		AskSocket:     sandbox.AskSocketEnv,
 	})
@@ -499,13 +494,52 @@ func applyAdapter(out io.Writer, spec *task.RunSpec, name string, secretKeys map
 	// the one place that knows the flag preserves the invariant the orchestrator relies on — a
 	// non-empty spec.TranscriptDir means "capture this" and nothing else needs consulting.
 	spec.TranscriptDir = plan.TranscriptDir
-	if len(plan.Secrets) > 0 {
-		merged, overrides := task.MergeSecretSpecs(spec.Network.Secrets, plan.Secrets)
-		spec.Network.Secrets = merged
-		for _, o := range overrides {
-			if _, err := fmt.Fprintf(out, "network.inject: %s\n", o); err != nil {
-				return err
-			}
+	return mergeAdapterSecrets(out, spec, plan.Secrets)
+}
+
+// applyAdapterSecrets resolves name's adapter and merges only its Plan.Secrets into
+// spec.Network.Secrets — the subset of applyAdapter that `krayt shell` needs. msb requires every
+// secrets-file key to carry a network.inject scope regardless of whether the agent is launched
+// automatically (`krayt run`) or by hand inside an interactive session (`krayt shell`), so this
+// runs even though shell never touches Plan.Env, Plan.TranscriptDir, or the krayt-ask wiring
+// (decision 2 in internal/orchestrator/shell.go still holds for all of those). An unset/empty
+// name resolves to the `none` adapter, whose Plan.Secrets is always empty — a no-op.
+func applyAdapterSecrets(out io.Writer, spec *task.RunSpec, name string, secretKeys map[string]bool) error {
+	plan, err := resolveAdapterPlan(name, secretKeys, adapter.Input{})
+	if err != nil {
+		return err
+	}
+	return mergeAdapterSecrets(out, spec, plan.Secrets)
+}
+
+// resolveAdapterPlan looks up name's adapter and runs its host-side Prepare, filling in
+// SecretKeys from secretKeys (names only, never values). extra carries the fields only a full
+// `krayt run` cares about (QuestionsWait/AskSocket); shell's secrets-only caller passes the zero
+// value.
+func resolveAdapterPlan(name string, secretKeys map[string]bool, extra adapter.Input) (adapter.Plan, error) {
+	ad, err := adapter.Get(name)
+	if err != nil {
+		return adapter.Plan{}, err
+	}
+	extra.SecretKeys = make([]string, 0, len(secretKeys))
+	for k := range secretKeys {
+		extra.SecretKeys = append(extra.SecretKeys, k)
+	}
+	return ad.Prepare(extra)
+}
+
+// mergeAdapterSecrets merges an adapter's selected credential scope into spec.Network.Secrets
+// (task.MergeSecretSpecs), printing the same override notice for each conflict the merge
+// resolved in the user's favor.
+func mergeAdapterSecrets(out io.Writer, spec *task.RunSpec, adapterSecrets []task.SecretSpec) error {
+	if len(adapterSecrets) == 0 {
+		return nil
+	}
+	merged, overrides := task.MergeSecretSpecs(spec.Network.Secrets, adapterSecrets)
+	spec.Network.Secrets = merged
+	for _, o := range overrides {
+		if _, err := fmt.Fprintf(out, "network.inject: %s\n", o); err != nil {
+			return err
 		}
 	}
 	return nil

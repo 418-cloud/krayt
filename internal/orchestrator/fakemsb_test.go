@@ -92,6 +92,20 @@ type fakeMsbScript struct {
 	// create time, keyed by file name — the shape captureTranscript copies out. Absent means the
 	// guest has no transcript, which must leave the run untouched rather than failing it.
 	TranscriptFiles map[string]string `json:"transcript_files,omitempty"`
+
+	// Shell describes the fake `msb exec --tty` attach (orchestrator.Shell/AttachShell) — the
+	// interactive counterpart to Agent, for add-interactive-shell-session.md's tests.
+	Shell fakeShellScript `json:"shell,omitempty"`
+}
+
+// fakeShellScript describes what the fake tty exec does: optionally write files into /workspace
+// (simulating edits the human made before exiting), then exit with the given code. Block
+// simulates a wedged/never-returning attach — killed by the real exec.CommandContext on ctx
+// cancellation (Ctrl-C), exactly as ExecTTY's real child would be.
+type fakeShellScript struct {
+	WorkspaceFiles map[string]string `json:"workspace_files,omitempty"`
+	ExitCode       int               `json:"exit_code"`
+	Block          bool              `json:"block,omitempty"`
 }
 
 // fakeGuestHome is the $HOME the fake reports for `sh -c 'printf %s "$HOME"'` and roots its
@@ -374,11 +388,15 @@ func copyDirRecursive(src, dst string) error {
 func fakeMsbExec(home string, args []string, script fakeMsbScript) int {
 	i := 0
 	var name string
+	tty := false
 	for i < len(args) {
 		switch args[i] {
 		case "--user":
 			i += 2
 		case "--stream":
+			i++
+		case "--tty":
+			tty = true
 			i++
 		default:
 			name = args[i]
@@ -387,12 +405,33 @@ func fakeMsbExec(home string, args []string, script fakeMsbScript) int {
 		}
 	}
 afterFlags:
-	if name == "" || i >= len(args) || args[i] != "--" {
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "fake-msb: exec malformed argv", args)
+		return 1
+	}
+	root := sandboxRoot(home, name)
+
+	// TTYExecSpec.Args() omits "--" entirely when Command is empty (msb "attaches to the default
+	// shell") — orchestrator.Shell/AttachShell no longer produce that case in practice (ttyCommand
+	// substitutes defaultShellCommand instead, see shell.go), but the sandbox package still
+	// supports it structurally, so this branch, unlike the --stream one below, must not require it.
+	if tty {
+		var cmd []string
+		if i < len(args) {
+			if args[i] != "--" {
+				fmt.Fprintln(os.Stderr, "fake-msb: exec --tty malformed argv", args)
+				return 1
+			}
+			cmd = args[i+1:]
+		}
+		return fakeTTYExec(root, cmd, script.Shell)
+	}
+
+	if i >= len(args) || args[i] != "--" {
 		fmt.Fprintln(os.Stderr, "fake-msb: exec malformed argv", args)
 		return 1
 	}
 	cmd := args[i+1:]
-	root := sandboxRoot(home, name)
 
 	switch {
 	case len(cmd) >= 2 && strings.HasSuffix(cmd[0], "/krayt-helper") && cmd[1] == "setup":
@@ -418,6 +457,22 @@ afterFlags:
 }
 
 func inSandbox(root, p string) string { return filepath.Join(root, p) }
+
+// fakeTTYExec simulates the interactive tty attach `orchestrator.Shell`/`AttachShell` runs in
+// place of the agent exec: it optionally writes files into /workspace (simulating edits the human
+// made before exiting), then exits with the scripted code.
+func fakeTTYExec(root string, _ []string, script fakeShellScript) int {
+	if script.Block {
+		select {} // killed by the real exec.CommandContext on ctx cancellation (Ctrl-C)
+	}
+	ws := filepath.Join(root, "workspace")
+	for name, content := range script.WorkspaceFiles {
+		p := filepath.Join(ws, name)
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		_ = os.WriteFile(p, []byte(content), 0o644)
+	}
+	return script.ExitCode
+}
 
 // writeFakeTranscript seeds the fake guest's transcript dir, mirroring where Claude Code writes
 // one: $HOME/.claude/projects/<slug-of-cwd>/<session>.jsonl, cwd being /workspace in the sandbox.

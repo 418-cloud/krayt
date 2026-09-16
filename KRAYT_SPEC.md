@@ -1048,9 +1048,11 @@ hatch for a non-`PATH` install. Methods: `Version` (parses `msb --version` again
 currently `0.6.16` — the version the ADR was verified against), `Context` (`msb context --format
 json`, the backend assertion below), `Create` (`msb create`, argv rendered by `CreateSpec.Args()`,
 a pure function so the whole surface is unit-testable without spawning anything), `Exec` (`msb exec
---stream`, see below), `Copy` (`msb copy`, docker-cp syntax), `Logs` (`msb logs --json`, JSON
+--stream`, see below), `ExecTTY` (`msb exec --tty`, `krayt shell`'s interactive attach — see
+below), `Copy` (`msb copy`, docker-cp syntax), `Logs` (`msb logs --json`, JSON
 Lines tagged by stream), `SystemLogs` (`msb logs --source system --json`, boot/system diagnostics —
-§7 step 2), `Stop`/`Remove` (`msb stop` / `msb rm --force`), and `Pull` (`msb pull`).
+§7 step 2), `Stop`/`Remove` (`msb stop` / `msb rm --force`), `Pull` (`msb pull`), and `List`
+(`msb ls --format json`, `krayt doctor`'s orphan check — see below).
 `CreateSpec` and friends carry no `krayt.yaml` vocabulary and no lifecycle policy — which flags a
 run deserves is decided above this package (network-policy translation §6.6, secret handling §6.8,
 and the run's own order of operations §7 all belong to `internal/orchestrator`, not to the driver
@@ -1084,6 +1086,36 @@ command". `Exec` resolves this structurally: a non-zero exit with **no** output 
 stream is reported as `ErrMsbFailed`, a distinct error the orchestrator can branch on, rather than
 guessed at as the agent's own exit code.
 
+**`ExecTTY` — `msb exec --tty` (`krayt shell`, `add-interactive-shell-session.md` decision 10).**
+A separate method with its own spec type (`TTYExecSpec`), not a flag on `ExecSpec`: `--stream` and
+`--tty` are mutually exclusive by msb's own clap config, and `ExecSpec`'s own doc comment states
+the rule this method is the one deliberate, reviewed exception to — "never the terminal/this
+process's own stdin". `ExecTTY` sets `cmd.Stdin`/`Stdout`/`Stderr` to the CALLING PROCESS's own
+`os.Stdin`/`Stdout`/`Stderr`, inherited directly, because a human-driven session is exactly the
+one case where that is correct: msb owns the pty from there — raw mode, echo, CRLF translation,
+`SIGWINCH` — so this method's only job is to get out of the way. `TTYExecSpec.Args()` is a pure
+function like `CreateSpec.Args()`/`ExecSpec.Args()`, so the argv surface stays unit-testable
+without a real terminal; `Command` is optional at this layer, and an empty value still omits the
+trailing `-- <argv>` so msb decides on its own documented "attaches to the default shell"
+behavior. `internal/orchestrator` no longer relies on that, though: hardware verification
+(2026-09-16, `HUMAN_TODO.md`) found that for any image that sets an `ENTRYPOINT` with no
+image-level `Shell` — every published krayt agent image does — an empty `Command` re-execs that
+`ENTRYPOINT` instead of a shell; a real `krayt shell` session against
+`ghcr.io/418-cloud/krayt-agent-claude-code` surfaced the headless entrypoint's own "task file
+`/task/prompt.md` not found" and exited 66 before a human ever saw a prompt. `orchestrator.Shell`/
+`AttachShell` now resolve the shell themselves (`ttyCommand`, falling back to `defaultShellCommand`
+when `--exec` wasn't given): `$SHELL` if set and executable, else `/bin/bash` (every published
+agent image ships it), else `/bin/sh`. Because stdout/stderr never pass through this package,
+`Exec`'s "no output observed" heuristic for `ErrMsbFailed` has no signal to work from here — a
+msb-level failure prints on the inherited terminal directly, in addition to surfacing as this
+call's own returned error.
+
+**`List` — `msb ls --format json` (`krayt doctor`'s orphan check, decision 6).** Returns every
+sandbox msb currently knows about, not filtered to krayt's own — the caller (`internal/cli`'s
+`orphanSandboxCheck`) is the one that knows the `"krayt-"` name prefix and cross-references it
+against `.krayt/runs/`'s recorded `sandbox_name`s. Tolerant JSON parsing, like `Images`/`Context`:
+msb's `ls` schema isn't pinned by anything this package can verify offline.
+
 **Secret handling (§6.8).**
 `Client.Create` is the only method that accepts a `secretEnv []string` parameter, appended to the
 child's environment on top of the closed allowlist above; every other method (`Exec` included)
@@ -1110,6 +1142,18 @@ than reimplementing any of it. All four are **mandatory** (`[FAIL]`, not `[warn]
 only sandbox backend, so a host without a healthy install cannot run anything. There are no more
 vfkit/firecracker/`/dev/kvm`/tap/NAT checks — that whole host-network-setup surface (§6.3, §6.6
 pre-msb) was deleted with the providers themselves.
+
+**A fifth check, orphaned sandboxes (`add-interactive-shell-session.md` decision 6).** With
+`--repo`, `krayt doctor` also cross-references `List`'s live sandbox names against
+`.krayt/runs/`'s recorded `sandbox_name`s and names any `"krayt-*"` sandbox with no matching run
+record — the failure mode decision 5 (no wall-clock timeout in `krayt shell`) opens up: a crashed
+or `kill -9`'d krayt leaves a sandbox running with nothing left to reap it. Unlike the four checks
+above, this one is a **`[warn]`, never a `[FAIL]`**, and it **never reaps** — only reports, naming
+the sandbox and the `msb stop`/`msb rm` commands to remove it by hand. A krayt that killed a
+sandbox it does not fully understand (one deliberately kept across a krayt upgrade, say) would be
+a destructive default; report-only is the safe one. It degrades to reporting nothing — not
+failing — when `--repo` is omitted or the repo has no `.krayt/` yet, since it's the first doctor
+check that needs any repo state at all.
 
 ---
 
@@ -1202,6 +1246,56 @@ pre-msb) was deleted with the providers themselves.
 11. **Teardown** fires via the deferred function from step 2 no matter which of the above steps
     errored, timed out, or the ctx was cancelled.
 12. **Review & apply** — human inspects the patch; `git apply` if satisfied. Unchanged.
+
+### Shell lifecycle — departures from the run lifecycle (`add-interactive-shell-session.md`)
+
+`orchestrator.Shell` reuses steps 1, 2, 4, 5, and 6 above *verbatim* — resolve spec, name the
+sandbox and register teardown immediately, `msb create`, copy in (git bundle, `krayt-helper`, and
+the task prompt only if one was given — decision 13; never `krayt-ask`, decision 12), `msb exec
+--user root` for `krayt-helper setup` — via the same shared helper functions
+(`copyInputs`/`helperSetup`/`finishAndCollect`) `Run` itself now calls, factored out rather than
+copied. Three points depart, each one of the task's decisions:
+
+- **No wall-clock timeout at all** (decision 5): no `context.WithTimeout` wrapping the call, and
+  `CreateSpec.MaxDuration` is left zero, so no `--max-duration` reaches `msb create` either. A
+  shell session is bounded by the human closing it or `krayt stop`, never a clock.
+- **Step 7's agent exec is replaced by an interactive tty attach** (decision 10): `msb exec --tty`
+  in place of `msb exec --stream /usr/local/bin/krayt-agent-entrypoint`, via `sandbox.ExecTTY`
+  (§6.15) — this call blocks until the human exits the shell (or, with `--exec`, until the given
+  command finishes), with no `KRAYT_ASK_SOCKET`/`--vsock` route ever created (decision 12).
+- **Teardown (steps 2's deferred function, and step 11) is conditional on `--keep`** (decision 3):
+  it fires on every path except `keep == true` with a clean exit — a failed `Create`, a failed
+  `krayt-helper setup`, a tty-attach error, or ctx cancellation (Ctrl-C, a killed terminal) all
+  still stop and remove whatever msb created, `--keep` or not. Only a session that reaches the
+  very end without error is eligible to survive, and the record's state (`kept`, a new state
+  alongside `done`/`failed`/`timed_out` — deliberately not `Terminal()`, since the sandbox is
+  still alive) is what `krayt shell --attach <run-id>` and `krayt doctor`'s orphan check both key
+  off. Steps 8-10 (`krayt-helper finish`, copy out, host-side diffstat/lint/secret-scan) run
+  unconditionally before that decision is made — decision 8: *"a session produces a patch, same as
+  a run."*
+
+`orchestrator.AttachShell` re-enters a `kept` session by run id (decision 4): no `Create`, no
+copy-in, no helper setup — the sandbox and its `/workspace` already exist exactly as the human
+left them, addressed by the record's persisted `sandbox_name`. It runs the same tty-attach +
+steps-8-10 tail as `Shell`, using `patch.BaselineTag` (the tag name, not a remembered SHA — it
+already resolves inside the root-only patch-git snapshotted at the *original* setup) as the
+`--baseline` `krayt-helper finish` diffs against. It never calls `Stop`/`Remove` on any path,
+including its own errors: decision 3 puts sole authority to destroy a kept sandbox in `krayt stop
+<run-id>`, so a failed re-attach must not make that worse by tearing down something a human might
+still want to inspect by hand (`msb logs`/`msb exec`).
+
+`krayt patch <run-id>` against a live session (decision 9) is a third, narrower entry point —
+`orchestrator.PatchLiveShell` — that repeats just the `krayt-helper finish` + copy-out half
+against the run's already-alive sandbox, on demand, without attaching a tty or touching the
+record's state/PID; the interactive session (wherever it's actually running) owns those. Safe to
+call repeatedly and idempotent, since each call re-derives `changes.patch` from whatever is
+currently in `/workspace`.
+
+`krayt stop <run-id>` on a `kept` record is the other side of decision 3: `Shell` clears the
+record's `PID` on the way to `kept` (no process outlives a `--keep` session's own exit), so there
+is nothing left for the existing PID-signal path to signal — `krayt stop` detects `state: kept`
+and stops + removes the sandbox directly by name instead, then flips the record to `done`. Every
+other run/session kind keeps the unmodified PID-signal path.
 
 ---
 
@@ -1506,6 +1600,39 @@ An image that writes into its own rootfs — e.g. `$HOME` under `/home/agent` (n
 `~/.claude`, Go caches) — needs a writable rootfs; msb's `--security` profile has no read-only-rootfs
 knob to opt into anyway (`container.readonly_rootfs` is a hard pre-flight error under msb, §8.1).
 
+**`/usr/local/bin/krayt-agent-shellenv`** (`add-interactive-shell-session.md` decision 14) — a
+*sourceable*, never-executed-directly shell fragment baked into every published agent image,
+extracted from the setup half of that image's own `krayt-agent-entrypoint`: the entrypoint sources
+it (`. /usr/local/bin/krayt-agent-shellenv`, one line replacing what used to be duplicated inline)
+rather than forking the logic a second time — the entrypoint's own header already warns that a
+second copy is exactly what caused a past bug (a shape-translated run exiting 78 before the agent
+started, `hack/test-entrypoint-credentials.sh`'s own header). `krayt shell` needs the same setup
+an interactive session as the entrypoint needs for a headless one — without it, a `krayt shell`
+session is one where the agent may not authenticate and `git` refuses every command as "dubious
+ownership", which defeats the feature — so the image ships a second call site for the identical
+script: `/etc/profile.d/krayt-shellenv.sh` (read by every POSIX login shell) and
+`/etc/bash.bashrc` (bash's own non-login-interactive hook) both source it, covering either shape
+of shell msb's `--tty` attach might invoke (unverified without real hardware which one actually
+fires — `HUMAN_TODO.md`).
+
+Scoped deliberately narrow: the credential materialization from `/run/secrets` and the
+`KRAYT_CA_CERT`/CA-bundle blocks that remain inline in each entrypoint are **dead code under
+msb** (this section's own "There is no `/run/secrets` under msb" above) and are **not** ported
+into the shared script — re-exporting what msb's own placeholder-substitution mechanism already
+set in the sandbox's create-time environment would be noise that rots, not a safety net. The one
+piece known, without hardware, to be genuinely missing from a bare shell is `git config --global
+--add safe.directory` (`/workspace`'s `.git` is root-owned, same reason the entrypoint already
+needed it). Deliberately **not** `set -e`/`set -u`: the script is sourced into the CALLER's own
+shell — the entrypoint's subshell for a headless run, or a human's interactive login shell for
+`krayt shell` — so turning those options on here would silently change that shell's behavior out
+from under it; every step is written to fail silently instead. One copy lives per image directory
+(`images/agents/{claude-code,gemini-cli,opencode}/krayt-agent-shellenv`), matching `entrypoint.sh`
+and the `rtk` wrapper's own existing per-image-directory pattern — Docker's build context can't
+reach a file outside `images/agents/<name>/`, so a genuinely shared file isn't buildable here the
+way it would be for two packages in the same Go module. `hack/krayt-dev` needs no copy of its own:
+it ships no entrypoint at all, inheriting `krayt-agent-claude-code`'s image layers — including this
+file — wholesale.
+
 Completion = the agent's exec exit code (§7). Exit code is surfaced in `meta.json`.
 
 ### 8.3 Flag/file precedence
@@ -1635,6 +1762,7 @@ directly into `meta.json`'s/`report.md`'s existing `Safety` list (`orchestrator.
   "image_ref": "my-agent@sha256:…",
   "repo_path": "/Users/me/proj",
   "task_summary": "first 200 chars of the task prompt",
+  "kind": "run",
   "network": { "mode": "allowlist", "allow": ["api.anthropic.com"] },
   "resources": { "cpus": 2, "memory_mib": 4096, "disk_gib": 20, "timeout_secs": 1800 },
   "questions_mode": "fail",
@@ -1659,6 +1787,14 @@ directly into `meta.json`'s/`report.md`'s existing `Safety` list (`orchestrator.
   "error": ""
 }
 ```
+
+**`kind`** (`add-interactive-shell-session.md` decision 7) — `"run"` (the headless autonomous
+path, §7) or `"shell"` (a human-driven `krayt shell` session, §7 "Shell lifecycle"). `omitempty`:
+a record written before this task carries no `kind` field at all, and every reader treats that
+absence as `"run"` (`RunRecord.EffectiveKind()`) — no migration, no rewrite of existing run dirs.
+A `krayt shell` session also introduces one new `state` value beyond the five below,
+`"kept"` (deliberately not a terminal state — see §7): the sandbox a `--keep` session left running,
+re-enterable with `krayt shell --attach <run-id>` and destroyed only by `krayt stop`.
 
 `provenance` records what source the run was based on (§6.7): `head_sha` is the real, checkoutable
 `git rev-parse HEAD` at bundle time (empty for an unborn HEAD); `bundle_sha` is the commit actually
@@ -2056,25 +2192,59 @@ krayt run     [--image] [--task] [--repo] [--config] [--secrets]
                  [--cpus] [--memory] [--disk] [--timeout] [--detach]
                  [--skip-resource-check]
                  [--on-question wait|fail] [--question-timeout DUR] [--on-question-timeout sentinel|abort]
-krayt ls                       # list active/recent runs (shows `waiting` runs)
+krayt shell   [--image] [--task] [--repo] [--config] [--secrets]
+                 [--net allowlist|full|none] [--allow domain ...]
+                 [--cpus] [--memory] [--disk] [--include-dirty] [--bundle-depth]
+                 [--skip-resource-check] [--max-concurrency]
+                 [--keep] [--attach <run-id>] [--exec <command>]
+krayt ls                       # list active/recent runs (shows `waiting` runs, and a `krayt shell` session's kind/state)
 krayt attach  <run-id>         # live-stream a running agent's logs
 krayt logs    <run-id>         # show persisted logs
 krayt questions <run-id> [--pending-only] [--sort asked|pending-first|pending-last]   # list a run's questions + answers (§6.13)
 krayt answer  <run-id> [<qid>] <response>   # answer a waiting agent question (§6.13); FIFO if qid omitted
-krayt patch   <run-id>         # print/locate the run's changes.patch
+krayt patch   <run-id>         # print/locate the run's changes.patch — re-derives it on demand for a live `krayt shell` session (§7 "Shell lifecycle", decision 9)
 krayt apply   <run-id>         # helper: git apply the patch onto the host (after review)
-krayt stop    <run-id>         # stop + destroy a run's VM
+krayt stop    <run-id>         # stop + destroy a run's VM, or a kept `krayt shell` sandbox directly by name (§6.15, §7)
 krayt rm      <run-id>         # remove run artifacts
 krayt image pull  <ref>                              # pre-warm msb's own image store (`msb pull`, §11)
 krayt image ls                                       # list images in msb's own store (`msb images --format json`)
 krayt image rm    <ref> [--force]                    # remove one image by reference (`msb rmi`; --force for one a sandbox still references)
 krayt image prune [--repo] [--older-than DUR] [--all] [--dry-run]   # bulk-reclaim under krayt's own age/in-use retention, then `msb image prune`
-krayt doctor                   # check host prereqs (msb installed+healthy, version floor, local backend — §6.15)
+krayt doctor [--repo]          # check host prereqs (msb installed+healthy, version floor, local backend — §6.15); with --repo, also warns on an orphaned krayt-* sandbox
 krayt upgrade [--version vX.Y.Z] [--yes|-y] [--check]   # update krayt in place from a GitHub release
 ```
 
 `run` is headless/detached-capable; default streams logs to the terminal but the VM
 work is the same either way.
+
+**`shell`** (`add-interactive-shell-session.md`) is `run`'s human-driven sibling, not a mode of
+it (§15 "Mid-run human input"): it attaches a bare login shell in `/workspace`, never an agent, so
+it deliberately carries no `--timeout`, `--detach`, `--on-question*`, `--agent`, or `--transcript`
+— a session a human is sitting in has no wall-clock budget, no question channel to wire (the human
+is already there), and nothing to adapt for. `--task` is optional (unlike `run`'s, which is
+required): given, it's copied to `/task/prompt.md` for an agent the human starts by hand inside
+the shell to read; omitted, nothing fails and the prompt is the human's to type. `--exec <command>`
+is a convenience — run one command instead of an interactive shell, then exit — not a per-agent
+launcher (§3 principle 2 stays intact: no `krayt shell --agent claude-code`, out of scope). Without
+`--keep` the sandbox is torn down when the shell exits, on every path (a clean exit, Ctrl-C, a
+failed setup step, a killed terminal); with `--keep` it survives, re-entered by run id with
+`--attach` and destroyed only by `krayt stop`. `--attach <run-id>` skips config/policy resolution
+entirely — the sandbox already exists exactly as it was left — so it only makes sense alongside
+`--secrets` (to re-arm the changes.patch secret-value scan on the refreshed patch) among `shell`'s
+other flags.
+
+**2026-09-16 amendment — secret scoping vs. decision 2.** Decision 2 ("no adapter or transcript
+capture") predates msb's rule that every secrets-file key must carry a `network.inject` scope
+(`hand-secrets-to-msb.md`); nothing reconciled the two, and the gap meant a human who `krayt
+shell`'d into an agent image with `agent.adapter: claude-code` in `krayt.yaml` had to hand-write
+the exact `network.inject` entry `krayt run` already derives automatically from that same field,
+just to start the agent by hand once inside. Decision 2 still holds for everything it was actually
+about — `shell` still never launches an agent process, wires the krayt-ask front-end, or captures
+a transcript; there is still no `--agent` flag (§3 principle 2). What changed: when
+`agent.adapter` names an adapter, `shell` now also resolves that adapter's secret scope (the
+`Plan.Secrets` half of what `krayt run`'s adapter integration produces, §6.14) and merges it into
+`network.Secrets` before `ValidateNetworkPolicyForMsb` runs — the same merge `run` performs, minus
+everything else the adapter would otherwise do. An unset `agent.adapter` remains a complete no-op.
 
 `upgrade` re-verifies the downloaded binary against the target release's published
 `checksums.txt` before installing it — the same check as the manual install path (README's
@@ -2096,7 +2266,10 @@ run's pending `<question-id>`. `image rm` completes `<ref>` from msb's own store
 `--agent`) and `questions --sort` complete their fixed value sets from the same constants that
 validate them; `run`'s `--image`/`--allow` complete from this repo's run history. Untrusted
 agent-originated text (question prompts) is sanitized (§6.13) before appearing in a completion
-description.
+description. `shell`'s `--attach` dynamically completes `<run-id>`, alongside the existing
+`completeRunIDs` helpers, filtered to LIVE `kind: shell` records — a run id whose sandbox `--keep`
+left running and nothing has re-entered or stopped yet — since a mid-session or already-torn-down
+record has no sandbox left for `--attach` to reach.
 
 ---
 
@@ -2624,6 +2797,96 @@ independently-landed progress rather than a single big-bang "Done when".
 
 ---
 
+### Phase 12 — Interactive shell sessions (`add-interactive-shell-session.md`)
+
+A new top-level `krayt shell`: a separate, human-driven session that boots a sandbox from the repo
+snapshot and hands the human a terminal in it, reopening §15's "Mid-run human input" bullet
+deliberately and narrowly (a standalone session, not mid-run pairing into an autonomous run, which
+stays out of scope). Full decision record and reasoning live in the task file; this phase records
+what shipped and what's left.
+
+- [x] `internal/sandbox` — `TTYExecSpec`/`Client.ExecTTY` (`msb exec --tty`, inheriting the
+  caller's own stdio — the one deliberate exception to `Exec`'s "never the terminal" rule) and
+  `ListEntry`/`Client.List` (`msb ls --format json`, the orphan check's data source). Both argv
+  surfaces are pure functions, unit-tested against the fake `msb` with no real terminal or sandbox
+  needed.
+- [x] `internal/orchestrator` — `RunRecord.Kind` (`omitempty`, absent means `"run"`) and the new
+  `"kept"` state; `Shell` and `AttachShell` beside `Run`, built on three functions factored out of
+  `Run` itself (`copyInputs`, `helperSetup`, `finishAndCollect`) rather than duplicated — §7 "Shell
+  lifecycle" has the full departure list (no timeout, tty attach in place of the agent exec,
+  `--keep`-conditional teardown). `PatchLiveShell` for `krayt patch` against a live session.
+  `WriteRecord` exported so `krayt stop` can flip a `kept` record to `done` without a live
+  in-process `Run`/`Shell` call to route through.
+- [x] `internal/cli` — `krayt shell` (`--image --repo --config --secrets --net/--allow
+  --cpus/--memory/--disk --include-dirty --bundle-depth --task --keep --attach --exec
+  --max-concurrency --skip-resource-check`), reusing `runFlags`/`applyConfig` for the
+  config-precedence path rather than re-deriving it; `--attach` dynamic completion filtered to
+  live `kind: shell` records. `krayt patch`'s live-session branch. `krayt doctor --repo`'s fifth,
+  optional, report-only orphan check. `krayt stop`'s kept-shell branch (a real, load-bearing
+  addition beyond "keep working with no new code" — see the note below).
+- [x] Image side — `krayt-agent-shellenv` extracted into each of the three published agent images
+  (`claude-code`, `gemini-cli`, `opencode`; `krayt-dev` inherits `claude-code`'s unchanged),
+  sourced by both the entrypoint and, via `/etc/profile.d/` + `/etc/bash.bashrc`, an interactive
+  shell. Scoped to the one gap confirmed without hardware (`git config --global --add
+  safe.directory`) — the dead `/run/secrets`/`KRAYT_CA_CERT` blocks are deliberately not ported.
+  `hack/test-entrypoint-credentials.sh` extended with cases exercising the extracted script
+  directly, both standalone and through each entrypoint.
+- [x] Spec amendments (this change): §15, §13, §6.15, §7, §8.2, §8.4, this phase, plus
+  `docs/ai-tasks/README.md` and `README.md`.
+
+**A decision the task made that hardware evidence would have settled, corrected here instead**
+(§14's "if you find hard evidence a decision is wrong, say so" — CLAUDE.md): decision 7 says `ls`,
+`logs`, `stop`, `rm`, `patch`, and `apply` "keep working on it with no new code" once a run record
+carries `Kind`. That holds for every command except `stop`: a `--keep` session's supervising
+`krayt shell` process is *gone* by design once the human's terminal returns control (that is what
+`--keep` means), so the existing PID-signal path — `killSupervisor(rec.PID)` — has no live process
+left to signal for a `kept` record. `krayt stop` now branches on `state: kept` and stops + removes
+the sandbox directly by name instead, an addition, not a rewrite, of the existing command.
+
+**Done when (offline)** — met: `go build ./...`, `go vet ./...`, and `go test ./...` are green (no
+new `GOOS`-tagged files; no new `go.mod` entry, so decision 10's `golang.org/x/term` contingency
+was not needed — msb's `--tty` handling was never exercised on real hardware to find out whether
+it would have been); `golangci-lint run` is clean; the `Shell`/`AttachShell` teardown-on-error-
+with-`--keep` matrix is unit-tested against the fake `msb` (`internal/orchestrator/shell_test.go`),
+including the case a naive implementation gets wrong — a shell that exits with a non-zero status
+(`exit 1` typed inside bash) is still a *clean* `Shell()` return and must still be kept when
+`--keep` was given, since "clean" means "no orchestration error", not "the shell's own exit code
+was 0".
+
+**Done when (hardware, `[HUMAN]`)** — **not met; every criterion below needs a real
+Apple-Silicon Mac with `msb` installed, which this environment does not have.** Handed off in
+full via `HUMAN_TODO.md`, including the four numbered "Verify first" checks the task requires
+*before* trusting decision 10's premise and decision 14's scoping — none of which could be run
+here either:
+1. `msb exec -t` gives a usable terminal when krayt inherits stdio: window resize reflows, Ctrl-C
+   interrupts the foreground command rather than the session, a full-screen TUI renders and exits
+   cleanly, 256-colour/mouse reporting survive. **Not yet reachable** — see #4 below; the first
+   real attempt never got past the first exec.
+2. Whether `msb exec` inherits the sandbox's create-time environment (`CreateSpec.Env`) — decides
+   how much (if anything) `krayt-agent-shellenv` is still missing beyond `safe.directory`.
+3. What the `--secret` placeholder looks like inside an exec'd shell, and whether an interactively
+   started `claude` reaches its API host under the run's allowlist.
+4. **Answered, 2026-09-16, first real-hardware attempt:** with no `Command`, `msb exec --tty`
+   re-execs the image's `ENTRYPOINT` — not a shell — for any image that sets one without an
+   image-level `Shell`, every published krayt agent image included. A `krayt shell` session
+   against `ghcr.io/418-cloud/krayt-agent-claude-code` surfaced the headless entrypoint's own
+   "task file `/task/prompt.md` not found" and exited 66 before a human ever saw a prompt, instead
+   of a shell that `/etc/profile.d/krayt-shellenv.sh` or `/etc/bash.bashrc` could fire inside.
+   **Fixed**: `internal/orchestrator` no longer leaves `Command` empty — `ttyCommand`/
+   `defaultShellCommand` (`internal/orchestrator/shell.go`) resolve `$SHELL`, else `/bin/bash`,
+   else `/bin/sh` explicitly, so a real shell starts and #1's checks (and which profile hook
+   fires) become reachable. **Not yet re-verified on hardware** — the fix is offline-only so far.
+
+Criteria 1–7 of the task's own numbered "Done when" (a `krayt shell` session producing a patch
+`krayt apply` accepts; `--keep`/`--attach`/`krayt stop` round-tripping; the error-path teardown
+matrix on real hardware, not just the fake; a hand-started `claude` authenticating) all sit behind
+the same gate. Windows is explicitly **not claimed to work** (§14's standing rule for every prior
+phase): inherited stdio is the same code path, but nobody in this environment can confirm ConPTY
+through msb without a Windows box, and that residual is logged separately in `HUMAN_TODO.md`
+rather than folded into the macOS entry.
+
+---
+
 ## 15. Open Questions / Future Work
 
 - **microsandbox as a fourth `Provider` — evaluated and rejected, 2026-08-29.** Forcing msb
@@ -2676,8 +2939,24 @@ independently-landed progress rather than a single big-bang "Done when".
 - **Dirty-tree fidelity** — *resolved:* non-mutating temp-index capture folds uncommitted
   (non-ignored) changes into the inbound bundle, leaving the user's index/worktree/refs
   untouched (§6.7).
-- **Mid-run human input** — *resolved:* async `ask_human` question channel (§6.13), not a
-  terminal. Full interactive/attached pairing remains intentionally out of scope.
+- **Mid-run human input** — *resolved, amended 2026-09-16 (`add-interactive-shell-session.md`):*
+  for pairing *into an autonomous agent run*, the answer is still the async `ask_human` question
+  channel (§6.13), not a terminal — attaching a live tty to a run already in progress (two actors
+  mutating one `/workspace` concurrently, with the run's own timeout and patch collection still
+  live around them) remains intentionally out of scope, its own task if ever built. What changed:
+  a **standalone, human-driven session** — `krayt shell` — was added deliberately, on the repo
+  owner's explicit sign-off to reopen this bullet for that narrower case. It boots a sandbox from
+  the repo snapshot exactly like `krayt run` does and hands the human a terminal in it (§6.15,
+  §7), rather than launching an agent — the value the sandbox gives an autonomous agent (run
+  anything, install anything, touch credentials, none of it reaching the host) is just as useful
+  with a human at the keyboard, and the alternative (an agent on the host in a git worktree,
+  fielding a permission prompt per tool call or a standing `--dangerously-skip-permissions`) is
+  the gap it closes. Ephemeral by default (§3 principle 3 unchanged); `--keep` opts into a
+  sandbox that survives the shell exiting, re-entered with `krayt shell --attach <run-id>` and
+  destroyed only by `krayt stop <run-id>` — the user asking for that leak risk by name. No
+  `ask_human` wiring in shell mode (the human is already in the room) and no wall-clock timeout
+  (a session a human is sitting in is bounded by them closing it or `krayt stop`, not a clock);
+  §14 Phase 12 has the full record.
 - **Artifact signing / provenance** — optionally sign run outputs for auditability.
 - **Removing the guest NIC entirely in `allowlist`/`none`** — since `move-egress-proxy-to-host.md`,
   the VM no longer needs one in those modes (no DNS, no registry egress, no bundle egress), which

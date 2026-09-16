@@ -602,6 +602,90 @@ func TestImagePruneRendersArgs(t *testing.T) {
 	}
 }
 
+func TestTTYExecSpecArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		spec TTYExecSpec
+		want []string
+	}{
+		{
+			name: "no user, no command — msb attaches its own default shell",
+			spec: TTYExecSpec{Name: "sbx"},
+			want: []string{"exec", "--tty", "sbx"},
+		},
+		{
+			name: "user set, no command",
+			spec: TTYExecSpec{Name: "sbx", User: "agent"},
+			want: []string{"exec", "--tty", "--user", "agent", "sbx"},
+		},
+		{
+			name: "user + explicit command (--exec convenience flag)",
+			spec: TTYExecSpec{Name: "sbx", User: "agent", Command: []string{"bash", "-lc", "vim"}},
+			want: []string{"exec", "--tty", "--user", "agent", "sbx", "--", "bash", "-lc", "vim"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.spec.Args()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Args() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExecTTYInheritsStdioAndMapsExitCode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"exec": {ExitCode: 3},
+	}})
+
+	res, err := c.ExecTTY(context.Background(), TTYExecSpec{Name: "sbx", User: "agent"})
+	if err != nil {
+		t.Fatalf("ExecTTY: %v (want a normal ExecResult — a plain non-zero exit is not a driver failure here)", err)
+	}
+	if res.ExitCode != 3 {
+		t.Fatalf("ExitCode = %d, want 3", res.ExitCode)
+	}
+
+	call := lastFakeCall(t, home)
+	want := []string{"exec", "--tty", "--user", "agent", "sbx"}
+	if !reflect.DeepEqual(call.Args, want) {
+		t.Errorf("ExecTTY args = %v, want %v", call.Args, want)
+	}
+}
+
+func TestListParsesToleratesFieldNameVariants(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"ls": {ExitCode: 0, Stdout: `[` +
+			`{"name":"krayt-run_abc123","state":"running"},` +
+			`{"sandbox":"krayt-run_def456"}` +
+			`]`},
+	}})
+
+	got, err := c.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []string{"krayt-run_abc123", "krayt-run_def456"}
+	if len(got) != len(want) {
+		t.Fatalf("List = %+v, want %d entries", got, len(want))
+	}
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Errorf("List[%d].Name = %q, want %q", i, got[i].Name, w)
+		}
+	}
+	call := lastFakeCall(t, home)
+	wantArgs := []string{"ls", "--format", "json"}
+	if !reflect.DeepEqual(call.Args, wantArgs) {
+		t.Errorf("List args = %v, want %v", call.Args, wantArgs)
+	}
+}
+
 func slicesContain(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {

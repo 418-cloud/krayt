@@ -335,106 +335,22 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	}
 
 	// 2. Copy in: the git bundle, the task prompt, and the two embedded guest binaries.
-	tmp, err := os.MkdirTemp("", "krayt-msb-")
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: temp copy-in dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmp) }()
-
-	bundlePath := filepath.Join(tmp, "repo.bundle")
-	// BundleDepth passes through literally: 0 = full history (§6.1/§8.1); CreateBundle treats
-	// depth<=0 as full history.
-	br, err := patch.CreateBundle(ctx, spec.RepoPath, bundlePath, spec.BundleDepth, spec.IncludeDirty)
+	cir, err := copyInputs(ctx, deps.Sandbox, name, spec, true)
 	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
 		return nil, err
 	}
-	bundleDigest, err := digestFile(bundlePath)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: digest bundle: %w", err)
-	}
 	recMu.Lock()
-	rec.Provenance = &ProvenanceMeta{
-		HeadSHA: br.HeadSHA, BundleSHA: br.BundleSHA,
-		BundleDepth: spec.BundleDepth, IncludeDirty: spec.IncludeDirty,
-		BundleDigest: bundleDigest.String(),
-	}
+	rec.Provenance = &cir.Provenance
 	_, _ = writeRecord(runDir, rec)
 	recMu.Unlock()
-
-	promptPath := filepath.Join(tmp, "prompt.md")
-	if err := os.WriteFile(promptPath, spec.TaskPrompt, 0o644); err != nil {
-		return nil, fmt.Errorf("orchestrator: write task prompt: %w", err)
-	}
-	helperLocal, err := writeEmbeddedBinary(tmp, guestbin.HelperName)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: %w", err)
-	}
-	askLocal, err := writeEmbeddedBinary(tmp, guestbin.AskName)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: %w", err)
-	}
-
-	copies := [...]copySpec{
-		{bundlePath, containerBundlePath},
-		{promptPath, containerTaskFile},
-		{helperLocal, guestbin.GuestPath(guestbin.HelperName)},
-		{askLocal, containerAskBinPath},
-	}
-
-	// `msb copy` writes the destination file but will NOT create a missing parent directory —
-	// it fails with "sandbox fs error: open: No such file or directory". Nothing promises those
-	// parents exist: §8.2's paths (/task, /output, and krayt's own guestbin.GuestRoot) are
-	// "injected by the tool", not part of what an agent image must provide, and even
-	// /usr/local/bin is absent from some Nix-built rootfs. So create every destination's parent
-	// here, derived from the copy table itself rather than a second hand-maintained list that
-	// could drift from it.
-	mkdirs := append(guestParentDirs(copies[:]), containerOutput)
-	if _, err := execCapture(ctx, deps.Sandbox, name, "root", append([]string{"mkdir", "-p"}, mkdirs...)); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, fmt.Errorf("orchestrator: create guest directories: %w", err)
-	}
-	// /output is the one of those the non-root agent writes to during the run (§8.2), and mkdir
-	// applied root's umask to it. krayt-helper's own finish does the same 0777 chmod for the same
-	// reason; doing it here too is what makes the directory usable BEFORE finish runs.
-	if _, err := execCapture(ctx, deps.Sandbox, name, "root", []string{"chmod", "0777", containerOutput}); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, fmt.Errorf("orchestrator: chmod %s: %w", containerOutput, err)
-	}
-
-	for _, c := range copies {
-		dst := name + ":" + c.guest
-		if err := deps.Sandbox.Copy(ctx, c.local, dst); err != nil {
-			if isWallClockTimeout(ctx, err) {
-				return earlyTimeoutResult(runDir), nil
-			}
-			return nil, fmt.Errorf("orchestrator: copy %s: %w", dst, err)
-		}
-	}
-	// Defensive: msb copy's mode-preservation is not a pinned contract, so make sure both
-	// binaries are actually executable before exec-ing either of them.
-	if _, err := execCapture(ctx, deps.Sandbox, name, "root",
-		[]string{"chmod", "+x", guestbin.GuestPath(guestbin.HelperName), containerAskBinPath}); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, fmt.Errorf("orchestrator: chmod copied binaries: %w", err)
-	}
 
 	// 3. Exec the helper as root: clone the bundle into /workspace, tag krayt-baseline, snapshot
 	// the root-only patch-git, then relax /workspace for the agent user
 	// (add-krayt-guest-helper.md's privilege-separation ordering).
-	setupOut, err := execCapture(ctx, deps.Sandbox, name, "root", []string{
-		guestbin.GuestPath(guestbin.HelperName), "setup",
-		"--bundle", containerBundlePath, "--workspace", containerWorkspace,
-		"--patch-git", containerPatchGit, "--agent-user", sandboxAgentUser,
-	})
+	baseline, err := helperSetup(ctx, deps.Sandbox, name)
 	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
@@ -442,12 +358,6 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		// decision 6: a driver failure (ErrMsbFailed) must surface as a failed run, never as
 		// "the agent/helper exited 1" — errors.Is sees through execCapture's %w wrapping.
 		return nil, fmt.Errorf("orchestrator: krayt-helper setup: %w", err)
-	}
-	var setupResult struct {
-		Baseline string `json:"baseline"`
-	}
-	if jerr := json.Unmarshal(setupOut, &setupResult); jerr != nil || setupResult.Baseline == "" {
-		return nil, fmt.Errorf("orchestrator: parse krayt-helper setup output %q: %v", setupOut, jerr)
 	}
 
 	// The code snapshot is now durably captured inside the sandbox (cloned from the bundle,
@@ -509,47 +419,19 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return res, nil
 	}
 
-	// 5. Exec the helper again as root: diff against the baseline, assemble /output.
-	if _, err := execCapture(ctx, deps.Sandbox, name, "root", []string{
-		guestbin.GuestPath(guestbin.HelperName), "finish",
-		"--workspace", containerWorkspace, "--patch-git", containerPatchGit,
-		"--baseline", setupResult.Baseline, "--out", containerOutput,
-	}); err != nil {
-		if isWallClockTimeout(ctx, err) {
+	// 5-7. Exec the helper again as root (diff against the baseline, assemble /output), copy
+	// /output/* out, then host-side diffstat + safety lint + secret-value scan (§6.7, §8.4, §14).
+	fres, ferr := finishAndCollect(ctx, deps.Sandbox, name, runDir, baseline, secretValues)
+	if ferr != nil {
+		if isWallClockTimeout(ctx, ferr) {
 			return earlyTimeoutResult(runDir), nil
 		}
-		return nil, fmt.Errorf("orchestrator: krayt-helper finish: %w", err)
+		return nil, fmt.Errorf("orchestrator: %w", ferr)
 	}
-
-	// 6. Copy out /output/* (§6.7, §8.4).
-	if err := collectOutput(ctx, deps.Sandbox, name, runDir); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, err
-	}
-	if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
-		res.CommitsBundle = cb
-	}
-
-	// 7. Host: diffstat + safety lint + secret-value scan of the collected patch (§8.4, §14) —
-	// none of this is an exec; the host already holds the patch bytes and every secret value.
+	res.CommitsBundle = fres.CommitsBundle
 	recMu.Lock()
-	if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
-		rec.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
-	}
-	if b, rerr := os.ReadFile(res.PatchPath); rerr == nil {
-		for _, f := range patch.Lint(b) {
-			rec.Safety = append(rec.Safety, f.Path+": "+f.Reason)
-		}
-	}
-	if len(secretValues) > 0 {
-		if keys, kerr := PatchSecretKeys(res.PatchPath, secretValues); kerr == nil {
-			for _, k := range keys {
-				rec.Safety = append(rec.Safety, "changes.patch contains the value of secret "+k+" — review before applying")
-			}
-		}
-	}
+	rec.Patch = fres.Patch
+	rec.Safety = append(rec.Safety, fres.Safety...)
 	res.Safety = rec.Safety
 	recMu.Unlock()
 	return res, nil
@@ -614,6 +496,171 @@ func digestFile(path string) (digest.Digest, error) {
 	}
 	defer func() { _ = f.Close() }()
 	return digest.Canonical.FromReader(f)
+}
+
+// copyInputsResult is what copyInputs' two callers (Run, Shell) need afterward — just the bundle
+// provenance; everything else copyInputs does (staging, mkdir, copy, chmod) is entirely its own.
+type copyInputsResult struct {
+	Provenance ProvenanceMeta
+}
+
+// copyInputs builds the git bundle and copies it, krayt-helper, the task prompt (if any), and
+// (when includeAsk) krayt-ask into the sandbox — §7 step 2, shared by Run and Shell
+// (add-interactive-shell-session.md's host-side "What to build": "reusing §7 steps 1, 2, 4, 5 and
+// 6 verbatim... factor the shared prologue rather than copying it"). The task prompt is copied
+// only when spec.TaskPrompt is non-empty: Run always has one (runRun requires --task), Shell's is
+// optional (decision 13). includeAsk is false for Shell (decision 12: no ask_human channel, so no
+// krayt-ask binary to stage).
+func copyInputs(ctx context.Context, sb *sandbox.Client, name string, spec task.RunSpec, includeAsk bool) (copyInputsResult, error) {
+	tmp, err := os.MkdirTemp("", "krayt-msb-")
+	if err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: temp copy-in dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+
+	bundlePath := filepath.Join(tmp, "repo.bundle")
+	// BundleDepth passes through literally: 0 = full history (§6.1/§8.1); CreateBundle treats
+	// depth<=0 as full history.
+	br, err := patch.CreateBundle(ctx, spec.RepoPath, bundlePath, spec.BundleDepth, spec.IncludeDirty)
+	if err != nil {
+		return copyInputsResult{}, err
+	}
+	bundleDigest, err := digestFile(bundlePath)
+	if err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: digest bundle: %w", err)
+	}
+	result := copyInputsResult{Provenance: ProvenanceMeta{
+		HeadSHA: br.HeadSHA, BundleSHA: br.BundleSHA,
+		BundleDepth: spec.BundleDepth, IncludeDirty: spec.IncludeDirty,
+		BundleDigest: bundleDigest.String(),
+	}}
+
+	copies := []copySpec{{bundlePath, containerBundlePath}}
+
+	if len(spec.TaskPrompt) > 0 {
+		promptPath := filepath.Join(tmp, "prompt.md")
+		if err := os.WriteFile(promptPath, spec.TaskPrompt, 0o644); err != nil {
+			return copyInputsResult{}, fmt.Errorf("orchestrator: write task prompt: %w", err)
+		}
+		copies = append(copies, copySpec{promptPath, containerTaskFile})
+	}
+
+	helperLocal, err := writeEmbeddedBinary(tmp, guestbin.HelperName)
+	if err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: %w", err)
+	}
+	copies = append(copies, copySpec{helperLocal, guestbin.GuestPath(guestbin.HelperName)})
+	execBins := []string{guestbin.GuestPath(guestbin.HelperName)}
+
+	if includeAsk {
+		askLocal, err := writeEmbeddedBinary(tmp, guestbin.AskName)
+		if err != nil {
+			return copyInputsResult{}, fmt.Errorf("orchestrator: %w", err)
+		}
+		copies = append(copies, copySpec{askLocal, containerAskBinPath})
+		execBins = append(execBins, containerAskBinPath)
+	}
+
+	// `msb copy` writes the destination file but will NOT create a missing parent directory —
+	// it fails with "sandbox fs error: open: No such file or directory". Nothing promises those
+	// parents exist: §8.2's paths (/task, /output, and krayt's own guestbin.GuestRoot) are
+	// "injected by the tool", not part of what an agent image must provide, and even
+	// /usr/local/bin is absent from some Nix-built rootfs. So create every destination's parent
+	// here, derived from the copy table itself rather than a second hand-maintained list that
+	// could drift from it.
+	mkdirs := append(guestParentDirs(copies), containerOutput)
+	if _, err := execCapture(ctx, sb, name, "root", append([]string{"mkdir", "-p"}, mkdirs...)); err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: create guest directories: %w", err)
+	}
+	// /output is the one of those the non-root agent writes to during the run (§8.2), and mkdir
+	// applied root's umask to it. krayt-helper's own finish does the same 0777 chmod for the same
+	// reason; doing it here too is what makes the directory usable BEFORE finish runs.
+	if _, err := execCapture(ctx, sb, name, "root", []string{"chmod", "0777", containerOutput}); err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: chmod %s: %w", containerOutput, err)
+	}
+
+	for _, c := range copies {
+		dst := name + ":" + c.guest
+		if err := sb.Copy(ctx, c.local, dst); err != nil {
+			return copyInputsResult{}, fmt.Errorf("orchestrator: copy %s: %w", dst, err)
+		}
+	}
+	// Defensive: msb copy's mode-preservation is not a pinned contract, so make sure every copied
+	// binary is actually executable before exec-ing it.
+	if _, err := execCapture(ctx, sb, name, "root", append([]string{"chmod", "+x"}, execBins...)); err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: chmod copied binaries: %w", err)
+	}
+	return result, nil
+}
+
+// helperSetup execs krayt-helper setup as root — §7 step 3, shared by Run and Shell: clones the
+// bundle into /workspace, tags krayt-baseline, snapshots the root-only patch-git, then relaxes
+// /workspace for the agent user (add-krayt-guest-helper.md's privilege-separation ordering).
+// Returns the baseline ref, consumed by finishAndCollect's --baseline flag.
+func helperSetup(ctx context.Context, sb *sandbox.Client, name string) (string, error) {
+	out, err := execCapture(ctx, sb, name, "root", []string{
+		guestbin.GuestPath(guestbin.HelperName), "setup",
+		"--bundle", containerBundlePath, "--workspace", containerWorkspace,
+		"--patch-git", containerPatchGit, "--agent-user", sandboxAgentUser,
+	})
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		Baseline string `json:"baseline"`
+	}
+	if jerr := json.Unmarshal(out, &result); jerr != nil || result.Baseline == "" {
+		return "", fmt.Errorf("orchestrator: parse krayt-helper setup output %q: %v", out, jerr)
+	}
+	return result.Baseline, nil
+}
+
+// finishResult is what finishAndCollect produced: the collected patch (and, if the agent/human
+// committed, a commits bundle), plus its diffstat and any Safety findings.
+type finishResult struct {
+	PatchPath     string
+	CommitsBundle string
+	Patch         *PatchMeta
+	Safety        []string
+}
+
+// finishAndCollect execs krayt-helper finish as root (diff against baseline, assemble /output),
+// copies /output/* out, then runs the host-side diffstat + safety lint + secret-value scan of the
+// collected patch — §7 steps 5-7, shared by Run and Shell (decision 8: "a session produces a
+// patch, same as a run"). None of the host-side scan is an exec; the host already holds the patch
+// bytes and every secret value.
+func finishAndCollect(ctx context.Context, sb *sandbox.Client, name, runDir, baseline string, secretValues map[string]string) (finishResult, error) {
+	if _, err := execCapture(ctx, sb, name, "root", []string{
+		guestbin.GuestPath(guestbin.HelperName), "finish",
+		"--workspace", containerWorkspace, "--patch-git", containerPatchGit,
+		"--baseline", baseline, "--out", containerOutput,
+	}); err != nil {
+		return finishResult{}, fmt.Errorf("krayt-helper finish: %w", err)
+	}
+	if err := collectOutput(ctx, sb, name, runDir); err != nil {
+		return finishResult{}, err
+	}
+
+	res := finishResult{PatchPath: filepath.Join(runDir, "changes.patch")}
+	if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
+		res.CommitsBundle = cb
+	}
+	if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
+		res.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
+	}
+	if b, rerr := os.ReadFile(res.PatchPath); rerr == nil {
+		for _, f := range patch.Lint(b) {
+			res.Safety = append(res.Safety, f.Path+": "+f.Reason)
+		}
+	}
+	if len(secretValues) > 0 {
+		if keys, kerr := PatchSecretKeys(res.PatchPath, secretValues); kerr == nil {
+			for _, k := range keys {
+				res.Safety = append(res.Safety, "changes.patch contains the value of secret "+k+" — review before applying")
+			}
+		}
+	}
+	return res, nil
 }
 
 // copySpec is one host-file -> guest-path copy-in. The guest path is kept separate from the

@@ -51,8 +51,37 @@ STUB
     PATH="$stub:/usr/bin:/bin" HOME="$sandbox" \
     KRAYT_SECRETS_DIR="$secrets" KRAYT_WORKSPACE="$sandbox/workspace" \
     KRAYT_TASK="$sandbox/task/prompt.md" KRAYT_OUTPUT="$sandbox/output" \
+    KRAYT_SHELLENV="$REPO/images/agents/$image/krayt-agent-shellenv" \
     "$@" \
     bash "$REPO/images/agents/$image/entrypoint.sh" 2>&1
+  local rc=$?
+  rm -rf "$sandbox"
+  return $rc
+}
+
+# run_shellenv_directly <image> [env assignments...]
+# Sources images/agents/<image>/krayt-agent-shellenv DIRECTLY — not through the entrypoint — the
+# same way /etc/profile.d/krayt-shellenv.sh and /etc/bash.bashrc source it for an interactive
+# `krayt shell` session (add-interactive-shell-session.md decision 14). No `set -e`/`set -u` here:
+# that absence is exactly the property under test — the script's own header promises not to
+# require or impose either on the shell it's sourced into, since that shell may be a human's
+# interactive login shell. Echoes stdout+stderr; returns the sourcing shell's own exit code.
+run_shellenv_directly() {
+  local image="$1"; shift
+  local sandbox stub
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/krayt-shellenv-test.XXXXXX")" || {
+    echo "mktemp -d failed (TMPDIR=${TMPDIR:-unset} not writable?)" >&2; return 70; }
+  stub="$sandbox/bin"
+  mkdir -p "$stub" "$sandbox/workspace"
+  cat > "$stub/git" <<'STUB'
+#!/usr/bin/env bash
+echo "STUB:git args=[$*]"
+exit 0
+STUB
+  chmod +x "$stub/git"
+
+  env -i PATH="$stub:/usr/bin:/bin" HOME="$sandbox" "$@" \
+    bash -c '. "$1"' _ "$REPO/images/agents/$image/krayt-agent-shellenv" 2>&1
   local rc=$?
   rm -rf "$sandbox"
   return $rc
@@ -63,6 +92,22 @@ check() {
   local desc="$1" want="$2"; shift 2
   local out; out="$(run_entrypoint "$@")"
   if [[ "$out" == *"$want"* ]]; then ok "$desc"; else bad "$desc"$'\n        want substring: '"$want"$'\n        got: '"${out//$'\n'/ | }"; fi
+}
+
+# check_shellenv <description> <expected-substring> <image> [env...]
+# Same shape as check, but against run_shellenv_directly (the script sourced on its own).
+check_shellenv() {
+  local desc="$1" want="$2"; shift 2
+  local out; out="$(run_shellenv_directly "$@")"
+  if [[ "$out" == *"$want"* ]]; then ok "$desc"; else bad "$desc"$'\n        want substring: '"$want"$'\n        got: '"${out//$'\n'/ | }"; fi
+}
+
+# check_shellenv_exit <description> <expected-code> <image> [env...]
+check_shellenv_exit() {
+  local desc="$1" want="$2"; shift 2
+  run_shellenv_directly "$@" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -eq "$want" ]; then ok "$desc"; else bad "$desc (exit $rc, want $want)"; fi
 }
 
 # check_exit <description> <expected-code> <image> <secrets-dir> [env...]
@@ -148,6 +193,50 @@ if [[ "$out" == *"gh authenticating"* || "$out" == *"authenticated gh"* || "$out
 else
   ok "15. no entrypoint touches GH_TOKEN — the proxy owns it"
 fi
+
+printf '\n\033[1mkrayt-agent-shellenv\033[0m (add-interactive-shell-session.md decision 14 — the extracted script, exercised directly and through each entrypoint)\n'
+
+# 16-17: through the entrypoint (claude-code stands in for all three — they source the identical
+# shape), proving the entrypoint's own `. "$SHELLENV"` actually reaches the extracted script
+# rather than silently no-op-ing.
+check "16. entrypoint sourcing marks KRAYT_WORKSPACE safe.directory" \
+  "STUB:git args=[config --global --add safe.directory" \
+  claude-code "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use
+check "17. entrypoint sourcing also marks '*' safe.directory (any workspace path)" \
+  "safe.directory *]" \
+  claude-code "$empty_secrets" ANTHROPIC_API_KEY=sk-ant-krayt-placeholder-do-not-use
+
+# 18-20: sourced directly (run_shellenv_directly), the way /etc/profile.d/krayt-shellenv.sh and
+# /etc/bash.bashrc source it for `krayt shell` — no entrypoint, no credential plumbing, no
+# `set -e`/`set -u` in the sourcing shell.
+check_shellenv "18. sourced directly, marks KRAYT_WORKSPACE safe.directory" \
+  "STUB:git args=[config --global --add safe.directory" \
+  claude-code KRAYT_WORKSPACE=/some/custom/workspace
+check_shellenv "19. sourced directly, honors KRAYT_WORKSPACE (not hardcoded /workspace)" \
+  "safe.directory /some/custom/workspace]" \
+  claude-code KRAYT_WORKSPACE=/some/custom/workspace
+check_shellenv "20. sourced directly with no KRAYT_WORKSPACE, defaults to /workspace" \
+  "safe.directory /workspace]" \
+  claude-code
+
+# 21: the property the "no set -e/-u" design is FOR — sourcing must not abort even when git is
+# entirely missing from PATH (a `. "$1"` failure inside would otherwise kill the interactive
+# shell it was sourced into, which is the opposite of "a human's login shell should not notice
+# this ran"). Exit code must be 0 (bash -c's own exit, from the git-less environment) even though
+# every safe.directory call individually failed.
+check_shellenv_exit "21. sourcing survives git being entirely absent from PATH" 0 \
+  claude-code PATH=/usr/bin:/bin
+
+# 22-23: gemini-cli and opencode carry the identical extracted script (one copy per image
+# directory, matching entrypoint.sh/rtk's existing per-image-directory pattern — Docker's build
+# context can't reach outside images/agents/<name>/) — confirm both independently rather than
+# assuming they match claude-code's.
+check_shellenv "22. gemini-cli's copy also marks KRAYT_WORKSPACE safe.directory" \
+  "STUB:git args=[config --global --add safe.directory" \
+  gemini-cli KRAYT_WORKSPACE=/gemini/workspace
+check_shellenv "23. opencode's copy also marks KRAYT_WORKSPACE safe.directory" \
+  "STUB:git args=[config --global --add safe.directory" \
+  opencode KRAYT_WORKSPACE=/opencode/workspace
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 exit $((fail > 0))
