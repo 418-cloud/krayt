@@ -42,6 +42,8 @@ rewritten; whoever picks one up needs to re-derive the msb-equivalent steps firs
    calls and that the opt-out is honoured rather than silently absent. What remains needs live
    Gemini/OpenCode credentials — the same proof for those two agents — plus the amd64/other-image
    manifest check. See the `[tooling]` entry below.
+6. **`seed-agent-first-run-config.md`** — code done, offline-verified; every hardware check is
+   unrun (no real Mac/msb/live credential here). See its own `[HUMAN]` entry below.
 
 (The two `hadolint`-the-{gemini-cli,opencode}-Dockerfile entries formerly here are resolved: this
 task's own Verify step ran `hadolint` against both — clean, same pre-existing warnings as
@@ -485,3 +487,68 @@ own seven-point Done-when — none of which this environment can run.
   who doesn't run `krayt shell` is affected, and every non-hardware Done-when criterion is met) —
   but yes for closing `KRAYT_SPEC.md` §14 Phase 12 and for trusting `krayt shell` in anger. Until
   this lands, treat `krayt shell` as "compiles, passes its offline tests, never run for real."
+
+---
+
+## [HUMAN] `seed-agent-first-run-config.md` — five hardware checks, real Mac + msb 0.6.16 + a live credential each
+
+Seeding each agent's first-run guest config from its adapter (`internal/adapter.Plan.ConfigSeeds`,
+`internal/orchestrator`'s shared `applyConfigSeeds` step wired into both `Run` and `Shell`,
+`internal/configseed`'s fill-in-never-override merge) is done and offline-verified: `go build`
+(both `GOOS`), `go vet`, `go test -race`, and `golangci-lint` are all green, and the merge/adapter/
+sandbox/orchestrator/CLI behavior is unit-tested — including against the fake `msb`
+(`internal/orchestrator/fakemsb_test.go`, extended to actually read/write files inside the fake
+sandbox root, honor a create-time `--env` value for the `DirEnv` probe, and accept piped stdin) —
+for every case the task's own test list names: seeds written as the agent user before the agent/
+tty exec, an existing file's other keys surviving the merge, an unchanged merge performing no
+write, invalid JSON left byte-identical with a warning, a failing seed exec not failing the run,
+`DirEnv` redirecting the path, an invalid `DirEnv` name rejected before any exec, and
+`AttachShell` performing no seed exec at all. **Nothing in it has run against a real guest.**
+
+- **Needed:** on a real Apple-Silicon Mac with `msb` (≥ `0.6.16`) installed:
+  1. **`CLAUDE_CODE_OAUTH_TOKEN`:** `krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code
+     --config krayt.yaml` (with `agent: { adapter: claude-code }` in that config, and the token in
+     the secrets file), then run `claude` by hand inside the shell. Expect no onboarding screen and
+     an authenticated prompt; a one-line request (`claude -p "say hello"` or the interactive
+     equivalent) succeeds.
+  2. **`ANTHROPIC_API_KEY`:** the same flow with an API key instead. Expect no "Detected a custom
+     API key in your environment" approval dialog, and authentication succeeds. Inside the shell,
+     run `printenv ANTHROPIC_API_KEY` and confirm it prints exactly `$MSB_ANTHROPIC_API_KEY` — if
+     it prints anything else, `sandbox.SecretPlaceholder`'s assumed default is wrong and the
+     seeded `customApiKeyResponses.approved` value (its last 20 characters) needs to be read from
+     the guest instead of assumed.
+  3. **Whether `platform.claude.com` is still needed.** With onboarding seeded
+     (`hasCompletedOnboarding: true`), the connectivity preflight that used to contact it no longer
+     runs. Test with it removed from `krayt.yaml`'s `allow`/`passthrough` and confirm `claude`
+     still authenticates; record the answer in `images/agents/claude-code/README.md`'s "Required
+     `--allow` hosts" section either way.
+  4. **`gemini-cli` with `GEMINI_API_KEY`:** `krayt shell --image ghcr.io/418-cloud/krayt-agent-gemini-cli
+     --config krayt.yaml` (`agent: { adapter: gemini-cli }`), then start `gemini` interactively
+     inside the shell. Expect no auth dialog (`security.auth.selectedType` seeded) and no
+     folder-trust dialog (`GEMINI_CLI_TRUST_WORKSPACE=true` in `Plan.Env`).
+  5. **A minimal image with no krayt entrypoint at all** — e.g. `debian:trixie-slim` plus the
+     official Claude Code installer, run as a non-root user named `agent`, no
+     `krayt-agent-entrypoint`/`krayt-agent-shellenv` baked in. Repeat check 1 against it. This is
+     the check that actually proves the "image-agnostic" claim: every other check above uses a
+     published krayt image, which could in principle still be passing for some unrelated reason.
+- **Why the agent can't:** no real hardware — no Apple-Silicon Mac (or Linux/KVM host) with `msb`
+  installed anywhere in this environment — and no live Anthropic or Gemini credential to test
+  authentication against a real API.
+- **Verify success by:** each numbered item above has its own inline check. Record the outcome of
+  each explicitly in `KRAYT_SPEC.md` §14 Phase 12's follow-up bullet for this task (currently every
+  hardware box is unchecked) and in this file's history, per `CLAUDE.md`'s "never fabricate a
+  result" rule — if any of them turns up a real gap (most likely #2, whether
+  `sandbox.SecretPlaceholder`'s assumed `$MSB_<NAME>` default still matches a real msb 0.6.16
+  install, or #5, whether a bare image needs something `krayt-agent-shellenv` normally provides
+  that this task didn't anticipate), fix it and re-verify before checking any box done.
+- **Also open, logged per the task's "out of scope" section — verify with a live key, don't fix
+  without one:** Gemini's `GOOGLE_API_KEY` credential is scoped to
+  `generativelanguage.googleapis.com` (this task's adapter change), but the gemini-cli entrypoint's
+  own comment says that credential shape actually goes through Vertex AI Express
+  (`aiplatform.googleapis.com`). If that's right, msb never substitutes it and a `GOOGLE_API_KEY`
+  run silently sends the placeholder string to Google. Confirm with a live `GOOGLE_API_KEY` which
+  host it actually calls, and file a follow-up to fix the adapter's `Hosts` if the entrypoint's
+  comment is right.
+- **Blocking:** no for shipping the code (additive; every non-hardware criterion is met) — but yes
+  for closing `KRAYT_SPEC.md` §14 Phase 12's follow-up bullet and for trusting that a `krayt shell`
+  user can actually start `claude`/`gemini` by hand without hitting onboarding or an auth dialog.

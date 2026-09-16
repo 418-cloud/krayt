@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/418-cloud/krayt/internal/orchestrator"
+	"github.com/418-cloud/krayt/internal/task"
 )
 
 // newTestShellCmd mirrors newTestRunCmd (run_test.go): bind flags onto a real *cobra.Command with
@@ -120,6 +121,11 @@ func TestShellNoTimeoutFlag(t *testing.T) {
 // applyAdapter — without it, ValidateNetworkPolicyForMsb rejects the run before it ever reaches
 // the (unrelated, hardware-only) msb-missing error pinMissingMsb forces. Mirrors
 // TestApplyAdapterScopesCredential (adapter_test.go) but through the real shell flag/config path.
+//
+// Extended (rather than paralleled — seed-agent-first-run-config.md's own test list says to) to
+// also cover decision 7's applyAdapterForShell additions: with agent.adapter: claude-code the
+// resolved spec carries claude-code's ConfigSeed, and with agent.adapter: gemini-cli the spec
+// gets the adapter's env additions with the user's own env: still winning any conflict.
 func TestShellResolvesAdapterSecretScope(t *testing.T) {
 	dir := t.TempDir()
 	pinMissingMsb(t, dir)
@@ -144,6 +150,67 @@ func TestShellResolvesAdapterSecretScope(t *testing.T) {
 	if err != nil && strings.Contains(err.Error(), "network.inject") {
 		t.Fatalf("runShell err = %v, want CLAUDE_CODE_OAUTH_TOKEN's network.inject scope resolved "+
 			"automatically from agent.adapter, no hand-written entry needed", err)
+	}
+
+	// The resolved spec itself carries claude-code's config seed (decision 9): the onboarding key
+	// always, and — since this credential is CLAUDE_CODE_OAUTH_TOKEN, not ANTHROPIC_API_KEY — no
+	// customApiKeyResponses approval.
+	if err := applyConfig(cmd, &f); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := resolveShellSpec(cmd, &f, dir, "run_test_seed", nil)
+	if err != nil {
+		t.Fatalf("resolveShellSpec: %v", err)
+	}
+	wantSeeds := []task.ConfigSeed{{
+		DirEnv:   "CLAUDE_CONFIG_DIR",
+		Path:     ".claude.json",
+		Defaults: map[string]any{"hasCompletedOnboarding": true},
+	}}
+	if !reflect.DeepEqual(spec.ConfigSeeds, wantSeeds) {
+		t.Errorf("ConfigSeeds = %+v, want %+v", spec.ConfigSeeds, wantSeeds)
+	}
+
+	// gemini-cli: the adapter's env additions (GEMINI_CLI_TRUST_WORKSPACE) land in spec.Env, and
+	// the user's own env: entry for the same key still wins (mergeEnv's existing precedence rule).
+	geminiDir := t.TempDir()
+	pinMissingMsb(t, geminiDir)
+	geminiCfgYAML := "image: file-image:1\nagent:\n  adapter: gemini-cli\n" +
+		"network:\n  mode: allowlist\n  allow: [generativelanguage.googleapis.com]\n" +
+		"env:\n  GEMINI_CLI_TRUST_WORKSPACE: user-set\n"
+	geminiCfgPath := filepath.Join(geminiDir, "krayt.yaml")
+	write(t, geminiCfgPath, geminiCfgYAML)
+	geminiSecretsPath := filepath.Join(geminiDir, "secrets.env")
+	write(t, geminiSecretsPath, "GEMINI_API_KEY=test-key\n")
+
+	var gf runFlags
+	var gsf shellFlags
+	gcmd := newTestShellCmd(&gf, &gsf)
+	if err := gcmd.ParseFlags([]string{
+		"--repo", geminiDir, "--config", geminiCfgPath, "--secrets", geminiSecretsPath, "--skip-resource-check",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyConfig(gcmd, &gf); err != nil {
+		t.Fatal(err)
+	}
+	geminiSpec, err := resolveShellSpec(gcmd, &gf, geminiDir, "run_test_seed_gemini", nil)
+	if err != nil {
+		t.Fatalf("resolveShellSpec (gemini-cli): %v", err)
+	}
+	if geminiSpec.Env["GEMINI_CLI_TRUST_WORKSPACE"] != "user-set" {
+		t.Errorf("GEMINI_CLI_TRUST_WORKSPACE = %q, want the user's own env: value (user-set) to win",
+			geminiSpec.Env["GEMINI_CLI_TRUST_WORKSPACE"])
+	}
+	wantGeminiSeeds := []task.ConfigSeed{{
+		DirEnv: "GEMINI_CLI_HOME",
+		Path:   ".gemini/settings.json",
+		Defaults: map[string]any{
+			"security": map[string]any{"auth": map[string]any{"selectedType": "gemini-api-key"}},
+		},
+	}}
+	if !reflect.DeepEqual(geminiSpec.ConfigSeeds, wantGeminiSeeds) {
+		t.Errorf("gemini-cli ConfigSeeds = %+v, want %+v", geminiSpec.ConfigSeeds, wantGeminiSeeds)
 	}
 }
 

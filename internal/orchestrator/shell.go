@@ -229,6 +229,13 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 	_, _ = writeRecord(runDir, rec)
 	recMu.Unlock()
 
+	// 3b. Seed each selected adapter's first-run guest config (§6.14 "First-run state",
+	// seed-agent-first-run-config.md) — as the agent user, before the human ever gets a shell, so
+	// an agent started by hand authenticates without hitting onboarding or an auth dialog.
+	// Best-effort: never fails the session. AttachShell/PatchLiveShell never seed (decision 5):
+	// the sandbox already exists and the human may have changed these files since.
+	applyConfigSeeds(ctx, deps.Sandbox, name, spec.ConfigSeeds, deps.Warn)
+
 	// 4. Attach an interactive tty in place of Run's agent exec (decision 10) — msb owns the pty
 	// from here on; this call blocks until the human exits the shell (or, with --exec, until the
 	// given command finishes). ttyCommand supplies defaultShellCommand when execCmd is empty —

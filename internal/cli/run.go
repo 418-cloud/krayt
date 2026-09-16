@@ -415,6 +415,7 @@ func runRun(cmd *cobra.Command, f *runFlags) error {
 	mgr := orchestrator.NewManager(orchestrator.Deps{
 		Sandbox: deps.sandbox,
 		LogOut:  logOut,
+		Warn:    cmd.ErrOrStderr(),
 	}, filepath.Join(repoAbs, ".krayt"), f.maxConc)
 	res, err := mgr.Run(cmd.Context(), spec)
 	if err != nil {
@@ -478,13 +479,14 @@ func loadSecretKeySet(secretsPath string) (map[string]bool, error) {
 // sandbox is created (and before task.ValidateNetworkPolicyForMsb, which re-checks the merged
 // set) so a bad credential set or a bad merged scope fails fast.
 //
-// `krayt run` is the only caller that wants the FULL plan (env, transcript dir, secrets) — see
-// applyAdapterSecrets for the secrets-only subset `krayt shell` needs (2026-09-16 amendment,
-// KRAYT_SPEC.md §13).
+// `krayt run` is the only caller that wants the FULL plan (env, transcript dir, secrets, config
+// seeds) — see applyAdapterForShell for the subset `krayt shell` needs (2026-09-16 amendment,
+// extended by seed-agent-first-run-config.md decision 7, KRAYT_SPEC.md §13).
 func applyAdapter(out io.Writer, spec *task.RunSpec, name string, secretKeys map[string]bool) error {
 	plan, err := resolveAdapterPlan(name, secretKeys, adapter.Input{
 		QuestionsWait: spec.Questions.Mode == task.QuestionWait,
 		AskSocket:     sandbox.AskSocketEnv,
+		Placeholder:   sandbox.SecretPlaceholder,
 	})
 	if err != nil {
 		return err
@@ -494,22 +496,46 @@ func applyAdapter(out io.Writer, spec *task.RunSpec, name string, secretKeys map
 	// the one place that knows the flag preserves the invariant the orchestrator relies on — a
 	// non-empty spec.TranscriptDir means "capture this" and nothing else needs consulting.
 	spec.TranscriptDir = plan.TranscriptDir
+	spec.ConfigSeeds = toTaskConfigSeeds(plan.ConfigSeeds)
 	return mergeAdapterSecrets(out, spec, plan.Secrets)
 }
 
-// applyAdapterSecrets resolves name's adapter and merges only its Plan.Secrets into
-// spec.Network.Secrets — the subset of applyAdapter that `krayt shell` needs. msb requires every
-// secrets-file key to carry a network.inject scope regardless of whether the agent is launched
-// automatically (`krayt run`) or by hand inside an interactive session (`krayt shell`), so this
-// runs even though shell never touches Plan.Env, Plan.TranscriptDir, or the krayt-ask wiring
-// (decision 2 in internal/orchestrator/shell.go still holds for all of those). An unset/empty
-// name resolves to the `none` adapter, whose Plan.Secrets is always empty — a no-op.
-func applyAdapterSecrets(out io.Writer, spec *task.RunSpec, name string, secretKeys map[string]bool) error {
-	plan, err := resolveAdapterPlan(name, secretKeys, adapter.Input{})
+// applyAdapterForShell resolves name's adapter and applies exactly the parts of its Plan `krayt
+// shell` needs — Plan.Env, Plan.Secrets, and Plan.ConfigSeeds (seed-agent-first-run-config.md
+// decision 7, extending the 2026-09-16 amendment this function replaced applyAdapterSecrets for).
+// Never Plan.TranscriptDir or the krayt-ask wiring: decision 2 in
+// internal/orchestrator/shell.go still holds for those — shell never launches an agent, wires
+// krayt-ask, or captures a transcript. QuestionsWait/AskSocket are always the zero value here, so
+// askEnv contributes nothing to Plan.Env regardless of adapter.
+//
+// Plan.Secrets and Plan.ConfigSeeds are needed even though shell never runs the rest of
+// applyAdapter: msb requires every secrets-file key to carry a network.inject scope regardless of
+// whether the agent is launched automatically (`krayt run`) or by hand inside an interactive
+// session, and a hand-started agent needs the same first-run seeding an automatic one gets — the
+// whole point of this task. An unset/empty name resolves to the `none` adapter, whose Plan is
+// always empty — a no-op.
+func applyAdapterForShell(out io.Writer, spec *task.RunSpec, name string, secretKeys map[string]bool) error {
+	plan, err := resolveAdapterPlan(name, secretKeys, adapter.Input{Placeholder: sandbox.SecretPlaceholder})
 	if err != nil {
 		return err
 	}
+	mergeEnv(spec, plan.Env)
+	spec.ConfigSeeds = toTaskConfigSeeds(plan.ConfigSeeds)
 	return mergeAdapterSecrets(out, spec, plan.Secrets)
+}
+
+// toTaskConfigSeeds converts an adapter's declared ConfigSeeds into task.RunSpec's mirror type
+// (internal/task cannot import internal/adapter — adapter imports task, and the reverse would
+// cycle).
+func toTaskConfigSeeds(seeds []adapter.ConfigSeed) []task.ConfigSeed {
+	if len(seeds) == 0 {
+		return nil
+	}
+	out := make([]task.ConfigSeed, len(seeds))
+	for i, s := range seeds {
+		out[i] = task.ConfigSeed{DirEnv: s.DirEnv, Path: s.Path, Defaults: s.Defaults}
+	}
+	return out
 }
 
 // resolveAdapterPlan looks up name's adapter and runs its host-side Prepare, filling in

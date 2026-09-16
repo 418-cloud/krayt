@@ -72,6 +72,14 @@ type Deps struct {
 	Sandbox *sandbox.Client
 	LogOut  io.Writer // live log sink when spec.Detach is false; may be nil
 
+	// Warn receives best-effort warning lines that must never fail a run or session — currently
+	// just applyConfigSeeds' one-line-per-failed-seed output (seed-agent-first-run-config.md
+	// decision 6). Distinct from LogOut: LogOut is the agent's OWN streamed stdout/stderr (nil
+	// when detached), while Warn is host-side progress/status output, wired to the same writer
+	// the CLI already uses for pre-boot messages (printNetworkPolicy and friends) — present for
+	// both Run and Shell, unlike LogOut, which Shell never sets. May be nil to discard.
+	Warn io.Writer
+
 	// OnClient, if set, is invoked once a run's answerer is ready (immediately, since msb has no
 	// boot handshake this package waits on) with an AnswerFunc that delivers a human answer to
 	// this run (§6.13), and again with nil as the run ends. The Manager uses it so
@@ -367,6 +375,11 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	rec.State = StateRunning
 	_, _ = writeRecord(runDir, rec)
 	recMu.Unlock()
+
+	// 3b. Seed each selected adapter's first-run guest config (§6.14 "First-run state",
+	// seed-agent-first-run-config.md) — as the agent user, before the agent ever runs, so it
+	// authenticates without hitting onboarding or an auth dialog. Best-effort: never fails the run.
+	applyConfigSeeds(ctx, deps.Sandbox, name, spec.ConfigSeeds, deps.Warn)
 
 	// 4. Exec the agent as the sandbox's non-root user, streamed to the run's log sink.
 	logFile, err := os.Create(filepath.Join(runDir, "logs", "agent.log"))
@@ -834,26 +847,41 @@ func captureTranscript(ctx context.Context, sb *sandbox.Client, name, guestDir, 
 // guestHome asks the sandbox what $HOME is for the user krayt runs the agent as. Resolved rather
 // than hardcoded because the images disagree — /home/agent for claude-code and krayt-dev,
 // /home/node for gemini-cli — and ExecSpec carries no env for krayt to set one itself.
+func guestHome(ctx context.Context, sb *sandbox.Client, name string) string {
+	return guestBaseDir(ctx, sb, name, "")
+}
+
+// guestBaseDir asks the sandbox for a base directory: $HOME when dirEnv is empty, or — when
+// dirEnv is non-empty — that guest env var's value if set and non-empty, else $HOME
+// (seed-agent-first-run-config.md decision 4.1; shared by captureTranscript, via guestHome, and
+// applyConfigSeed). dirEnv must already be validated by the caller against dirEnvNameRE: it is
+// interpolated into the shell script TEXT, not passed as a value, because sh has no
+// positional-argument mechanism for expanding "the variable named by this argument" — only the
+// regex anchor (identifier characters only) keeps that safe.
 //
-// `printf %s "$HOME"` and not `test`/`echo -n`: Exec reports a non-zero exit with no output on
+// `printf %s "..."` and not `test`/`echo -n`: Exec reports a non-zero exit with no output on
 // either stream as ErrMsbFailed rather than as an exit code, so a probe must always emit
 // something. printf also avoids echo's trailing newline without relying on `echo -n`, which is not
 // portable across the shells these images ship.
-func guestHome(ctx context.Context, sb *sandbox.Client, name string) string {
+func guestBaseDir(ctx context.Context, sb *sandbox.Client, name, dirEnv string) string {
+	expr := `"$HOME"`
+	if dirEnv != "" {
+		expr = fmt.Sprintf(`"${%s:-$HOME}"`, dirEnv)
+	}
 	var out bytes.Buffer
 	res, err := sb.Exec(ctx, sandbox.ExecSpec{
 		Name: name, User: sandboxAgentUser,
-		Command: []string{"sh", "-c", `printf %s "$HOME"`},
+		Command: []string{"sh", "-c", "printf %s " + expr},
 		Stdout:  &out,
 	})
 	if err != nil || res.ExitCode != 0 {
 		return ""
 	}
-	home := strings.TrimSpace(out.String())
-	if !path.IsAbs(home) {
-		return "" // a relative or empty HOME would make path.Join produce a nonsense guest path
+	dir := strings.TrimSpace(out.String())
+	if !path.IsAbs(dir) {
+		return "" // a relative or empty result would make path.Join produce a nonsense guest path
 	}
-	return home
+	return dir
 }
 
 // writeTranscript moves the staged copy into runDir/logs/transcript, redacting and size-capping

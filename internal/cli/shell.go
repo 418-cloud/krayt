@@ -27,10 +27,13 @@ type shellFlags struct {
 // for a session a human is sitting in), --detach, --on-question*, --agent, --transcript
 // (decision 2 — krayt shell attaches a bare login shell, never an agent; it never auto-launches
 // one, wires krayt-ask, or captures a transcript). What decision 2 does NOT cover: msb requires
-// every secrets-file key to carry a network.inject scope, so when agent.adapter names one in
-// krayt.yaml, shell still resolves that adapter's secret scope (applyAdapterSecrets) the same way
-// `krayt run` does — otherwise a human starting that same agent by hand inside the shell would
-// have to hand-write the scope the adapter already knows (2026-09-16 amendment, KRAYT_SPEC.md §13).
+// every secrets-file key to carry a network.inject scope, and an agent started by hand needs the
+// same first-run config seeding an automatic one gets, so when agent.adapter names one in
+// krayt.yaml, shell still resolves that adapter's env/secrets/config-seed contribution
+// (applyAdapterForShell) the same way `krayt run` does — otherwise a human starting that same
+// agent by hand inside the shell would have to hand-write the scope the adapter already knows, or
+// hit the same onboarding/auth-dialog gap this whole feature exists to close (2026-09-16
+// amendment, extended by seed-agent-first-run-config.md decision 7, KRAYT_SPEC.md §13).
 func newShellCmd() *cobra.Command {
 	var f runFlags
 	var sf shellFlags
@@ -137,7 +140,8 @@ func runShellAttach(cmd *cobra.Command, stateDirPath, runID, secretsFile, execFl
 	}
 	// No LogOut: unlike Run, Shell/AttachShell never write to a log sink — the tty attach goes
 	// straight to the inherited terminal (sandbox.ExecTTY), not through this package at all.
-	deps := orchestrator.Deps{Sandbox: sb}
+	// AttachShell never seeds (decision 5), so Warn is unused here, but set for consistency.
+	deps := orchestrator.Deps{Sandbox: sb, Warn: cmd.ErrOrStderr()}
 	runDir := orchestrator.RunDir(stateDirPath, runID)
 	res, err := orchestrator.AttachShell(cmd.Context(), deps, runDir, secretsPath, execCommand(execFlag))
 	if err != nil {
@@ -165,58 +169,9 @@ func runShellFresh(cmd *cobra.Command, f *runFlags, sf *shellFlags, repoAbs, sta
 	if err != nil {
 		return err
 	}
-	secretsPath := f.secretsFile
-	if secretsPath != "" {
-		if secretsPath, err = filepath.Abs(secretsPath); err != nil {
-			return err
-		}
-	}
-	netMode, err := task.ParseNetworkMode(f.netMode)
-	if err != nil {
-		return fmt.Errorf("--net: %w", err)
-	}
-	if netMode != task.NetworkAllowlist && len(f.allow) > 0 {
-		return fmt.Errorf("--allow can only be used with --net allowlist")
-	}
 
-	spec := task.RunSpec{
-		ID:           id,
-		ImageRef:     f.image,
-		RepoPath:     repoAbs,
-		SecretsPath:  secretsPath,
-		IncludeDirty: f.includeDirty,
-		Network: task.NetworkPolicy{
-			Mode: netMode, Allow: f.allow,
-			MITM: f.mitm, Passthrough: f.passthrough, Secrets: f.secrets,
-		},
-		Env:         f.env,
-		BundleDepth: f.bundleDepth,
-		TaskPrompt:  prompt,
-		// Resources.Timeout is deliberately left zero — decision 5, no wall-clock budget at all
-		// in shell mode, regardless of what a krayt.yaml's resources.timeout says. Shell() never
-		// reads it, but leaving it unset here too means a `krayt shell` invocation never even
-		// LOOKS like it inherited a timeout from the file.
-		Resources: task.Resources{CPUs: f.cpus, MemoryMiB: f.memory, DiskGiB: f.disk},
-		Container: f.container,
-		ExtraConf: f.extraConf,
-	}
-
-	secretKeys, err := loadSecretKeySet(spec.SecretsPath)
+	spec, err := resolveShellSpec(cmd, f, repoAbs, id, prompt)
 	if err != nil {
-		return err
-	}
-	// Secret scope only (2026-09-16 amendment, KRAYT_SPEC.md §13): agent.adapter still resolves
-	// which secrets-file key is the agent's model credential and which hosts msb may substitute it
-	// into — msb requires that scope regardless of whether the agent is launched automatically or
-	// by hand — but shell never runs the rest of applyAdapter (no launcher, no krayt-ask wiring, no
-	// transcript capture; decision 2 in internal/orchestrator/shell.go still holds for those).
-	if err := applyAdapterSecrets(cmd.OutOrStdout(), &spec, f.agent, secretKeys); err != nil {
-		return err
-	}
-	if err := task.ValidateContainerPolicyForMsb(spec.Container); err != nil {
-		return err
-	}
-	if err := task.ValidateNetworkPolicyForMsb(spec.Network, secretKeys, secretsToInjectRules(spec.Network.Secrets)); err != nil {
 		return err
 	}
 
@@ -269,13 +224,83 @@ func runShellFresh(cmd *cobra.Command, f *runFlags, sf *shellFlags, repoAbs, sta
 	defer release()
 
 	// No LogOut: unlike Run, Shell/AttachShell never write to a log sink — the tty attach goes
-	// straight to the inherited terminal (sandbox.ExecTTY), not through this package at all.
-	deps := orchestrator.Deps{Sandbox: sb}
+	// straight to the inherited terminal (sandbox.ExecTTY), not through this package at all. Warn
+	// is set, though (unlike LogOut): it's where applyConfigSeeds' best-effort warnings land, and
+	// this is the same writer krayt shell already uses for its own pre-boot messages just above.
+	deps := orchestrator.Deps{Sandbox: sb, Warn: cmd.ErrOrStderr()}
 	res, err := orchestrator.Shell(cmd.Context(), deps, spec, orchestrator.RunDir(stateDirPath, id), sf.keep, execCommand(sf.exec))
 	if err != nil {
 		return err
 	}
 	return printShellResult(cmd, id, res)
+}
+
+// resolveShellSpec builds and validates a fresh krayt shell session's RunSpec: secrets path
+// resolution, network mode parsing, the adapter's env/secrets/config-seed contribution
+// (applyAdapterForShell, decision 7), and both msb pre-flight validations — everything
+// runShellFresh needs before it prints the policy summary and touches a sandbox. Factored out of
+// runShellFresh so a test can inspect the resolved spec (e.g. ConfigSeeds, adapter env) without
+// booting anything.
+func resolveShellSpec(cmd *cobra.Command, f *runFlags, repoAbs, id string, prompt []byte) (task.RunSpec, error) {
+	secretsPath := f.secretsFile
+	if secretsPath != "" {
+		var err error
+		if secretsPath, err = filepath.Abs(secretsPath); err != nil {
+			return task.RunSpec{}, err
+		}
+	}
+	netMode, err := task.ParseNetworkMode(f.netMode)
+	if err != nil {
+		return task.RunSpec{}, fmt.Errorf("--net: %w", err)
+	}
+	if netMode != task.NetworkAllowlist && len(f.allow) > 0 {
+		return task.RunSpec{}, fmt.Errorf("--allow can only be used with --net allowlist")
+	}
+
+	spec := task.RunSpec{
+		ID:           id,
+		ImageRef:     f.image,
+		RepoPath:     repoAbs,
+		SecretsPath:  secretsPath,
+		IncludeDirty: f.includeDirty,
+		Network: task.NetworkPolicy{
+			Mode: netMode, Allow: f.allow,
+			MITM: f.mitm, Passthrough: f.passthrough, Secrets: f.secrets,
+		},
+		Env:         f.env,
+		BundleDepth: f.bundleDepth,
+		TaskPrompt:  prompt,
+		// Resources.Timeout is deliberately left zero — decision 5, no wall-clock budget at all
+		// in shell mode, regardless of what a krayt.yaml's resources.timeout says. Shell() never
+		// reads it, but leaving it unset here too means a `krayt shell` invocation never even
+		// LOOKS like it inherited a timeout from the file.
+		Resources: task.Resources{CPUs: f.cpus, MemoryMiB: f.memory, DiskGiB: f.disk},
+		Container: f.container,
+		ExtraConf: f.extraConf,
+	}
+
+	secretKeys, err := loadSecretKeySet(spec.SecretsPath)
+	if err != nil {
+		return task.RunSpec{}, err
+	}
+	// Env/secret scope/config seeds (2026-09-16 amendment, extended by
+	// seed-agent-first-run-config.md decision 7): agent.adapter still resolves which secrets-file
+	// key is the agent's model credential, which hosts msb may substitute it into, and what
+	// first-run config that agent needs seeded — msb requires the former regardless of whether
+	// the agent is launched automatically or by hand, and a hand-started agent needs the latter
+	// just as much as an automatic one does. Shell still never runs the rest of applyAdapter (no
+	// launcher, no krayt-ask wiring, no transcript capture; decision 2 in
+	// internal/orchestrator/shell.go still holds for those).
+	if err := applyAdapterForShell(cmd.OutOrStdout(), &spec, f.agent, secretKeys); err != nil {
+		return task.RunSpec{}, err
+	}
+	if err := task.ValidateContainerPolicyForMsb(spec.Container); err != nil {
+		return task.RunSpec{}, err
+	}
+	if err := task.ValidateNetworkPolicyForMsb(spec.Network, secretKeys, secretsToInjectRules(spec.Network.Secrets)); err != nil {
+		return task.RunSpec{}, err
+	}
+	return spec, nil
 }
 
 func printShellResult(cmd *cobra.Command, id string, res *orchestrator.ShellResult) error {

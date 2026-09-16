@@ -31,10 +31,26 @@ type RunSpec struct {
 	Container     ContainerPolicy   // least-privilege OCI overrides applied by the guest runner (§6.10, §10)
 	Detach        bool              // headless vs stream-to-terminal
 
+	// ConfigSeeds is the selected adapter's first-run guest config state (adapter.Plan.ConfigSeeds,
+	// §6.14 "First-run state", seed-agent-first-run-config.md) — applied by the orchestrator's
+	// shared prologue, host-side, as the sandbox's agent user, before the agent/tty exec. A
+	// task-local mirror of adapter.ConfigSeed rather than that type directly: internal/adapter
+	// already imports internal/task, so the reverse would cycle.
+	ConfigSeeds []ConfigSeed
+
 	// ExtraConf is the resolved, absolute path to an msb configuration file supplied via
 	// sandbox.extra_conf (§8.1); empty means none. Passed to `msb create` as a root --conf, before
 	// every krayt-owned flag (add-msb-extra-conf-escape-hatch.md decision 1). krayt never parses it.
 	ExtraConf string
+}
+
+// ConfigSeed mirrors adapter.ConfigSeed (see RunSpec.ConfigSeeds' doc comment for why this is a
+// separate type rather than an import): one first-run guest config file to fill in, never
+// overwrite (seed-agent-first-run-config.md decision 3).
+type ConfigSeed struct {
+	DirEnv   string
+	Path     string
+	Defaults map[string]any
 }
 
 // ContainerPolicy is the resolved per-task container hardening policy the guest runner turns

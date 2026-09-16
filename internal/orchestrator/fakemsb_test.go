@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,6 +49,9 @@ var fakeMsbVerbs = map[string]bool{
 const (
 	fakeMsbScriptFile = "fake-msb-script.json"
 	fakeMsbCallsFile  = "fake-msb-calls.jsonl"
+	// fakeEnvFile records create-time --env pairs inside the fake sandbox root, so a later exec's
+	// DirEnv probe (guestBaseDir) can resolve one — see fakeMsbCreate's doc comment.
+	fakeEnvFile = ".fake-env.json"
 )
 
 // fakeAskScript describes one ask_human exchange the fake agent performs.
@@ -96,6 +100,11 @@ type fakeMsbScript struct {
 	// Shell describes the fake `msb exec --tty` attach (orchestrator.Shell/AttachShell) — the
 	// interactive counterpart to Agent, for add-interactive-shell-session.md's tests.
 	Shell fakeShellScript `json:"shell,omitempty"`
+
+	// FailConfigSeedWrite makes the fake config-seed write script (writeSeedFile's `mkdir/cat/mv`
+	// exec) always fail — seed-agent-first-run-config.md's "a failing seed exec does not fail the
+	// run or session" test, distinct from an invalid DirEnv (rejected before any exec at all).
+	FailConfigSeedWrite bool `json:"fail_config_seed_write,omitempty"`
 }
 
 // fakeShellScript describes what the fake tty exec does: optionally write files into /workspace
@@ -174,6 +183,17 @@ func readFakeMsbCalls(t *testing.T, home string) []fakeCall {
 
 func sandboxRoot(home, name string) string { return filepath.Join(home, "state", name) }
 
+// readFakeEnv reads the create-time --env pairs fakeMsbCreate recorded for this sandbox root.
+func readFakeEnv(root string) map[string]string {
+	b, err := os.ReadFile(filepath.Join(root, fakeEnvFile))
+	if err != nil {
+		return nil
+	}
+	var env map[string]string
+	_ = json.Unmarshal(b, &env)
+	return env
+}
+
 // runFakeMsb is this test binary re-exec'd as `msb`.
 func runFakeMsb() int {
 	home := os.Getenv("HOME")
@@ -243,14 +263,18 @@ func envMap(environ []string) map[string]string {
 	return m
 }
 
-// fakeMsbCreate makes the sandbox root directory and records the --vsock host path (if any) so a
-// later exec can dial it for real.
+// fakeMsbCreate makes the sandbox root directory, records the --vsock host path (if any) so a
+// later exec can dial it for real, and records every --env pair (fakeEnvFile) so a later exec's
+// DirEnv probe (guestBaseDir's `${NAME:-$HOME}` shell expansion) can resolve it — simulating
+// "Verify first" #2's create-time-env-inheritance premise, which this fake takes as given so
+// applyConfigSeed's own logic (not msb's real inheritance behavior) is what these tests exercise.
 func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 	if script.CreateExitCode != 0 {
 		fmt.Fprintln(os.Stderr, "fake-msb: create scripted to fail")
 		return script.CreateExitCode
 	}
 	var name, vsock string
+	env := map[string]string{}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--name":
@@ -262,6 +286,13 @@ func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 			i++
 			if i < len(args) {
 				vsock = args[i]
+			}
+		case "--env":
+			i++
+			if i < len(args) {
+				if k, v, ok := strings.Cut(args[i], "="); ok {
+					env[k] = v
+				}
 			}
 		}
 	}
@@ -279,6 +310,13 @@ func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 	if vsock != "" {
 		hostPath, _, _ := strings.Cut(vsock, ":")
 		if err := os.WriteFile(filepath.Join(root, ".vsock-host-path"), []byte(hostPath), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-msb create:", err)
+			return 1
+		}
+	}
+	if len(env) > 0 {
+		b, _ := json.Marshal(env)
+		if err := os.WriteFile(filepath.Join(root, fakeEnvFile), b, 0o600); err != nil {
 			fmt.Fprintln(os.Stderr, "fake-msb create:", err)
 			return 1
 		}
@@ -438,12 +476,25 @@ afterFlags:
 		return fakeHelperSetup(root, cmd[2:])
 	case len(cmd) >= 2 && strings.HasSuffix(cmd[0], "/krayt-helper") && cmd[1] == "finish":
 		return fakeHelperFinish(root, cmd[2:])
-	// The $HOME probe captureTranscript issues before copying a transcript out. Emits on stdout
-	// and exits 0 — Exec treats a non-zero exit with no output as a driver failure, so a probe
-	// that stays silent would be misreported.
+	// guestBaseDir's probe (captureTranscript's plain $HOME, and applyConfigSeed's
+	// `${DirEnv:-$HOME}` form) — both always emit something on stdout and exit 0, since Exec
+	// treats a non-zero exit with no output as a driver failure.
 	case len(cmd) == 3 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "$HOME"):
-		fmt.Print(fakeGuestHome)
+		fmt.Print(fakeBaseDir(root, cmd[2]))
 		return 0
+	// applyConfigSeed's read step (readSeedFile): `cat <path>`. A missing/unreadable file prints
+	// to stderr and exits 1, exactly like the real coreutils cat — Exec sees that as evidence the
+	// command ran (output was observed), not a driver failure, matching readSeedFile's own
+	// "missing means {}" contract.
+	case len(cmd) == 2 && cmd[0] == "cat":
+		return fakeCat(root, cmd[1])
+	// applyConfigSeed's write step (writeSeedFile): `sh -c '<mkdir/cat/mv script>' sh dir tmp dst`.
+	case len(cmd) == 7 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "krayt-config-seed") && cmd[3] == "sh":
+		if script.FailConfigSeedWrite {
+			fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed (scripted failure)")
+			return 1
+		}
+		return fakeSeedWrite(root, cmd[4], cmd[5], cmd[6])
 	case len(cmd) >= 1 && cmd[0] == "mkdir":
 		return fakeMkdir(root, cmd[1:])
 	case len(cmd) >= 1 && cmd[0] == "chmod":
@@ -454,6 +505,58 @@ afterFlags:
 		fmt.Fprintf(os.Stderr, "fake-msb: exec unrecognized command %v\n", cmd)
 		return 1
 	}
+}
+
+// dirEnvProbeRE extracts the guest env var name out of guestBaseDir's `${NAME:-$HOME}` shell
+// expansion, when the probe is asking for a DirEnv rather than plain $HOME.
+var dirEnvProbeRE = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*):-\$HOME\}`)
+
+// fakeBaseDir answers guestBaseDir's probe: the recorded --env value for the named var if the
+// script asks for one and it's set and non-empty, else fakeGuestHome — mirroring the real shell
+// expansion `${NAME:-$HOME}`.
+func fakeBaseDir(root, script string) string {
+	if m := dirEnvProbeRE.FindStringSubmatch(script); m != nil {
+		if v := readFakeEnv(root)[m[1]]; v != "" {
+			return v
+		}
+	}
+	return fakeGuestHome
+}
+
+// fakeCat mimics `cat <path>`: prints the file's content and exits 0, or an error to stderr and
+// exits 1 if it's missing — real cat's own behavior, and what readSeedFile's "missing means {}"
+// contract relies on Exec's ErrMsbFailed heuristic seeing SOME output either way.
+func fakeCat(root, guestPath string) int {
+	b, err := os.ReadFile(inSandbox(root, guestPath))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cat: %s: No such file or directory\n", guestPath)
+		return 1
+	}
+	_, _ = os.Stdout.Write(b)
+	return 0
+}
+
+// fakeSeedWrite mimics writeSeedFile's script: mkdir -p dir, write stdin to tmp, mv -f tmp to
+// dst — all inside the fake sandbox root.
+func fakeSeedWrite(root, dir, tmp, dst string) int {
+	b, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed:", err)
+		return 1
+	}
+	if err := os.MkdirAll(inSandbox(root, dir), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed:", err)
+		return 1
+	}
+	if err := os.WriteFile(inSandbox(root, tmp), b, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed:", err)
+		return 1
+	}
+	if err := os.Rename(inSandbox(root, tmp), inSandbox(root, dst)); err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed:", err)
+		return 1
+	}
+	return 0
 }
 
 func inSandbox(root, p string) string { return filepath.Join(root, p) }

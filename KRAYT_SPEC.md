@@ -1028,7 +1028,34 @@ access to every allowlisted host, and can spend the credential's quota/rate budg
 duration regardless of delivery mechanism. Prefer a scoped, independently-revocable API key over a
 subscription token for untrusted code either way (§10).
 
-### 6.15 microsandbox driver (`internal/sandbox`)
+**First-run state (`seed-agent-first-run-config.md`).** A credential landing on its env var is not
+always enough: Claude Code shows first-run onboarding (theme picker, login flow, a connectivity
+preflight that fails against an unallowlisted host) unless its global config already has
+`hasCompletedOnboarding: true`, and — for `ANTHROPIC_API_KEY` specifically — even a completed
+onboarding still rejects the key interactively unless `customApiKeyResponses.approved` contains its
+own last 20 characters (`key.trim().slice(-20)`; since the value the guest sees is msb's own
+placeholder, never the real secret, this is `sandbox.SecretPlaceholder`'s last 20 characters, not
+anything secret). Gemini CLI shows its auth dialog even with `GEMINI_API_KEY`/`GOOGLE_API_KEY` set,
+unless `security.auth.selectedType` is already in its settings. `krayt run`'s `claude -p`/`gemini
+-p` never hit this — print mode skips onboarding and chooses auth from the environment
+unconditionally — but `krayt shell` hands a human a bare terminal in **any image with the CLI
+installed**, not just the published ones, so an image-side fix can't reach every case and the user
+should not need to know any of this either way.
+
+Each adapter therefore declares the first-run guest config it needs as data —
+`Plan.ConfigSeeds []ConfigSeed`, one `{DirEnv, Path, Defaults}` per file, `Defaults` a JSON object —
+rather than doing any I/O itself (adapters stay msb-agnostic). `internal/orchestrator` applies every
+declared seed once per sandbox, as the sandbox's own agent user, by merging `Defaults` into
+whatever's already at that guest path with **fill-in-never-override** semantics: a key the file (or
+the image, or a prior run) already set — of any type, including an explicit `false` or `null` —
+always wins; arrays take the union; a type conflict skips that branch; nothing overwrites a file
+krayt could not parse. This is exactly the merge policy the gemini-cli entrypoint's own
+`settings.json` rewrite already used, generalized and made adapter-declared instead of
+hand-written per image. The whole mechanism is image-agnostic by construction: it reads and writes
+a path relative to the guest's own `$HOME` (or a `DirEnv` override, e.g. `CLAUDE_CONFIG_DIR`), the
+same way transcript capture already does, so it works whether the image is a published krayt one or
+a bare `debian:trixie-slim` with the CLI installed by hand. See §7 for when it runs and §8.2 for
+what this means for image authors.
 
 Under ADR option B1 (`docs/adr-microsandbox-sandbox-layer.md`), krayt drives its sandbox layer
 through [microsandbox](https://github.com/superradcompany/microsandbox) (`msb`), a libkrun-based
@@ -1218,6 +1245,15 @@ check that needs any repo state at all.
    `baseline`. Only now — once the code snapshot is durably cloned into the sandbox — does
    `rec.State` flip to `running`, preserving the pre-msb invariant that `running` means "safe to
    mutate the host repo now" (§6.2).
+6b. **Seed first-run config** (`seed-agent-first-run-config.md`, §6.14 "First-run state") — apply
+   every `spec.ConfigSeeds` entry, entirely as `msb exec --user agent` (never root): resolve the
+   entry's base directory (`$DirEnv` if set in the guest env, else `$HOME`), `cat` the existing
+   file (missing means `{}`), merge `Defaults` in host-side (fill-in-never-override), and, only if
+   that changed anything, write the merged bytes back via a `mkdir -p` + temp-file + `mv -f`
+   script fed on stdin. Best-effort: a failure here prints one warning and moves on to the next
+   seed, never fails the run. Shared by `Run` and `Shell` (below) through one function; `AttachShell`
+   and `PatchLiveShell` never run it — the sandbox already exists and a human may have changed
+   these files since.
 7. **`msb exec --user agent --stream`** — runs the one fixed command every agent image exposes,
    `/usr/local/bin/krayt-agent-entrypoint` (uniform across every published agent image; no
    per-adapter command table needed), stdout+stderr both wired to `io.MultiWriter(logFile,
@@ -1249,12 +1285,14 @@ check that needs any repo state at all.
 
 ### Shell lifecycle — departures from the run lifecycle (`add-interactive-shell-session.md`)
 
-`orchestrator.Shell` reuses steps 1, 2, 4, 5, and 6 above *verbatim* — resolve spec, name the
+`orchestrator.Shell` reuses steps 1, 2, 4, 5, 6, and 6b above *verbatim* — resolve spec, name the
 sandbox and register teardown immediately, `msb create`, copy in (git bundle, `krayt-helper`, and
 the task prompt only if one was given — decision 13; never `krayt-ask`, decision 12), `msb exec
---user root` for `krayt-helper setup` — via the same shared helper functions
-(`copyInputs`/`helperSetup`/`finishAndCollect`) `Run` itself now calls, factored out rather than
-copied. Three points depart, each one of the task's decisions:
+--user root` for `krayt-helper setup`, then seed first-run config the same way `Run` does (a human
+starting an agent by hand inside the shell needs the same onboarding/auth-dialog fix an automatic
+run gets, `seed-agent-first-run-config.md`) — via the same shared helper functions
+(`copyInputs`/`helperSetup`/`applyConfigSeeds`/`finishAndCollect`) `Run` itself now calls, factored
+out rather than copied. Three points depart, each one of the task's decisions:
 
 - **No wall-clock timeout at all** (decision 5): no `context.WithTimeout` wrapping the call, and
   `CreateSpec.MaxDuration` is left zero, so no `--max-duration` reaches `msb create` either. A
@@ -1275,8 +1313,10 @@ copied. Three points depart, each one of the task's decisions:
   a run."*
 
 `orchestrator.AttachShell` re-enters a `kept` session by run id (decision 4): no `Create`, no
-copy-in, no helper setup — the sandbox and its `/workspace` already exist exactly as the human
-left them, addressed by the record's persisted `sandbox_name`. It runs the same tty-attach +
+copy-in, no helper setup, and no first-run config seeding either
+(`seed-agent-first-run-config.md` decision 5) — the sandbox and its `/workspace` already exist
+exactly as the human left them, addressed by the record's persisted `sandbox_name`, and the human
+may have changed the very files a seed would touch since. It runs the same tty-attach +
 steps-8-10 tail as `Shell`, using `patch.BaselineTag` (the tag name, not a remembered SHA — it
 already resolves inside the root-only patch-git snapshotted at the *original* setup) as the
 `--baseline` `krayt-helper finish` diffs against. It never calls `Stop`/`Remove` on any path,
@@ -1583,6 +1623,12 @@ treat **an already-set, recognized credential env var** as sufficient — it mus
 set. `hack/test-entrypoint-credentials.sh` guards this contract; every reference image satisfies
 it already, since none needed rebuilding for the msb cutover (msb sets the guest environment
 itself, and `krayt-ask` was already copied in rather than baked in).
+
+**An image need not pre-seed its agent CLI's first-run config either**, when `agent.adapter`
+names one that has some (§6.14 "First-run state", `seed-agent-first-run-config.md`): krayt fills
+it in from the host, in the guest, before the agent (or a human inside `krayt shell`) ever runs —
+so the published entrypoints' own `GEMINI_CLI_TRUST_WORKSPACE`/`GOOGLE_GENAI_USE_VERTEXAI` exports
+are harmless duplicates now, kept only because they still serve `agent.adapter: none`.
 
 The container **must** run as a **non-root** uid — this is **enforced, not just a convention**
 (§10): an image whose `USER` is root (uid 0) or unset **fails the run** with a clear error and
@@ -2246,6 +2292,18 @@ a transcript; there is still no `--agent` flag (§3 principle 2). What changed: 
 `network.Secrets` before `ValidateNetworkPolicyForMsb` runs — the same merge `run` performs, minus
 everything else the adapter would otherwise do. An unset `agent.adapter` remains a complete no-op.
 
+**Extended 2026-09-16 (`seed-agent-first-run-config.md` decision 7) — not a reversal.** `shell` now
+also applies the adapter's `Plan.Env` (e.g. gemini-cli's `GEMINI_CLI_TRUST_WORKSPACE`) and
+`Plan.ConfigSeeds` (§6.14 "First-run state"), in addition to `Plan.Secrets` — a human starting an
+agent by hand inside the shell needs the same env/first-run-config fix an automatic `krayt run`
+gets, or the whole feature (an interactive agent authenticating in any image) doesn't hold. These
+three are exactly what `internal/cli`'s `applyAdapterForShell` applies (replacing the narrower
+`applyAdapterSecrets` this amendment originally introduced); `shell` still passes a zero
+`QuestionsWait`/`AskSocket` so `askEnv` contributes nothing, and still never touches
+`Plan.TranscriptDir` or launches anything — decision 2 holds for those exactly as before.
+`Plan.Env` goes through the same `mergeEnv` `run` uses, so a user's own `krayt.yaml` `env:` still
+wins any conflict.
+
 `upgrade` re-verifies the downloaded binary against the target release's published
 `checksums.txt` before installing it — the same check as the manual install path (README's
 "Prebuilt binaries"), automated — and never touches any other command's behavior: it is the only
@@ -2884,6 +2942,39 @@ the same gate. Windows is explicitly **not claimed to work** (§14's standing ru
 phase): inherited stdio is the same code path, but nobody in this environment can confirm ConPTY
 through msb without a Windows box, and that residual is logged separately in `HUMAN_TODO.md`
 rather than folded into the macOS entry.
+
+**Follow-up — seed each agent's first-run config from its adapter
+(`seed-agent-first-run-config.md`).** A hand-started `claude`/`gemini` inside `krayt shell` hits
+first-run onboarding / an auth dialog even with a valid credential env var — neither CLI's own
+headless-vs-interactive split is enough, and `krayt shell` needs no
+`krayt-agent-entrypoint`/`krayt-agent-shellenv`, so an image-side fix cannot reach a user-supplied
+image the way it reaches the published ones. Fixed host-side and adapter-declared, image-agnostic
+(§6.14 "First-run state", §7 step 6b): `adapter.Plan.ConfigSeeds`, applied by the orchestrator as
+the sandbox's agent user with fill-in-never-override merge semantics (`internal/configseed`),
+wired into both `Run` and `Shell`, never `AttachShell`/`PatchLiveShell`.
+- [x] `internal/configseed` — the pure `Merge`/`Apply` functions, table-tested against every case
+  the task's decisions enumerate (missing file, every JSON type not overwritten including `false`
+  and `null`, nested object merge, array union, a type conflict, the unchanged signal, non-object
+  and invalid JSON refused).
+- [x] `internal/adapter` — `ConfigSeed`, `Plan.ConfigSeeds`, `Input.Placeholder`; claude-code seeds
+  `hasCompletedOnboarding` always and `customApiKeyResponses.approved` for `ANTHROPIC_API_KEY`;
+  gemini-cli seeds `security.auth.selectedType` and gains `GEMINI_CLI_TRUST_WORKSPACE`/
+  `GOOGLE_GENAI_USE_VERTEXAI` in `Plan.Env`; opencode/`none` seed nothing.
+- [x] `internal/sandbox.SecretPlaceholder` — msb's default `"$MSB_" + key`, unit-pinned.
+- [x] `internal/task.RunSpec.ConfigSeeds` (a mirror type — `adapter` already imports `task`, so the
+  reverse would cycle) and `internal/orchestrator`'s shared `applyConfigSeeds` step (§7 step 6b),
+  best-effort per decision 6, tested against the fake `msb` extended to actually read/write files
+  inside the fake sandbox root, honor a create-time `--env` value for the `DirEnv` probe, and
+  accept piped stdin.
+- [x] `internal/cli` — `applyAdapter` now sets `spec.ConfigSeeds`/`Input.Placeholder`;
+  `applyAdapterForShell` replaces `applyAdapterSecrets` (§13's 2026-09-16 amendment, extended).
+- [x] Spec amendments (this change): §6.14, §7, §8.2, §13, this phase, `docs/ai-tasks/README.md`.
+- [ ] **Hardware, `[HUMAN]`** — five checks needing a real Mac, msb 0.6.16, and a live credential
+  each: `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` both authenticate with no onboarding/
+  approval dialog inside `krayt shell`; whether `platform.claude.com` is still needed once
+  onboarding is seeded; `gemini-cli` with `GEMINI_API_KEY` shows neither the auth nor the
+  folder-trust dialog; the same `CLAUDE_CODE_OAUTH_TOKEN` check against a minimal image with no
+  krayt entrypoint at all. Handed off in full via `HUMAN_TODO.md`.
 
 ---
 
