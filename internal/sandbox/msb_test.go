@@ -623,6 +623,11 @@ func TestTTYExecSpecArgs(t *testing.T) {
 			spec: TTYExecSpec{Name: "sbx", User: "agent", Command: []string{"bash", "-lc", "vim"}},
 			want: []string{"exec", "--tty", "--user", "agent", "sbx", "--", "bash", "-lc", "vim"},
 		},
+		{
+			name: "workdir set — a flag, so it precedes the sandbox name",
+			spec: TTYExecSpec{Name: "sbx", User: "agent", Workdir: "/workspace", Command: []string{"bash", "-l"}},
+			want: []string{"exec", "--tty", "--user", "agent", "--workdir", "/workspace", "sbx", "--", "bash", "-l"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

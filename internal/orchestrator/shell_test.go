@@ -125,6 +125,9 @@ func TestShellExecTTYCommand(t *testing.T) {
 			for _, c := range readFakeMsbCalls(t, home) {
 				if len(c.Args) >= 2 && c.Args[0] == "exec" && c.Args[1] == "--tty" {
 					gotTTYExec = true
+					if got := ttyWorkdir(c.Args); got != "/workspace" {
+						t.Errorf("exec --tty --workdir = %q, want /workspace (args %v)", got, c.Args)
+					}
 					i := len(c.Args)
 					for j, a := range c.Args {
 						if a == "--" {
@@ -284,6 +287,7 @@ func TestAttachShellReEntersKeptSession(t *testing.T) {
 	}
 
 	var sawStop, sawRm bool
+	ttyCalls := 0
 	for _, c := range readFakeMsbCalls(t, home) {
 		if c.Args[0] == "stop" {
 			sawStop = true
@@ -291,8 +295,28 @@ func TestAttachShellReEntersKeptSession(t *testing.T) {
 		if c.Args[0] == "rm" {
 			sawRm = true
 		}
+		if isTTYCall(c) {
+			ttyCalls++
+			if got := ttyWorkdir(c.Args); got != "/workspace" {
+				t.Errorf("exec --tty --workdir = %q, want /workspace for the initial and re-attached session (args %v)", got, c.Args)
+			}
+		}
 	}
 	if sawStop || sawRm {
 		t.Error("AttachShell must never call stop/rm — only `krayt stop` destroys a kept sandbox")
 	}
+	if ttyCalls != 2 {
+		t.Errorf("saw %d `exec --tty` calls, want 2 (initial Shell + AttachShell)", ttyCalls)
+	}
+}
+
+// ttyWorkdir returns the --workdir value of one recorded `msb exec` argv, looking only at the
+// flags before the `--` that starts the guest command; "" when absent.
+func ttyWorkdir(args []string) string {
+	for i := 0; i+1 < len(args) && args[i] != "--"; i++ {
+		if args[i] == "--workdir" {
+			return args[i+1]
+		}
+	}
+	return ""
 }

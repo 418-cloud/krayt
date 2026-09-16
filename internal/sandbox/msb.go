@@ -581,6 +581,10 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 type TTYExecSpec struct {
 	Name string // sandbox name
 	User string // --user override; empty means msb's default
+	// Workdir is `--workdir`: the directory the command starts in. Empty means msb's default, the
+	// image's own WORKDIR. msb 0.6.16's agentd ignores a failed chdir in the pty child, so a
+	// directory that doesn't exist leaves the session in that default rather than erroring.
+	Workdir string
 	// Command is optional at this layer: empty omits the trailing `-- <argv>` and leaves what
 	// runs up to msb's own "attaches to the default shell" behavior (its own documented words).
 	// The orchestrator package no longer relies on that for `krayt shell`, though — hardware
@@ -597,6 +601,9 @@ func (s TTYExecSpec) Args() []string {
 	args := []string{"exec", "--tty"}
 	if s.User != "" {
 		args = append(args, "--user", s.User)
+	}
+	if s.Workdir != "" {
+		args = append(args, "--workdir", s.Workdir)
 	}
 	args = append(args, s.Name)
 	if len(s.Command) > 0 {

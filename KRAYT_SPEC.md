@@ -1132,8 +1132,15 @@ image-level `Shell` — every published krayt agent image does — an empty `Com
 `/task/prompt.md` not found" and exited 66 before a human ever saw a prompt. `orchestrator.Shell`/
 `AttachShell` now resolve the shell themselves (`ttyCommand`, falling back to `defaultShellCommand`
 when `--exec` wasn't given): `$SHELL` if set and executable, else `/bin/bash` (every published
-agent image ships it), else `/bin/sh`. Because stdout/stderr never pass through this package,
-`Exec`'s "no output observed" heuristic for `ErrMsbFailed` has no signal to work from here — a
+agent image ships it), else `/bin/sh`. `TTYExecSpec.Workdir` renders msb's `--workdir`, and
+`Shell`/`AttachShell` set it to `/workspace` for the default shell and `--exec` alike: without it
+msb starts the session in the image's own `WORKDIR` (`/home/agent` for the published images,
+observed 2026-09-16), not in the repo §13 promises the shell opens in. Verified on hardware the
+same day: a fresh session (`run_ed1e1654`) opened at `agent@…:/workspace$` and `pwd` printed
+`/workspace`, `krayt shell --exec pwd` printed `/workspace`, and so did `pwd` after `--keep`, exit,
+and `krayt shell --attach` (`run_f9ac185c`). Because stdout/stderr
+never pass through this package, `Exec`'s "no output observed" heuristic for `ErrMsbFailed` has
+no signal to work from here — a
 msb-level failure prints on the inherited terminal directly, in addition to surfacing as this
 call's own returned error.
 
@@ -2918,8 +2925,11 @@ full via `HUMAN_TODO.md`, including the four numbered "Verify first" checks the 
 here either:
 1. `msb exec -t` gives a usable terminal when krayt inherits stdio: window resize reflows, Ctrl-C
    interrupts the foreground command rather than the session, a full-screen TUI renders and exits
-   cleanly, 256-colour/mouse reporting survive. **Not yet reachable** — see #4 below; the first
-   real attempt never got past the first exec.
+   cleanly, 256-colour/mouse reporting survive. **Partly verified on hardware 2026-09-16**:
+   resize reflows (`run_60606516`: `stty size` went `33 138` → `33 86` → `41 133` across terminal
+   resizes), and Ctrl-C at an idle prompt reaches the guest shell without ending the session
+   (`run_f9ac185c`, `run_34b64ca5`). Still unverified: Ctrl-C on a foreground command, a
+   full-screen TUI, 256-colour/mouse.
 2. Whether `msb exec` inherits the sandbox's create-time environment (`CreateSpec.Env`) — decides
    how much (if anything) `krayt-agent-shellenv` is still missing beyond `safe.directory`.
 3. What the `--secret` placeholder looks like inside an exec'd shell, and whether an interactively
@@ -2933,12 +2943,20 @@ here either:
    **Fixed**: `internal/orchestrator` no longer leaves `Command` empty — `ttyCommand`/
    `defaultShellCommand` (`internal/orchestrator/shell.go`) resolve `$SHELL`, else `/bin/bash`,
    else `/bin/sh` explicitly, so a real shell starts and #1's checks (and which profile hook
-   fires) become reachable. **Not yet re-verified on hardware** — the fix is offline-only so far.
+   fires) become reachable. **Fix verified on hardware 2026-09-16**: `run_ed1e1654`,
+   `run_f9ac185c` and `run_34b64ca5` each landed at a real `agent@krayt-…:/workspace$` bash
+   prompt. Which profile hook fired is still unchecked.
 
 Criteria 1–7 of the task's own numbered "Done when" (a `krayt shell` session producing a patch
 `krayt apply` accepts; `--keep`/`--attach`/`krayt stop` round-tripping; the error-path teardown
 matrix on real hardware, not just the fake; a hand-started `claude` authenticating) all sit behind
-the same gate. Windows is explicitly **not claimed to work** (§14's standing rule for every prior
+the same gate. **Partly verified on hardware 2026-09-16 (`run_34b64ca5`)**: after a `--keep`
+session exited, `msb list` still showed `krayt-run_34b64ca5` running; `krayt shell --attach`
+re-entered it; `krayt stop run_34b64ca5` printed `stopped kept shell session` and `msb list` then
+showed no sandboxes. The same run also showed Ctrl-C at an idle prompt reaching the guest shell
+without ending the session. Still unverified: edits surviving a re-attach and landing in
+`changes.patch`, `krayt ls` state after `stop`, `krayt apply`, and the error-path teardown
+matrix. Windows is explicitly **not claimed to work** (§14's standing rule for every prior
 phase): inherited stdio is the same code path, but nobody in this environment can confirm ConPTY
 through msb without a Windows box, and that residual is logged separately in `HUMAN_TODO.md`
 rather than folded into the macOS entry.

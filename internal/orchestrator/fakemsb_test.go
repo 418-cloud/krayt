@@ -429,7 +429,7 @@ func fakeMsbExec(home string, args []string, script fakeMsbScript) int {
 	tty := false
 	for i < len(args) {
 		switch args[i] {
-		case "--user":
+		case "--user", "--workdir":
 			i += 2
 		case "--stream":
 			i++

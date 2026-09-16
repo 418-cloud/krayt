@@ -406,7 +406,8 @@ own seven-point Done-when — none of which this environment can run.
      (`top`, `vim`) renders and exits cleanly, and 256-colour (`echo -e '\e[38;5;196mred\e[0m'`)
      survives. This is decision 10's whole premise — if it fails, the fallback is hand-rolled raw
      mode via `golang.org/x/sys` (already pinned) and needs a redesign of `sandbox.ExecTTY`, not
-     just a note.
+     just a note. Resize and Ctrl-C at an idle prompt are verified (`KRAYT_SPEC.md` Phase 12).
+     Still to check: Ctrl-C on a foreground `sleep 100`, a full-screen TUI, 256-colour.
   2. **"Verify first" #2 — does `msb exec` inherit the sandbox's create-time environment?**
      `CreateSpec.Env` sets it at `msb create`; `TTYExecSpec` (deliberately) carries no `Env` field
      at all. Inside the shell, `echo $SOME_TEST_VAR` after `krayt shell --image ... --repo ...`
@@ -439,20 +440,21 @@ own seven-point Done-when — none of which this environment can run.
      `/task/prompt.md`, not a shell prompt with `krayt-agent-shellenv` sourced. **Fixed**:
      `internal/orchestrator/shell.go` no longer leaves `TTYExecSpec.Command` empty —
      `ttyCommand`/`defaultShellCommand` resolve `$SHELL`, else `/bin/bash`, else `/bin/sh`
-     explicitly (`KRAYT_SPEC.md` §6.15 and Phase 12 updated with the finding and the fix). **Still
-     needs a hardware re-run** to confirm the fix actually lands at a shell prompt this time, and
-     then: `echo $0` and `git config --global --get-all safe.directory` (should show `/workspace`
+     explicitly — verified on hardware, it lands at a real bash prompt (`KRAYT_SPEC.md` Phase 12).
+     **Still to check** inside a session: `echo $0` and
+     `git config --global --get-all safe.directory` (should show `/workspace`
      and `*`, proving `krayt-agent-shellenv` ran) — if neither hook fires even now, that's a
      separate real bug in `images/agents/*/Dockerfile`'s two `RUN printf ... /etc/...` lines.
   5. **Done-when 1-2:** `krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code --repo .`
-     drops you at a shell with the repo present; edit a file, `exit`; confirm
+     drops you at a shell with the repo present (opening in `/workspace`, with and without
+     `--exec`, is verified — KRAYT_SPEC.md §6.15); edit a file, `exit`; confirm
      `.krayt/runs/<id>/changes.patch` (and `meta.json` with `"kind": "shell"`) contains the edit,
      and `krayt apply <run-id>` lands it on the host repo cleanly.
-  6. **Done-when 3-4:** `krayt shell --keep`, edit a file, `exit` — confirm the sandbox is still
-     listed by `msb ls`. `krayt shell --attach <run-id>` from a second terminal — confirm the edit
-     from step 5 is still there, make a second edit, exit again — confirm both edits are now in
-     `changes.patch`. `krayt stop <run-id>` — confirm `msb ls` no longer lists the sandbox and
-     `krayt ls` shows the record as `done`. Separately, repeat the ephemeral (no `--keep`) case and
+  6. **Done-when 3-4:** the bare `--keep` → `--attach` → `krayt stop` round trip is verified
+     (`run_34b64ca5`, `KRAYT_SPEC.md` Phase 12). Still to check: `krayt shell --keep`, edit a
+     file, `exit`; `krayt shell --attach <run-id>` — confirm the edit is still there, make a second
+     edit, exit again — confirm both edits are now in `changes.patch`; after `krayt stop
+     <run-id>`, confirm `krayt ls` shows the record as `done`. Separately, repeat the ephemeral (no `--keep`) case and
      kill the `krayt shell` process (`kill` its pid, or close the terminal) mid-session, plus once
      with a deliberately bad `--image` (to force a failed `krayt-helper setup`) — confirm `msb ls`
      shows no leaked sandbox in either case (this is the one part the fake-`msb` unit tests

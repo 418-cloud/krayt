@@ -69,6 +69,17 @@ func ttyCommand(execCmd []string) []string {
 	return execCmd
 }
 
+// shellTTYSpec is the one TTYExecSpec both Shell and AttachShell attach with: the agent user,
+// ttyCommand's command, and /workspace as the working directory. Without Workdir msb starts the
+// session in the image's own WORKDIR (/home/agent for the published images, observed 2026-09-16),
+// not in the repo the session exists to work on (KRAYT_SPEC.md §13: "a bare login shell in
+// /workspace"). It applies to --exec too, so `krayt shell --exec 'go test ./...'` runs in the repo.
+func shellTTYSpec(name string, execCmd []string) sandbox.TTYExecSpec {
+	return sandbox.TTYExecSpec{
+		Name: name, User: sandboxAgentUser, Workdir: containerWorkspace, Command: ttyCommand(execCmd),
+	}
+}
+
 // ShellResult summarizes one `krayt shell` (or `--attach`) session for the caller and `krayt`
 // output.
 type ShellResult struct {
@@ -238,9 +249,10 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 
 	// 4. Attach an interactive tty in place of Run's agent exec (decision 10) — msb owns the pty
 	// from here on; this call blocks until the human exits the shell (or, with --exec, until the
-	// given command finishes). ttyCommand supplies defaultShellCommand when execCmd is empty —
-	// see its doc comment for why krayt picks the shell explicitly rather than leaving this to msb.
-	execResult, execErr := deps.Sandbox.ExecTTY(ctx, sandbox.TTYExecSpec{Name: name, User: sandboxAgentUser, Command: ttyCommand(execCmd)})
+	// given command finishes), started in /workspace. ttyCommand supplies defaultShellCommand when
+	// execCmd is empty — see its doc comment for why krayt picks the shell explicitly rather than
+	// leaving this to msb.
+	execResult, execErr := deps.Sandbox.ExecTTY(ctx, shellTTYSpec(name, execCmd))
 	if execErr != nil {
 		return nil, fmt.Errorf("orchestrator: attach shell: %w", execErr)
 	}
@@ -327,7 +339,7 @@ func AttachShell(ctx context.Context, deps Deps, runDir, secretsPath string, exe
 		_ = writeReport(runDir, rec, notes, metaDigest)
 	}()
 
-	execResult, execErr := deps.Sandbox.ExecTTY(ctx, sandbox.TTYExecSpec{Name: name, User: sandboxAgentUser, Command: ttyCommand(execCmd)})
+	execResult, execErr := deps.Sandbox.ExecTTY(ctx, shellTTYSpec(name, execCmd))
 	if execErr != nil {
 		return nil, fmt.Errorf("orchestrator: attach shell: %w", execErr)
 	}
