@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/418-cloud/krayt/internal/orchestrator"
 	"github.com/418-cloud/krayt/internal/sandbox"
@@ -92,13 +95,104 @@ func TestStopKeptShellDestroysSandboxDirectly(t *testing.T) {
 
 // TestStopRunningRunStillSignalsSupervisor is the regression check: an ordinary live run (or a
 // shell session still mid-session, PID belonging to a real process) must keep using the existing
-// PID-signal path, not the new kept-shell branch.
+// PID-signal path, not the kept-shell or dead-run branches.
 func TestStopRunningRunStillSignalsSupervisor(t *testing.T) {
-	repo := t.TempDir()
-	seedRun(t, repo, "run_live", "running") // seedRun sets pid:0
+	if runtime.GOOS == "windows" {
+		t.Skip("killSupervisor hard-terminates on Windows; the signal path is unix-only")
+	}
+	child := exec.Command("sleep", "30")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	t.Cleanup(func() { _ = child.Process.Kill() })
 
-	err := execErr(newStopCmd(), "--repo", repo, "run_live")
-	if err == nil || !strings.Contains(err.Error(), "no recorded supervisor pid") {
-		t.Fatalf("err = %v, want the existing PID-signal path's error (pid 0 recorded)", err)
+	repo := t.TempDir()
+	runDir := seedShellRun(t, repo, "run_live", orchestrator.StateRunning)
+	rec, err := orchestrator.ReadRecord(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.PID = child.Process.Pid
+	if err := orchestrator.WriteRecord(runDir, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	out := run(t, newStopCmd(), "--repo", repo, "run_live")
+	if !strings.Contains(out, "stopping run_live") {
+		t.Errorf("stop output = %q, want the signal path's message", out)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the supervisor process was not signalled")
+	}
+}
+
+// TestStopDeadRunCleansUpSandbox covers a run whose krayt process died without tearing down:
+// `krayt stop` removes the sandbox by name (if msb still lists it) and marks the record failed,
+// instead of trying to signal a pid that no longer exists.
+func TestStopDeadRunCleansUpSandbox(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		listed      bool
+		wantOutput  string
+		wantRemoved bool
+	}{
+		{name: "sandbox still listed", listed: true, wantOutput: "removed sandbox krayt-run_dead", wantRemoved: true},
+		{name: "sandbox already gone", listed: false, wantOutput: "no sandbox was left to remove"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv(sandbox.BinEnv, testBinPath)
+			list := `[]`
+			if tc.listed {
+				list = `[{"name":"krayt-run_dead"}]`
+			}
+			writeFakeScript(t, home, fakeScript{
+				Responses: map[string]fakeResponse{"ls --format json": {Stdout: list}},
+				Default:   fakeResponse{ExitCode: 0},
+			})
+			stubProcessAlive(t, false)
+
+			repo := t.TempDir()
+			runDir := seedShellRun(t, repo, "run_dead", orchestrator.StateRunning)
+			rec, err := orchestrator.ReadRecord(runDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec.PID = 81003
+			if err := orchestrator.WriteRecord(runDir, rec); err != nil {
+				t.Fatal(err)
+			}
+
+			out := run(t, newStopCmd(), "--repo", repo, "run_dead")
+			if !strings.Contains(out, "pid 81003") || !strings.Contains(out, tc.wantOutput) {
+				t.Errorf("stop output = %q, want the pid and %q", out, tc.wantOutput)
+			}
+
+			var sawStop, sawRm bool
+			for _, c := range readFakeCalls(t, home) {
+				switch c.Args[0] {
+				case "stop":
+					sawStop = true
+				case "rm":
+					sawRm = true
+				}
+			}
+			if sawStop != tc.wantRemoved || sawRm != tc.wantRemoved {
+				t.Errorf("sawStop=%v sawRm=%v, want both %v", sawStop, sawRm, tc.wantRemoved)
+			}
+
+			got, err := orchestrator.ReadRecord(runDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != orchestrator.StateFailed || got.PID != 0 || !strings.Contains(got.Error, "pid 81003") {
+				t.Errorf("record state=%q pid=%d error=%q, want failed, pid 0, and an error naming the pid", got.State, got.PID, got.Error)
+			}
+		})
 	}
 }

@@ -17,9 +17,14 @@ const sandboxNamePrefix = "krayt-"
 
 // orphanSandboxCheck is `krayt doctor`'s fifth check (decision 6, add-interactive-shell-session.md):
 // cross-reference the live msb sandbox list against .krayt/runs/ under repo, and report any
-// "krayt-*" sandbox with no matching run record — naming it and the command to stop it. This can
+// "krayt-*" sandbox with no LIVE run record — naming it and the command to stop it. This can
 // happen because decision 5 gives a `krayt shell` session no wall-clock budget, so a crashed or
-// `kill -9`'d krayt can leave a sandbox running with nothing left to reap it.
+// `kill -9`'d krayt can leave a sandbox running with nothing left to reap it. A record only keeps
+// its sandbox legitimately while something owns it: a kept shell session (re-attachable by
+// design), or a run/session whose supervising krayt process is still alive. A finished record's
+// sandbox is already gone (teardown runs before the record is marked finished), and a dead
+// process's sandbox is exactly the crashed-krayt leak — so both still count as orphans even
+// though a record exists.
 //
 // It NEVER reaps. A krayt that kills a sandbox it does not fully understand — one deliberately
 // kept across a krayt upgrade, say, or created by a version of krayt that named sandboxes
@@ -42,10 +47,17 @@ func orphanSandboxCheck(ctx context.Context, repo string) checkResult {
 	if err != nil {
 		return checkResult{name: name, optional: true, detail: "skipped — " + err.Error()}
 	}
-	tracked := make(map[string]bool, len(recs))
+	owned := make(map[string]bool, len(recs))
+	deadRun := map[string]string{} // sandbox name -> id of a non-terminal run whose krayt process is gone
 	for _, r := range recs {
-		if r.SandboxName != "" {
-			tracked[r.SandboxName] = true
+		if r.SandboxName == "" {
+			continue
+		}
+		switch {
+		case r.State == orchestrator.StateKept, !r.Terminal() && processAlive(r.PID):
+			owned[r.SandboxName] = true
+		case !r.Terminal():
+			deadRun[r.SandboxName] = r.ID
 		}
 	}
 
@@ -60,7 +72,7 @@ func orphanSandboxCheck(ctx context.Context, repo string) checkResult {
 
 	var orphans []string
 	for _, s := range sandboxes {
-		if !strings.HasPrefix(s.Name, sandboxNamePrefix) || tracked[s.Name] {
+		if !strings.HasPrefix(s.Name, sandboxNamePrefix) || owned[s.Name] {
 			continue
 		}
 		orphans = append(orphans, s.Name)
@@ -70,8 +82,12 @@ func orphanSandboxCheck(ctx context.Context, repo string) checkResult {
 	}
 	details := make([]string, 0, len(orphans))
 	for _, o := range orphans {
-		// No run id survives to offer `krayt stop <run-id>` — that's the definition of orphaned
-		// — so the actionable command is the raw msb one.
+		// A dead run's record can still be cleaned up through krayt, which also marks it failed.
+		// Otherwise no run needs updating, so the actionable command is the raw msb one.
+		if id, ok := deadRun[o]; ok {
+			details = append(details, fmt.Sprintf("%s (run %s's krayt process is gone; stop with: krayt stop --repo %s %s)", o, id, repo, id))
+			continue
+		}
 		details = append(details, fmt.Sprintf("%s (stop with: msb stop %s && msb rm %s)", o, o, o))
 	}
 	return checkResult{name: name, optional: true, detail: strings.Join(details, "; ")}

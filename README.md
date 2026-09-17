@@ -466,7 +466,7 @@ See `CHANGELOG.md` for the full release history.
 | 7 — Linux backend (parity) | `firecracker` provider behind the same interface | ✅ hardware (superseded, Phase 11) |
 | 8 — Host-side egress proxy, step 1 | L7 allowlist proxy moved off the guest to a separate host process over a new guest-initiated vsock channel (`move-egress-proxy-to-host.md`) | ✅ offline (superseded, Phase 11) |
 | 11 — Microsandbox migration (ADR option B1) | Replace krayt's own vfkit/Firecracker/guest-agent/proxy stack with a driver for [msb](https://github.com/superradcompany/microsandbox); msb now owns the sandbox and credential substitution (`run-tasks-on-microsandbox.md`, the cut-over) | ✅ cut-over landed — a real end-to-end `krayt run` against real msb on hardware is still outstanding |
-| 12 — Interactive shell sessions | `krayt shell` — a human-driven terminal inside the sandbox, ephemeral by default with `--keep`/`--attach`, patch out on exit and on demand mid-session, `krayt doctor` orphan check (`add-interactive-shell-session.md`) | ✅ code + offline tests — every hardware check is outstanding (no Apple-Silicon Mac with `msb` available here) |
+| 12 — Interactive shell sessions | `krayt shell` — a human-driven terminal inside the sandbox, ephemeral by default with `--keep`/`--attach`, patch out on exit and on demand mid-session, `krayt doctor` orphan check (`add-interactive-shell-session.md`) | ✅ done — hardware-verified on an Apple-Silicon Mac (2026-09-16/17); a few terminal/edge checks remain in `HUMAN_TODO.md` |
 
 The showcase: a real agent, blocked mid-task on a decision only a human could make, paused,
 asked over MCP, got the answer, and continued with it — all inside the sandbox with a live

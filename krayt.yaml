@@ -61,7 +61,6 @@ network:
     - registry-1.docker.io
     - index.docker.io
     - downloads.claude.ai
-    - platform.claude.com
     # Azure Blob storage is per-ACCOUNT: every request goes to <account>.blob.core.windows.net and
     # nothing ever carries the bare apex, so an exact entry would be a rule no request can match —
     # the silently-ineffective allowlist entry pre-flight exists to refuse. Only a suffix rule can
@@ -86,7 +85,6 @@ network:
     - registry-1.docker.io
     - index.docker.io
     - downloads.claude.ai
-    - platform.claude.com
     # Wildcards work identically on --tls-bypass, so per-account storage traffic stays tunneled
     # rather than intercepted, like every other non-credential host in this list. Without it, any
     # secret declared anywhere in the run would put msb's interception CA in front of these

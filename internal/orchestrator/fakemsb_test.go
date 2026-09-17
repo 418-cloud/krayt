@@ -44,6 +44,7 @@ import (
 var fakeMsbVerbs = map[string]bool{
 	"--version": true, "context": true, "create": true, "exec": true,
 	"copy": true, "logs": true, "stop": true, "rm": true, "pull": true, "doctor": true,
+	"image": true,
 }
 
 const (
@@ -52,6 +53,12 @@ const (
 	// fakeEnvFile records create-time --env pairs inside the fake sandbox root, so a later exec's
 	// DirEnv probe (guestBaseDir) can resolve one — see fakeMsbCreate's doc comment.
 	fakeEnvFile = ".fake-env.json"
+	// fakePulledFile marks, under HOME, that `pull` ran — what lets an ImageNotCached script's
+	// second `image inspect` succeed.
+	fakePulledFile = "fake-image-pulled"
+	// fakeGitTrustFile records, inside the fake sandbox root, the directory trustWorkspaceForGit
+	// was asked to trust.
+	fakeGitTrustFile = ".fake-git-safe-directory"
 )
 
 // fakeAskScript describes one ask_human exchange the fake agent performs.
@@ -91,6 +98,15 @@ type fakeAgentScript struct {
 type fakeMsbScript struct {
 	Agent          fakeAgentScript `json:"agent"`
 	CreateExitCode int             `json:"create_exit_code,omitempty"`
+	// CreateStderr replaces the fake's generic create-failure message (with CreateExitCode set),
+	// e.g. to reproduce msb's own "run `msb logs --source system <name>`" hint.
+	CreateStderr string `json:"create_stderr,omitempty"`
+	// NoSystemLogs makes `logs --source system` fail with no output, as it does for a sandbox msb
+	// never registered, so no console.log is written.
+	NoSystemLogs bool `json:"no_system_logs,omitempty"`
+	// FailGitTrust makes trustWorkspaceForGit's exec fail, like `git config --global` would with
+	// no writable $HOME.
+	FailGitTrust bool `json:"fail_git_trust,omitempty"`
 
 	// TranscriptFiles are written into the fake guest's $HOME/.claude/projects/-workspace at
 	// create time, keyed by file name — the shape captureTranscript copies out. Absent means the
@@ -105,6 +121,15 @@ type fakeMsbScript struct {
 	// exec) always fail — seed-agent-first-run-config.md's "a failing seed exec does not fail the
 	// run or session" test, distinct from an invalid DirEnv (rejected before any exec at all).
 	FailConfigSeedWrite bool `json:"fail_config_seed_write,omitempty"`
+
+	// ImageUser is the USER `image inspect` reports for the image (resolveSandboxUser). Nil
+	// means "agent", the published claude-code images' user; a pointer to "" means the image sets
+	// no USER at all.
+	ImageUser *string `json:"image_user,omitempty"`
+	// ImageNotCached makes `image inspect` fail until `pull` has run, like msb's local-cache-only
+	// inspect. PullExitCode makes that pull fail.
+	ImageNotCached bool `json:"image_not_cached,omitempty"`
+	PullExitCode   int  `json:"pull_exit_code,omitempty"`
 }
 
 // fakeShellScript describes what the fake tty exec does: optionally write files into /workspace
@@ -219,13 +244,49 @@ func runFakeMsb() int {
 	case "exec":
 		return fakeMsbExec(home, args[1:], script)
 	case "logs":
+		if script.NoSystemLogs {
+			return 1
+		}
 		_, _ = fmt.Fprintln(os.Stdout, `{"source":"system","line":"fake msb: boot ok"}`)
 		return 0
-	case "stop", "rm", "pull", "doctor":
+	case "image":
+		return fakeMsbImage(home, args[1:], script)
+	case "pull":
+		if script.PullExitCode != 0 {
+			fmt.Fprintln(os.Stderr, "error: registry error: pull scripted to fail")
+			return script.PullExitCode
+		}
+		if err := os.WriteFile(filepath.Join(home, fakePulledFile), nil, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-msb pull:", err)
+			return 1
+		}
+		return 0
+	case "stop", "rm", "doctor":
 		return 0
 	}
 	fmt.Fprintf(os.Stderr, "fake-msb: unhandled verb %q\n", args[0])
 	return 1
+}
+
+// fakeMsbImage answers `image inspect --format json <ref>` with the scripted USER.
+func fakeMsbImage(home string, args []string, script fakeMsbScript) int {
+	if len(args) != 4 || args[0] != "inspect" || args[1] != "--format" || args[2] != "json" {
+		fmt.Fprintln(os.Stderr, "fake-msb: unhandled image argv", args)
+		return 1
+	}
+	if script.ImageNotCached {
+		if _, err := os.Stat(filepath.Join(home, fakePulledFile)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: image not found: %s\n", args[3])
+			return 1
+		}
+	}
+	user := "agent"
+	if script.ImageUser != nil {
+		user = *script.ImageUser
+	}
+	b, _ := json.Marshal(map[string]any{"reference": args[3], "config": map[string]any{"user": user}})
+	fmt.Println(string(b))
+	return 0
 }
 
 func appendFakeMsbCall(home string, call fakeCall) {
@@ -270,7 +331,11 @@ func envMap(environ []string) map[string]string {
 // applyConfigSeed's own logic (not msb's real inheritance behavior) is what these tests exercise.
 func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 	if script.CreateExitCode != 0 {
-		fmt.Fprintln(os.Stderr, "fake-msb: create scripted to fail")
+		if script.CreateStderr != "" {
+			fmt.Fprintln(os.Stderr, script.CreateStderr)
+		} else {
+			fmt.Fprintln(os.Stderr, "fake-msb: create scripted to fail")
+		}
 		return script.CreateExitCode
 	}
 	var name, vsock string
@@ -495,6 +560,19 @@ afterFlags:
 			return 1
 		}
 		return fakeSeedWrite(root, cmd[4], cmd[5], cmd[6])
+	// trustWorkspaceForGit: `sh -c '<script>' sh /workspace`, recorded under the sandbox root so a
+	// test can check it ran.
+	case len(cmd) == 5 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "krayt-git-safe-directory") && cmd[3] == "sh":
+		if script.FailGitTrust {
+			fmt.Fprintln(os.Stderr, "krayt-git-safe-directory: git config --global failed")
+			return 1
+		}
+		if err := os.WriteFile(filepath.Join(root, fakeGitTrustFile), []byte(cmd[4]+"\n"), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-msb git trust:", err)
+			return 1
+		}
+		fmt.Println("trusted")
+		return 0
 	case len(cmd) >= 1 && cmd[0] == "mkdir":
 		return fakeMkdir(root, cmd[1:])
 	case len(cmd) >= 1 && cmd[0] == "chmod":

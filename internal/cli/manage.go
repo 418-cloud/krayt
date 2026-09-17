@@ -150,8 +150,10 @@ func newStopCmd() *cobra.Command {
 			if rec.Terminal() {
 				return fmt.Errorf("run %q already finished (%s)", args[0], rec.State)
 			}
-			if rec.PID <= 0 {
-				return fmt.Errorf("run %q has no recorded supervisor pid", args[0])
+			// The supervising krayt process is gone (kill -9, a crash) — there is nothing left
+			// to signal and nothing that will ever tear the sandbox down, so clean it up here.
+			if !processAlive(rec.PID) {
+				return stopOrphanedRun(cmd, runDir, args[0], rec)
 			}
 			// Signal the supervising `krayt run`/`krayt shell` to stop (proc_unix.go/
 			// proc_windows.go); on unix its SIGTERM handler cancels the run context, which
@@ -166,6 +168,54 @@ func newStopCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&repo, "repo", ".", "repo whose .krayt state to read")
 	return cmd
+}
+
+// processAlive is supervisorAlive (proc_unix.go/proc_windows.go), swappable in tests.
+var processAlive = supervisorAlive
+
+// stopOrphanedRun cleans up a non-terminal run whose supervising krayt process died without
+// tearing its sandbox down: it stops and removes the sandbox by name if msb still lists it, then
+// marks the record failed so it no longer reads as live to `krayt ls` or `krayt doctor`.
+func stopOrphanedRun(cmd *cobra.Command, runDir, id string, rec orchestrator.RunRecord) error {
+	removed := false
+	if rec.SandboxName != "" {
+		sb, err := sandbox.NewClient()
+		if err != nil {
+			return err
+		}
+		ctx := cmd.Context()
+		sandboxes, err := sb.List(ctx)
+		if err != nil {
+			return fmt.Errorf("list sandboxes: %w", err)
+		}
+		for _, s := range sandboxes {
+			if s.Name != rec.SandboxName {
+				continue
+			}
+			if err := sb.Stop(ctx, rec.SandboxName); err != nil {
+				return fmt.Errorf("stop sandbox %q: %w", rec.SandboxName, err)
+			}
+			if err := sb.Remove(ctx, rec.SandboxName); err != nil {
+				return fmt.Errorf("remove sandbox %q: %w", rec.SandboxName, err)
+			}
+			removed = true
+			break
+		}
+	}
+	pid := rec.PID
+	rec.State, rec.PID = orchestrator.StateFailed, 0
+	if rec.Error == "" {
+		rec.Error = fmt.Sprintf("krayt process (pid %d) exited without tearing the sandbox down; cleaned up by `krayt stop`", pid)
+	}
+	if err := orchestrator.WriteRecord(runDir, rec); err != nil {
+		return err
+	}
+	outcome := "no sandbox was left to remove"
+	if removed {
+		outcome = "removed sandbox " + rec.SandboxName
+	}
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "stopped %s: its krayt process (pid %d) was no longer running; %s\n", id, pid, outcome)
+	return err
 }
 
 // stopKeptShell destroys a `krayt shell --keep` sandbox directly (msb stop + rm by name) —

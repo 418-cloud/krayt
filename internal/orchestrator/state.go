@@ -64,6 +64,7 @@ type RunRecord struct {
 	PID          int             `json:"pid,omitempty"`          // supervising process (for `krayt stop`)
 	CtrlSocket   string          `json:"ctrl_socket,omitempty"`  // run control socket (for `krayt answer`, §6.13)
 	SandboxName  string          `json:"sandbox_name,omitempty"` // the msb sandbox this run created ("krayt-<id>")
+	SandboxUser  string          `json:"sandbox_user,omitempty"` // the image's USER the sandbox runs as (§8.2); empty until resolved
 	ExtraConf    *ExtraConfMeta  `json:"extra_conf,omitempty"`   // nil unless sandbox.extra_conf was used (§8.1)
 }
 
@@ -140,6 +141,15 @@ func (r RunRecord) EffectiveKind() string {
 		return KindRun
 	}
 	return r.Kind
+}
+
+// EffectiveSandboxUser returns r.SandboxUser, defaulting to the fixed `agent` user every sandbox
+// ran as for a record written before krayt read the user from the image.
+func (r RunRecord) EffectiveSandboxUser() string {
+	if r.SandboxUser == "" {
+		return legacySandboxUser
+	}
+	return r.SandboxUser
 }
 
 // runsDir is `<stateDir>/runs`.

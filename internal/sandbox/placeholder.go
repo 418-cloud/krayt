@@ -6,7 +6,9 @@ package sandbox
 // NAME@HOST=PLACEHOLDER` form, so this is exactly what a guest process observes.
 //
 // Pure and pinned by a unit test: verified on hardware by P5 (§14 Phase 11,
-// $MSB_ANTHROPIC_API_KEY) and against msb 0.6.16's crates/network/lib/secrets/config.rs.
+// $MSB_ANTHROPIC_API_KEY), again inside a `krayt shell` session (run_5e8392ed,
+// $MSB_CLAUDE_CODE_OAUTH_TOKEN, §14 Phase 12), and against msb 0.6.16's
+// crates/network/lib/secrets/config.rs.
 func SecretPlaceholder(key string) string {
 	return "$MSB_" + key
 }

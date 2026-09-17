@@ -722,3 +722,78 @@ func TestMsbDurationIsSingleUnit(t *testing.T) {
 		}
 	}
 }
+
+func TestParseImageUser(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "named user", raw: `{"config":{"user":"agent"}}`, want: "agent"},
+		{name: "uid:gid", raw: `{"config":{"user":"1000:1000"}}`, want: "1000:1000"},
+		{name: "whitespace trimmed", raw: `{"config":{"user":" node "}}`, want: "node"},
+		{name: "empty user", raw: `{"config":{"user":""}}`, want: ""},
+		{name: "null user", raw: `{"config":{"user":null}}`, want: ""},
+		{name: "no user key", raw: `{"config":{"env":["A=b"]}}`, want: ""},
+		{name: "null config", raw: `{"config":null}`, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseImageUser([]byte(tc.raw))
+			if err != nil {
+				t.Fatalf("parseImageUser: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("parseImageUser = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if _, err := parseImageUser([]byte("not json")); err == nil {
+		t.Error("parseImageUser accepted invalid JSON")
+	}
+}
+
+func TestImageUserCachedImageNeedsNoPull(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"image": {Stdout: `{"reference":"img:1","config":{"user":"node"}}`},
+	}})
+
+	got, err := c.ImageUser(context.Background(), "img:1")
+	if err != nil {
+		t.Fatalf("ImageUser: %v", err)
+	}
+	if got != "node" {
+		t.Errorf("ImageUser = %q, want node", got)
+	}
+	calls := readFakeCalls(t, home)
+	if len(calls) != 1 {
+		t.Fatalf("got %d msb calls, want exactly one inspect (no pull for a cached image): %+v", len(calls), calls)
+	}
+	want := []string{"image", "inspect", "--format", "json", "img:1"}
+	if !reflect.DeepEqual(calls[0].Args, want) {
+		t.Errorf("args = %v, want %v", calls[0].Args, want)
+	}
+}
+
+func TestImageUserPullFailureIsReported(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"image": {ExitCode: 1, Stderr: "error: image not found in local cache"},
+		"pull":  {ExitCode: 1, Stderr: "error: registry error: Not authorized"},
+	}})
+
+	_, err := c.ImageUser(context.Background(), "ghcr.io/nope/missing")
+	if err == nil || !strings.Contains(err.Error(), "msb pull ghcr.io/nope/missing") || !strings.Contains(err.Error(), "Not authorized") {
+		t.Fatalf("err = %v, want the pull failure with msb's own message", err)
+	}
+	var verbs []string
+	for _, c := range readFakeCalls(t, home) {
+		verbs = append(verbs, c.Args[0])
+	}
+	if !reflect.DeepEqual(verbs, []string{"image", "pull"}) {
+		t.Errorf("msb calls = %v, want [image pull] (inspect, then pull, then stop)", verbs)
+	}
+}

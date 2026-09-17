@@ -35,10 +35,10 @@ import (
 	"github.com/418-cloud/krayt/internal/task"
 )
 
-// sandboxAgentUser is the non-root user krayt's agent images run as (§8.2 — enforced, not just
-// convention) and the `msb create --user`/`msb exec --user` value the agent's own exec uses. The
-// guest helper always execs as root instead (add-krayt-guest-helper.md's privilege separation).
-const sandboxAgentUser = "agent"
+// legacySandboxUser is the user every sandbox ran as before krayt read it from the image's own
+// USER (resolveSandboxUser, §8.2). RunRecord.EffectiveSandboxUser falls back to it for records
+// written before sandbox_user existed, so `krayt shell --attach` still reaches those sandboxes.
+const legacySandboxUser = "agent"
 
 // sandboxSecurity is msb's `--security` profile every krayt sandbox is created with. Fixed, not
 // user-configurable: P2 (probe-microsandbox-feasibility.md, 2026-08-30) confirmed `msb exec
@@ -204,11 +204,15 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// created. SystemLogs is captured first (ordered before rm, decision 7): it is msb's
 	// replacement for the pre-msb console log, including the reconstructed boot-error block msb
 	// prepends when a sandbox never finished starting.
+	var user string // the image's own USER, resolved just before Create
+	createFailed := false
 	defer func() {
 		if out, lerr := deps.Sandbox.SystemLogs(ctx, name); lerr == nil || len(out) > 0 {
-			writeConsoleLog(out, runDir, secretValues)
+			if writeConsoleLog(out, runDir, secretValues) && createFailed {
+				err = pointCreateErrorAtConsoleLog(err, name, ConsoleLogPath(runDir))
+			}
 		}
-		captureTranscript(ctx, deps.Sandbox, name, spec.TranscriptDir, runDir, secretValues)
+		captureTranscript(ctx, deps.Sandbox, name, user, spec.TranscriptDir, runDir, secretValues)
 		_ = deps.Sandbox.Stop(ctx, name)
 		_ = deps.Sandbox.Remove(ctx, name)
 	}()
@@ -324,8 +328,22 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// run's own context.WithTimeout (above) is belt-and-braces alongside --max-duration
 	// (run-tasks-on-microsandbox.md decision 5): the ctx is what makes teardown deterministic,
 	// --max-duration is what stops a wedged guest outliving it.
+	//
+	// The sandbox runs as the image's own USER (§8.2), refused here with a clear error if that is
+	// root or unset, before anything is created.
+	user, err = resolveSandboxUser(ctx, deps.Sandbox, spec.ImageRef)
+	if err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
+		return nil, err
+	}
+	recMu.Lock()
+	rec.SandboxUser = user
+	recMu.Unlock()
+	persistRec()
 	createSpec := sandbox.CreateSpec{
-		Image: spec.ImageRef, Name: name, User: sandboxAgentUser,
+		Image: spec.ImageRef, Name: name, User: user,
 		CPUs: spec.Resources.CPUs, MemoryMiB: spec.Resources.MemoryMiB, DiskGiB: spec.Resources.DiskGiB,
 		MaxDuration: spec.Resources.Timeout,
 		Env:         envVarsFromMap(spec.Env),
@@ -339,6 +357,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
+		createFailed = true
 		return nil, fmt.Errorf("orchestrator: create sandbox: %w", err)
 	}
 
@@ -358,7 +377,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// 3. Exec the helper as root: clone the bundle into /workspace, tag krayt-baseline, snapshot
 	// the root-only patch-git, then relax /workspace for the agent user
 	// (add-krayt-guest-helper.md's privilege-separation ordering).
-	baseline, err := helperSetup(ctx, deps.Sandbox, name)
+	baseline, err := helperSetup(ctx, deps.Sandbox, name, user)
 	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
@@ -379,7 +398,9 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// 3b. Seed each selected adapter's first-run guest config (§6.14 "First-run state",
 	// seed-agent-first-run-config.md) — as the agent user, before the agent ever runs, so it
 	// authenticates without hitting onboarding or an auth dialog. Best-effort: never fails the run.
-	applyConfigSeeds(ctx, deps.Sandbox, name, spec.ConfigSeeds, deps.Warn)
+	applyConfigSeeds(ctx, deps.Sandbox, name, user, spec.ConfigSeeds, deps.Warn)
+	// 3c. Let the sandbox user's git work in the root-owned /workspace (gitsafe.go).
+	trustWorkspaceForGit(ctx, deps.Sandbox, name, user, deps.Warn)
 
 	// 4. Exec the agent as the sandbox's non-root user, streamed to the run's log sink.
 	logFile, err := os.Create(filepath.Join(runDir, "logs", "agent.log"))
@@ -398,7 +419,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	defer cancelStream()
 
 	execResult, execErr := deps.Sandbox.Exec(streamCtx, sandbox.ExecSpec{
-		Name: name, User: sandboxAgentUser, Command: []string{containerEntrypoint},
+		Name: name, User: user, Command: []string{containerEntrypoint},
 		Stdout: logWriter, Stderr: logWriter,
 	})
 
@@ -610,11 +631,11 @@ func copyInputs(ctx context.Context, sb *sandbox.Client, name string, spec task.
 // bundle into /workspace, tags krayt-baseline, snapshots the root-only patch-git, then relaxes
 // /workspace for the agent user (add-krayt-guest-helper.md's privilege-separation ordering).
 // Returns the baseline ref, consumed by finishAndCollect's --baseline flag.
-func helperSetup(ctx context.Context, sb *sandbox.Client, name string) (string, error) {
+func helperSetup(ctx context.Context, sb *sandbox.Client, name, user string) (string, error) {
 	out, err := execCapture(ctx, sb, name, "root", []string{
 		guestbin.GuestPath(guestbin.HelperName), "setup",
 		"--bundle", containerBundlePath, "--workspace", containerWorkspace,
-		"--patch-git", containerPatchGit, "--agent-user", sandboxAgentUser,
+		"--patch-git", containerPatchGit, "--agent-user", user,
 	})
 	if err != nil {
 		return "", err
@@ -811,8 +832,10 @@ const transcriptHeadBytes = 1 << 20 // 1 MiB
 // Every failure here is swallowed. A transcript is a diagnostic, and a run that already succeeded
 // must not be reported as failed because an optional artifact could not be fetched; a run that
 // already failed must not have its real error replaced by this one.
-func captureTranscript(ctx context.Context, sb *sandbox.Client, name, guestDir, runDir string, secretValues map[string]string) {
-	if guestDir == "" {
+func captureTranscript(ctx context.Context, sb *sandbox.Client, name, user, guestDir, runDir string, secretValues map[string]string) {
+	// An empty user means the run failed before the sandbox user was resolved, so no sandbox was
+	// ever created to copy from.
+	if guestDir == "" || user == "" {
 		return
 	}
 	// The run's ctx is frequently already dead here — a wall-clock timeout cancels it, and that is
@@ -822,7 +845,7 @@ func captureTranscript(ctx context.Context, sb *sandbox.Client, name, guestDir, 
 	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), transcriptTimeout)
 	defer cancel()
 
-	home := guestHome(tctx, sb, name)
+	home := guestHome(tctx, sb, name, user)
 	if home == "" {
 		return
 	}
@@ -844,11 +867,11 @@ func captureTranscript(ctx context.Context, sb *sandbox.Client, name, guestDir, 
 	}
 }
 
-// guestHome asks the sandbox what $HOME is for the user krayt runs the agent as. Resolved rather
-// than hardcoded because the images disagree — /home/agent for claude-code and krayt-dev,
-// /home/node for gemini-cli — and ExecSpec carries no env for krayt to set one itself.
-func guestHome(ctx context.Context, sb *sandbox.Client, name string) string {
-	return guestBaseDir(ctx, sb, name, "")
+// guestHome asks the sandbox what $HOME is for user, the image's own USER. Resolved rather than
+// hardcoded because the images disagree — /home/agent for claude-code and krayt-dev, /home/node
+// for gemini-cli — and ExecSpec carries no env for krayt to set one itself.
+func guestHome(ctx context.Context, sb *sandbox.Client, name, user string) string {
+	return guestBaseDir(ctx, sb, name, user, "")
 }
 
 // guestBaseDir asks the sandbox for a base directory: $HOME when dirEnv is empty, or — when
@@ -863,14 +886,14 @@ func guestHome(ctx context.Context, sb *sandbox.Client, name string) string {
 // either stream as ErrMsbFailed rather than as an exit code, so a probe must always emit
 // something. printf also avoids echo's trailing newline without relying on `echo -n`, which is not
 // portable across the shells these images ship.
-func guestBaseDir(ctx context.Context, sb *sandbox.Client, name, dirEnv string) string {
+func guestBaseDir(ctx context.Context, sb *sandbox.Client, name, user, dirEnv string) string {
 	expr := `"$HOME"`
 	if dirEnv != "" {
 		expr = fmt.Sprintf(`"${%s:-$HOME}"`, dirEnv)
 	}
 	var out bytes.Buffer
 	res, err := sb.Exec(ctx, sandbox.ExecSpec{
-		Name: name, User: sandboxAgentUser,
+		Name: name, User: user,
 		Command: []string{"sh", "-c", "printf %s " + expr},
 		Stdout:  &out,
 	})
@@ -955,9 +978,10 @@ func elideMiddle(b []byte, maxLen, head int) []byte {
 // (run-tasks-on-microsandbox.md decision 7, replacing the pre-msb guest serial console) — into
 // the run's logs dir, redacted against the task's secrets. Same fail-closed rule as before: if
 // the secret values can't be confirmed, nothing is written rather than risking one in the clear.
-func writeConsoleLog(b []byte, runDir string, secretValues map[string]string) {
+// It reports whether the file was written.
+func writeConsoleLog(b []byte, runDir string, secretValues map[string]string) bool {
 	if len(b) == 0 {
-		return
+		return false
 	}
 	if len(b) > maxConsoleLog {
 		b = b[len(b)-maxConsoleLog:]
@@ -965,7 +989,7 @@ func writeConsoleLog(b []byte, runDir string, secretValues map[string]string) {
 	if len(secretValues) > 0 {
 		b = secrets.NewRedactor(secrets.Values(secretValues)).Redact(b)
 	}
-	_ = os.WriteFile(ConsoleLogPath(runDir), b, 0o644)
+	return os.WriteFile(ConsoleLogPath(runDir), b, 0o644) == nil
 }
 
 // redactChoices applies r to each choice string, same as a question's prompt — an agent could in

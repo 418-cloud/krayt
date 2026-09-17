@@ -3,7 +3,7 @@ package orchestrator
 // This file is the shell lifecycle for `krayt shell` (add-interactive-shell-session.md) — a
 // separate, human-driven session, not the headless autonomous path Run drives. It reuses Run's
 // shared prologue helpers (copyInputs, helperSetup, finishAndCollect, and the sandboxName/
-// sandboxAgentUser/sandboxSecurity/container-path constants defined in orchestrator.go) rather
+// sandboxSecurity/container-path constants defined in orchestrator.go) rather
 // than duplicating them, and departs from Run in exactly the ways the task's decisions require:
 // no context.WithTimeout / --max-duration (decision 5), no ask_human wiring (decision 12), no
 // adapter-driven launcher, krayt-ask wiring, or transcript capture (decision 2), and conditional
@@ -39,7 +39,7 @@ import (
 // supervises it any more (PID is cleared), and it is re-entered with `krayt shell --attach
 // <run-id>` or destroyed with `krayt stop <run-id>` (decisions 3, 4). A record in this state is
 // exactly what `krayt doctor`'s orphan check (decision 6) expects to find still tracking a live
-// "krayt-*" sandbox — the orphan case is a sandbox with NO such record, not this one.
+// "krayt-*" sandbox — the orphan case is a sandbox with no LIVE record, not this one.
 const StateKept = "kept"
 
 // defaultShellCommand is what a `krayt shell` session execs when the human didn't ask for
@@ -69,14 +69,15 @@ func ttyCommand(execCmd []string) []string {
 	return execCmd
 }
 
-// shellTTYSpec is the one TTYExecSpec both Shell and AttachShell attach with: the agent user,
-// ttyCommand's command, and /workspace as the working directory. Without Workdir msb starts the
-// session in the image's own WORKDIR (/home/agent for the published images, observed 2026-09-16),
-// not in the repo the session exists to work on (KRAYT_SPEC.md §13: "a bare login shell in
-// /workspace"). It applies to --exec too, so `krayt shell --exec 'go test ./...'` runs in the repo.
-func shellTTYSpec(name string, execCmd []string) sandbox.TTYExecSpec {
+// shellTTYSpec is the one TTYExecSpec both Shell and AttachShell attach with: the sandbox's user
+// (the image's own USER, §8.2), ttyCommand's command, and /workspace as the working directory.
+// Without Workdir msb starts the session in the image's own WORKDIR (/home/agent for the published
+// images, observed 2026-09-16), not in the repo the session exists to work on (KRAYT_SPEC.md §13:
+// "a bare login shell in /workspace"). It applies to --exec too, so
+// `krayt shell --exec 'go test ./...'` runs in the repo.
+func shellTTYSpec(name, user string, execCmd []string) sandbox.TTYExecSpec {
 	return sandbox.TTYExecSpec{
-		Name: name, User: sandboxAgentUser, Workdir: containerWorkspace, Command: ttyCommand(execCmd),
+		Name: name, User: user, Workdir: containerWorkspace, Command: ttyCommand(execCmd),
 	}
 }
 
@@ -176,12 +177,15 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 
 	// Teardown, EXCEPT a --keep session that ended cleanly (decision 3) — see the doc comment
 	// above. Registered before Create so it fires on every earlier failure regardless of --keep.
+	createFailed := false
 	defer func() {
 		if keep && cleanExit {
 			return
 		}
 		if out, lerr := deps.Sandbox.SystemLogs(ctx, name); lerr == nil || len(out) > 0 {
-			writeConsoleLog(out, runDir, secretValues)
+			if writeConsoleLog(out, runDir, secretValues) && createFailed {
+				err = pointCreateErrorAtConsoleLog(err, name, ConsoleLogPath(runDir))
+			}
 		}
 		_ = deps.Sandbox.Stop(ctx, name)
 		_ = deps.Sandbox.Remove(ctx, name)
@@ -202,8 +206,17 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 
 	// 1. Create (rent) the sandbox. No --max-duration (decision 5: no wall-clock budget for a
 	// human-driven session) and no --vsock route (decision 12: no ask_human channel in shell mode).
+	// Like Run, the sandbox runs as the image's own USER, refused if root or unset (§8.2).
+	user, err := resolveSandboxUser(ctx, deps.Sandbox, spec.ImageRef)
+	if err != nil {
+		return nil, err
+	}
+	recMu.Lock()
+	rec.SandboxUser = user
+	_, _ = writeRecord(runDir, rec)
+	recMu.Unlock()
 	createSpec := sandbox.CreateSpec{
-		Image: spec.ImageRef, Name: name, User: sandboxAgentUser,
+		Image: spec.ImageRef, Name: name, User: user,
 		CPUs: spec.Resources.CPUs, MemoryMiB: spec.Resources.MemoryMiB, DiskGiB: spec.Resources.DiskGiB,
 		Env:       envVarsFromMap(spec.Env),
 		Secrets:   secretRefs,
@@ -212,6 +225,7 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 		ExtraArgs: netArgs,
 	}
 	if err := deps.Sandbox.Create(ctx, createSpec, secretEnv); err != nil {
+		createFailed = true
 		return nil, fmt.Errorf("orchestrator: create sandbox: %w", err)
 	}
 
@@ -228,7 +242,7 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 
 	// 3. Exec the helper as root: clone the bundle into /workspace, tag krayt-baseline, snapshot
 	// the root-only patch-git, then relax /workspace for the agent user.
-	baseline, err := helperSetup(ctx, deps.Sandbox, name)
+	baseline, err := helperSetup(ctx, deps.Sandbox, name, user)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: krayt-helper setup: %w", err)
 	}
@@ -241,18 +255,21 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 	recMu.Unlock()
 
 	// 3b. Seed each selected adapter's first-run guest config (§6.14 "First-run state",
-	// seed-agent-first-run-config.md) — as the agent user, before the human ever gets a shell, so
+	// seed-agent-first-run-config.md) — as the sandbox's user, before the human ever gets a shell, so
 	// an agent started by hand authenticates without hitting onboarding or an auth dialog.
 	// Best-effort: never fails the session. AttachShell/PatchLiveShell never seed (decision 5):
 	// the sandbox already exists and the human may have changed these files since.
-	applyConfigSeeds(ctx, deps.Sandbox, name, spec.ConfigSeeds, deps.Warn)
+	applyConfigSeeds(ctx, deps.Sandbox, name, user, spec.ConfigSeeds, deps.Warn)
+	// 3c. Let the human's git work in the root-owned /workspace (gitsafe.go). Like seeding, only a
+	// fresh session does this; the setting persists in the user's $HOME for --attach.
+	trustWorkspaceForGit(ctx, deps.Sandbox, name, user, deps.Warn)
 
 	// 4. Attach an interactive tty in place of Run's agent exec (decision 10) — msb owns the pty
 	// from here on; this call blocks until the human exits the shell (or, with --exec, until the
 	// given command finishes), started in /workspace. ttyCommand supplies defaultShellCommand when
 	// execCmd is empty — see its doc comment for why krayt picks the shell explicitly rather than
 	// leaving this to msb.
-	execResult, execErr := deps.Sandbox.ExecTTY(ctx, shellTTYSpec(name, execCmd))
+	execResult, execErr := deps.Sandbox.ExecTTY(ctx, shellTTYSpec(name, user, execCmd))
 	if execErr != nil {
 		return nil, fmt.Errorf("orchestrator: attach shell: %w", execErr)
 	}
@@ -339,7 +356,7 @@ func AttachShell(ctx context.Context, deps Deps, runDir, secretsPath string, exe
 		_ = writeReport(runDir, rec, notes, metaDigest)
 	}()
 
-	execResult, execErr := deps.Sandbox.ExecTTY(ctx, shellTTYSpec(name, execCmd))
+	execResult, execErr := deps.Sandbox.ExecTTY(ctx, shellTTYSpec(name, rec.EffectiveSandboxUser(), execCmd))
 	if execErr != nil {
 		return nil, fmt.Errorf("orchestrator: attach shell: %w", execErr)
 	}

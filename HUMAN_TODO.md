@@ -42,8 +42,8 @@ rewritten; whoever picks one up needs to re-derive the msb-equivalent steps firs
    calls and that the opt-out is honoured rather than silently absent. What remains needs live
    Gemini/OpenCode credentials — the same proof for those two agents — plus the amd64/other-image
    manifest check. See the `[tooling]` entry below.
-6. **`seed-agent-first-run-config.md`** — code done, offline-verified; every hardware check is
-   unrun (no real Mac/msb/live credential here). See its own `[HUMAN]` entry below.
+6. **`seed-agent-first-run-config.md`** — done and verified on hardware; only the `GOOGLE_API_KEY`
+   host-scope question remains. See its own `[HUMAN]` entry below.
 
 (The two `hadolint`-the-{gemini-cli,opencode}-Dockerfile entries formerly here are resolved: this
 task's own Verify step ran `hadolint` against both — clean, same pre-existing warnings as
@@ -384,173 +384,38 @@ that hosted runner doesn't expose (see the intro above), so the hardware needs b
 
 ---
 
-## [HUMAN] `krayt shell` — every "Verify first" check and every hardware Done-when criterion (`add-interactive-shell-session.md`, `KRAYT_SPEC.md` §14 Phase 12)
+## [HUMAN] `krayt shell` on Windows (`add-interactive-shell-session.md`, `KRAYT_SPEC.md` §14 Phase 12)
 
-`krayt shell` (host code, `orchestrator.Shell`/`AttachShell`/`PatchLiveShell`, `krayt-agent-shellenv`
-in all three published agent images, the spec/README amendments) is done and offline-verified —
-`go build`/`go vet`/`go test`/`golangci-lint` are all green, and the `Shell`/`AttachShell`
-teardown-on-error-with-`--keep` matrix is unit-tested against the fake `msb`
-(`internal/orchestrator/shell_test.go`). **Nothing in it has run against a real sandbox.** The
-task requires four numbered "Verify first" checks *before* trusting the design at all, plus its
-own seven-point Done-when — none of which this environment can run.
+`krayt shell` is fully verified on an Apple-Silicon Mac (2026-09-16/17; the record is
+`KRAYT_SPEC.md` §14 Phase 12). Windows has never been tried.
 
-- **Needed:** a real Apple-Silicon Mac with `msb` (≥ `0.6.16`) installed and a live model-provider
-  credential (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`), to run the following in order —
-  each decides how much of the next one even applies, so don't skip ahead:
-  1. **"Verify first" #1 — is `msb exec -t` a usable terminal when krayt inherits stdio?** Boot
-     `ghcr.io/418-cloud/krayt-agent-claude-code` by hand
-     (`krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code --repo <some-repo>`) and check:
-     window resize reflows (`SIGWINCH` — resize your terminal mid-session and run `stty size`
-     inside), `Ctrl-C` interrupts the foreground command (`sleep 100` then Ctrl-C — you should stay
-     in the shell, not lose the session) rather than killing the session, a full-screen TUI
-     (`top`, `vim`) renders and exits cleanly, and 256-colour (`echo -e '\e[38;5;196mred\e[0m'`)
-     survives. This is decision 10's whole premise — if it fails, the fallback is hand-rolled raw
-     mode via `golang.org/x/sys` (already pinned) and needs a redesign of `sandbox.ExecTTY`, not
-     just a note. Resize and Ctrl-C at an idle prompt are verified (`KRAYT_SPEC.md` Phase 12).
-     Still to check: Ctrl-C on a foreground `sleep 100`, a full-screen TUI, 256-colour.
-  2. **"Verify first" #2 — does `msb exec` inherit the sandbox's create-time environment?**
-     `CreateSpec.Env` sets it at `msb create`; `TTYExecSpec` (deliberately) carries no `Env` field
-     at all. Inside the shell, `echo $SOME_TEST_VAR` after `krayt shell --image ... --repo ...`
-     where the image sets a test env var, or more directly: does the model-provider credential env
-     var (`ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`) already show up in `env` inside the shell
-     with no help from `krayt-agent-shellenv`? If yes, `krayt-agent-shellenv`'s scope (currently
-     just `safe.directory`) is confirmed complete. If no, find out what's actually missing and add
-     it there, scoped as narrowly as `safe.directory` is.
-  3. **"Verify first" #3 — what does the `--secret` placeholder look like inside an exec'd shell,
-     and does `claude` started by hand actually authenticate?** Inside the shell:
-     `claude -p "say hello"` (with `--secrets` naming a real `ANTHROPIC_API_KEY` and `--allow
-     api.anthropic.com` on the `krayt shell` invocation) should reach the real API — confirms §8.2's
-     placeholder-substitution contract holds for an interactively-started agent, not just the
-     headless entrypoint's `claude -p`. Note (2026-09-16): under msb, `--allow api.anthropic.com`
-     alone is not enough — the credential also needs a `network.inject` scope, or
-     `ValidateNetworkPolicyForMsb` rejects the run before it boots. As of this date that scope is
-     resolved automatically whenever `krayt.yaml` sets `agent.adapter: claude-code` (`shell` now
-     calls the same adapter secret-scoping `run` does, KRAYT_SPEC.md §13's 2026-09-16 amendment) —
-     so the simplest repro is `krayt shell --image ... --config krayt.yaml --secrets <file>` with
-     `agent: { adapter: claude-code }` in that config, no hand-written `network.inject` needed. A
-     bare `--allow api.anthropic.com` with no `agent.adapter` and no hand-written
-     `network.inject` should still fail pre-flight, the same way `krayt run` would.
-  4. **Answered, 2026-09-16, by the first real attempt (`krayt shell --image
-     ghcr.io/418-cloud/krayt-agent-claude-code --config krayt.yaml --skip-resource-check`, no
-     `--task`): with no `Command`, `msb exec --tty` re-execs the image's `ENTRYPOINT`
-     (`krayt-agent-entrypoint`), not a shell.** The session showed
-     `[claude-code] authenticated via CLAUDE_CODE_OAUTH_TOKEN` immediately followed by
-     `[claude-code] task file /task/prompt.md not found` and ended with exit 66 — the headless
-     entrypoint running and failing because `krayt shell` (no `--task`) never copies in
-     `/task/prompt.md`, not a shell prompt with `krayt-agent-shellenv` sourced. **Fixed**:
-     `internal/orchestrator/shell.go` no longer leaves `TTYExecSpec.Command` empty —
-     `ttyCommand`/`defaultShellCommand` resolve `$SHELL`, else `/bin/bash`, else `/bin/sh`
-     explicitly — verified on hardware, it lands at a real bash prompt (`KRAYT_SPEC.md` Phase 12).
-     **Still to check** inside a session: `echo $0` and
-     `git config --global --get-all safe.directory` (should show `/workspace`
-     and `*`, proving `krayt-agent-shellenv` ran) — if neither hook fires even now, that's a
-     separate real bug in `images/agents/*/Dockerfile`'s two `RUN printf ... /etc/...` lines.
-  5. **Done-when 1-2:** `krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code --repo .`
-     drops you at a shell with the repo present (opening in `/workspace`, with and without
-     `--exec`, is verified — KRAYT_SPEC.md §6.15); edit a file, `exit`; confirm
-     `.krayt/runs/<id>/changes.patch` (and `meta.json` with `"kind": "shell"`) contains the edit,
-     and `krayt apply <run-id>` lands it on the host repo cleanly.
-  6. **Done-when 3-4:** the bare `--keep` → `--attach` → `krayt stop` round trip is verified
-     (`run_34b64ca5`, `KRAYT_SPEC.md` Phase 12). Still to check: `krayt shell --keep`, edit a
-     file, `exit`; `krayt shell --attach <run-id>` — confirm the edit is still there, make a second
-     edit, exit again — confirm both edits are now in `changes.patch`; after `krayt stop
-     <run-id>`, confirm `krayt ls` shows the record as `done`. Separately, repeat the ephemeral (no `--keep`) case and
-     kill the `krayt shell` process (`kill` its pid, or close the terminal) mid-session, plus once
-     with a deliberately bad `--image` (to force a failed `krayt-helper setup`) — confirm `msb ls`
-     shows no leaked sandbox in either case (this is the one part the fake-`msb` unit tests
-     *cannot* prove — they prove krayt calls `msb stop`/`msb rm`, not that a real `msb` actually
-     tears the VM down when asked).
-  7. **Done-when 5:** from a second terminal while a `krayt shell` session (no `--keep` needed) is
-     live, run `krayt patch <run-id>` — confirm it prints a fresh `changes.patch` reflecting
-     whatever's currently in `/workspace`, without ending the session; run it again after another
-     edit — confirm the patch updates.
-  8. **Done-when 6:** manually create an orphan (`msb create --name krayt-test-orphan <image>`,
-     no matching `.krayt/runs/` entry) and run `krayt doctor --repo .` — confirm it reports a
-     `[warn]` naming `krayt-test-orphan` and the `msb stop`/`msb rm` command to remove it, and does
-     **not** remove it itself. Then `krayt doctor --repo .` again with no orphan present — confirm
-     it stays silent (no `[warn]` line at all).
-  9. **Done-when 7:** confirmed by step 3 above, if `claude -p` authenticates and reaches
-     `api.anthropic.com` under the run's allowlist.
-- **Why the agent can't:** no real hardware — no Apple-Silicon Mac (or Linux/KVM host) with `msb`
-  installed anywhere in this environment, and every one of the nine checks above needs a real
-  sandbox boot, a real pty, or a real credential reaching a real API.
-- **Verify success by:** each numbered item above has its own inline check. Record the outcome of
-  each "Verify first" check explicitly in `KRAYT_SPEC.md` §14 Phase 12 (the phase currently says
-  "not met; every criterion below needs a real Apple-Silicon Mac") and in this file's history —
-  if any of them turns up a real gap (most likely #2/#3, whether `krayt-agent-shellenv` needs more
-  than `safe.directory`, or #4, which hook actually fires), fix it and re-verify before checking
-  the phase done, per `CLAUDE.md`'s "never fabricate a result" rule.
-- **Windows:** genuinely untested and **not claimed to work** — inherited stdio is the same code
-  path as macOS, but nobody in this environment can confirm ConPTY through msb without a Windows
-  box at all (a lesser bar than the WHP entry above even needs, since `krayt shell` needs a real
-  interactive terminal, not just a boot). Track this as a separate follow-up once the macOS pass
-  above lands; don't fold it into this entry.
-- **Blocking:** no for shipping the code (it's additive, off by default in the sense that nobody
-  who doesn't run `krayt shell` is affected, and every non-hardware Done-when criterion is met) —
-  but yes for closing `KRAYT_SPEC.md` §14 Phase 12 and for trusting `krayt shell` in anger. Until
-  this lands, treat `krayt shell` as "compiles, passes its offline tests, never run for real."
+- **Needed:** a Windows host with `msb` and a real interactive console. Run
+  `krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code --repo .` and repeat the macOS
+  terminal checks: a prompt in `/workspace`, resize, Ctrl-C, a full-screen app, and a clean exit
+  with `changes.patch` collected. Separately, close the console mid-session and confirm
+  `msb list` is empty.
+  Background: inherited stdio is the same code path as on macOS, but whether ConPTY works through
+  msb can only be seen on a Windows machine with a real interactive console; a boot alone, as in
+  the WHP entry above, isn't enough.
+- **Why the agent can't:** no Windows machine with `msb` in this environment.
+- **Verify success by:** record the outcome in `KRAYT_SPEC.md` §14 Phase 12, then delete this
+  entry.
+- **Blocking:** no. Windows is not claimed to work.
 
 ---
 
-## [HUMAN] `seed-agent-first-run-config.md` — five hardware checks, real Mac + msb 0.6.16 + a live credential each
+## [HUMAN] `seed-agent-first-run-config.md` — the `GOOGLE_API_KEY` host scope
 
-Seeding each agent's first-run guest config from its adapter (`internal/adapter.Plan.ConfigSeeds`,
-`internal/orchestrator`'s shared `applyConfigSeeds` step wired into both `Run` and `Shell`,
-`internal/configseed`'s fill-in-never-override merge) is done and offline-verified: `go build`
-(both `GOOS`), `go vet`, `go test -race`, and `golangci-lint` are all green, and the merge/adapter/
-sandbox/orchestrator/CLI behavior is unit-tested — including against the fake `msb`
-(`internal/orchestrator/fakemsb_test.go`, extended to actually read/write files inside the fake
-sandbox root, honor a create-time `--env` value for the `DirEnv` probe, and accept piped stdin) —
-for every case the task's own test list names: seeds written as the agent user before the agent/
-tty exec, an existing file's other keys surviving the merge, an unchanged merge performing no
-write, invalid JSON left byte-identical with a warning, a failing seed exec not failing the run,
-`DirEnv` redirecting the path, an invalid `DirEnv` name rejected before any exec, and
-`AttachShell` performing no seed exec at all. **Nothing in it has run against a real guest.**
+Every hardware check for seeding first-run config is verified: Claude Code with an OAuth token and
+with an API key, an image with no krayt shell setup, and Gemini with `GEMINI_API_KEY`
+(`KRAYT_SPEC.md` §14 Phase 12). One question the task logged as out of scope is still open.
 
-- **Needed:** on a real Apple-Silicon Mac with `msb` (≥ `0.6.16`) installed:
-  1. **`CLAUDE_CODE_OAUTH_TOKEN`:** `krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code
-     --config krayt.yaml` (with `agent: { adapter: claude-code }` in that config, and the token in
-     the secrets file), then run `claude` by hand inside the shell. Expect no onboarding screen and
-     an authenticated prompt; a one-line request (`claude -p "say hello"` or the interactive
-     equivalent) succeeds.
-  2. **`ANTHROPIC_API_KEY`:** the same flow with an API key instead. Expect no "Detected a custom
-     API key in your environment" approval dialog, and authentication succeeds. Inside the shell,
-     run `printenv ANTHROPIC_API_KEY` and confirm it prints exactly `$MSB_ANTHROPIC_API_KEY` — if
-     it prints anything else, `sandbox.SecretPlaceholder`'s assumed default is wrong and the
-     seeded `customApiKeyResponses.approved` value (its last 20 characters) needs to be read from
-     the guest instead of assumed.
-  3. **Whether `platform.claude.com` is still needed.** With onboarding seeded
-     (`hasCompletedOnboarding: true`), the connectivity preflight that used to contact it no longer
-     runs. Test with it removed from `krayt.yaml`'s `allow`/`passthrough` and confirm `claude`
-     still authenticates; record the answer in `images/agents/claude-code/README.md`'s "Required
-     `--allow` hosts" section either way.
-  4. **`gemini-cli` with `GEMINI_API_KEY`:** `krayt shell --image ghcr.io/418-cloud/krayt-agent-gemini-cli
-     --config krayt.yaml` (`agent: { adapter: gemini-cli }`), then start `gemini` interactively
-     inside the shell. Expect no auth dialog (`security.auth.selectedType` seeded) and no
-     folder-trust dialog (`GEMINI_CLI_TRUST_WORKSPACE=true` in `Plan.Env`).
-  5. **A minimal image with no krayt entrypoint at all** — e.g. `debian:trixie-slim` plus the
-     official Claude Code installer, run as a non-root user named `agent`, no
-     `krayt-agent-entrypoint`/`krayt-agent-shellenv` baked in. Repeat check 1 against it. This is
-     the check that actually proves the "image-agnostic" claim: every other check above uses a
-     published krayt image, which could in principle still be passing for some unrelated reason.
-- **Why the agent can't:** no real hardware — no Apple-Silicon Mac (or Linux/KVM host) with `msb`
-  installed anywhere in this environment — and no live Anthropic or Gemini credential to test
-  authentication against a real API.
-- **Verify success by:** each numbered item above has its own inline check. Record the outcome of
-  each explicitly in `KRAYT_SPEC.md` §14 Phase 12's follow-up bullet for this task (currently every
-  hardware box is unchecked) and in this file's history, per `CLAUDE.md`'s "never fabricate a
-  result" rule — if any of them turns up a real gap (most likely #2, whether
-  `sandbox.SecretPlaceholder`'s assumed `$MSB_<NAME>` default still matches a real msb 0.6.16
-  install, or #5, whether a bare image needs something `krayt-agent-shellenv` normally provides
-  that this task didn't anticipate), fix it and re-verify before checking any box done.
-- **Also open, logged per the task's "out of scope" section — verify with a live key, don't fix
-  without one:** Gemini's `GOOGLE_API_KEY` credential is scoped to
+- **Needed:** Gemini's `GOOGLE_API_KEY` credential is scoped to
   `generativelanguage.googleapis.com` (this task's adapter change), but the gemini-cli entrypoint's
   own comment says that credential shape actually goes through Vertex AI Express
   (`aiplatform.googleapis.com`). If that's right, msb never substitutes it and a `GOOGLE_API_KEY`
   run silently sends the placeholder string to Google. Confirm with a live `GOOGLE_API_KEY` which
   host it actually calls, and file a follow-up to fix the adapter's `Hosts` if the entrypoint's
   comment is right.
-- **Blocking:** no for shipping the code (additive; every non-hardware criterion is met) — but yes
-  for closing `KRAYT_SPEC.md` §14 Phase 12's follow-up bullet and for trusting that a `krayt shell`
-  user can actually start `claude`/`gemini` by hand without hitting onboarding or an auth dialog.
+- **Why the agent can't:** it needs a live `GOOGLE_API_KEY` and a real sandbox.
+- **Blocking:** no. `GEMINI_API_KEY`, the recommended credential, works.

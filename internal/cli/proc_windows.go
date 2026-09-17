@@ -3,9 +3,34 @@
 package cli
 
 import (
+	"errors"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/windows"
 )
+
+// stillActive is GetExitCodeProcess's STILL_ACTIVE (259), which x/sys/windows does not export.
+const stillActive = 259
+
+// supervisorAlive reports whether pid still names a running process: it can be opened and has no
+// exit code yet. Access denied means the process exists but can't be queried, so it counts as
+// alive — the conservative direction for both callers, as on unix (proc_unix.go).
+func supervisorAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return errors.Is(err, windows.ERROR_ACCESS_DENIED)
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return true
+	}
+	return code == stillActive
+}
 
 // killSupervisor hard-terminates the supervising `krayt run` process via TerminateProcess
 // (os.Process.Kill) — Windows has no SIGTERM equivalent Go can deliver to an arbitrary process

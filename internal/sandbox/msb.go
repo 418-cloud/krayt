@@ -786,6 +786,44 @@ func (c *Client) Pull(ctx context.Context, ref string) error {
 	return nil
 }
 
+// ImageUser returns the USER from ref's OCI image config, as `msb image inspect --format json`
+// reports it ("" when the image sets none, i.e. it would run as root). msb inspects only its local
+// image cache (msb 0.6.16, crates/cli/lib/commands/image.rs's run_inspect), so when the first
+// inspect fails the image is pulled and inspected once more: a cached image costs no network
+// round trip, exactly like `msb create`'s own implicit pull.
+func (c *Client) ImageUser(ctx context.Context, ref string) (string, error) {
+	args := []string{"image", "inspect", "--format", "json", ref}
+	out, _, err := c.runCaptured(ctx, args)
+	if err != nil {
+		if perr := c.Pull(ctx, ref); perr != nil {
+			return "", perr
+		}
+		var stderr []byte
+		out, stderr, err = c.runCaptured(ctx, args)
+		if err != nil {
+			return "", fmt.Errorf("sandbox: msb image inspect %s: %w (%s)", ref, err, firstNonEmpty(stderr))
+		}
+	}
+	return parseImageUser(out)
+}
+
+// parseImageUser reads config.user out of `msb image inspect --format json`. A null config or a
+// null/absent user both mean the image sets no USER.
+func parseImageUser(raw []byte) (string, error) {
+	var v struct {
+		Config *struct {
+			User *string `json:"user"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", fmt.Errorf("sandbox: parse msb image inspect output: %w", err)
+	}
+	if v.Config == nil || v.Config.User == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(*v.Config.User), nil
+}
+
 // ImageInfo is one parsed entry from `msb images --format json` (retire-vm-image-pipeline.md
 // decision 2: `krayt image ls` is a thin render of this). Like ContextInfo, msb's JSON schema
 // here is not pinned by the ADR or its docs, so field extraction is tolerant of a few plausible

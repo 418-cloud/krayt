@@ -1078,8 +1078,10 @@ a pure function so the whole surface is unit-testable without spawning anything)
 --stream`, see below), `ExecTTY` (`msb exec --tty`, `krayt shell`'s interactive attach — see
 below), `Copy` (`msb copy`, docker-cp syntax), `Logs` (`msb logs --json`, JSON
 Lines tagged by stream), `SystemLogs` (`msb logs --source system --json`, boot/system diagnostics —
-§7 step 2), `Stop`/`Remove` (`msb stop` / `msb rm --force`), `Pull` (`msb pull`), and `List`
-(`msb ls --format json`, `krayt doctor`'s orphan check — see below).
+§7 step 2), `Stop`/`Remove` (`msb stop` / `msb rm --force`), `Pull` (`msb pull`), `ImageUser`
+(`msb image inspect --format json`'s `config.user`, pulling first when the image isn't cached —
+§7 step 4, §8.2), and `List` (`msb ls --format json`, `krayt doctor`'s orphan check — see
+below).
 `CreateSpec` and friends carry no `krayt.yaml` vocabulary and no lifecycle policy — which flags a
 run deserves is decided above this package (network-policy translation §6.6, secret handling §6.8,
 and the run's own order of operations §7 all belong to `internal/orchestrator`, not to the driver
@@ -1179,9 +1181,14 @@ pre-msb) was deleted with the providers themselves.
 
 **A fifth check, orphaned sandboxes (`add-interactive-shell-session.md` decision 6).** With
 `--repo`, `krayt doctor` also cross-references `List`'s live sandbox names against
-`.krayt/runs/`'s recorded `sandbox_name`s and names any `"krayt-*"` sandbox with no matching run
+`.krayt/runs/`'s recorded `sandbox_name`s and names any `"krayt-*"` sandbox with no **live** run
 record — the failure mode decision 5 (no wall-clock timeout in `krayt shell`) opens up: a crashed
-or `kill -9`'d krayt leaves a sandbox running with nothing left to reap it. Unlike the four checks
+or `kill -9`'d krayt leaves a sandbox running with nothing left to reap it. A record owns its
+sandbox only while it is `kept`, or non-terminal with a supervising krayt process that is still
+alive (signal 0 on unix; `OpenProcess` + `GetExitCodeProcess` on Windows). A finished record's
+sandbox is already gone, because teardown runs before the record is marked finished, so one that
+is still listed is a leak too. For a dead process's run the hint is `krayt stop --repo <repo>
+<run-id>`, which also marks the record failed; for anything else it is the raw msb commands. Unlike the four checks
 above, this one is a **`[warn]`, never a `[FAIL]`**, and it **never reaps** — only reports, naming
 the sandbox and the `msb stop`/`msb rm` commands to remove it by hand. A krayt that killed a
 sandbox it does not fully understand (one deliberately kept across a krayt upgrade, say) would be
@@ -1211,7 +1218,19 @@ check that needs any repo state at all.
    replacement for the pre-msb guest serial console — `msb logs --source system --json` includes a
    reconstructed `boot-error.json` block when a sandbox never finished starting), then (b) calls
    `Stop` then `Remove`, both of which wrap `context.WithoutCancel` plus a 30s timeout internally
-   (`sandbox.teardownTimeout`) so the caller need not.
+   (`sandbox.teardownTimeout`) so the caller need not. When `Create` itself failed and (a) saved a
+   `console.log`, the returned error (and so `meta.json`'s) points at that file. msb's own
+   message says ``run `msb logs --source system <name>` for full diagnostics``, but by the time
+   anyone reads it (b) has removed the sandbox, and that command prints `error: sandbox not found`
+   (`run_012a74f8`). The saved file holds the same diagnostics, including the root cause
+   (`agentd: init failed: … guest user not found: agent`, `run_985a6aae`). So the hint is
+   rewritten to `full diagnostics saved to <run dir>/logs/console.log (the sandbox has been
+   removed)`, or that pointer is appended if msb's hint isn't there. If nothing was saved, msb's
+   message is left unchanged (`pointCreateErrorAtConsoleLog`, shared with `Shell`). Verified on
+   hardware (`run_95a0903e`, 2026-09-17): `krayt shell --memory 32` failed at start, and its error
+   ended `→ full diagnostics saved to …/run_95a0903e/logs/console.log (the sandbox has been
+   removed)`. That file held msb's boot log: VM start, then shutdown about 65s later. The log names
+   no cause for this failure; msb records none.
 3. **Wire the `ask_human` channel, only if `spec.Questions.Mode == task.QuestionWait`** —
    `askbridge.Listen(runDir/ask)` binds `ask.sock`; a `Bridge` is constructed whose push callback
    redacts the prompt/choices against the secrets file's values, persists a `QuestionRecord`, flips
@@ -1230,7 +1249,11 @@ check that needs any repo state at all.
    (`"vsock://2:1026"`) — in `fail` mode **no** `--vsock` route is created at all, so the sandbox's
    own `krayt-ask` simply fails to dial and its CLI front-end maps that to the no-answer sentinel;
    there is no separate host-side "fail mode" branch to maintain.
-4. **`msb create`** — `sandbox.CreateSpec{Image: spec.ImageRef, Name: name, User: "agent",
+4. **Resolve the sandbox user, then `msb create`.** The user is the image's own `USER`
+   (`sandbox.Client.ImageUser`: `msb image inspect --format json`, pulling the image first if msb's
+   local cache doesn't have it yet). An unset or root `USER` fails the run here, before anything is
+   created (§8.2). The result is recorded as `RunRecord.SandboxUser` and used for every non-root
+   exec below. `sandbox.CreateSpec{Image: spec.ImageRef, Name: name, User: <that user>,
    CPUs/MemoryMiB/DiskGiB: from spec.Resources, MaxDuration: spec.Resources.Timeout, Env:
    spec.Env (sorted), Vsock: (see step 3), Secrets: one `SecretRef` per `spec.Network.Secrets`
    entry, Security: "restricted" (fixed, not configurable, §6.6), ExtraArgs:
@@ -1248,12 +1271,12 @@ check that needs any repo state at all.
    agent image needed rebuilding). A defensive `chmod +x` runs as root afterward, since msb's
    mode-preservation on copy is not a pinned contract.
 6. **`msb exec --user root`** — `krayt-helper setup --bundle /tmp/repo.bundle --workspace
-   /workspace --patch-git /.krayt/patchgit --agent-user agent`, JSON stdout parsed for
+   /workspace --patch-git /.krayt/patchgit --agent-user <sandbox user>`, JSON stdout parsed for
    `baseline`. Only now — once the code snapshot is durably cloned into the sandbox — does
    `rec.State` flip to `running`, preserving the pre-msb invariant that `running` means "safe to
    mutate the host repo now" (§6.2).
 6b. **Seed first-run config** (`seed-agent-first-run-config.md`, §6.14 "First-run state") — apply
-   every `spec.ConfigSeeds` entry, entirely as `msb exec --user agent` (never root): resolve the
+   every `spec.ConfigSeeds` entry, entirely as `msb exec --user <sandbox user>` (never root): resolve the
    entry's base directory (`$DirEnv` if set in the guest env, else `$HOME`), `cat` the existing
    file (missing means `{}`), merge `Defaults` in host-side (fill-in-never-override), and, only if
    that changed anything, write the merged bytes back via a `mkdir -p` + temp-file + `mv -f`
@@ -1261,7 +1284,20 @@ check that needs any repo state at all.
    seed, never fails the run. Shared by `Run` and `Shell` (below) through one function; `AttachShell`
    and `PatchLiveShell` never run it — the sandbox already exists and a human may have changed
    these files since.
-7. **`msb exec --user agent --stream`** — runs the one fixed command every agent image exposes,
+6c. **Trust `/workspace` for git** (`internal/orchestrator/gitsafe.go`).
+   - What it does: one `msb exec --user <sandbox user>` runs `git config --global --add
+     safe.directory /workspace`, unless that entry is already there. Without git in the image it
+     does nothing.
+   - Why: `/workspace` is root-owned, because krayt-helper clones it as root and only relaxes its
+     mode. So the sandbox user's git refuses it with "detected dubious ownership" in any image
+     that doesn't configure this itself; `run_499009c0` showed that on the published claude-code
+     image.
+   - Why the user's global config, not a create-time `GIT_CONFIG_*` variable: create-time env
+     reaches every exec, root's included. krayt-helper's git ignores global config but inherits
+     env, and it must keep refusing a `.git` the agent could have replaced with one it owns.
+   - Best-effort and shared, like 6b: `Run` and `Shell` both run it, a failure only warns, and
+     `AttachShell` doesn't repeat it (the setting lives in the user's `$HOME`).
+7. **`msb exec --user <sandbox user> --stream`** — runs the one fixed command every agent image exposes,
    `/usr/local/bin/krayt-agent-entrypoint` (uniform across every published agent image; no
    per-adapter command table needed), stdout+stderr both wired to `io.MultiWriter(logFile,
    LogOut-if-not-detached)`. A non-zero exit with **zero bytes observed on either stream** is
@@ -1341,8 +1377,11 @@ currently in `/workspace`.
 `krayt stop <run-id>` on a `kept` record is the other side of decision 3: `Shell` clears the
 record's `PID` on the way to `kept` (no process outlives a `--keep` session's own exit), so there
 is nothing left for the existing PID-signal path to signal — `krayt stop` detects `state: kept`
-and stops + removes the sandbox directly by name instead, then flips the record to `done`. Every
-other run/session kind keeps the unmodified PID-signal path.
+and stops + removes the sandbox directly by name instead, then flips the record to `done`. A
+non-terminal record whose supervising krayt process is no longer alive (`kill -9`, a crash) gets
+the same by-name cleanup, if msb still lists the sandbox. Its record then becomes `failed`, with
+an error naming the dead pid, so it stops reading as live. Every other live run/session keeps the
+unmodified PID-signal path.
 
 ---
 
@@ -1638,9 +1677,23 @@ so the published entrypoints' own `GEMINI_CLI_TRUST_WORKSPACE`/`GOOGLE_GENAI_USE
 are harmless duplicates now, kept only because they still serve `agent.adapter: none`.
 
 The container **must** run as a **non-root** uid — this is **enforced, not just a convention**
-(§10): an image whose `USER` is root (uid 0) or unset **fails the run** with a clear error and
-never launches (`msb create --user`/`msb exec --user`, always a fixed non-root user, §7). Some
-agents (Claude Code among them) also refuse uid 0 independently.
+(§10): krayt reads the image's own `USER` (`msb image inspect`, §7 step 4) and runs the sandbox as
+it (`msb create --user`/`msb exec --user`). An image whose `USER` is unset, `root`, or uid 0
+**fails the run** with a clear error naming the image, before any sandbox is created. Any
+non-root form works — `agent`, `node`, `1000`, `1000:1000` — so an image needs no user of a
+particular name. A non-root *name* that the image's own `/etc/passwd` maps to uid 0 is not
+detected; that is an accepted residual. Some agents (Claude Code among them) also refuse uid 0
+independently.
+
+An image also needs no git configuration for `/workspace`: krayt marks it `safe.directory` for the
+sandbox user itself (§7 step 6c). The `safe.directory` lines in the published images'
+`krayt-agent-shellenv` and entrypoint are now harmless duplicates.
+
+This replaced a fixed `--user agent` (2026-09-17). msb refuses to boot any image without a user of
+exactly that name: `run_985a6aae` (`docker.io/ubuntu:latest`) died with
+`agentd: init failed: exec session error: guest user not found: agent`, surfaced to the user only
+as msb's generic `sandbox process exited … before agent relay became available`. The published
+`krayt-agent-gemini-cli` image (`USER node`) was affected the same way.
 
 **The agent's own state directory is read, not injected.** `--transcript` copies the agent's
 session transcript out of `$HOME` (the path is the adapter's, relative to whatever `$HOME` the
@@ -2257,7 +2310,7 @@ krayt questions <run-id> [--pending-only] [--sort asked|pending-first|pending-la
 krayt answer  <run-id> [<qid>] <response>   # answer a waiting agent question (§6.13); FIFO if qid omitted
 krayt patch   <run-id>         # print/locate the run's changes.patch — re-derives it on demand for a live `krayt shell` session (§7 "Shell lifecycle", decision 9)
 krayt apply   <run-id>         # helper: git apply the patch onto the host (after review)
-krayt stop    <run-id>         # stop + destroy a run's VM, or a kept `krayt shell` sandbox directly by name (§6.15, §7)
+krayt stop    <run-id>         # stop + destroy a run's VM; a kept `krayt shell` sandbox, or one whose krayt process died, directly by name (§6.15, §7)
 krayt rm      <run-id>         # remove run artifacts
 krayt image pull  <ref>                              # pre-warm msb's own image store (`msb pull`, §11)
 krayt image ls                                       # list images in msb's own store (`msb images --format json`)
@@ -2918,22 +2971,60 @@ including the case a naive implementation gets wrong — a shell that exits with
 `--keep` was given, since "clean" means "no orchestration error", not "the shell's own exit code
 was 0".
 
-**Done when (hardware, `[HUMAN]`)** — **not met; every criterion below needs a real
-Apple-Silicon Mac with `msb` installed, which this environment does not have.** Handed off in
-full via `HUMAN_TODO.md`, including the four numbered "Verify first" checks the task requires
-*before* trusting decision 10's premise and decision 14's scoping — none of which could be run
-here either:
+**Done when (hardware, `[HUMAN]`)** — **criteria 1–7 met on an Apple-Silicon Mac, 2026-09-16/17**
+(details below). Still open in `HUMAN_TODO.md`:
+- which profile hook fires (#4).
+
+The four numbered "Verify first" checks, as originally handed off:
 1. `msb exec -t` gives a usable terminal when krayt inherits stdio: window resize reflows, Ctrl-C
    interrupts the foreground command rather than the session, a full-screen TUI renders and exits
    cleanly, 256-colour/mouse reporting survive. **Partly verified on hardware 2026-09-16**:
    resize reflows (`run_60606516`: `stty size` went `33 138` → `33 86` → `41 133` across terminal
    resizes), and Ctrl-C at an idle prompt reaches the guest shell without ending the session
-   (`run_f9ac185c`, `run_34b64ca5`). Still unverified: Ctrl-C on a foreground command, a
-   full-screen TUI, 256-colour/mouse.
+   (`run_f9ac185c`, `run_34b64ca5`), and Ctrl-C interrupts a foreground command without ending
+   the session (`run_6d0cba01`: `sleep 1000`, `^C`, back at the prompt). 256-colour renders
+   (`echo -e '\e[38;5;196mred\e[0m'` printed red, per the repo owner). Alternate-screen and cursor
+   addressing work: `tput smcup; tput clear; tput cup 10 20; echo test; sleep 3; tput rmcup` put
+   the text mid-screen. The image ships no `top`/`vim`. On a window shrink the static text moved up
+   and stayed there on regrow; that is the host terminal clipping a screen nothing redraws, not a
+   resize-propagation fault (`stty size` above already tracks resizes). `tput rmcup` then
+   restored the previous screen and the prompt worked normally. Interactive `claude` drew, redrew on
+   window resize, and exited back to a normal shell. **Decision 10's premise holds: msb owns the
+   pty, and krayt inherits stdio with no terminal code of its own.** Mouse reporting was not
+   exercised.
 2. Whether `msb exec` inherits the sandbox's create-time environment (`CreateSpec.Env`) — decides
    how much (if anything) `krayt-agent-shellenv` is still missing beyond `safe.directory`.
+   **Answered 2026-09-16: yes, for both channels.** `claude -p` authenticated in the exec'd shell
+   (`run_bd146fec`, see #3), so msb's secret placeholder variable, which arrives through agentd's
+   baseline environment, reaches it with no help from `krayt-agent-shellenv`. `echo $CLAUDE_MODEL`
+   printed `claude-sonnet-5` from `krayt.yaml`'s `env:` (`run_45ccf721`), so `CreateSpec.Env`
+   (`--env`) reaches it too. `krayt-agent-shellenv` needs nothing beyond `safe.directory` for
+   environment. **That `safe.directory` gap is real** (`run_499009c0`, 2026-09-17): on the
+   published claude-code image, built from `main` without `krayt-agent-shellenv`, `git status` in
+   `/workspace` as `agent` fails with `fatal: detected dubious ownership in repository at
+   '/workspace'`. **Fixed offline in krayt itself** (§7 step 6c, 2026-09-17), so it no longer depends
+   on any image hook: krayt adds `safe.directory /workspace` to the sandbox user's global git
+   config.
+   - `TestTrustWorkspaceScript` runs the real script against real git. Under git's own
+     `GIT_TEST_ASSUME_DIFFERENT_OWNER`, a refused `git status` then succeeds. A second run adds
+     nothing, an image without git is a no-op, and an unwritable `$HOME` fails with a message.
+   - The fake-msb tests pin that it runs as the image user, after setup and before the agent or
+     tty, that a failure only warns, and that `--attach` doesn't repeat it.
+   - **Verified on hardware** (`run_1dfbd249`, 2026-09-17, the same published image): `git status`
+     in `/workspace` printed `On branch main … working tree clean`, and
+     `git config --global --get-all safe.directory` printed `/workspace`, once.
 3. What the `--secret` placeholder looks like inside an exec'd shell, and whether an interactively
-   started `claude` reaches its API host under the run's allowlist.
+   started `claude` reaches its API host under the run's allowlist. **Second half verified
+   2026-09-16 (`run_bd146fec`)**: with `--config krayt.yaml --secrets secrets.env` and no
+   hand-written `network.inject` for the model credential, `claude -p "say hello"` typed into the
+   shell got a real model reply. `CLAUDE_CODE_OAUTH_TOKEN` was scoped to `api.anthropic.com` by the
+   claude-code adapter (§13's 2026-09-16 amendment) and substituted by msb. **First half answered
+   too** (`run_5e8392ed`): `printenv CLAUDE_CODE_OAUTH_TOKEN` in the shell printed
+   `$MSB_CLAUDE_CODE_OAUTH_TOKEN`, msb's default `$MSB_<NAME>` and exactly what
+   `sandbox.SecretPlaceholder` returns. **Negative control verified** the same day: the same
+   invocation with `agent.adapter` removed from `krayt.yaml` (and no hand-written
+   `network.inject` for the token) was refused before boot with `secrets-file key
+   "CLAUDE_CODE_OAUTH_TOKEN" has no network.inject entry`, exactly as `krayt run` refuses it.
 4. **Answered, 2026-09-16, first real-hardware attempt:** with no `Command`, `msb exec --tty`
    re-execs the image's `ENTRYPOINT` — not a shell — for any image that sets one without an
    image-level `Shell`, every published krayt agent image included. A `krayt shell` session
@@ -2954,12 +3045,122 @@ the same gate. **Partly verified on hardware 2026-09-16 (`run_34b64ca5`)**: afte
 session exited, `msb list` still showed `krayt-run_34b64ca5` running; `krayt shell --attach`
 re-entered it; `krayt stop run_34b64ca5` printed `stopped kept shell session` and `msb list` then
 showed no sandboxes. The same run also showed Ctrl-C at an idle prompt reaching the guest shell
-without ending the session. Still unverified: edits surviving a re-attach and landing in
-`changes.patch`, `krayt ls` state after `stop`, `krayt apply`, and the error-path teardown
-matrix. Windows is explicitly **not claimed to work** (§14's standing rule for every prior
-phase): inherited stdio is the same code path, but nobody in this environment can confirm ConPTY
-through msb without a Windows box, and that residual is logged separately in `HUMAN_TODO.md`
-rather than folded into the macOS entry.
+without ending the session. **Criteria 1 and 2 are met**
+(`run_52f22905`, 2026-09-17, a scratch repo; teardown confirmed by the `msb list` below): `echo "Hello" >> greetings.txt` in the shell, then
+`exit`, produced a `changes.patch` adding exactly that file and a `meta.json` with
+`"kind": "shell"`, `"state": "done"`, `"exit_code": 0`; `krayt apply run_52f22905` wrote
+`greetings.txt` into the host repo. **Criterion 3 is met too** (`run_0281053c`, same repo):
+- A `--keep` session appended a line and exited; `krayt shell --attach` found that line still
+  there and appended another.
+- `changes.patch` then held both lines. The host's uncommitted `greetings.txt` from
+  `run_52f22905` was in the snapshot, and the patch applied cleanly on top of it.
+- `krayt stop run_0281053c` left `meta.json` at `"state": "done"`, and `msb list` then printed
+  `No sandboxes found.` That listing also confirms `run_52f22905`'s sandbox was removed after its
+  plain `exit`.
+
+Teardown after a killed session is verified for SIGTERM (`run_850f964b`): with `msb list` showing
+`krayt-run_850f964b` running, `kill <krayt shell pid>` left `msb list` printing
+`No sandboxes found.` **Closing the terminal leaked, and is fixed**:
+- On hardware, closing the terminal of `run_f771973c` left `krayt-run_f771973c` running in
+  `msb list` with no `krayt` process left.
+- Cause: `cmd/krayt/main.go` handled only `os.Interrupt` and `SIGTERM`, and Go's default action for
+  an unhandled `SIGHUP` exits without running the orchestrator's deferred teardown.
+- Fix: `SIGHUP` is now in `shutdownSignals`, and `cmd/krayt/main_test.go` proves each of
+  SIGINT/SIGTERM/SIGHUP cancels the context instead of killing the process (it fails with `SIGHUP`
+  removed).
+- **Fix verified on hardware** (`run_3b460ff0`, `bin/krayt` rebuilt after the fix): after the
+  terminal was closed, `msb list` showed the sandbox go from `running` to `draining` to gone.
+  `meta.json` ended `"state": "failed"` with `krayt-helper finish: … context canceled`, and
+  teardown wrote `logs/console.log`. Because the cancelled context skips patch collection, edits
+  made in a session whose terminal is closed are not collected. That is the same as any other
+  cancellation today.
+
+A failed `msb create` leaves nothing either: a nonexistent `--image` (2026-09-17) failed with
+`registry error: Not authorized`, and `msb list` stayed empty. That path never creates a sandbox,
+so it does not exercise teardown. A sandbox that msb registers but that fails to start is also
+cleaned up (`run_985a6aae`, `--image docker.io/ubuntu:latest`, 2026-09-17): the run record ends
+`failed`, teardown wrote `logs/console.log`, and `msb list` was empty afterwards.
+
+That run also exposed an **undocumented image requirement**, now **fixed offline**. `console.log`
+shows `agentd: init failed: exec session error: guest user not found: agent`:
+- krayt always created the sandbox with `--user agent`, so an image with no user literally named
+  `agent` could not boot. The published `krayt-agent-gemini-cli` image (`USER node`, no `agent`
+  user) was affected the same way; its recorded runs predate the msb cutover.
+- The user saw only msb's generic `sandbox process exited … before agent relay became available`.
+- Fix: every sandbox now runs as the image's own `USER`, and root/unset is refused before create
+  with a clear error (§7 step 4, §8.2; `internal/orchestrator/sandboxuser.go`,
+  `sandbox.Client.ImageUser`, `RunRecord.SandboxUser`). Unit-tested against the fake msb:
+  - Run and Shell create and exec as the image's user.
+  - Root, uid 0, and unset `USER` are refused with no `create` issued.
+  - An uncached image is pulled before inspect, and a failed pull stops before create.
+  - `--attach` reuses the recorded user, and a legacy record falls back to `agent`.
+- **Verified on hardware, 2026-09-17** (`bin/krayt` rebuilt from this change):
+  - `--image docker.io/ubuntu:latest` (`run_15e2db5c`) was refused before any sandbox was created,
+    with `image docker.io/ubuntu:latest sets no USER, so it would run as root …`.
+  - `--image docker.io/nginxinc/nginx-unprivileged` (`run_fe8283e8`) booted with
+    `"sandbox_user": "101"`, a numeric USER that the old fixed `agent` user could never boot.
+  - `--image ghcr.io/418-cloud/krayt-agent-gemini-cli` (`run_fd8e87cf`), which could not boot
+    before, reached a `node@krayt-run_fd8e87cf:/workspace$` prompt. `id` printed
+    `uid=1000(node)`, and the record ended `"state": "done"` with `"sandbox_user": "node"`.
+  - The claude-code image still boots with this binary (`run_230cf487`, `--keep`). It recorded
+    `"sandbox_user": "agent"`, and `krayt stop` destroyed the kept sandbox and set the record to
+    `done`.
+
+Also fixed offline the same day: a run whose krayt process died (`kill -9`, a crash) is no longer
+treated as live.
+- `krayt doctor --repo` now reports its sandbox, with a `krayt stop` hint.
+- `krayt stop <run-id>` removes the sandbox by name and marks the record `failed`, instead of
+  signalling a pid that no longer exists.
+- The same applies to a finished record whose sandbox is somehow still listed.
+- Unit-tested with the process check stubbed. `supervisorAlive` itself is tested against the test
+  process and a reaped child.
+- **Verified on hardware, 2026-09-17.**
+  - `krayt stop run_f771973c`, the closed-terminal leak whose sandbox had already been removed by
+    hand, printed `its krayt process (pid 81003) was no longer running; no sandbox was left to
+    remove`. The record ended `failed`, with that pid in its error and `pid` cleared.
+  - `run_4227f2de`: after `kill -9` on its `krayt shell` (pid 98095), `msb list` kept showing
+    `krayt-run_4227f2de` running. `krayt doctor --repo .` warned `krayt-run_4227f2de (run
+    run_4227f2de's krayt process is gone; stop with: krayt stop --repo . run_4227f2de)`.
+    Running that command printed `… was no longer running; removed sandbox krayt-run_4227f2de`,
+    `msb list` then printed `No sandboxes found.`, and the record ended `failed` with the pid
+    in its error.
+
+**Failed-setup teardown is verified** (`run_fe8283e8`): nginx-unprivileged has no `git`, so
+`krayt-helper setup` failed with `exec: "git": executable file not found in $PATH`. Teardown wrote
+`logs/console.log`, and `msb ls` then printed `No sandboxes found.`
+
+**Criterion 4 is met.** A sandbox without `--keep` is gone after each of these, all on hardware:
+- a plain `exit` (`run_52f22905`)
+- SIGTERM (`run_850f964b`)
+- a closed terminal, once SIGHUP was handled (`run_3b460ff0`)
+- a failed `krayt-helper setup` (`run_fe8283e8`)
+- a failed start (`run_985a6aae`)
+
+Ctrl-C from outside the session (SIGINT) takes the same `shutdownSignals` path as SIGTERM. That is
+unit-tested (`cmd/krayt/main_test.go`) but was not separately run on hardware.
+
+**Criterion 5 is met** (2026-09-17). While `run_c5cfde2d` was attached in another terminal:
+- `cat $(krayt patch run_c5cfde2d --repo .)` showed the in-session edit `+Hello`.
+- After a further edit, the same command showed `+Hello` and `+Hello again`, a new post-image blob
+  (`7bf4a63` → `96a4ef7`).
+- The record stayed `"state": "running"` with no `ended_at`, so neither call ended the session.
+
+An earlier single call against a live `run_97555ea3` also returned its in-session edit.
+
+**Criterion 6 is met** (2026-09-17):
+- With a hand-made `krayt-test-orphan` sandbox, `krayt doctor --repo .` printed `[warn] no orphaned
+  krayt-* sandboxes — krayt-test-orphan (stop with: msb stop krayt-test-orphan && msb rm
+  krayt-test-orphan)`, while the four msb checks stayed `[ok]`.
+- Doctor did not remove it: a second `krayt doctor` still warned, and the printed `msb stop` then
+  reported `Stopped krayt-test-orphan`.
+- After the printed commands removed it, `krayt doctor --repo .` printed `[ok] no orphaned krayt-*
+  sandboxes` with no `[warn]`.
+**Criterion 7 is met** (`run_bd146fec`, #3 above): `claude` started by hand in the
+claude-code image authenticated and reached `api.anthropic.com` under the run's allowlist.
+Windows is explicitly **not claimed to work** (§14's standing rule for every prior phase):
+inherited stdio is the same code path, but nobody in this environment can confirm ConPTY through
+msb without a Windows box, and that residual is logged separately in `HUMAN_TODO.md` rather than
+folded into the macOS entry.
 
 **Follow-up — seed each agent's first-run config from its adapter
 (`seed-agent-first-run-config.md`).** A hand-started `claude`/`gemini` inside `krayt shell` hits
@@ -2987,12 +3188,53 @@ wired into both `Run` and `Shell`, never `AttachShell`/`PatchLiveShell`.
 - [x] `internal/cli` — `applyAdapter` now sets `spec.ConfigSeeds`/`Input.Placeholder`;
   `applyAdapterForShell` replaces `applyAdapterSecrets` (§13's 2026-09-16 amendment, extended).
 - [x] Spec amendments (this change): §6.14, §7, §8.2, §13, this phase, `docs/ai-tasks/README.md`.
-- [ ] **Hardware, `[HUMAN]`** — five checks needing a real Mac, msb 0.6.16, and a live credential
+- [x] **Hardware, `[HUMAN]`** — five checks needing a real Mac, msb 0.6.16, and a live credential
   each: `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` both authenticate with no onboarding/
   approval dialog inside `krayt shell`; whether `platform.claude.com` is still needed once
   onboarding is seeded; `gemini-cli` with `GEMINI_API_KEY` shows neither the auth nor the
   folder-trust dialog; the same `CLAUDE_CODE_OAUTH_TOKEN` check against a minimal image with no
-  krayt entrypoint at all. Handed off in full via `HUMAN_TODO.md`.
+  krayt entrypoint at all. Handed off in full via `HUMAN_TODO.md`. The placeholder format the
+  `ANTHROPIC_API_KEY` approval seed depends on is confirmed inside a `krayt shell` session
+  (`run_5e8392ed`: `$MSB_CLAUDE_CODE_OAUTH_TOKEN`); the approval dialog itself is still unchecked.
+  **The `CLAUDE_CODE_OAUTH_TOKEN` check is verified** (2026-09-17, claude-code image, `krayt.yaml`
+  with `agent.adapter: claude-code`). Interactive `claude` started by hand in `krayt shell` opened
+  with no onboarding screen; the only prompt was Claude Code's per-folder trust question, which
+  decision 9 of the task deliberately leaves to the human. A one-line request through the same
+  credential succeeded earlier (`run_bd146fec`, `claude -p "say hello"`).
+  **`platform.claude.com` is no longer needed** (2026-09-17, reported by the repo owner): with it
+  removed from `krayt.yaml`'s `allow`/`passthrough`, interactive `claude` still authenticated. The
+  onboarding connectivity check that contacted it no longer runs once onboarding is seeded.
+  Recorded in `images/agents/claude-code/README.md`'s "Required `--allow` hosts".
+  **The `ANTHROPIC_API_KEY` check is verified** (`run_499009c0`, 2026-09-17,
+  `platform.claude.com` already removed from `krayt.yaml`).
+  - Interactive `claude` opened straight to its "Welcome back!" screen ("API Usage Billing"), with
+    no onboarding and no "Detected a custom API key" dialog.
+  - `/status` reported `API key: ANTHROPIC_API_KEY`. Interactive Claude Code uses an env key only
+    when it is approved, so the seeded `customApiKeyResponses.approved` entry (the placeholder's
+    last 20 characters) matched.
+  - `/status` also reported `Additional CA cert(s): /.msb/tls/ca.pem`: msb's `NODE_EXTRA_CA_CERTS`
+    reaches a hand-started shell.
+  - In the same session, `claude -p "say hello"` got a real reply (`Hello! 👋 …`), so msb
+    substituted the real key. `printenv ANTHROPIC_API_KEY` printed `$MSB_ANTHROPIC_API_KEY`, the
+    value the approval seed is computed from, and `CLAUDE_CODE_OAUTH_TOKEN` was unset.
+  **The image-agnostic check is met by the published claude-code image itself.** That image is
+  built only from `main` (`agent-images.yml` pushes on `main` only), where there is no
+  `krayt-agent-shellenv`, no profile hook, and nothing that writes `~/.claude.json`: neither the
+  Dockerfile nor the entrypoint touches it, and `krayt shell` never runs the entrypoint. The same
+  image showed onboarding before seeding existed (the session that started this work) and opens
+  without it now, for both `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`. The only difference
+  from the proposed bare image is its `agent` user name, which no longer matters (§8.2).
+  **The `gemini-cli` / `GEMINI_API_KEY` check is verified** (`run_4057b6dc`, 2026-09-17; a config
+  with only `agent.adapter: gemini-cli` and `allow: [generativelanguage.googleapis.com]`, and a
+  secrets file holding only `GEMINI_API_KEY`).
+  - Inside the published gemini-cli image (running as `node`), `printenv GEMINI_API_KEY` printed
+    `$MSB_GEMINI_API_KEY` and `GEMINI_CLI_TRUST_WORKSPACE` was `true`.
+  - `~/.gemini/settings.json` held `"security": {"auth": {"selectedType": "gemini-api-key"}}`.
+  - Interactive `gemini` opened with `Authenticated with gemini-api-key`, with no auth dialog and
+    no folder-trust dialog.
+  - `gemini -p "say hello"` got a real reply.
+  - **With this, every hardware check in this follow-up is met.** The `GOOGLE_API_KEY` host-scope
+    question stays open.
 
 ---
 
