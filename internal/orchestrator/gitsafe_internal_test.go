@@ -13,7 +13,11 @@ import (
 // reads a global config from there.
 func runTrustScript(t *testing.T, home, path, dir string) (string, error) {
 	t.Helper()
-	cmd := exec.Command("/bin/sh", "-c", trustWorkspaceScript, "sh", dir)
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not installed")
+	}
+	cmd := exec.Command(sh, "-c", trustWorkspaceScript, "sh", dir)
 	cmd.Env = []string{"HOME=" + home, "XDG_CONFIG_HOME=" + filepath.Join(home, ".config"), "PATH=" + path, "GIT_CONFIG_NOSYSTEM=1"}
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
