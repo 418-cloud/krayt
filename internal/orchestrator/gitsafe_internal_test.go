@@ -1,9 +1,9 @@
 package orchestrator
 
 import (
-	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -59,20 +59,40 @@ func TestTrustWorkspaceScript(t *testing.T) {
 	if out, err := runTrustScript(t, home, path, repo); err != nil || out != "already trusted" {
 		t.Fatalf("second run: %q, %v", out, err)
 	}
-	cfg, err := os.ReadFile(filepath.Join(home, ".gitconfig"))
+	// Ask git what it has, rather than counting occurrences in the raw .gitconfig: git escapes
+	// backslashes when it writes a value, so a Windows path is stored as C:\\Users\\... and never
+	// matches the path the script was handed. --get-all reports the values as git parses them, on
+	// every platform, and is the same "added exactly once" assertion.
+	cmd := exec.Command("git", "config", "--global", "--get-all", "safe.directory")
+	cmd.Env = []string{"HOME=" + home, "XDG_CONFIG_HOME=" + filepath.Join(home, ".config"), "PATH=" + path, "GIT_CONFIG_NOSYSTEM=1"}
+	listed, err := cmd.Output()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("git config --get-all safe.directory: %v", err)
 	}
-	if n := strings.Count(string(cfg), repo); n != 1 {
-		t.Errorf(".gitconfig names %s %d times, want exactly once:\n%s", repo, n, cfg)
+	trusted := strings.Split(strings.TrimSpace(string(listed)), "\n")
+	n := 0
+	for _, dir := range trusted {
+		if dir == repo {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("git reports safe.directory %s %d times, want exactly once: %q", repo, n, trusted)
 	}
 	if err := gitStatus(); err != nil {
 		t.Errorf("git status still refuses the trusted repo: %v", err)
 	}
 
-	emptyPath := t.TempDir()
-	if out, err := runTrustScript(t, t.TempDir(), emptyPath, repo); err != nil || out != "no git" {
-		t.Errorf("without git: %q, %v; want a clean no-op", out, err)
+	// The no-git no-op is only observable where PATH alone decides what the shell can find. On the
+	// Windows runner `sh` resolves to Git for Windows' own shell, which reaches git whatever PATH
+	// the test hands it — run 35231757916 printed "trusted" here with PATH set to an empty
+	// directory. That is a property of that host shell, not of the script, which only ever runs in
+	// the Linux guest (trustWorkspaceForGit).
+	if runtime.GOOS != "windows" {
+		emptyPath := t.TempDir()
+		if out, err := runTrustScript(t, t.TempDir(), emptyPath, repo); err != nil || out != "no git" {
+			t.Errorf("without git: %q, %v; want a clean no-op", out, err)
+		}
 	}
 
 	out, err := runTrustScript(t, filepath.Join(t.TempDir(), "missing", "home"), path, repo)

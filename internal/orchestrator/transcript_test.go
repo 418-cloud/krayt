@@ -202,7 +202,13 @@ func TestTranscriptCapturedOnWallClockTimeout(t *testing.T) {
 	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, task.RunSpec{
 		ID: "run_tr_timeout", ImageRef: "img", RepoPath: newRepo(t, map[string]string{"a.txt": "1\n"}),
 		BundleDepth: 1, TaskPrompt: []byte("t"), Network: allowlistAll,
-		Resources:     task.Resources{Timeout: 300 * time.Millisecond},
+		// The wall clock has to outlast sandbox creation, not merely be short: the run's first
+		// step is an `msb image inspect` (resolveSandboxUser), and a budget that expires during
+		// it returns earlyTimeoutResult before any sandbox exists — a timed-out run with nothing
+		// to capture from, which is not the path under test. Every msb call here is a re-exec of
+		// this test binary, so under -race on a loaded runner one round-trip alone can take
+		// seconds; seconds of headroom, not milliseconds.
+		Resources:     task.Resources{Timeout: 10 * time.Second},
 		TranscriptDir: transcriptGuestDir,
 	}, runDir)
 	if err != nil {
