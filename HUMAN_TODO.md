@@ -422,7 +422,7 @@ with an API key, an image with no krayt shell setup, and Gemini with `GEMINI_API
 
 ---
 
-## [CI] confirm PR #163's `build + test` legs, and a pre-existing question-timeout data race
+## [CI] confirm PR #163's `build + test` legs
 
 The four failing `build + test` legs on PR #163 (run `35231757916`, head `e9c08d4`) are fixed in
 this branch: the three `-race` legs died on `panic: test timed out after 10m0s` in
@@ -438,23 +438,17 @@ one of them can only be confirmed on a Windows runner.
      and reaches git whatever `PATH` the test sets. Verify with
      `go test ./internal/orchestrator/ -run TestTrustWorkspaceScript` on `windows-latest`.
      Everything else is verified on Linux.
-  2. **`hack/test-entrypoint-credentials.sh` on macOS is still unconfirmed for this PR.** That step
-     runs after `go test`, so it never executed on the red `macos-latest` leg. It passes here on
-     bash 5, and a scan of the PR's changed `hack/*.sh`, `entrypoint.sh` and `krayt-agent-shellenv`
-     files found no bash-4-only construct (no `mapfile`, `declare -A`, `${v^^}`, `&>>`, and the one
-     array expansion already uses the 3.2-safe `${extra[@]+"${extra[@]}"}` form) — but bash 3.2
-     itself only exists on the macOS runner.
-  3. **Decide what to do about a pre-existing data race, separately from this PR.**
-     `TestQuestionTimeoutAbort` fails under `-race` roughly half the time:
-     `armQuestionTimeout`'s `time.AfterFunc` closure reads `*streamCancel`
-     (`internal/orchestrator/orchestrator.go:1084`) while `Run` writes `streamCancel = cancelStream`
-     (`:418`) with nothing synchronizing the two. It reproduces identically at the merge base
-     (`b593fe4`, 8 iterations), so it is **not** this PR's doing and the code is untouched here —
-     but with the 10m timeout lifted the legs now reach that test, so it will intermittently redden
-     `build + test` until it is fixed (guard the pointer, or pass the cancel through the latch's
-     mutex).
-- **Why the agent can't:** items 1 and 2 need a Windows and a macOS runner; item 3 is a
-  pre-existing defect on `main` that is out of this PR's scope to change.
+  2. **`hack/test-entrypoint-credentials.sh` has still never run on the `macos-latest` leg.** That
+     step is `ci.yml:45`, immediately after the `go test` at `:39`, so it never executed on the red
+     leg. **The bash 3.2 risk this item was opened for is closed** (2026-09-18): the full suite
+     passed 23/23 on an Apple-Silicon Mac whose only `bash` is `/bin/bash` 3.2.57 — the harness and
+     all three `entrypoint.sh` files are `#!/usr/bin/env bash`, which resolves to that binary, and
+     it is the same interpreter `macos-latest` gets for `bash hack/…`. This corrects the original
+     claim here that "bash 3.2 itself only exists on the macOS runner". The earlier static scan
+     (no `mapfile`, `declare -A`, `${v^^}`, `&>>`; the one array expansion already in the 3.2-safe
+     `${extra[@]+"${extra[@]}"}` form) is now backed by an actual 3.2 run. What is left is only
+     that the leg has never reached the step, which needs `go test` to pass there first.
+- **Why the agent can't:** items 1 and 2 need a Windows and a macOS runner.
 - **Verify success by:** a green `build + test` on all four legs, then delete items 1 and 2 from
-  this entry; item 3 belongs in its own issue.
+  this entry.
 - **Blocking:** no.

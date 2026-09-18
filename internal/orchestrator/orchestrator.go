@@ -237,7 +237,14 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// front-end maps that straight to the no-answer sentinel; there is no separate in-process
 	// "fail mode" branch to maintain here the way the pre-msb Start-stream loop needed one.
 	var vsockRoutes []sandbox.VsockRoute
-	var streamCancel context.CancelFunc // set just before the agent Exec call; referenced by the question-timeout closure below
+	// Created here rather than at the agent Exec below so the question-timeout closure can
+	// capture the CancelFunc by value. The ask bridge's goroutine is forked further down, before
+	// the exec: assigning a shared variable afterwards would be a write with no happens-before
+	// edge to the timer goroutine that reads it, which is a data race the detector reports. Still
+	// a child of the wall-clock ctx wrapped at the top of Run, so that timeout still cancels the
+	// exec and stays distinguishable from an abort (isWallClockTimeout reads ctx, not streamCtx).
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
 	var aborted abortLatch
 	var outstandingQuestions atomic.Int32
 	setState := func(st string) {
@@ -279,7 +286,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 			setState(StateWaiting)
 			notifyWaiting(filepath.Base(runDir), prompt)
 			if to := spec.Questions.Timeout; to > 0 {
-				armQuestionTimeout(bridge, runDir, id, to, spec.Questions.OnTimeout, &aborted, &streamCancel)
+				armQuestionTimeout(bridge, runDir, id, to, spec.Questions.OnTimeout, &aborted, cancelStream)
 			}
 			return nil
 		})
@@ -413,10 +420,6 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		writers = append(writers, deps.LogOut)
 	}
 	logWriter := io.MultiWriter(writers...)
-
-	streamCtx, cancelStream := context.WithCancel(ctx)
-	streamCancel = cancelStream
-	defer cancelStream()
 
 	execResult, execErr := deps.Sandbox.Exec(streamCtx, sandbox.ExecSpec{
 		Name: name, User: user, Command: []string{containerEntrypoint},
@@ -1035,8 +1038,10 @@ func earlyTimeoutResult(runDir string) *Result {
 // no-answer sentinel directly to the bridge — unblocking the sandbox's still-pending Ask call —
 // and records it; Bridge.Answer is itself idempotent-safe (a no-op if the question was already
 // answered by a human first, since the human's answer already consumed the pending channel). For
-// `abort` it also cancels the agent's exec via *streamCancel (a pointer so it can be armed before
-// the agent's own exec has actually started the real context it will cancel).
+// `abort` it also cancels the agent's exec through cancelStream, captured by value: Run creates
+// that context before the bridge goroutine exists, so there is no later write for this closure to
+// race against. A timeout that fires before the exec is reached simply hands Exec an
+// already-cancelled context — the right outcome, and the run fails via aborted.fired() either way.
 // abortLatch records whether a question timeout under the `abort` policy fired, and — the part a
 // bare flag cannot do — makes that decision observable to the goroutine that reads it.
 //
@@ -1071,7 +1076,7 @@ func (l *abortLatch) fired() bool {
 	return l.aborted
 }
 
-func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Duration, onTimeout task.QuestionTimeoutAction, aborted *abortLatch, streamCancel *context.CancelFunc) {
+func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Duration, onTimeout task.QuestionTimeoutAction, aborted *abortLatch, cancelStream context.CancelFunc) {
 	time.AfterFunc(to, func() {
 		// Held across the whole body, Answer included: see abortLatch.
 		defer aborted.begin()()
@@ -1081,9 +1086,7 @@ func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Du
 		_ = RecordAnswer(runDir, qid, "", true)
 		if onTimeout == task.OnTimeoutAbort {
 			aborted.set()
-			if cancel := *streamCancel; cancel != nil {
-				cancel()
-			}
+			cancelStream()
 		}
 	})
 }
