@@ -639,12 +639,33 @@ func fakeSeedWrite(root, dir, tmp, dst string) int {
 
 func inSandbox(root, p string) string { return filepath.Join(root, p) }
 
+// blockUntilKilled is how the fake wedges: it never returns on its own, leaving the real
+// exec.CommandContext to kill the process at the run's deadline (or on Ctrl-C), exactly as a
+// genuinely stuck agent or attach would be killed.
+//
+// It is deliberately NOT `select {}`. A goroutine parked forever with nothing else to run is
+// exactly what the runtime's deadlock detector looks for: checkdead fatals with "all goroutines
+// are asleep - deadlock!" and the process exits AT ONCE — a crashed agent, not a wedged one. Two
+// things make checkdead bail out before that verdict, and neither is something this fake controls:
+// a non-idle OS thread, or a timer still pending on some P. On unix this binary happens to have
+// the first (a runtime-internal goroutine locked to its own thread), which is why the same
+// `select {}` blocks for the full deadline on linux and macos. On windows/amd64 neither held, so
+// the fake agent died in milliseconds and the run completed cleanly ~8s before its wall clock —
+// how TestTranscriptCapturedOnWallClockTimeout came to see TimedOut == false there and only there.
+// A sleep gives checkdead the second reason on every platform: the process will wake up
+// eventually, so it is not deadlocked, and it blocks until something kills it.
+func blockUntilKilled() {
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
 // fakeTTYExec simulates the interactive tty attach `orchestrator.Shell`/`AttachShell` runs in
 // place of the agent exec: it optionally writes files into /workspace (simulating edits the human
 // made before exiting), then exits with the scripted code.
 func fakeTTYExec(root string, _ []string, script fakeShellScript) int {
 	if script.Block {
-		select {} // killed by the real exec.CommandContext on ctx cancellation (Ctrl-C)
+		blockUntilKilled() // killed by the real exec.CommandContext on ctx cancellation (Ctrl-C)
 	}
 	ws := filepath.Join(root, "workspace")
 	for name, content := range script.WorkspaceFiles {
@@ -795,7 +816,7 @@ func fakeChmod(root string, args []string) int {
 // path, and exits with the scripted code.
 func fakeAgentExec(root string, script fakeAgentScript) int {
 	if script.Block {
-		select {} // killed by the real exec.CommandContext at the run's deadline
+		blockUntilKilled() // killed by the real exec.CommandContext at the run's deadline
 	}
 	if script.TimingFile != "" {
 		start := time.Now().UnixNano()

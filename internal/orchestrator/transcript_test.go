@@ -199,23 +199,33 @@ func TestTranscriptCapturedOnWallClockTimeout(t *testing.T) {
 		TranscriptFiles: transcriptFiles(),
 	})
 	runDir := filepath.Join(t.TempDir(), "run")
+	// The wall clock has to outlast sandbox creation, not merely be short: the run's first step
+	// is an `msb image inspect` (resolveSandboxUser), and a budget that expires during it returns
+	// earlyTimeoutResult before any sandbox exists — a timed-out run with nothing to capture
+	// from, which is not the path under test. Every msb call here is a re-exec of this test
+	// binary, so under -race on a loaded runner one round-trip alone can take seconds; seconds of
+	// headroom, not milliseconds.
+	const wallClock = 10 * time.Second
+	started := time.Now()
 	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, task.RunSpec{
 		ID: "run_tr_timeout", ImageRef: "img", RepoPath: newRepo(t, map[string]string{"a.txt": "1\n"}),
 		BundleDepth: 1, TaskPrompt: []byte("t"), Network: allowlistAll,
-		// The wall clock has to outlast sandbox creation, not merely be short: the run's first
-		// step is an `msb image inspect` (resolveSandboxUser), and a budget that expires during
-		// it returns earlyTimeoutResult before any sandbox exists — a timed-out run with nothing
-		// to capture from, which is not the path under test. Every msb call here is a re-exec of
-		// this test binary, so under -race on a loaded runner one round-trip alone can take
-		// seconds; seconds of headroom, not milliseconds.
-		Resources:     task.Resources{Timeout: 10 * time.Second},
+		Resources:     task.Resources{Timeout: wallClock},
 		TranscriptDir: transcriptGuestDir,
 	}, runDir)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !res.TimedOut {
-		t.Fatal("expected a timed-out run; this test is about capture after the ctx is dead")
+		// The agent log is the evidence that separates the two ways this can go wrong: a fake
+		// agent that never wedged at all (it died on its own, so the run finished early and
+		// cleanly — what `select {}` used to do on windows/amd64, see blockUntilKilled) from one
+		// that wedged but whose kill was misclassified. Without it the assertion only says
+		// "not timed out", which is true of both.
+		log, _ := os.ReadFile(filepath.Join(runDir, "logs", "agent.log"))
+		t.Fatalf("expected a timed-out run; this test is about capture after the ctx is dead "+
+			"(exit code %d, agent ran for %s of a %s budget, agent log: %q)",
+			res.ExitCode, time.Since(started).Round(time.Millisecond), wallClock, log)
 	}
 	if got := readTranscript(t, runDir); !strings.Contains(got, `"tool_use"`) {
 		t.Errorf("transcript not captured on the timeout path (WithoutCancel not applied?): %q", got)

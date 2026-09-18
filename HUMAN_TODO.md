@@ -424,31 +424,32 @@ with an API key, an image with no krayt shell setup, and Gemini with `GEMINI_API
 
 ## [CI] confirm PR #163's `build + test` legs
 
-The four failing `build + test` legs on PR #163 (run `35231757916`, head `e9c08d4`) are fixed in
-this branch: the three `-race` legs died on `panic: test timed out after 10m0s` in
-`internal/orchestrator` (raised to `-timeout 30m`, that package alone measured 943s under `-race`),
-and the Windows leg failed two assertions in `TestTrustWorkspaceScript`. Both of those are fixed;
-one of them can only be confirmed on a Windows runner.
+Three of this entry's four legs are now green on a real runner and their items are deleted:
+run `35382855324` (head `41685cc`) passed `build + test` on `ubuntu-latest`, `macos-latest` and
+`linux/arm64`, which closes both the `-timeout 30m` fix and the "`hack/test-entrypoint-credentials.sh`
+has never reached the macOS leg" item — that step (`ci.yml:45`) ran and passed there. The Windows
+leg's `TestTrustWorkspaceScript` assertions are likewise confirmed fixed: they no longer appear in
+that run's Windows log.
+
+One Windows failure is left, and its fix is the only thing in this entry that a Linux agent cannot
+confirm itself.
 
 - **Needed:**
-  1. **Confirm `build + test (windows/amd64, native)`.** The `.gitconfig` assertion now asks
-     `git config --global --get-all safe.directory` instead of counting substrings in the raw file
-     (git escapes backslashes, so a Windows path is stored as `C:\\Users\\...` and never matched),
-     and the no-git no-op check is now skipped on Windows, where `sh` is Git for Windows' own shell
-     and reaches git whatever `PATH` the test sets. Verify with
-     `go test ./internal/orchestrator/ -run TestTrustWorkspaceScript` on `windows-latest`.
-     Everything else is verified on Linux.
-  2. **`hack/test-entrypoint-credentials.sh` has still never run on the `macos-latest` leg.** That
-     step is `ci.yml:45`, immediately after the `go test` at `:39`, so it never executed on the red
-     leg. **The bash 3.2 risk this item was opened for is closed** (2026-09-18): the full suite
-     passed 23/23 on an Apple-Silicon Mac whose only `bash` is `/bin/bash` 3.2.57 — the harness and
-     all three `entrypoint.sh` files are `#!/usr/bin/env bash`, which resolves to that binary, and
-     it is the same interpreter `macos-latest` gets for `bash hack/…`. This corrects the original
-     claim here that "bash 3.2 itself only exists on the macOS runner". The earlier static scan
-     (no `mapfile`, `declare -A`, `${v^^}`, `&>>`; the one array expansion already in the 3.2-safe
-     `${extra[@]+"${extra[@]}"}` form) is now backed by an actual 3.2 run. What is left is only
-     that the leg has never reached the step, which needs `go test` to pass there first.
-- **Why the agent can't:** items 1 and 2 need a Windows and a macOS runner.
-- **Verify success by:** a green `build + test` on all four legs, then delete items 1 and 2 from
-  this entry.
+  1. **Confirm `build + test (windows/amd64, native)`.** `TestTranscriptCapturedOnWallClockTimeout`
+     failed there — and only there — on three consecutive heads (`7610648`, `d063fe6`, `41685cc`),
+     always as `expected a timed-out run` after ~1.6s of a 10s budget. Cause: the fake agent wedged
+     with `select {}`, which is not a portable "block forever" — with no timer pending and no other
+     non-system goroutine the runtime fatals with `all goroutines are asleep - deadlock!` and the
+     process exits at once, so the agent died instead of being killed at the deadline and the run
+     was recorded as a clean, non-timed-out exit. On Linux/macOS an extra non-idle locked thread
+     makes `checkdead` return before that point, which is why the same code blocks there.
+     `blockUntilKilled` (`fakemsb_test.go`) now sleeps in a loop, keeping a timer on the heap that
+     `checkdead` honours on every platform. Verify with
+     `go test ./internal/orchestrator/ -run TestTranscriptCapturedOnWallClockTimeout` on
+     `windows-latest`; it passes on linux/arm64 (10.02s, the full budget, 5/5 runs). If it still
+     fails, the assertion now prints the run's exit code, how long the agent actually ran, and the
+     agent log — which distinguishes "never wedged" from "wedged but the kill was misclassified"
+     without another round trip.
+- **Why the agent can't:** item 1 needs a Windows runner; the sandbox is Linux.
+- **Verify success by:** a green `build + test (windows/amd64, native)`, then delete this entry.
 - **Blocking:** no.
