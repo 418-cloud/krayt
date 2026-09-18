@@ -441,6 +441,18 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return nil, fmt.Errorf("orchestrator: question timed out (abort policy, §6.13)")
 	case execErr != nil && isWallClockTimeout(ctx, execErr):
 		timedOut, exitCode = true, -1
+	// The same timeout, reported by the driver as a plain nonzero exit instead of an error.
+	// sandbox.Exec only returns ErrMsbFailed for a dead child that wrote NOTHING; if any byte
+	// reached either stream it flattens the kill into (ExitCode, nil), so whether a timed-out run
+	// was classified as one depended on whether the dying agent happened to emit output — which
+	// krayt does not control and which differs by platform. That is how a genuinely timed-out run
+	// reached the default branch and was recorded as a clean exit on windows/amd64
+	// (TestTranscriptCapturedOnWallClockTimeout). A killed process never exits 0 (SIGKILL reports
+	// -1, TerminateProcess 1), so a nonzero exit with the deadline already past is that kill,
+	// while an agent that genuinely finished 0 just under the wire stays a success and keeps its
+	// collected output. Canceled (Ctrl-C) is deliberately not matched.
+	case ctx.Err() == context.DeadlineExceeded && execResult.ExitCode != 0:
+		timedOut, exitCode = true, -1
 	case errors.Is(execErr, sandbox.ErrMsbFailed):
 		return nil, fmt.Errorf("orchestrator: %w", execErr)
 	case execErr != nil:
