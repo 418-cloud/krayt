@@ -44,7 +44,7 @@ import (
 var fakeMsbVerbs = map[string]bool{
 	"--version": true, "context": true, "create": true, "exec": true,
 	"copy": true, "logs": true, "stop": true, "rm": true, "pull": true, "doctor": true,
-	"image": true,
+	"image": true, "ls": true,
 }
 
 const (
@@ -121,6 +121,12 @@ type fakeMsbScript struct {
 	// exec) always fail — seed-agent-first-run-config.md's "a failing seed exec does not fail the
 	// run or session" test, distinct from an invalid DirEnv (rejected before any exec at all).
 	FailConfigSeedWrite bool `json:"fail_config_seed_write,omitempty"`
+
+	// FailConfigSeedRead makes the fake config-seed read script (readSeedFile) report the file as
+	// present but unreadable — a root-owned 0600 config in a user-writable dir, say. Distinct
+	// from absent, which the same script reports with seedMissingExit, and the distinction
+	// readSeedFile must honor: only absence may be read as "{}" and merged over.
+	FailConfigSeedRead bool `json:"fail_config_seed_read,omitempty"`
 
 	// ImageUser is the USER `image inspect` reports for the image (resolveSandboxUser). Nil
 	// means "agent", the published claude-code images' user; a pointer to "" means the image sets
@@ -208,6 +214,50 @@ func readFakeMsbCalls(t *testing.T, home string) []fakeCall {
 
 func sandboxRoot(home, name string) string { return filepath.Join(home, "state", name) }
 
+// fakeRemovedFile marks a sandbox root as destroyed by `msb rm`. The directory itself stays —
+// tests read the fake guest's files after teardown — so removal is recorded rather than enacted,
+// and `msb ls` skips a root carrying this marker.
+const fakeRemovedFile = ".removed"
+
+func markFakeSandboxRemoved(home, name string) {
+	_ = os.WriteFile(filepath.Join(sandboxRoot(home, name), fakeRemovedFile), nil, 0o600)
+}
+
+// removeFakeSandbox simulates a human destroying a sandbox out from under krayt (`msb rm` by
+// hand between attaches) — the one case in which a failed attach really is terminal.
+func removeFakeSandbox(t *testing.T, home, name string) {
+	t.Helper()
+	markFakeSandboxRemoved(home, name)
+}
+
+// fakeMsbLs answers `msb ls --format json` with every sandbox root fakeMsbCreate made and no
+// `msb rm` has since removed — what orchestrator's sandboxExists probe and `krayt doctor`'s
+// orphan check read.
+func fakeMsbLs(home string) int {
+	entries, err := os.ReadDir(filepath.Join(home, "state"))
+	if err != nil {
+		fmt.Println("[]") // no sandbox was ever created
+		return 0
+	}
+	names := make([]map[string]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(home, "state", e.Name(), fakeRemovedFile)); err == nil {
+			continue
+		}
+		names = append(names, map[string]string{"name": e.Name()})
+	}
+	b, err := json.Marshal(names)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fake-msb ls:", err)
+		return 1
+	}
+	_, _ = os.Stdout.Write(b)
+	return 0
+}
+
 // readFakeEnv reads the create-time --env pairs fakeMsbCreate recorded for this sandbox root.
 func readFakeEnv(root string) map[string]string {
 	b, err := os.ReadFile(filepath.Join(root, fakeEnvFile))
@@ -261,7 +311,14 @@ func runFakeMsb() int {
 			return 1
 		}
 		return 0
-	case "stop", "rm", "doctor":
+	case "ls":
+		return fakeMsbLs(home)
+	case "rm":
+		if len(args) > 1 {
+			markFakeSandboxRemoved(home, args[1])
+		}
+		return 0
+	case "stop", "doctor":
 		return 0
 	}
 	fmt.Fprintf(os.Stderr, "fake-msb: unhandled verb %q\n", args[0])
@@ -547,12 +604,17 @@ afterFlags:
 	case len(cmd) == 3 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "$HOME"):
 		fmt.Print(fakeBaseDir(root, cmd[2]))
 		return 0
-	// applyConfigSeed's read step (readSeedFile): `cat <path>`. A missing/unreadable file prints
-	// to stderr and exits 1, exactly like the real coreutils cat — Exec sees that as evidence the
-	// command ran (output was observed), not a driver failure, matching readSeedFile's own
-	// "missing means {}" contract.
-	case len(cmd) == 2 && cmd[0] == "cat":
-		return fakeCat(root, cmd[1])
+	// applyConfigSeed's read step (readSeedFile): `sh -c '<exists-then-cat script>' sh <path>`.
+	// A missing file prints to stderr and exits seedMissingExit; an unreadable one exits like
+	// cat's own failure — the two must stay distinguishable, which is the whole point of the
+	// script. Either way something reaches stderr, so Exec sees evidence the command ran rather
+	// than a driver failure.
+	case len(cmd) == 5 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "krayt-seed-read") && cmd[3] == "sh":
+		if script.FailConfigSeedRead {
+			fmt.Fprintf(os.Stderr, "cat: %s: Permission denied\n", cmd[4])
+			return 1
+		}
+		return fakeSeedRead(root, cmd[4])
 	// applyConfigSeed's write step (writeSeedFile): `sh -c '<mkdir/cat/mv script>' sh dir tmp dst`.
 	case len(cmd) == 7 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "krayt-config-seed") && cmd[3] == "sh":
 		if script.FailConfigSeedWrite {
@@ -601,13 +663,20 @@ func fakeBaseDir(root, script string) string {
 	return fakeGuestHome
 }
 
-// fakeCat mimics `cat <path>`: prints the file's content and exits 0, or an error to stderr and
-// exits 1 if it's missing — real cat's own behavior, and what readSeedFile's "missing means {}"
-// contract relies on Exec's ErrMsbFailed heuristic seeing SOME output either way.
-func fakeCat(root, guestPath string) int {
-	b, err := os.ReadFile(inSandbox(root, guestPath))
+// fakeSeedRead mimics readSeedFile's script: exit 3 (readSeedFile's seedMissingExit) when the
+// file is absent, print it and exit 0 when it can be read, and exit 1 like cat itself when it
+// exists but cannot be — the distinction readSeedFile depends on to never treat an unreadable
+// config as "{}" and overwrite it. Something always reaches stderr on the non-zero paths, which
+// is what keeps Exec's ErrMsbFailed heuristic from reading a missing file as a driver failure.
+func fakeSeedRead(root, guestPath string) int {
+	hostPath := inSandbox(root, guestPath)
+	if _, err := os.Lstat(hostPath); err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-seed-read: no such file")
+		return 3
+	}
+	b, err := os.ReadFile(hostPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cat: %s: No such file or directory\n", guestPath)
+		fmt.Fprintf(os.Stderr, "cat: %s: Permission denied\n", guestPath)
 		return 1
 	}
 	_, _ = os.Stdout.Write(b)

@@ -68,7 +68,7 @@ func isSeedWriteCall(c fakeCall) bool {
 	return len(c.Args) > 0 && c.Args[0] == "exec" && containsArgSubstring(c.Args, "krayt-config-seed")
 }
 func isSeedReadCall(c fakeCall) bool {
-	return len(c.Args) > 0 && c.Args[0] == "exec" && hasArg(c.Args, "cat")
+	return len(c.Args) > 0 && c.Args[0] == "exec" && containsArgSubstring(c.Args, "krayt-seed-read")
 }
 func isTTYCall(c fakeCall) bool {
 	return len(c.Args) > 0 && c.Args[0] == "exec" && hasArg(c.Args, "--tty")
@@ -307,6 +307,130 @@ func TestConfigSeedInvalidJSONLeftByteIdenticalAndWarns(t *testing.T) {
 	}
 	if !strings.Contains(warn.String(), "config seed") {
 		t.Errorf("no warning printed: %q", warn.String())
+	}
+}
+
+// TestConfigSeedUnreadableFileIsNeverOverwritten proves the other half of decision 4.2: only an
+// ABSENT file means "{}". A file that exists but the sandbox user cannot read (a root-owned 0600
+// config in a user-writable directory) must not be merged over — `mv -f` would replace it even
+// though nothing could read what it held, silently destroying state the fill-in-never-overwrite
+// contract promises to preserve. The seed is skipped with a warning and the run still succeeds.
+func TestConfigSeedUnreadableFileIsNeverOverwritten(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	home := t.TempDir()
+	id := "run_seed_unreadable"
+	fixturePath := fakeSeedFilePath(home, id, "", ".claude.json")
+	const original = `{"hasCompletedOnboarding":false,"secretish":"keep me"}`
+	writeFixture(t, fixturePath, original)
+
+	sb := newFakeSandbox(t, home, fakeMsbScript{Agent: fakeAgentScript{ExitCode: 0}, FailConfigSeedRead: true})
+	spec := task.RunSpec{
+		ID: id, ImageRef: "img", RepoPath: newRepo(t, map[string]string{"a.txt": "1\n"}),
+		BundleDepth: 1, TaskPrompt: []byte("t"), Network: allowlistAll,
+		ConfigSeeds: []task.ConfigSeed{{
+			Path:     ".claude.json",
+			Defaults: map[string]any{"hasCompletedOnboarding": true},
+		}},
+	}
+	runDir := filepath.Join(t.TempDir(), "run")
+	var warn bytes.Buffer
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb, Warn: &warn}, spec, runDir); err != nil {
+		t.Fatalf("Run: %v (an unreadable seed file must not fail the run)", err)
+	}
+
+	got, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Errorf("an unreadable file was overwritten: got %q, want the original %q untouched", got, original)
+	}
+	for _, c := range readFakeMsbCalls(t, home) {
+		if isSeedWriteCall(c) {
+			t.Errorf("a write exec ran for a file krayt could not read: %v", c.Args)
+		}
+	}
+	if !strings.Contains(warn.String(), "config seed") {
+		t.Errorf("warning = %q, want a config-seed warning naming the failed read", warn.String())
+	}
+}
+
+// TestConfigSeedInvalidPathRejectedBeforeAnyExec: adapter.ConfigSeed.Path is documented "clean,
+// relative, and carries no '..'", and applyConfigSeed is where that contract has to hold, since
+// it is the one place Path is joined to a base directory the guest helped resolve. A Path that
+// escapes is refused before any exec, warned about, and does not fail the run — the same
+// treatment an invalid DirEnv gets.
+func TestConfigSeedInvalidPathRejectedBeforeAnyExec(t *testing.T) {
+	for _, bad := range []string{"../escaped.json", "/etc/passwd", "a/../../escaped.json", ""} {
+		t.Run(bad, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			home := t.TempDir()
+			sb := newFakeSandbox(t, home, fakeMsbScript{Agent: fakeAgentScript{ExitCode: 0}})
+			spec := task.RunSpec{
+				ID: "run_seed_bad_path", ImageRef: "img", RepoPath: newRepo(t, map[string]string{"a.txt": "1\n"}),
+				BundleDepth: 1, TaskPrompt: []byte("t"), Network: allowlistAll,
+				ConfigSeeds: []task.ConfigSeed{{Path: bad, Defaults: map[string]any{"x": true}}},
+			}
+			runDir := filepath.Join(t.TempDir(), "run")
+			var warn bytes.Buffer
+			res, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb, Warn: &warn}, spec, runDir)
+			if err != nil {
+				t.Fatalf("Run: %v (an invalid Path must not fail the run)", err)
+			}
+			if res.ExitCode != 0 {
+				t.Errorf("exit code = %d, want 0", res.ExitCode)
+			}
+			if !strings.Contains(warn.String(), "invalid Path") {
+				t.Errorf("warning = %q, want it to name the invalid Path", warn.String())
+			}
+			for _, c := range readFakeMsbCalls(t, home) {
+				if isSeedReadCall(c) || isSeedWriteCall(c) {
+					t.Errorf("an exec ran for the invalid-Path seed: %v", c.Args)
+				}
+			}
+		})
+	}
+}
+
+// TestConfigSeedWriteScriptSetsRestrictiveUmask guards the one property of writeSeedFile's script
+// that no other test can observe through the fake guest (which does its own os.WriteFile): the
+// replacement is a new inode, so without a restrictive umask `mv -f` would carry the guest
+// shell's default 0644 onto a config that was 0600 — widening a file that holds auth state.
+func TestConfigSeedWriteScriptSetsRestrictiveUmask(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	home := t.TempDir()
+	sb := newFakeSandbox(t, home, fakeMsbScript{Agent: fakeAgentScript{ExitCode: 0}})
+	spec := task.RunSpec{
+		ID: "run_seed_umask", ImageRef: "img", RepoPath: newRepo(t, map[string]string{"a.txt": "1\n"}),
+		BundleDepth: 1, TaskPrompt: []byte("t"), Network: allowlistAll,
+		ConfigSeeds: []task.ConfigSeed{{
+			Path:     ".claude.json",
+			Defaults: map[string]any{"hasCompletedOnboarding": true},
+		}},
+	}
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Run(ctx, orchestrator.Deps{Sandbox: sb}, spec, runDir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	sawWrite := false
+	for _, c := range readFakeMsbCalls(t, home) {
+		if !isSeedWriteCall(c) {
+			continue
+		}
+		sawWrite = true
+		if !containsArgSubstring(c.Args, "umask 077") {
+			t.Errorf("write script does not set a restrictive umask: %v", c.Args)
+		}
+	}
+	if !sawWrite {
+		t.Error("expected a seed write exec")
 	}
 }
 

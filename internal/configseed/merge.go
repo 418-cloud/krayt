@@ -16,13 +16,18 @@ import (
 // null — and no matter whether a default disagrees with it in shape (a type conflict just skips
 // that branch, leaving existing untouched). Objects merge recursively; arrays take the union,
 // appending each default element not already present (deep equality) and preserving existing
-// order. Both inputs are treated as read-only; the result is an independent copy, so a caller
-// can't accidentally alias a shared Defaults literal into the file it just merged. changed
-// reports whether the merge altered anything, so a caller can skip a write when nothing did.
+// order. Both inputs are treated as read-only, and BOTH are deep-copied on the way into the
+// result — a kept existing value as much as an inserted default — so the result is an
+// independent copy and a caller can't accidentally alias a shared Defaults literal, or its own
+// existing map, into the file it just merged. changed reports whether the merge altered
+// anything, so a caller can skip a write when nothing did.
 func Merge(existing, defaults map[string]any) (result map[string]any, changed bool) {
 	result = make(map[string]any, len(existing))
 	for k, v := range existing {
-		result[k] = v
+		// cloneValue, not a bare assignment: a shallow copy would alias existing's nested maps
+		// and slices into the result for every key a default never touches (and for every branch
+		// where the recursive merge changed nothing), which is most of them.
+		result[k] = cloneValue(v)
 	}
 	for k, dv := range defaults {
 		ev, present := result[k]

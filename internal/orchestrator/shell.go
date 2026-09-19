@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/418-cloud/krayt/internal/patch"
 	"github.com/418-cloud/krayt/internal/sandbox"
@@ -307,9 +308,28 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 // re-scanning the refreshed patch for a leaked secret VALUE on this second pass needs the
 // secrets file supplied again — via the same --secrets flag `krayt shell` already has. Empty
 // means the scan is skipped for this attach, same as an ordinary run with no secrets.
+//
+// Only one attach at a time, enforced across processes by lockAttach: the kept→running check and
+// transition below are a read followed by a write, so two `krayt shell --attach <run-id>` in two
+// terminals would otherwise both see `kept`, both proceed, overwrite each other's PID in the one
+// record, and race each other's finishAndCollect over the same changes.patch/report.md/meta.json.
 func AttachShell(ctx context.Context, deps Deps, runDir, secretsPath string, execCmd []string) (res *ShellResult, err error) {
 	rec, rerr := ReadRecord(runDir)
 	if rerr != nil {
+		return nil, fmt.Errorf("orchestrator: read run record: %w", rerr)
+	}
+	// Claim the session before re-reading it: everything validated below is state another attach
+	// could be changing right now, so the checks are only meaningful under the lock. The record is
+	// read once above purely so a bad run id fails with "read run record" rather than as a
+	// confusing failure to open a lock file in a directory that does not exist.
+	release, lerr := lockAttach(runDir)
+	if lerr != nil {
+		return nil, lerr
+	}
+	// Registered before the record-writing defer below, so it releases only AFTER that defer has
+	// returned the record to `kept` — the next attach must never observe the in-between state.
+	defer release()
+	if rec, rerr = ReadRecord(runDir); rerr != nil {
 		return nil, fmt.Errorf("orchestrator: read run record: %w", rerr)
 	}
 	if rec.EffectiveKind() != KindShell {
@@ -347,7 +367,21 @@ func AttachShell(ctx context.Context, deps Deps, runDir, secretsPath string, exe
 				!errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
 				err = cause
 			}
-			rec.State, rec.Error = StateFailed, err.Error()
+			rec.Error = err.Error()
+			// A failed attach does not destroy anything — this function never calls Stop/Remove on
+			// any path (see the doc comment) — so the sandbox is normally still there, and the
+			// terminal `failed` a run would take here would strand it: `krayt shell --attach`
+			// refuses a record that is not `kept`, `krayt stop` refuses a terminal one, and
+			// `krayt doctor` can then only suggest raw msb. Hand it back in the state that is
+			// actually true — `kept`: sandbox alive, PID cleared because nothing supervises it any
+			// more — so both commands keep working, including after a SIGHUP or Ctrl-C mid-session.
+			// `failed` is kept for the one case where it is accurate: the sandbox is really gone
+			// (removed by hand between attaches), which is usually WHY the attach failed.
+			if sandboxExists(ctx, deps.Sandbox, name) {
+				rec.State, rec.PID = StateKept, 0
+			} else {
+				rec.State, rec.PID = StateFailed, 0
+			}
 		case cleanExit:
 			rec.State, rec.ExitCode, rec.PID = StateKept, res.ExitCode, 0
 		}
@@ -375,6 +409,67 @@ func AttachShell(ctx context.Context, deps Deps, runDir, secretsPath string, exe
 	rec.Safety = fres.Safety
 	return res, nil
 }
+
+// attachLockName is the per-run lock file backing AttachShell's exclusive claim on a kept
+// session. It lives in the run dir, next to meta.json, so the lock's scope is exactly one run.
+const attachLockName = "attach.lock"
+
+// ErrAttachInProgress is what AttachShell returns when another process is already attached to
+// this session. Distinct from the not-kept error: the record it would have refused is `running`
+// only because someone else is in that shell right now, and the answer is to wait, not to
+// conclude the session is unusable.
+var ErrAttachInProgress = errors.New("orchestrator: another krayt shell --attach is already in this session")
+
+// lockAttach takes the run's attach lock, reusing the same cross-process advisory whole-file
+// lock the concurrency limiter uses (climit_unix.go/climit_windows.go): flock on unix,
+// LockFileEx on Windows, released by the OS when the holder's fd closes — so a crashed or
+// kill -9'd attach never leaves the session permanently claimed. Non-blocking on purpose: a
+// human who runs --attach on a session someone else is already in wants to be told that, not to
+// have their terminal hang on a lock.
+func lockAttach(runDir string) (release func(), err error) {
+	f, err := os.OpenFile(filepath.Join(runDir, attachLockName), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: open attach lock: %w", err)
+	}
+	locked, lerr := tryLockSlot(f)
+	if lerr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("orchestrator: lock attach: %w", lerr)
+	}
+	if !locked {
+		_ = f.Close()
+		return nil, ErrAttachInProgress
+	}
+	return func() { _ = unlockSlot(f); _ = f.Close() }, nil
+}
+
+// sandboxExists reports whether msb still knows about the named sandbox. Used only to decide
+// which state a failed attach should leave behind, so it answers "yes" whenever it cannot tell:
+// the caller never removes the sandbox itself, and `kept` is the recoverable state to be wrong
+// in (`krayt stop` reaches it; a terminal `failed` reaches nothing). It runs on a detached
+// context with its own deadline because the common failure it has to classify IS a cancelled
+// one — a SIGHUP'd session's ctx is already dead by the time this is asked.
+func sandboxExists(ctx context.Context, sb *sandbox.Client, name string) bool {
+	if sb == nil {
+		return true
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sandboxProbeTimeout)
+	defer cancel()
+	entries, err := sb.List(probeCtx)
+	if err != nil {
+		return true
+	}
+	for _, e := range entries {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// sandboxProbeTimeout bounds sandboxExists' `msb ls`, which runs on a deferred path while a
+// human waits at a terminal that has just failed them.
+const sandboxProbeTimeout = 15 * time.Second
 
 // PatchLiveShell re-derives changes.patch from a still-running (not yet `kept`) shell session's
 // current workspace state, without ending the session — `krayt patch <run-id>` against a live

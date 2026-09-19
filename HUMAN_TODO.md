@@ -453,3 +453,32 @@ confirm itself.
 - **Why the agent can't:** item 1 needs a Windows runner; the sandbox is Linux.
 - **Verify success by:** a green `build + test (windows/amd64, native)`, then delete this entry.
 - **Blocking:** no.
+
+---
+
+## [HUMAN] re-verify the two config-seed guest scripts changed by PR #163's review fixes
+
+`seed-agent-first-run-config.md`'s hardware checks (Claude Code with an OAuth token and with an
+API key, Gemini with `GEMINI_API_KEY`, an image with no krayt shell setup) all passed against the
+*previous* shape of the two shell snippets in `internal/orchestrator/configseed.go`. Two Copilot
+review findings on PR #163 changed both snippets, so the guest-side behaviour they proved is no
+longer literally the code that shipped. Both are covered by the fake-msb suite
+(`TestConfigSeedUnreadableFileIsNeverOverwritten`, `TestConfigSeedWriteScriptSetsRestrictiveUmask`),
+which is the honest limit of what a fake guest can show: it does not execute `sh`, so neither the
+real `[ -e ]`/exit-3 branch nor the real `umask`-to-`mv` mode behaviour has run in a sandbox.
+
+- **Needed:** one `krayt run` (or `krayt shell`) per agent image against a real msb sandbox:
+  1. **Read path.** With no config file present, the seed must still be written — confirms the
+     `exit 3` "missing" branch is reached and not misread as a read failure (a regression here is
+     silent: the seed is skipped with a warning and onboarding reappears).
+  2. **Write path.** Pre-create the config `0600`, run a seed that changes something, then check
+     the file's mode in the guest: it must still be `0600`, not `0644`. Before this fix `mv -f`
+     carried the temp file's umask-`022` mode onto the destination.
+  3. **Unreadable path (optional, root needed in the guest).** A root-owned `0600` config in the
+     user's home must be left byte-identical, with one `warning: config seed …` line.
+- **Why the agent can't:** no msb sandbox in this environment; the fake guest reimplements these
+  scripts in Go rather than running `sh`.
+- **Verify success by:** note the run ids against `KRAYT_SPEC.md` §14 Phase 12's
+  `seed-agent-first-run-config.md` checkbox, then delete this entry.
+- **Blocking:** no. Both changes are strictly safer than what they replace — the read path refuses
+  to overwrite where it used to clobber, and the write path only ever tightens a mode.

@@ -138,6 +138,32 @@ func TestMergeDoesNotAliasDefaults(t *testing.T) {
 	}
 }
 
+// TestMergeDoesNotAliasExisting is the same guarantee for the other input. Merge documents the
+// result as an independent copy, but a shallow key copy would hand back existing's own nested
+// maps and slices for every key a default never touched — and for every branch where the
+// recursive merge changed nothing — so a caller mutating the merged config would reach back into
+// the map it passed in.
+func TestMergeDoesNotAliasExisting(t *testing.T) {
+	existing := map[string]any{
+		"untouched": map[string]any{"deep": []any{"keep"}},
+		"merged":    map[string]any{"existingKey": "keep"},
+	}
+	result, changed := Merge(existing, map[string]any{"merged": map[string]any{"newKey": true}})
+	if !changed {
+		t.Fatal("want changed=true")
+	}
+
+	result["untouched"].(map[string]any)["deep"].([]any)[0] = "mutated"
+	if existing["untouched"].(map[string]any)["deep"].([]any)[0] != "keep" {
+		t.Error("Merge aliased a nested value no default touched — mutating the result mutated the input")
+	}
+
+	result["merged"].(map[string]any)["existingKey"] = "mutated"
+	if existing["merged"].(map[string]any)["existingKey"] != "keep" {
+		t.Error("Merge aliased an existing value inside a branch it did merge into")
+	}
+}
+
 // TestApplyTable covers the byte-level entry point, including the cases Merge itself can't see:
 // a missing file, non-object JSON, and invalid JSON.
 func TestApplyTable(t *testing.T) {

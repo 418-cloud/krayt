@@ -7,6 +7,7 @@ package orchestrator_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -308,6 +309,165 @@ func TestAttachShellReEntersKeptSession(t *testing.T) {
 	if ttyCalls != 2 {
 		t.Errorf("saw %d `exec --tty` calls, want 2 (initial Shell + AttachShell)", ttyCalls)
 	}
+}
+
+// TestAttachShellFailureLeavesSessionManageable proves a failed re-attach does not strand the
+// sandbox. AttachShell never calls stop/rm on any path, so the sandbox outlives the failure — and
+// a terminal `failed` record would then be a dead end: `krayt shell --attach` refuses anything
+// that is not `kept`, `krayt stop` refuses a terminal record, and `krayt doctor` can only point
+// at raw msb. The record must come back as `kept` (PID cleared, the error recorded) so both
+// commands still reach it. The failure here is the realistic one: the terminal went away
+// mid-session (SIGHUP/Ctrl-C), cancelling the context out from under the attach.
+func TestAttachShellFailureLeavesSessionManageable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	home := t.TempDir()
+	sb := newFakeSandbox(t, home, fakeMsbScript{Shell: fakeShellScript{ExitCode: 0}})
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Shell(ctx, orchestrator.Deps{Sandbox: sb}, shellSpec("run_attach_fail", src), runDir, true, nil); err != nil {
+		t.Fatalf("Shell (initial, --keep): %v", err)
+	}
+
+	// Re-attach into a wedged shell, then kill the terminal.
+	attachCtx, attachCancel := context.WithCancel(ctx)
+	go func() { time.Sleep(200 * time.Millisecond); attachCancel() }()
+	sb2 := newFakeSandbox(t, home, fakeMsbScript{Shell: fakeShellScript{Block: true}})
+	if _, err := orchestrator.AttachShell(attachCtx, orchestrator.Deps{Sandbox: sb2}, runDir, "", nil); err == nil {
+		t.Fatal("AttachShell returned nil error for a cancelled session")
+	}
+	attachCancel()
+
+	final, err := orchestrator.ReadRecord(runDir)
+	if err != nil {
+		t.Fatalf("ReadRecord after failed AttachShell: %v", err)
+	}
+	if final.State != orchestrator.StateKept {
+		t.Errorf("State after a failed attach = %q, want %q — the sandbox is still running, so the record must stay attachable and stoppable", final.State, orchestrator.StateKept)
+	}
+	if final.Terminal() {
+		t.Error("a failed attach left a terminal record; `krayt stop` refuses those, and nothing else can destroy the sandbox")
+	}
+	if final.Error == "" {
+		t.Error("the failure was not recorded in the run record")
+	}
+	if final.PID != 0 {
+		t.Errorf("PID = %d, want 0 — no process supervises the sandbox once the attach returned", final.PID)
+	}
+	for _, c := range readFakeMsbCalls(t, home) {
+		if c.Args[0] == "stop" || c.Args[0] == "rm" {
+			t.Errorf("AttachShell tore the sandbox down on an error path: %v", c.Args)
+		}
+	}
+}
+
+// TestAttachShellFailureWithRemovedSandboxIsTerminal is the other half: `kept` is only honest
+// while the sandbox exists. When it was destroyed out from under krayt (`msb rm` by hand between
+// attaches — usually the very reason the attach failed), there is nothing left to re-enter or
+// stop, and the record must say so rather than advertise a session that cannot be resumed.
+func TestAttachShellFailureWithRemovedSandboxIsTerminal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	home := t.TempDir()
+	sb := newFakeSandbox(t, home, fakeMsbScript{Shell: fakeShellScript{ExitCode: 0}})
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Shell(ctx, orchestrator.Deps{Sandbox: sb}, shellSpec("run_attach_gone", src), runDir, true, nil); err != nil {
+		t.Fatalf("Shell (initial, --keep): %v", err)
+	}
+	rec, err := orchestrator.ReadRecord(runDir)
+	if err != nil {
+		t.Fatalf("ReadRecord: %v", err)
+	}
+	removeFakeSandbox(t, home, rec.SandboxName)
+
+	attachCtx, attachCancel := context.WithCancel(ctx)
+	go func() { time.Sleep(200 * time.Millisecond); attachCancel() }()
+	sb2 := newFakeSandbox(t, home, fakeMsbScript{Shell: fakeShellScript{Block: true}})
+	if _, err := orchestrator.AttachShell(attachCtx, orchestrator.Deps{Sandbox: sb2}, runDir, "", nil); err == nil {
+		t.Fatal("AttachShell returned nil error for a cancelled session")
+	}
+	attachCancel()
+
+	final, err := orchestrator.ReadRecord(runDir)
+	if err != nil {
+		t.Fatalf("ReadRecord after failed AttachShell: %v", err)
+	}
+	if final.State != orchestrator.StateFailed {
+		t.Errorf("State = %q, want failed — the sandbox is gone, so the session is not resumable", final.State)
+	}
+}
+
+// TestAttachShellIsExclusiveAcrossProcesses proves the kept→running claim is atomic: the check
+// and the transition are a read followed by a write, so without a lock two `krayt shell --attach
+// <run-id>` in two terminals both see `kept`, both attach, overwrite each other's PID in the one
+// record, and race each other's patch/report/meta writes on exit. The second attempt is refused
+// with ErrAttachInProgress instead. The two attaches are goroutines here, but the lock they
+// contend on is the OS's (flock/LockFileEx on a file in the run dir), which is what makes it hold
+// across processes too.
+func TestAttachShellIsExclusiveAcrossProcesses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	src := newRepo(t, map[string]string{"a.txt": "1\n"})
+	home := t.TempDir()
+	sb := newFakeSandbox(t, home, fakeMsbScript{Shell: fakeShellScript{ExitCode: 0}})
+
+	runDir := filepath.Join(t.TempDir(), "run")
+	if _, err := orchestrator.Shell(ctx, orchestrator.Deps{Sandbox: sb}, shellSpec("run_attach_excl", src), runDir, true, nil); err != nil {
+		t.Fatalf("Shell (initial, --keep): %v", err)
+	}
+
+	// First attach: wedged in the shell, holding the session, until we cancel it.
+	firstCtx, cancelFirst := context.WithCancel(ctx)
+	defer cancelFirst()
+	sbBlocking := newFakeSandbox(t, home, fakeMsbScript{Shell: fakeShellScript{Block: true}})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = orchestrator.AttachShell(firstCtx, orchestrator.Deps{Sandbox: sbBlocking}, runDir, "", nil)
+	}()
+
+	// Wait for it to have actually claimed the session (its record write to `running`).
+	if !waitForState(t, runDir, "running") {
+		cancelFirst()
+		<-done
+		t.Fatal("first attach never reached state running")
+	}
+
+	sb2 := newFakeSandbox(t, home, fakeMsbScript{Shell: fakeShellScript{ExitCode: 0}})
+	_, err := orchestrator.AttachShell(ctx, orchestrator.Deps{Sandbox: sb2}, runDir, "", nil)
+	if !errors.Is(err, orchestrator.ErrAttachInProgress) {
+		t.Errorf("second concurrent attach err = %v, want ErrAttachInProgress", err)
+	}
+
+	cancelFirst()
+	<-done
+
+	// Once the first attach is gone, the session is claimable again.
+	if !waitForState(t, runDir, orchestrator.StateKept) {
+		t.Fatal("session never returned to kept after the first attach ended")
+	}
+	sb3 := newFakeSandbox(t, home, fakeMsbScript{Shell: fakeShellScript{ExitCode: 0}})
+	if _, err := orchestrator.AttachShell(ctx, orchestrator.Deps{Sandbox: sb3}, runDir, "", nil); err != nil {
+		t.Errorf("attach after the first one released the session: %v", err)
+	}
+}
+
+// waitForState polls the run record until it reaches want, up to a few seconds.
+func waitForState(t *testing.T, runDir, want string) bool {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if rec, err := orchestrator.ReadRecord(runDir); err == nil && rec.State == want {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return false
 }
 
 // ttyWorkdir returns the --workdir value of one recorded `msb exec` argv, looking only at the

@@ -34,6 +34,24 @@ import (
 // out of the `${NAME:-$HOME}` expansion it's spliced into.
 var dirEnvNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// validSeedPath enforces adapter.ConfigSeed.Path's documented contract — "clean, relative, and
+// carries no '..' element" — at the one place it is actually joined to a base directory. Today
+// every Path is a compile-time constant in internal/adapter, so nothing can currently violate
+// it; this is what keeps a future adapter's `../settings.json` typo from silently writing
+// outside the resolved config dir instead of failing loudly, the same way an out-of-contract
+// DirEnv already does.
+func validSeedPath(p string) bool {
+	if p == "" || path.IsAbs(p) || p != path.Clean(p) {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 // maxConfigSeedFile bounds the existing guest file applyConfigSeed reads before merging into it
 // (decision 4.2) — the guest is untrusted (§10), so nothing else bounds how large a file a
 // hostile or merely strange image could hand back.
@@ -68,6 +86,9 @@ func warnConfigSeed(out io.Writer, seed task.ConfigSeed, err error) {
 func applyConfigSeed(ctx context.Context, sb *sandbox.Client, name, user string, seed task.ConfigSeed) error {
 	if seed.DirEnv != "" && !dirEnvNameRE.MatchString(seed.DirEnv) {
 		return fmt.Errorf("invalid DirEnv %q", seed.DirEnv)
+	}
+	if !validSeedPath(seed.Path) {
+		return fmt.Errorf("invalid Path %q: must be clean, relative, and free of %q", seed.Path, "..")
 	}
 	base := guestBaseDir(ctx, sb, name, user, seed.DirEnv)
 	if base == "" {
@@ -118,25 +139,47 @@ func (c *capBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// readSeedFile execs `cat guestPath` as user. A missing (or otherwise unreadable) file
-// is reported by `cat` as a non-zero exit with an error message on stderr — Exec sees that as
-// evidence the command ran (its ErrMsbFailed heuristic needs SOME output), not a driver failure —
-// so it is treated as decision 4.2 requires: "a missing file means {}", i.e. nil bytes, no error.
+// seedMissingExit is the exit status readScript uses for "the file is not there", distinct from
+// any status `cat` itself can produce (1 or 2) — the one thing decision 4.2's "a missing file
+// means {}" may NOT be conflated with is a file that exists but could not be read.
+const seedMissingExit = 3
+
+// readScript tests for the file's existence itself instead of inferring it from a failed `cat`.
+// The two are not equivalent: a config that exists but is unreadable by the sandbox user (a
+// root-owned 0600 file in a user-writable directory, say) would otherwise read as `{}`, merge
+// cleanly, and get replaced by writeSeedFile's `mv -f` — silently overwriting a file krayt is
+// contractually forbidden to overwrite. Absence exits seedMissingExit; any other failure keeps
+// `cat`'s own non-zero status and is reported as an error, so the seed is skipped with a warning.
+// The missing branch writes to stderr deliberately: sandbox.Exec's ErrMsbFailed heuristic treats
+// a non-zero exit with no output on EITHER stream as "the command never ran", and a missing file
+// is the common case, not a driver failure.
+const readScript = `p=$1
+if [ ! -e "$p" ]; then echo "krayt-seed-read: no such file" >&2; exit 3; fi
+cat "$p"`
+
+// readSeedFile execs readScript as user and returns the file's current bytes. A missing file is
+// decision 4.2's "{}": nil bytes, no error. An existing-but-unreadable file — or any other
+// failure — is an error, which applyConfigSeeds turns into one warning line and no write.
 func readSeedFile(ctx context.Context, sb *sandbox.Client, name, user, guestPath string) ([]byte, error) {
 	cb := &capBuffer{limit: maxConfigSeedFile}
+	var stderr bytes.Buffer
 	res, err := sb.Exec(ctx, sandbox.ExecSpec{
 		Name: name, User: user,
-		Command: []string{"cat", guestPath},
+		Command: []string{"sh", "-c", readScript, "sh", guestPath},
 		Stdout:  cb,
+		Stderr:  &stderr,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if cb.over {
-		return nil, fmt.Errorf("exceeds %d bytes, skipping", maxConfigSeedFile)
+	if res.ExitCode == seedMissingExit {
+		return nil, nil // missing: {} per decision 4.2
 	}
 	if res.ExitCode != 0 {
-		return nil, nil // missing (or unreadable): {} per decision 4.2
+		return nil, fmt.Errorf("exit %d: %s", res.ExitCode, strings.TrimSpace(stderr.String()))
+	}
+	if cb.over {
+		return nil, fmt.Errorf("exceeds %d bytes, skipping", maxConfigSeedFile)
 	}
 	return cb.buf.Bytes(), nil
 }
@@ -147,10 +190,20 @@ func readSeedFile(ctx context.Context, sb *sandbox.Client, name, user, guestPath
 // and never a partial file if the write is interrupted. Every path travels as a positional shell
 // argument (`sh -c '…' sh "$1" "$2" "$3"`), never interpolated into the script text, since
 // guestPath is derived from a guest-controlled DirEnv value that could contain anything.
+//
+// The script opens with `umask 077` because the replacement is a NEW inode: the temp file is
+// created with whatever umask the guest shell inherited (typically 022 → 0644), and `mv -f`
+// carries that mode onto the destination, so seeding an existing 0600 config would otherwise
+// widen it to world-readable — and these files carry account and auth state (Claude Code's
+// customApiKeyResponses, Gemini's selected auth type). 077 is deliberately one-way: krayt may
+// tighten a seeded config's mode, never loosen it. mkdir -p inherits the same umask, which is
+// the right default for a per-user config dir (~/.claude, ~/.gemini) and leaves an existing
+// directory's mode alone.
 func writeSeedFile(ctx context.Context, sb *sandbox.Client, name, user, guestPath string, content []byte) error {
 	dir := path.Dir(guestPath)
 	tmp := path.Join(dir, "."+path.Base(guestPath)+".krayt-seed-tmp")
-	const script = `dir=$1; tmp=$2; dst=$3
+	const script = `umask 077
+dir=$1; tmp=$2; dst=$3
 mkdir -p "$dir" && cat > "$tmp" && mv -f "$tmp" "$dst" || { echo "krayt-config-seed: write failed" >&2; exit 1; }`
 	var stderr bytes.Buffer
 	res, err := sb.Exec(ctx, sandbox.ExecSpec{
