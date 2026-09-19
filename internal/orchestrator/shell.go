@@ -314,14 +314,14 @@ func Shell(ctx context.Context, deps Deps, spec task.RunSpec, runDir string, kee
 // terminals would otherwise both see `kept`, both proceed, overwrite each other's PID in the one
 // record, and race each other's finishAndCollect over the same changes.patch/report.md/meta.json.
 func AttachShell(ctx context.Context, deps Deps, runDir, secretsPath string, execCmd []string) (res *ShellResult, err error) {
-	rec, rerr := ReadRecord(runDir)
-	if rerr != nil {
+	// Claim the session before reading it for real: everything validated below is state another
+	// attach could be changing right now, so the checks are only meaningful under the lock. This
+	// first read is discarded on purpose — only its error is wanted, so that a bad run id fails
+	// with "read run record" rather than as a confusing failure to open a lock file in a directory
+	// that does not exist.
+	if _, rerr := ReadRecord(runDir); rerr != nil {
 		return nil, fmt.Errorf("orchestrator: read run record: %w", rerr)
 	}
-	// Claim the session before re-reading it: everything validated below is state another attach
-	// could be changing right now, so the checks are only meaningful under the lock. The record is
-	// read once above purely so a bad run id fails with "read run record" rather than as a
-	// confusing failure to open a lock file in a directory that does not exist.
 	release, lerr := lockAttach(runDir)
 	if lerr != nil {
 		return nil, lerr
@@ -329,7 +329,8 @@ func AttachShell(ctx context.Context, deps Deps, runDir, secretsPath string, exe
 	// Registered before the record-writing defer below, so it releases only AFTER that defer has
 	// returned the record to `kept` — the next attach must never observe the in-between state.
 	defer release()
-	if rec, rerr = ReadRecord(runDir); rerr != nil {
+	rec, rerr := ReadRecord(runDir)
+	if rerr != nil {
 		return nil, fmt.Errorf("orchestrator: read run record: %w", rerr)
 	}
 	if rec.EffectiveKind() != KindShell {
