@@ -22,7 +22,7 @@ RUN apt-get update \
 # (renovate.json). Installed as root (global npm installs need a root-owned prefix, unlike
 # Claude Code's user-local installer) — the resulting /usr/local/bin/gemini is world-executable,
 # so the non-root user below can still run it.
-ARG GEMINI_CLI_VERSION=0.55.1
+ARG GEMINI_CLI_VERSION=0.60.0
 RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION} \
  && npm cache clean --force
 
