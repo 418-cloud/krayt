@@ -38,7 +38,7 @@ ARG PROTOC_GEN_GO_GRPC_VERSION=v1.6.2
 ARG BUF_VERSION=v1.71.0
 ARG ORAS_VERSION=v1.3.2
 ARG GOLANGCI_LINT_VERSION=v2.12.2
-ARG GH_CLI_VERSION=2.96.0
+ARG GH_CLI_VERSION=2.101.0
 ARG HADOLINT_VERSION=2.15.1
 
 # The base image is debian:trixie-slim + `ca-certificates curl git bash`; these are what krayt's
