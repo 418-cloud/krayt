@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.11.0](https://github.com/418-cloud/krayt/compare/v0.10.0...v0.11.0) (2026-09-19)
+
+
+### Features
+
+* Implement shell lifecycle management and enhance user resolution ([#163](https://github.com/418-cloud/krayt/issues/163)) ([24b164f](https://github.com/418-cloud/krayt/commit/24b164fe5c6e854c30e59b57ce2b7a5406984fa2))
+
+
+### Dependencies
+
+* update dependency @anthropic-ai/claude-code to v2.1.273 ([#166](https://github.com/418-cloud/krayt/issues/166)) ([c5b68f6](https://github.com/418-cloud/krayt/commit/c5b68f66bf86786d44470b7b1303ed553057259c))
+* update dependency rtk-ai/rtk to v0.49.0 ([#172](https://github.com/418-cloud/krayt/issues/172)) ([ef0dd58](https://github.com/418-cloud/krayt/commit/ef0dd58d116eee24992315df3c9d17a03b47f983))
+* update gomod non-major dependencies ([#129](https://github.com/418-cloud/krayt/issues/129)) ([4085f9a](https://github.com/418-cloud/krayt/commit/4085f9a405eca45602559f69acaa25b0294cd817))
+
 ## [0.10.0](https://github.com/418-cloud/krayt/compare/v0.9.0...v0.10.0) (2026-09-07)
 
 
