@@ -166,6 +166,48 @@ Reproducible, ready-to-run examples live under `hack/` — most notably `hack/cl
 (a real Claude Code agent, build-it-yourself version of the published image below) and
 `hack/krayt-ask-probe/` (the question channel).
 
+### Interactive shell sessions
+
+`krayt run` is headless — the agent works alone and hands back a patch. `krayt shell` is its
+human-driven sibling: it boots a sandbox from the same repo snapshot and hands *you* a terminal
+in `/workspace`, instead of launching an agent. The same isolation an autonomous agent gets —
+run anything, install anything, touch a real credential, none of it reaching the host — is just
+as useful with a human at the keyboard, especially when you want to sit down with `claude` (or
+`vim`, or `pytest`) in a tree with the real code and no permission prompt in the way, because the
+blast radius is already bounded by the VM.
+
+```bash
+krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code --repo . \
+  --secrets ./secrets.env --allow api.anthropic.com
+# you're now at a shell in /workspace inside the sandbox — run claude, vim, pytest, whatever you like
+# `exit` tears the sandbox down and leaves changes.patch + report.md in .krayt/runs/<id>/, same as a run
+```
+
+- **Ephemeral by default**, exactly like `krayt run`: the sandbox is created for the session and
+  destroyed when the shell exits — on a clean exit, a failed setup step, Ctrl-C, or a killed
+  terminal. `--keep` opts into a sandbox that survives the shell exiting instead; re-enter it with
+  `krayt shell --attach <run-id>`, and destroy it (only) with `krayt stop <run-id>`.
+- **`--task <file>` is optional** (unlike `run`'s, which is required) — given, it's copied to
+  `/task/prompt.md` for an agent you start by hand inside the shell to read; omitted, the prompt
+  is yours to type.
+- **No `--on-question=wait`, no `--timeout`.** You're already in the room to answer any question
+  yourself, and a session you're sitting in has no wall-clock budget — it's bounded by you closing
+  it or `krayt stop`, not a clock.
+- **`krayt patch <run-id>`** works against a *live* session too — it re-derives `changes.patch`
+  from whatever's currently in `/workspace` on demand, without ending the session, so you can peek
+  at your diff from a second terminal mid-session.
+- **`krayt doctor`** (with `--repo`) warns — never destroys — if a `krayt-*` sandbox is running
+  with no run record to explain it (e.g. after a `kill -9` of `krayt shell`, since decision 5 above
+  means nothing else is watching the clock).
+
+**Snapshot drift.** Like `krayt run`, `krayt shell` works from a snapshot of your repo taken at
+boot time — the host repo isn't touched while the sandbox runs, and vice versa. A `krayt run`
+is usually done in minutes, so drift between the snapshot and your host tree rarely matters. A
+`krayt shell` session is a different story: you might sit in one for an hour while also committing
+on the host in another terminal. That's not a bug — it's the same model `run` already uses — but
+it means `changes.patch` is far more likely to conflict with the host tree by the time you
+`krayt apply` it, so review the diff before applying rather than assuming it'll land cleanly.
+
 ### Egress control
 
 `--net allowlist` (default) — only hosts in `--allow`/`network.allow` are reachable; `--net full`
@@ -424,6 +466,7 @@ See `CHANGELOG.md` for the full release history.
 | 7 — Linux backend (parity) | `firecracker` provider behind the same interface | ✅ hardware (superseded, Phase 11) |
 | 8 — Host-side egress proxy, step 1 | L7 allowlist proxy moved off the guest to a separate host process over a new guest-initiated vsock channel (`move-egress-proxy-to-host.md`) | ✅ offline (superseded, Phase 11) |
 | 11 — Microsandbox migration (ADR option B1) | Replace krayt's own vfkit/Firecracker/guest-agent/proxy stack with a driver for [msb](https://github.com/superradcompany/microsandbox); msb now owns the sandbox and credential substitution (`run-tasks-on-microsandbox.md`, the cut-over) | ✅ cut-over landed — a real end-to-end `krayt run` against real msb on hardware is still outstanding |
+| 12 — Interactive shell sessions | `krayt shell` — a human-driven terminal inside the sandbox, ephemeral by default with `--keep`/`--attach`, patch out on exit and on demand mid-session, `krayt doctor` orphan check (`add-interactive-shell-session.md`) | ✅ done — hardware-verified on an Apple-Silicon Mac (2026-09-16/17); a few terminal/edge checks remain in `HUMAN_TODO.md` |
 
 The showcase: a real agent, blocked mid-task on a decision only a human could make, paused,
 asked over MCP, got the answer, and continued with it — all inside the sandbox with a live

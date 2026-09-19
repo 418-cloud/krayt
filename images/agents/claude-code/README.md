@@ -93,9 +93,16 @@ Claude Code's own precedence would otherwise silently prefer one and bypass the 
 
 ## Required `--allow` hosts
 
-- `api.anthropic.com` — the inference endpoint. Required in every case.
-- If using `CLAUDE_CODE_OAUTH_TOKEN`, the auth/refresh flow may also need `console.anthropic.com`
-  and/or `claude.ai` — verify against current Anthropic docs if a run stalls on egress.
+- `api.anthropic.com` — the inference endpoint, and the only host Claude Code needs with either
+  credential. That is verified with `CLAUDE_CODE_OAUTH_TOKEN` for headless `krayt run` and for
+  `claude` started by hand inside `krayt shell` (2026-09-17).
+- Interactive `claude` normally runs a first-run onboarding check that also contacts
+  `platform.claude.com`. With `agent.adapter: claude-code`, krayt marks onboarding complete inside
+  the sandbox (`KRAYT_SPEC.md` §6.14, "First-run state"), so that check never runs and the host
+  isn't needed. Without the adapter, interactive `claude` stops at onboarding instead of using the
+  token. If `platform.claude.com` isn't allowed either, that onboarding check fails with a
+  misleading `UNKNOWN_CERTIFICATE_VERIFICATION_ERROR`, because msb drops the denied connection
+  mid-handshake. Use the adapter.
 
 ## Usage
 

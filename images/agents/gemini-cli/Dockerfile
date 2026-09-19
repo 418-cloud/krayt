@@ -28,6 +28,19 @@ RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION} \
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/krayt-agent-entrypoint
 
+# krayt-agent-shellenv (§8.2, add-interactive-shell-session.md decision 14): the setup the
+# entrypoint above and an interactive `krayt shell` session both need, sourced rather than
+# duplicated — see images/agents/claude-code/krayt-agent-shellenv's header for the full reasoning.
+COPY --chmod=0755 krayt-agent-shellenv /usr/local/bin/krayt-agent-shellenv
+
+# Source it for an interactive shell too (`krayt shell`). Both /etc/profile.d (login shells) and
+# /etc/bash.bashrc (bash's own non-login-interactive hook) are wired because which one actually
+# fires depends on how msb invokes the sandbox's default shell — unverified without real hardware
+# (§"Verify first" #1 in the task; see HUMAN_TODO.md) — so both are covered rather than guessing.
+RUN printf '. /usr/local/bin/krayt-agent-shellenv\n' > /etc/profile.d/krayt-shellenv.sh \
+ && chmod 0644 /etc/profile.d/krayt-shellenv.sh \
+ && printf '\n. /usr/local/bin/krayt-agent-shellenv\n' >> /etc/bash.bashrc
+
 # rtk (Rust Token Killer, Apache-2.0, https://github.com/rtk-ai/rtk): sits in front of common dev
 # commands and compresses their output before this headless agent reads it — every byte of
 # command output here becomes model context. Installed as a pinned prebuilt release tarball, the

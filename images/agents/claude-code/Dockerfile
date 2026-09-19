@@ -27,6 +27,22 @@ RUN useradd --create-home --uid 1000 --shell /bin/bash agent
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/krayt-agent-entrypoint
 
+# krayt-agent-shellenv (§8.2, add-interactive-shell-session.md decision 14): the setup the
+# entrypoint above and an interactive `krayt shell` session both need, sourced rather than
+# duplicated (see the file's own header). Not executable on its own — it's only ever sourced —
+# but 0755 costs nothing and matches every other file this Dockerfile copies in.
+COPY --chmod=0755 krayt-agent-shellenv /usr/local/bin/krayt-agent-shellenv
+
+# Source it for an interactive shell too (`krayt shell`, as opposed to the headless entrypoint
+# above, which sources it itself). /etc/profile.d/*.sh is read by /etc/profile, which every
+# POSIX-compliant login shell (bash -l, sh, dash) reads; /etc/bash.bashrc is bash's own
+# non-login-interactive hook. Both are wired because which one actually fires depends on how msb
+# invokes the sandbox's default shell — unverified without real hardware (§"Verify first" #1 in
+# the task; see HUMAN_TODO.md) — so both are covered rather than guessing.
+RUN printf '. /usr/local/bin/krayt-agent-shellenv\n' > /etc/profile.d/krayt-shellenv.sh \
+ && chmod 0644 /etc/profile.d/krayt-shellenv.sh \
+ && printf '\n. /usr/local/bin/krayt-agent-shellenv\n' >> /etc/bash.bashrc
+
 # rtk (Rust Token Killer, Apache-2.0, https://github.com/rtk-ai/rtk): sits in front of common dev
 # commands and compresses their output before this headless agent reads it — every byte of
 # command output here becomes model context. Installed as a pinned prebuilt release tarball, the

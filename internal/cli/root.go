@@ -23,6 +23,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newDoctorCmd())
 	root.AddCommand(newImageCmd())
 	root.AddCommand(newRunCmd())
+	root.AddCommand(newShellCmd())
 	root.AddCommand(newApplyCmd())
 	root.AddCommand(newLsCmd())
 	root.AddCommand(newLogsCmd())

@@ -20,6 +20,11 @@ var openCodeAPIHosts = map[string]string{
 
 // openCode is the opencode adapter: same shape as claude-code/gemini-cli (exactly-one auth +
 // krayt-ask wiring + msb secret scoping), different credential names/hosts.
+//
+// No ConfigSeeds (seed-agent-first-run-config.md decision 11): opencode loads provider auth from
+// whatever's in the environment at startup (packages/web/src/content/docs/cli.mdx, "auth
+// login") — no login or first-run step gates an env-var credential the way Claude Code's
+// onboarding or Gemini CLI's auth dialog do.
 type openCode struct{}
 
 func (openCode) Name() string { return "opencode" }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -25,20 +26,33 @@ func commonChecks() []checkResult {
 	return msbChecks()
 }
 
-// newDoctorCmd builds the `doctor` command (§13).
+// newDoctorCmd builds the `doctor` command (§13). --repo is optional and, unlike every other
+// management command's --repo, defaults to empty rather than ".": doctor is commonly run with no
+// repo in mind at all (a bare host-prereq check), and an empty default keeps the orphan-sandbox
+// check's "skipped — pass --repo to check" honest rather than silently scanning the current
+// directory's .krayt/ nobody asked about.
 func newDoctorCmd() *cobra.Command {
-	return &cobra.Command{
+	var repo string
+	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check host prerequisites for running krayt",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runDoctor(cmd.OutOrStdout())
+			return runDoctor(cmd.Context(), cmd.OutOrStdout(), repo)
 		},
 	}
+	cmd.Flags().StringVar(&repo, "repo", "", "repo whose .krayt/ to cross-reference for the orphaned-sandbox check (add-interactive-shell-session.md decision 6); omit to skip that check")
+	return cmd
 }
 
-func runDoctor(w io.Writer) error {
+func runDoctor(ctx context.Context, w io.Writer, repo string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	checks := commonChecks()
+	// Fifth check, needing repo state that the four msb checks above don't — see
+	// orphanSandboxCheck's own doc comment for why it degrades rather than fails.
+	checks = append(checks, orphanSandboxCheck(ctx, repo))
 	allOK := true
 	for _, c := range checks {
 		mark := "ok"

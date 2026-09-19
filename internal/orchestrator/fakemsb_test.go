@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,11 +44,21 @@ import (
 var fakeMsbVerbs = map[string]bool{
 	"--version": true, "context": true, "create": true, "exec": true,
 	"copy": true, "logs": true, "stop": true, "rm": true, "pull": true, "doctor": true,
+	"image": true, "ls": true,
 }
 
 const (
 	fakeMsbScriptFile = "fake-msb-script.json"
 	fakeMsbCallsFile  = "fake-msb-calls.jsonl"
+	// fakeEnvFile records create-time --env pairs inside the fake sandbox root, so a later exec's
+	// DirEnv probe (guestBaseDir) can resolve one — see fakeMsbCreate's doc comment.
+	fakeEnvFile = ".fake-env.json"
+	// fakePulledFile marks, under HOME, that `pull` ran — what lets an ImageNotCached script's
+	// second `image inspect` succeed.
+	fakePulledFile = "fake-image-pulled"
+	// fakeGitTrustFile records, inside the fake sandbox root, the directory trustWorkspaceForGit
+	// was asked to trust.
+	fakeGitTrustFile = ".fake-git-safe-directory"
 )
 
 // fakeAskScript describes one ask_human exchange the fake agent performs.
@@ -87,11 +98,54 @@ type fakeAgentScript struct {
 type fakeMsbScript struct {
 	Agent          fakeAgentScript `json:"agent"`
 	CreateExitCode int             `json:"create_exit_code,omitempty"`
+	// CreateStderr replaces the fake's generic create-failure message (with CreateExitCode set),
+	// e.g. to reproduce msb's own "run `msb logs --source system <name>`" hint.
+	CreateStderr string `json:"create_stderr,omitempty"`
+	// NoSystemLogs makes `logs --source system` fail with no output, as it does for a sandbox msb
+	// never registered, so no console.log is written.
+	NoSystemLogs bool `json:"no_system_logs,omitempty"`
+	// FailGitTrust makes trustWorkspaceForGit's exec fail, like `git config --global` would with
+	// no writable $HOME.
+	FailGitTrust bool `json:"fail_git_trust,omitempty"`
 
 	// TranscriptFiles are written into the fake guest's $HOME/.claude/projects/-workspace at
 	// create time, keyed by file name — the shape captureTranscript copies out. Absent means the
 	// guest has no transcript, which must leave the run untouched rather than failing it.
 	TranscriptFiles map[string]string `json:"transcript_files,omitempty"`
+
+	// Shell describes the fake `msb exec --tty` attach (orchestrator.Shell/AttachShell) — the
+	// interactive counterpart to Agent, for add-interactive-shell-session.md's tests.
+	Shell fakeShellScript `json:"shell,omitempty"`
+
+	// FailConfigSeedWrite makes the fake config-seed write script (writeSeedFile's `mkdir/cat/mv`
+	// exec) always fail — seed-agent-first-run-config.md's "a failing seed exec does not fail the
+	// run or session" test, distinct from an invalid DirEnv (rejected before any exec at all).
+	FailConfigSeedWrite bool `json:"fail_config_seed_write,omitempty"`
+
+	// FailConfigSeedRead makes the fake config-seed read script (readSeedFile) report the file as
+	// present but unreadable — a root-owned 0600 config in a user-writable dir, say. Distinct
+	// from absent, which the same script reports with seedMissingExit, and the distinction
+	// readSeedFile must honor: only absence may be read as "{}" and merged over.
+	FailConfigSeedRead bool `json:"fail_config_seed_read,omitempty"`
+
+	// ImageUser is the USER `image inspect` reports for the image (resolveSandboxUser). Nil
+	// means "agent", the published claude-code images' user; a pointer to "" means the image sets
+	// no USER at all.
+	ImageUser *string `json:"image_user,omitempty"`
+	// ImageNotCached makes `image inspect` fail until `pull` has run, like msb's local-cache-only
+	// inspect. PullExitCode makes that pull fail.
+	ImageNotCached bool `json:"image_not_cached,omitempty"`
+	PullExitCode   int  `json:"pull_exit_code,omitempty"`
+}
+
+// fakeShellScript describes what the fake tty exec does: optionally write files into /workspace
+// (simulating edits the human made before exiting), then exit with the given code. Block
+// simulates a wedged/never-returning attach — killed by the real exec.CommandContext on ctx
+// cancellation (Ctrl-C), exactly as ExecTTY's real child would be.
+type fakeShellScript struct {
+	WorkspaceFiles map[string]string `json:"workspace_files,omitempty"`
+	ExitCode       int               `json:"exit_code"`
+	Block          bool              `json:"block,omitempty"`
 }
 
 // fakeGuestHome is the $HOME the fake reports for `sh -c 'printf %s "$HOME"'` and roots its
@@ -160,6 +214,61 @@ func readFakeMsbCalls(t *testing.T, home string) []fakeCall {
 
 func sandboxRoot(home, name string) string { return filepath.Join(home, "state", name) }
 
+// fakeRemovedFile marks a sandbox root as destroyed by `msb rm`. The directory itself stays —
+// tests read the fake guest's files after teardown — so removal is recorded rather than enacted,
+// and `msb ls` skips a root carrying this marker.
+const fakeRemovedFile = ".removed"
+
+func markFakeSandboxRemoved(home, name string) {
+	_ = os.WriteFile(filepath.Join(sandboxRoot(home, name), fakeRemovedFile), nil, 0o600)
+}
+
+// removeFakeSandbox simulates a human destroying a sandbox out from under krayt (`msb rm` by
+// hand between attaches) — the one case in which a failed attach really is terminal.
+func removeFakeSandbox(t *testing.T, home, name string) {
+	t.Helper()
+	markFakeSandboxRemoved(home, name)
+}
+
+// fakeMsbLs answers `msb ls --format json` with every sandbox root fakeMsbCreate made and no
+// `msb rm` has since removed — what orchestrator's sandboxExists probe and `krayt doctor`'s
+// orphan check read.
+func fakeMsbLs(home string) int {
+	entries, err := os.ReadDir(filepath.Join(home, "state"))
+	if err != nil {
+		fmt.Println("[]") // no sandbox was ever created
+		return 0
+	}
+	names := make([]map[string]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(home, "state", e.Name(), fakeRemovedFile)); err == nil {
+			continue
+		}
+		names = append(names, map[string]string{"name": e.Name()})
+	}
+	b, err := json.Marshal(names)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fake-msb ls:", err)
+		return 1
+	}
+	_, _ = os.Stdout.Write(b)
+	return 0
+}
+
+// readFakeEnv reads the create-time --env pairs fakeMsbCreate recorded for this sandbox root.
+func readFakeEnv(root string) map[string]string {
+	b, err := os.ReadFile(filepath.Join(root, fakeEnvFile))
+	if err != nil {
+		return nil
+	}
+	var env map[string]string
+	_ = json.Unmarshal(b, &env)
+	return env
+}
+
 // runFakeMsb is this test binary re-exec'd as `msb`.
 func runFakeMsb() int {
 	home := os.Getenv("HOME")
@@ -185,13 +294,56 @@ func runFakeMsb() int {
 	case "exec":
 		return fakeMsbExec(home, args[1:], script)
 	case "logs":
+		if script.NoSystemLogs {
+			return 1
+		}
 		_, _ = fmt.Fprintln(os.Stdout, `{"source":"system","line":"fake msb: boot ok"}`)
 		return 0
-	case "stop", "rm", "pull", "doctor":
+	case "image":
+		return fakeMsbImage(home, args[1:], script)
+	case "pull":
+		if script.PullExitCode != 0 {
+			fmt.Fprintln(os.Stderr, "error: registry error: pull scripted to fail")
+			return script.PullExitCode
+		}
+		if err := os.WriteFile(filepath.Join(home, fakePulledFile), nil, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-msb pull:", err)
+			return 1
+		}
+		return 0
+	case "ls":
+		return fakeMsbLs(home)
+	case "rm":
+		if len(args) > 1 {
+			markFakeSandboxRemoved(home, args[1])
+		}
+		return 0
+	case "stop", "doctor":
 		return 0
 	}
 	fmt.Fprintf(os.Stderr, "fake-msb: unhandled verb %q\n", args[0])
 	return 1
+}
+
+// fakeMsbImage answers `image inspect --format json <ref>` with the scripted USER.
+func fakeMsbImage(home string, args []string, script fakeMsbScript) int {
+	if len(args) != 4 || args[0] != "inspect" || args[1] != "--format" || args[2] != "json" {
+		fmt.Fprintln(os.Stderr, "fake-msb: unhandled image argv", args)
+		return 1
+	}
+	if script.ImageNotCached {
+		if _, err := os.Stat(filepath.Join(home, fakePulledFile)); err != nil {
+			fmt.Fprintf(os.Stderr, "error: image not found: %s\n", args[3])
+			return 1
+		}
+	}
+	user := "agent"
+	if script.ImageUser != nil {
+		user = *script.ImageUser
+	}
+	b, _ := json.Marshal(map[string]any{"reference": args[3], "config": map[string]any{"user": user}})
+	fmt.Println(string(b))
+	return 0
 }
 
 func appendFakeMsbCall(home string, call fakeCall) {
@@ -229,14 +381,22 @@ func envMap(environ []string) map[string]string {
 	return m
 }
 
-// fakeMsbCreate makes the sandbox root directory and records the --vsock host path (if any) so a
-// later exec can dial it for real.
+// fakeMsbCreate makes the sandbox root directory, records the --vsock host path (if any) so a
+// later exec can dial it for real, and records every --env pair (fakeEnvFile) so a later exec's
+// DirEnv probe (guestBaseDir's `${NAME:-$HOME}` shell expansion) can resolve it — simulating
+// "Verify first" #2's create-time-env-inheritance premise, which this fake takes as given so
+// applyConfigSeed's own logic (not msb's real inheritance behavior) is what these tests exercise.
 func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 	if script.CreateExitCode != 0 {
-		fmt.Fprintln(os.Stderr, "fake-msb: create scripted to fail")
+		if script.CreateStderr != "" {
+			fmt.Fprintln(os.Stderr, script.CreateStderr)
+		} else {
+			fmt.Fprintln(os.Stderr, "fake-msb: create scripted to fail")
+		}
 		return script.CreateExitCode
 	}
 	var name, vsock string
+	env := map[string]string{}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--name":
@@ -248,6 +408,13 @@ func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 			i++
 			if i < len(args) {
 				vsock = args[i]
+			}
+		case "--env":
+			i++
+			if i < len(args) {
+				if k, v, ok := strings.Cut(args[i], "="); ok {
+					env[k] = v
+				}
 			}
 		}
 	}
@@ -265,6 +432,13 @@ func fakeMsbCreate(home string, args []string, script fakeMsbScript) int {
 	if vsock != "" {
 		hostPath, _, _ := strings.Cut(vsock, ":")
 		if err := os.WriteFile(filepath.Join(root, ".vsock-host-path"), []byte(hostPath), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-msb create:", err)
+			return 1
+		}
+	}
+	if len(env) > 0 {
+		b, _ := json.Marshal(env)
+		if err := os.WriteFile(filepath.Join(root, fakeEnvFile), b, 0o600); err != nil {
 			fmt.Fprintln(os.Stderr, "fake-msb create:", err)
 			return 1
 		}
@@ -374,11 +548,15 @@ func copyDirRecursive(src, dst string) error {
 func fakeMsbExec(home string, args []string, script fakeMsbScript) int {
 	i := 0
 	var name string
+	tty := false
 	for i < len(args) {
 		switch args[i] {
-		case "--user":
+		case "--user", "--workdir":
 			i += 2
 		case "--stream":
+			i++
+		case "--tty":
+			tty = true
 			i++
 		default:
 			name = args[i]
@@ -387,23 +565,75 @@ func fakeMsbExec(home string, args []string, script fakeMsbScript) int {
 		}
 	}
 afterFlags:
-	if name == "" || i >= len(args) || args[i] != "--" {
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "fake-msb: exec malformed argv", args)
+		return 1
+	}
+	root := sandboxRoot(home, name)
+
+	// TTYExecSpec.Args() omits "--" entirely when Command is empty (msb "attaches to the default
+	// shell") — orchestrator.Shell/AttachShell no longer produce that case in practice (ttyCommand
+	// substitutes defaultShellCommand instead, see shell.go), but the sandbox package still
+	// supports it structurally, so this branch, unlike the --stream one below, must not require it.
+	if tty {
+		var cmd []string
+		if i < len(args) {
+			if args[i] != "--" {
+				fmt.Fprintln(os.Stderr, "fake-msb: exec --tty malformed argv", args)
+				return 1
+			}
+			cmd = args[i+1:]
+		}
+		return fakeTTYExec(root, cmd, script.Shell)
+	}
+
+	if i >= len(args) || args[i] != "--" {
 		fmt.Fprintln(os.Stderr, "fake-msb: exec malformed argv", args)
 		return 1
 	}
 	cmd := args[i+1:]
-	root := sandboxRoot(home, name)
 
 	switch {
 	case len(cmd) >= 2 && strings.HasSuffix(cmd[0], "/krayt-helper") && cmd[1] == "setup":
 		return fakeHelperSetup(root, cmd[2:])
 	case len(cmd) >= 2 && strings.HasSuffix(cmd[0], "/krayt-helper") && cmd[1] == "finish":
 		return fakeHelperFinish(root, cmd[2:])
-	// The $HOME probe captureTranscript issues before copying a transcript out. Emits on stdout
-	// and exits 0 — Exec treats a non-zero exit with no output as a driver failure, so a probe
-	// that stays silent would be misreported.
+	// guestBaseDir's probe (captureTranscript's plain $HOME, and applyConfigSeed's
+	// `${DirEnv:-$HOME}` form) — both always emit something on stdout and exit 0, since Exec
+	// treats a non-zero exit with no output as a driver failure.
 	case len(cmd) == 3 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "$HOME"):
-		fmt.Print(fakeGuestHome)
+		fmt.Print(fakeBaseDir(root, cmd[2]))
+		return 0
+	// applyConfigSeed's read step (readSeedFile): `sh -c '<exists-then-cat script>' sh <path>`.
+	// A missing file prints to stderr and exits seedMissingExit; an unreadable one exits like
+	// cat's own failure — the two must stay distinguishable, which is the whole point of the
+	// script. Either way something reaches stderr, so Exec sees evidence the command ran rather
+	// than a driver failure.
+	case len(cmd) == 5 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "krayt-seed-read") && cmd[3] == "sh":
+		if script.FailConfigSeedRead {
+			fmt.Fprintf(os.Stderr, "cat: %s: Permission denied\n", cmd[4])
+			return 1
+		}
+		return fakeSeedRead(root, cmd[4])
+	// applyConfigSeed's write step (writeSeedFile): `sh -c '<mkdir/cat/mv script>' sh dir tmp dst`.
+	case len(cmd) == 7 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "krayt-config-seed") && cmd[3] == "sh":
+		if script.FailConfigSeedWrite {
+			fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed (scripted failure)")
+			return 1
+		}
+		return fakeSeedWrite(root, cmd[4], cmd[5], cmd[6])
+	// trustWorkspaceForGit: `sh -c '<script>' sh /workspace`, recorded under the sandbox root so a
+	// test can check it ran.
+	case len(cmd) == 5 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "krayt-git-safe-directory") && cmd[3] == "sh":
+		if script.FailGitTrust {
+			fmt.Fprintln(os.Stderr, "krayt-git-safe-directory: git config --global failed")
+			return 1
+		}
+		if err := os.WriteFile(filepath.Join(root, fakeGitTrustFile), []byte(cmd[4]+"\n"), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake-msb git trust:", err)
+			return 1
+		}
+		fmt.Println("trusted")
 		return 0
 	case len(cmd) >= 1 && cmd[0] == "mkdir":
 		return fakeMkdir(root, cmd[1:])
@@ -417,7 +647,103 @@ afterFlags:
 	}
 }
 
+// dirEnvProbeRE extracts the guest env var name out of guestBaseDir's `${NAME:-$HOME}` shell
+// expansion, when the probe is asking for a DirEnv rather than plain $HOME.
+var dirEnvProbeRE = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*):-\$HOME\}`)
+
+// fakeBaseDir answers guestBaseDir's probe: the recorded --env value for the named var if the
+// script asks for one and it's set and non-empty, else fakeGuestHome — mirroring the real shell
+// expansion `${NAME:-$HOME}`.
+func fakeBaseDir(root, script string) string {
+	if m := dirEnvProbeRE.FindStringSubmatch(script); m != nil {
+		if v := readFakeEnv(root)[m[1]]; v != "" {
+			return v
+		}
+	}
+	return fakeGuestHome
+}
+
+// fakeSeedRead mimics readSeedFile's script: exit 3 (readSeedFile's seedMissingExit) when the
+// file is absent, print it and exit 0 when it can be read, and exit 1 like cat itself when it
+// exists but cannot be — the distinction readSeedFile depends on to never treat an unreadable
+// config as "{}" and overwrite it. Something always reaches stderr on the non-zero paths, which
+// is what keeps Exec's ErrMsbFailed heuristic from reading a missing file as a driver failure.
+func fakeSeedRead(root, guestPath string) int {
+	hostPath := inSandbox(root, guestPath)
+	if _, err := os.Lstat(hostPath); err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-seed-read: no such file")
+		return 3
+	}
+	b, err := os.ReadFile(hostPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cat: %s: Permission denied\n", guestPath)
+		return 1
+	}
+	_, _ = os.Stdout.Write(b)
+	return 0
+}
+
+// fakeSeedWrite mimics writeSeedFile's script: mkdir -p dir, write stdin to tmp, mv -f tmp to
+// dst — all inside the fake sandbox root.
+func fakeSeedWrite(root, dir, tmp, dst string) int {
+	b, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed:", err)
+		return 1
+	}
+	if err := os.MkdirAll(inSandbox(root, dir), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed:", err)
+		return 1
+	}
+	if err := os.WriteFile(inSandbox(root, tmp), b, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed:", err)
+		return 1
+	}
+	if err := os.Rename(inSandbox(root, tmp), inSandbox(root, dst)); err != nil {
+		fmt.Fprintln(os.Stderr, "krayt-config-seed: write failed:", err)
+		return 1
+	}
+	return 0
+}
+
 func inSandbox(root, p string) string { return filepath.Join(root, p) }
+
+// blockUntilKilled is how the fake wedges: it never returns on its own, leaving the real
+// exec.CommandContext to kill the process at the run's deadline (or on Ctrl-C), exactly as a
+// genuinely stuck agent or attach would be killed.
+//
+// It is deliberately NOT `select {}`. A goroutine parked forever with nothing else to run is
+// exactly what the runtime's deadlock detector looks for: checkdead fatals with "all goroutines
+// are asleep - deadlock!" and the process exits AT ONCE — a crashed agent, not a wedged one. Two
+// things make checkdead bail out before that verdict, and neither is something this fake controls:
+// a non-idle OS thread, or a timer still pending on some P. On unix this binary happens to have
+// the first (a runtime-internal goroutine locked to its own thread), which is why the same
+// `select {}` blocks for the full deadline on linux and macos. On windows/amd64 neither held, so
+// the fake agent died in milliseconds and the run completed cleanly ~8s before its wall clock —
+// how TestTranscriptCapturedOnWallClockTimeout came to see TimedOut == false there and only there.
+// A sleep gives checkdead the second reason on every platform: the process will wake up
+// eventually, so it is not deadlocked, and it blocks until something kills it.
+func blockUntilKilled() {
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+// fakeTTYExec simulates the interactive tty attach `orchestrator.Shell`/`AttachShell` runs in
+// place of the agent exec: it optionally writes files into /workspace (simulating edits the human
+// made before exiting), then exits with the scripted code.
+func fakeTTYExec(root string, _ []string, script fakeShellScript) int {
+	if script.Block {
+		blockUntilKilled() // killed by the real exec.CommandContext on ctx cancellation (Ctrl-C)
+	}
+	ws := filepath.Join(root, "workspace")
+	for name, content := range script.WorkspaceFiles {
+		p := filepath.Join(ws, name)
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		_ = os.WriteFile(p, []byte(content), 0o644)
+	}
+	return script.ExitCode
+}
 
 // writeFakeTranscript seeds the fake guest's transcript dir, mirroring where Claude Code writes
 // one: $HOME/.claude/projects/<slug-of-cwd>/<session>.jsonl, cwd being /workspace in the sandbox.
@@ -559,7 +885,7 @@ func fakeChmod(root string, args []string) int {
 // path, and exits with the scripted code.
 func fakeAgentExec(root string, script fakeAgentScript) int {
 	if script.Block {
-		select {} // killed by the real exec.CommandContext at the run's deadline
+		blockUntilKilled() // killed by the real exec.CommandContext at the run's deadline
 	}
 	if script.TimingFile != "" {
 		start := time.Now().UnixNano()

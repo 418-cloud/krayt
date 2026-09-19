@@ -602,6 +602,95 @@ func TestImagePruneRendersArgs(t *testing.T) {
 	}
 }
 
+func TestTTYExecSpecArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		spec TTYExecSpec
+		want []string
+	}{
+		{
+			name: "no user, no command — msb attaches its own default shell",
+			spec: TTYExecSpec{Name: "sbx"},
+			want: []string{"exec", "--tty", "sbx"},
+		},
+		{
+			name: "user set, no command",
+			spec: TTYExecSpec{Name: "sbx", User: "agent"},
+			want: []string{"exec", "--tty", "--user", "agent", "sbx"},
+		},
+		{
+			name: "user + explicit command (--exec convenience flag)",
+			spec: TTYExecSpec{Name: "sbx", User: "agent", Command: []string{"bash", "-lc", "vim"}},
+			want: []string{"exec", "--tty", "--user", "agent", "sbx", "--", "bash", "-lc", "vim"},
+		},
+		{
+			name: "workdir set — a flag, so it precedes the sandbox name",
+			spec: TTYExecSpec{Name: "sbx", User: "agent", Workdir: "/workspace", Command: []string{"bash", "-l"}},
+			want: []string{"exec", "--tty", "--user", "agent", "--workdir", "/workspace", "sbx", "--", "bash", "-l"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.spec.Args()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("Args() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExecTTYInheritsStdioAndMapsExitCode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"exec": {ExitCode: 3},
+	}})
+
+	res, err := c.ExecTTY(context.Background(), TTYExecSpec{Name: "sbx", User: "agent"})
+	if err != nil {
+		t.Fatalf("ExecTTY: %v (want a normal ExecResult — a plain non-zero exit is not a driver failure here)", err)
+	}
+	if res.ExitCode != 3 {
+		t.Fatalf("ExitCode = %d, want 3", res.ExitCode)
+	}
+
+	call := lastFakeCall(t, home)
+	want := []string{"exec", "--tty", "--user", "agent", "sbx"}
+	if !reflect.DeepEqual(call.Args, want) {
+		t.Errorf("ExecTTY args = %v, want %v", call.Args, want)
+	}
+}
+
+func TestListParsesToleratesFieldNameVariants(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"ls": {ExitCode: 0, Stdout: `[` +
+			`{"name":"krayt-run_abc123","state":"running"},` +
+			`{"sandbox":"krayt-run_def456"}` +
+			`]`},
+	}})
+
+	got, err := c.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []string{"krayt-run_abc123", "krayt-run_def456"}
+	if len(got) != len(want) {
+		t.Fatalf("List = %+v, want %d entries", got, len(want))
+	}
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Errorf("List[%d].Name = %q, want %q", i, got[i].Name, w)
+		}
+	}
+	call := lastFakeCall(t, home)
+	wantArgs := []string{"ls", "--format", "json"}
+	if !reflect.DeepEqual(call.Args, wantArgs) {
+		t.Errorf("List args = %v, want %v", call.Args, wantArgs)
+	}
+}
+
 func slicesContain(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {
@@ -631,5 +720,80 @@ func TestMsbDurationIsSingleUnit(t *testing.T) {
 		if got := msbDuration(tc.in); got != tc.want {
 			t.Errorf("msbDuration(%v) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestParseImageUser(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "named user", raw: `{"config":{"user":"agent"}}`, want: "agent"},
+		{name: "uid:gid", raw: `{"config":{"user":"1000:1000"}}`, want: "1000:1000"},
+		{name: "whitespace trimmed", raw: `{"config":{"user":" node "}}`, want: "node"},
+		{name: "empty user", raw: `{"config":{"user":""}}`, want: ""},
+		{name: "null user", raw: `{"config":{"user":null}}`, want: ""},
+		{name: "no user key", raw: `{"config":{"env":["A=b"]}}`, want: ""},
+		{name: "null config", raw: `{"config":null}`, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseImageUser([]byte(tc.raw))
+			if err != nil {
+				t.Fatalf("parseImageUser: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("parseImageUser = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if _, err := parseImageUser([]byte("not json")); err == nil {
+		t.Error("parseImageUser accepted invalid JSON")
+	}
+}
+
+func TestImageUserCachedImageNeedsNoPull(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"image": {Stdout: `{"reference":"img:1","config":{"user":"node"}}`},
+	}})
+
+	got, err := c.ImageUser(context.Background(), "img:1")
+	if err != nil {
+		t.Fatalf("ImageUser: %v", err)
+	}
+	if got != "node" {
+		t.Errorf("ImageUser = %q, want node", got)
+	}
+	calls := readFakeCalls(t, home)
+	if len(calls) != 1 {
+		t.Fatalf("got %d msb calls, want exactly one inspect (no pull for a cached image): %+v", len(calls), calls)
+	}
+	want := []string{"image", "inspect", "--format", "json", "img:1"}
+	if !reflect.DeepEqual(calls[0].Args, want) {
+		t.Errorf("args = %v, want %v", calls[0].Args, want)
+	}
+}
+
+func TestImageUserPullFailureIsReported(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := newFakeClient(t, home, fakeScript{Responses: map[string]fakeResponse{
+		"image": {ExitCode: 1, Stderr: "error: image not found in local cache"},
+		"pull":  {ExitCode: 1, Stderr: "error: registry error: Not authorized"},
+	}})
+
+	_, err := c.ImageUser(context.Background(), "ghcr.io/nope/missing")
+	if err == nil || !strings.Contains(err.Error(), "msb pull ghcr.io/nope/missing") || !strings.Contains(err.Error(), "Not authorized") {
+		t.Fatalf("err = %v, want the pull failure with msb's own message", err)
+	}
+	var verbs []string
+	for _, c := range readFakeCalls(t, home) {
+		verbs = append(verbs, c.Args[0])
+	}
+	if !reflect.DeepEqual(verbs, []string{"image", "pull"}) {
+		t.Errorf("msb calls = %v, want [image pull] (inspect, then pull, then stop)", verbs)
 	}
 }

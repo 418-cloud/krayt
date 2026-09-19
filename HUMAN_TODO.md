@@ -42,6 +42,8 @@ rewritten; whoever picks one up needs to re-derive the msb-equivalent steps firs
    calls and that the opt-out is honoured rather than silently absent. What remains needs live
    Gemini/OpenCode credentials — the same proof for those two agents — plus the amd64/other-image
    manifest check. See the `[tooling]` entry below.
+6. **`seed-agent-first-run-config.md`** — done and verified on hardware; only the `GOOGLE_API_KEY`
+   host-scope question remains. See its own `[HUMAN]` entry below.
 
 (The two `hadolint`-the-{gemini-cli,opencode}-Dockerfile entries formerly here are resolved: this
 task's own Verify step ran `hadolint` against both — clean, same pre-existing warnings as
@@ -379,3 +381,104 @@ that hosted runner doesn't expose (see the intro above), so the hardware needs b
 - **Blocking:** no — Part B's non-hardware criteria (build, vet, unit tests, CI) are all met and
   shippable without this; it closes the loop the way §14 Phase 11's hardware pass did for the msb
   cutover, and the way the linux/arm64 entry above closes it for that platform.
+
+---
+
+## [HUMAN] `krayt shell` on Windows (`add-interactive-shell-session.md`, `KRAYT_SPEC.md` §14 Phase 12)
+
+`krayt shell` is fully verified on an Apple-Silicon Mac (2026-09-16/17; the record is
+`KRAYT_SPEC.md` §14 Phase 12). Windows has never been tried.
+
+- **Needed:** a Windows host with `msb` and a real interactive console. Run
+  `krayt shell --image ghcr.io/418-cloud/krayt-agent-claude-code --repo .` and repeat the macOS
+  terminal checks: a prompt in `/workspace`, resize, Ctrl-C, a full-screen app, and a clean exit
+  with `changes.patch` collected. Separately, close the console mid-session and confirm
+  `msb list` is empty.
+  Background: inherited stdio is the same code path as on macOS, but whether ConPTY works through
+  msb can only be seen on a Windows machine with a real interactive console; a boot alone, as in
+  the WHP entry above, isn't enough.
+- **Why the agent can't:** no Windows machine with `msb` in this environment.
+- **Verify success by:** record the outcome in `KRAYT_SPEC.md` §14 Phase 12, then delete this
+  entry.
+- **Blocking:** no. Windows is not claimed to work.
+
+---
+
+## [HUMAN] `seed-agent-first-run-config.md` — the `GOOGLE_API_KEY` host scope
+
+Every hardware check for seeding first-run config is verified: Claude Code with an OAuth token and
+with an API key, an image with no krayt shell setup, and Gemini with `GEMINI_API_KEY`
+(`KRAYT_SPEC.md` §14 Phase 12). One question the task logged as out of scope is still open.
+
+- **Needed:** Gemini's `GOOGLE_API_KEY` credential is scoped to
+  `generativelanguage.googleapis.com` (this task's adapter change), but the gemini-cli entrypoint's
+  own comment says that credential shape actually goes through Vertex AI Express
+  (`aiplatform.googleapis.com`). If that's right, msb never substitutes it and a `GOOGLE_API_KEY`
+  run silently sends the placeholder string to Google. Confirm with a live `GOOGLE_API_KEY` which
+  host it actually calls, and file a follow-up to fix the adapter's `Hosts` if the entrypoint's
+  comment is right.
+- **Why the agent can't:** it needs a live `GOOGLE_API_KEY` and a real sandbox.
+- **Blocking:** no. `GEMINI_API_KEY`, the recommended credential, works.
+
+---
+
+## [CI] confirm PR #163's `build + test` legs
+
+Three of this entry's four legs are now green on a real runner and their items are deleted:
+run `35382855324` (head `41685cc`) passed `build + test` on `ubuntu-latest`, `macos-latest` and
+`linux/arm64`, which closes both the `-timeout 30m` fix and the "`hack/test-entrypoint-credentials.sh`
+has never reached the macOS leg" item — that step (`ci.yml:45`) ran and passed there. The Windows
+leg's `TestTrustWorkspaceScript` assertions are likewise confirmed fixed: they no longer appear in
+that run's Windows log.
+
+One Windows failure is left, and its fix is the only thing in this entry that a Linux agent cannot
+confirm itself.
+
+- **Needed:**
+  1. **Confirm `build + test (windows/amd64, native)`.** `TestTranscriptCapturedOnWallClockTimeout`
+     failed there — and only there — on three consecutive heads (`7610648`, `d063fe6`, `41685cc`),
+     always as `expected a timed-out run` after ~1.6s of a 10s budget. Cause: the fake agent wedged
+     with `select {}`, which is not a portable "block forever" — with no timer pending and no other
+     non-system goroutine the runtime fatals with `all goroutines are asleep - deadlock!` and the
+     process exits at once, so the agent died instead of being killed at the deadline and the run
+     was recorded as a clean, non-timed-out exit. On Linux/macOS an extra non-idle locked thread
+     makes `checkdead` return before that point, which is why the same code blocks there.
+     `blockUntilKilled` (`fakemsb_test.go`) now sleeps in a loop, keeping a timer on the heap that
+     `checkdead` honours on every platform. Verify with
+     `go test ./internal/orchestrator/ -run TestTranscriptCapturedOnWallClockTimeout` on
+     `windows-latest`; it passes on linux/arm64 (10.02s, the full budget, 5/5 runs). If it still
+     fails, the assertion now prints the run's exit code, how long the agent actually ran, and the
+     agent log — which distinguishes "never wedged" from "wedged but the kill was misclassified"
+     without another round trip.
+- **Why the agent can't:** item 1 needs a Windows runner; the sandbox is Linux.
+- **Verify success by:** a green `build + test (windows/amd64, native)`, then delete this entry.
+- **Blocking:** no.
+
+---
+
+## [HUMAN] re-verify the two config-seed guest scripts changed by PR #163's review fixes
+
+`seed-agent-first-run-config.md`'s hardware checks (Claude Code with an OAuth token and with an
+API key, Gemini with `GEMINI_API_KEY`, an image with no krayt shell setup) all passed against the
+*previous* shape of the two shell snippets in `internal/orchestrator/configseed.go`. Two Copilot
+review findings on PR #163 changed both snippets, so the guest-side behaviour they proved is no
+longer literally the code that shipped. Both are covered by the fake-msb suite
+(`TestConfigSeedUnreadableFileIsNeverOverwritten`, `TestConfigSeedWriteScriptSetsRestrictiveUmask`),
+which is the honest limit of what a fake guest can show: it does not execute `sh`, so neither the
+real `[ -e ]`/exit-3 branch nor the real `umask`-to-`mv` mode behaviour has run in a sandbox.
+
+- **Needed:** one `krayt run` (or `krayt shell`) per agent image against a real msb sandbox:
+  1. **Read path.** With no config file present, the seed must still be written — confirms the
+     `exit 3` "missing" branch is reached and not misread as a read failure (a regression here is
+     silent: the seed is skipped with a warning and onboarding reappears).
+  2. **Write path.** Pre-create the config `0600`, run a seed that changes something, then check
+     the file's mode in the guest: it must still be `0600`, not `0644`. Before this fix `mv -f`
+     carried the temp file's umask-`022` mode onto the destination.
+  3. **Unreadable path (optional, root needed in the guest).** A root-owned `0600` config in the
+     user's home must be left byte-identical, with one `warning: config seed …` line.
+- **Why the agent can't:** no msb sandbox in this environment; the fake guest reimplements these
+  scripts in Go rather than running `sh`.
+- **Verify success by:** note the run ids against `KRAYT_SPEC.md` §14 Phase 12's
+  `seed-agent-first-run-config.md` checkbox, then delete this entry.
+- **Blocking:** no. Both changes are strictly safer than what they replace — the read path refuses
+  to overwrite where it used to clobber, and the write path only ever tightens a mode.

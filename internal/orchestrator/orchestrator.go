@@ -35,10 +35,10 @@ import (
 	"github.com/418-cloud/krayt/internal/task"
 )
 
-// sandboxAgentUser is the non-root user krayt's agent images run as (§8.2 — enforced, not just
-// convention) and the `msb create --user`/`msb exec --user` value the agent's own exec uses. The
-// guest helper always execs as root instead (add-krayt-guest-helper.md's privilege separation).
-const sandboxAgentUser = "agent"
+// legacySandboxUser is the user every sandbox ran as before krayt read it from the image's own
+// USER (resolveSandboxUser, §8.2). RunRecord.EffectiveSandboxUser falls back to it for records
+// written before sandbox_user existed, so `krayt shell --attach` still reaches those sandboxes.
+const legacySandboxUser = "agent"
 
 // sandboxSecurity is msb's `--security` profile every krayt sandbox is created with. Fixed, not
 // user-configurable: P2 (probe-microsandbox-feasibility.md, 2026-08-30) confirmed `msb exec
@@ -71,6 +71,14 @@ const (
 type Deps struct {
 	Sandbox *sandbox.Client
 	LogOut  io.Writer // live log sink when spec.Detach is false; may be nil
+
+	// Warn receives best-effort warning lines that must never fail a run or session — currently
+	// just applyConfigSeeds' one-line-per-failed-seed output (seed-agent-first-run-config.md
+	// decision 6). Distinct from LogOut: LogOut is the agent's OWN streamed stdout/stderr (nil
+	// when detached), while Warn is host-side progress/status output, wired to the same writer
+	// the CLI already uses for pre-boot messages (printNetworkPolicy and friends) — present for
+	// both Run and Shell, unlike LogOut, which Shell never sets. May be nil to discard.
+	Warn io.Writer
 
 	// OnClient, if set, is invoked once a run's answerer is ready (immediately, since msb has no
 	// boot handshake this package waits on) with an AnswerFunc that delivers a human answer to
@@ -196,11 +204,15 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// created. SystemLogs is captured first (ordered before rm, decision 7): it is msb's
 	// replacement for the pre-msb console log, including the reconstructed boot-error block msb
 	// prepends when a sandbox never finished starting.
+	var user string // the image's own USER, resolved just before Create
+	createFailed := false
 	defer func() {
 		if out, lerr := deps.Sandbox.SystemLogs(ctx, name); lerr == nil || len(out) > 0 {
-			writeConsoleLog(out, runDir, secretValues)
+			if writeConsoleLog(out, runDir, secretValues) && createFailed {
+				err = pointCreateErrorAtConsoleLog(err, name, ConsoleLogPath(runDir))
+			}
 		}
-		captureTranscript(ctx, deps.Sandbox, name, spec.TranscriptDir, runDir, secretValues)
+		captureTranscript(ctx, deps.Sandbox, name, user, spec.TranscriptDir, runDir, secretValues)
 		_ = deps.Sandbox.Stop(ctx, name)
 		_ = deps.Sandbox.Remove(ctx, name)
 	}()
@@ -225,7 +237,14 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// front-end maps that straight to the no-answer sentinel; there is no separate in-process
 	// "fail mode" branch to maintain here the way the pre-msb Start-stream loop needed one.
 	var vsockRoutes []sandbox.VsockRoute
-	var streamCancel context.CancelFunc // set just before the agent Exec call; referenced by the question-timeout closure below
+	// Created here rather than at the agent Exec below so the question-timeout closure can
+	// capture the CancelFunc by value. The ask bridge's goroutine is forked further down, before
+	// the exec: assigning a shared variable afterwards would be a write with no happens-before
+	// edge to the timer goroutine that reads it, which is a data race the detector reports. Still
+	// a child of the wall-clock ctx wrapped at the top of Run, so that timeout still cancels the
+	// exec and stays distinguishable from an abort (isWallClockTimeout reads ctx, not streamCtx).
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
 	var aborted abortLatch
 	var outstandingQuestions atomic.Int32
 	setState := func(st string) {
@@ -267,7 +286,7 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 			setState(StateWaiting)
 			notifyWaiting(filepath.Base(runDir), prompt)
 			if to := spec.Questions.Timeout; to > 0 {
-				armQuestionTimeout(bridge, runDir, id, to, spec.Questions.OnTimeout, &aborted, &streamCancel)
+				armQuestionTimeout(bridge, runDir, id, to, spec.Questions.OnTimeout, &aborted, cancelStream)
 			}
 			return nil
 		})
@@ -316,8 +335,22 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	// run's own context.WithTimeout (above) is belt-and-braces alongside --max-duration
 	// (run-tasks-on-microsandbox.md decision 5): the ctx is what makes teardown deterministic,
 	// --max-duration is what stops a wedged guest outliving it.
+	//
+	// The sandbox runs as the image's own USER (§8.2), refused here with a clear error if that is
+	// root or unset, before anything is created.
+	user, err = resolveSandboxUser(ctx, deps.Sandbox, spec.ImageRef)
+	if err != nil {
+		if isWallClockTimeout(ctx, err) {
+			return earlyTimeoutResult(runDir), nil
+		}
+		return nil, err
+	}
+	recMu.Lock()
+	rec.SandboxUser = user
+	recMu.Unlock()
+	persistRec()
 	createSpec := sandbox.CreateSpec{
-		Image: spec.ImageRef, Name: name, User: sandboxAgentUser,
+		Image: spec.ImageRef, Name: name, User: user,
 		CPUs: spec.Resources.CPUs, MemoryMiB: spec.Resources.MemoryMiB, DiskGiB: spec.Resources.DiskGiB,
 		MaxDuration: spec.Resources.Timeout,
 		Env:         envVarsFromMap(spec.Env),
@@ -331,110 +364,27 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
+		createFailed = true
 		return nil, fmt.Errorf("orchestrator: create sandbox: %w", err)
 	}
 
 	// 2. Copy in: the git bundle, the task prompt, and the two embedded guest binaries.
-	tmp, err := os.MkdirTemp("", "krayt-msb-")
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: temp copy-in dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmp) }()
-
-	bundlePath := filepath.Join(tmp, "repo.bundle")
-	// BundleDepth passes through literally: 0 = full history (§6.1/§8.1); CreateBundle treats
-	// depth<=0 as full history.
-	br, err := patch.CreateBundle(ctx, spec.RepoPath, bundlePath, spec.BundleDepth, spec.IncludeDirty)
+	cir, err := copyInputs(ctx, deps.Sandbox, name, spec, true)
 	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
 		}
 		return nil, err
 	}
-	bundleDigest, err := digestFile(bundlePath)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: digest bundle: %w", err)
-	}
 	recMu.Lock()
-	rec.Provenance = &ProvenanceMeta{
-		HeadSHA: br.HeadSHA, BundleSHA: br.BundleSHA,
-		BundleDepth: spec.BundleDepth, IncludeDirty: spec.IncludeDirty,
-		BundleDigest: bundleDigest.String(),
-	}
+	rec.Provenance = &cir.Provenance
 	_, _ = writeRecord(runDir, rec)
 	recMu.Unlock()
-
-	promptPath := filepath.Join(tmp, "prompt.md")
-	if err := os.WriteFile(promptPath, spec.TaskPrompt, 0o644); err != nil {
-		return nil, fmt.Errorf("orchestrator: write task prompt: %w", err)
-	}
-	helperLocal, err := writeEmbeddedBinary(tmp, guestbin.HelperName)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: %w", err)
-	}
-	askLocal, err := writeEmbeddedBinary(tmp, guestbin.AskName)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator: %w", err)
-	}
-
-	copies := [...]copySpec{
-		{bundlePath, containerBundlePath},
-		{promptPath, containerTaskFile},
-		{helperLocal, guestbin.GuestPath(guestbin.HelperName)},
-		{askLocal, containerAskBinPath},
-	}
-
-	// `msb copy` writes the destination file but will NOT create a missing parent directory —
-	// it fails with "sandbox fs error: open: No such file or directory". Nothing promises those
-	// parents exist: §8.2's paths (/task, /output, and krayt's own guestbin.GuestRoot) are
-	// "injected by the tool", not part of what an agent image must provide, and even
-	// /usr/local/bin is absent from some Nix-built rootfs. So create every destination's parent
-	// here, derived from the copy table itself rather than a second hand-maintained list that
-	// could drift from it.
-	mkdirs := append(guestParentDirs(copies[:]), containerOutput)
-	if _, err := execCapture(ctx, deps.Sandbox, name, "root", append([]string{"mkdir", "-p"}, mkdirs...)); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, fmt.Errorf("orchestrator: create guest directories: %w", err)
-	}
-	// /output is the one of those the non-root agent writes to during the run (§8.2), and mkdir
-	// applied root's umask to it. krayt-helper's own finish does the same 0777 chmod for the same
-	// reason; doing it here too is what makes the directory usable BEFORE finish runs.
-	if _, err := execCapture(ctx, deps.Sandbox, name, "root", []string{"chmod", "0777", containerOutput}); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, fmt.Errorf("orchestrator: chmod %s: %w", containerOutput, err)
-	}
-
-	for _, c := range copies {
-		dst := name + ":" + c.guest
-		if err := deps.Sandbox.Copy(ctx, c.local, dst); err != nil {
-			if isWallClockTimeout(ctx, err) {
-				return earlyTimeoutResult(runDir), nil
-			}
-			return nil, fmt.Errorf("orchestrator: copy %s: %w", dst, err)
-		}
-	}
-	// Defensive: msb copy's mode-preservation is not a pinned contract, so make sure both
-	// binaries are actually executable before exec-ing either of them.
-	if _, err := execCapture(ctx, deps.Sandbox, name, "root",
-		[]string{"chmod", "+x", guestbin.GuestPath(guestbin.HelperName), containerAskBinPath}); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, fmt.Errorf("orchestrator: chmod copied binaries: %w", err)
-	}
 
 	// 3. Exec the helper as root: clone the bundle into /workspace, tag krayt-baseline, snapshot
 	// the root-only patch-git, then relax /workspace for the agent user
 	// (add-krayt-guest-helper.md's privilege-separation ordering).
-	setupOut, err := execCapture(ctx, deps.Sandbox, name, "root", []string{
-		guestbin.GuestPath(guestbin.HelperName), "setup",
-		"--bundle", containerBundlePath, "--workspace", containerWorkspace,
-		"--patch-git", containerPatchGit, "--agent-user", sandboxAgentUser,
-	})
+	baseline, err := helperSetup(ctx, deps.Sandbox, name, user)
 	if err != nil {
 		if isWallClockTimeout(ctx, err) {
 			return earlyTimeoutResult(runDir), nil
@@ -442,12 +392,6 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		// decision 6: a driver failure (ErrMsbFailed) must surface as a failed run, never as
 		// "the agent/helper exited 1" — errors.Is sees through execCapture's %w wrapping.
 		return nil, fmt.Errorf("orchestrator: krayt-helper setup: %w", err)
-	}
-	var setupResult struct {
-		Baseline string `json:"baseline"`
-	}
-	if jerr := json.Unmarshal(setupOut, &setupResult); jerr != nil || setupResult.Baseline == "" {
-		return nil, fmt.Errorf("orchestrator: parse krayt-helper setup output %q: %v", setupOut, jerr)
 	}
 
 	// The code snapshot is now durably captured inside the sandbox (cloned from the bundle,
@@ -457,6 +401,13 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	rec.State = StateRunning
 	_, _ = writeRecord(runDir, rec)
 	recMu.Unlock()
+
+	// 3b. Seed each selected adapter's first-run guest config (§6.14 "First-run state",
+	// seed-agent-first-run-config.md) — as the agent user, before the agent ever runs, so it
+	// authenticates without hitting onboarding or an auth dialog. Best-effort: never fails the run.
+	applyConfigSeeds(ctx, deps.Sandbox, name, user, spec.ConfigSeeds, deps.Warn)
+	// 3c. Let the sandbox user's git work in the root-owned /workspace (gitsafe.go).
+	trustWorkspaceForGit(ctx, deps.Sandbox, name, user, deps.Warn)
 
 	// 4. Exec the agent as the sandbox's non-root user, streamed to the run's log sink.
 	logFile, err := os.Create(filepath.Join(runDir, "logs", "agent.log"))
@@ -470,12 +421,8 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 	}
 	logWriter := io.MultiWriter(writers...)
 
-	streamCtx, cancelStream := context.WithCancel(ctx)
-	streamCancel = cancelStream
-	defer cancelStream()
-
 	execResult, execErr := deps.Sandbox.Exec(streamCtx, sandbox.ExecSpec{
-		Name: name, User: sandboxAgentUser, Command: []string{containerEntrypoint},
+		Name: name, User: user, Command: []string{containerEntrypoint},
 		Stdout: logWriter, Stderr: logWriter,
 	})
 
@@ -494,6 +441,18 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return nil, fmt.Errorf("orchestrator: question timed out (abort policy, §6.13)")
 	case execErr != nil && isWallClockTimeout(ctx, execErr):
 		timedOut, exitCode = true, -1
+	// The same timeout, reported by the driver as a plain nonzero exit instead of an error.
+	// sandbox.Exec only returns ErrMsbFailed for a dead child that wrote NOTHING; if any byte
+	// reached either stream it flattens the kill into (ExitCode, nil), so whether a timed-out run
+	// was classified as one depended on whether the dying agent happened to emit output — which
+	// krayt does not control and which differs by platform. That is how a genuinely timed-out run
+	// reached the default branch and was recorded as a clean exit on windows/amd64
+	// (TestTranscriptCapturedOnWallClockTimeout). A killed process never exits 0 (SIGKILL reports
+	// -1, TerminateProcess 1), so a nonzero exit with the deadline already past is that kill,
+	// while an agent that genuinely finished 0 just under the wire stays a success and keeps its
+	// collected output. Canceled (Ctrl-C) is deliberately not matched.
+	case ctx.Err() == context.DeadlineExceeded && execResult.ExitCode != 0:
+		timedOut, exitCode = true, -1
 	case errors.Is(execErr, sandbox.ErrMsbFailed):
 		return nil, fmt.Errorf("orchestrator: %w", execErr)
 	case execErr != nil:
@@ -509,47 +468,19 @@ func Run(ctx context.Context, deps Deps, spec task.RunSpec, runDir string) (res 
 		return res, nil
 	}
 
-	// 5. Exec the helper again as root: diff against the baseline, assemble /output.
-	if _, err := execCapture(ctx, deps.Sandbox, name, "root", []string{
-		guestbin.GuestPath(guestbin.HelperName), "finish",
-		"--workspace", containerWorkspace, "--patch-git", containerPatchGit,
-		"--baseline", setupResult.Baseline, "--out", containerOutput,
-	}); err != nil {
-		if isWallClockTimeout(ctx, err) {
+	// 5-7. Exec the helper again as root (diff against the baseline, assemble /output), copy
+	// /output/* out, then host-side diffstat + safety lint + secret-value scan (§6.7, §8.4, §14).
+	fres, ferr := finishAndCollect(ctx, deps.Sandbox, name, runDir, baseline, secretValues)
+	if ferr != nil {
+		if isWallClockTimeout(ctx, ferr) {
 			return earlyTimeoutResult(runDir), nil
 		}
-		return nil, fmt.Errorf("orchestrator: krayt-helper finish: %w", err)
+		return nil, fmt.Errorf("orchestrator: %w", ferr)
 	}
-
-	// 6. Copy out /output/* (§6.7, §8.4).
-	if err := collectOutput(ctx, deps.Sandbox, name, runDir); err != nil {
-		if isWallClockTimeout(ctx, err) {
-			return earlyTimeoutResult(runDir), nil
-		}
-		return nil, err
-	}
-	if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
-		res.CommitsBundle = cb
-	}
-
-	// 7. Host: diffstat + safety lint + secret-value scan of the collected patch (§8.4, §14) —
-	// none of this is an exec; the host already holds the patch bytes and every secret value.
+	res.CommitsBundle = fres.CommitsBundle
 	recMu.Lock()
-	if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
-		rec.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
-	}
-	if b, rerr := os.ReadFile(res.PatchPath); rerr == nil {
-		for _, f := range patch.Lint(b) {
-			rec.Safety = append(rec.Safety, f.Path+": "+f.Reason)
-		}
-	}
-	if len(secretValues) > 0 {
-		if keys, kerr := PatchSecretKeys(res.PatchPath, secretValues); kerr == nil {
-			for _, k := range keys {
-				rec.Safety = append(rec.Safety, "changes.patch contains the value of secret "+k+" — review before applying")
-			}
-		}
-	}
+	rec.Patch = fres.Patch
+	rec.Safety = append(rec.Safety, fres.Safety...)
 	res.Safety = rec.Safety
 	recMu.Unlock()
 	return res, nil
@@ -614,6 +545,171 @@ func digestFile(path string) (digest.Digest, error) {
 	}
 	defer func() { _ = f.Close() }()
 	return digest.Canonical.FromReader(f)
+}
+
+// copyInputsResult is what copyInputs' two callers (Run, Shell) need afterward — just the bundle
+// provenance; everything else copyInputs does (staging, mkdir, copy, chmod) is entirely its own.
+type copyInputsResult struct {
+	Provenance ProvenanceMeta
+}
+
+// copyInputs builds the git bundle and copies it, krayt-helper, the task prompt (if any), and
+// (when includeAsk) krayt-ask into the sandbox — §7 step 2, shared by Run and Shell
+// (add-interactive-shell-session.md's host-side "What to build": "reusing §7 steps 1, 2, 4, 5 and
+// 6 verbatim... factor the shared prologue rather than copying it"). The task prompt is copied
+// only when spec.TaskPrompt is non-empty: Run always has one (runRun requires --task), Shell's is
+// optional (decision 13). includeAsk is false for Shell (decision 12: no ask_human channel, so no
+// krayt-ask binary to stage).
+func copyInputs(ctx context.Context, sb *sandbox.Client, name string, spec task.RunSpec, includeAsk bool) (copyInputsResult, error) {
+	tmp, err := os.MkdirTemp("", "krayt-msb-")
+	if err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: temp copy-in dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+
+	bundlePath := filepath.Join(tmp, "repo.bundle")
+	// BundleDepth passes through literally: 0 = full history (§6.1/§8.1); CreateBundle treats
+	// depth<=0 as full history.
+	br, err := patch.CreateBundle(ctx, spec.RepoPath, bundlePath, spec.BundleDepth, spec.IncludeDirty)
+	if err != nil {
+		return copyInputsResult{}, err
+	}
+	bundleDigest, err := digestFile(bundlePath)
+	if err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: digest bundle: %w", err)
+	}
+	result := copyInputsResult{Provenance: ProvenanceMeta{
+		HeadSHA: br.HeadSHA, BundleSHA: br.BundleSHA,
+		BundleDepth: spec.BundleDepth, IncludeDirty: spec.IncludeDirty,
+		BundleDigest: bundleDigest.String(),
+	}}
+
+	copies := []copySpec{{bundlePath, containerBundlePath}}
+
+	if len(spec.TaskPrompt) > 0 {
+		promptPath := filepath.Join(tmp, "prompt.md")
+		if err := os.WriteFile(promptPath, spec.TaskPrompt, 0o644); err != nil {
+			return copyInputsResult{}, fmt.Errorf("orchestrator: write task prompt: %w", err)
+		}
+		copies = append(copies, copySpec{promptPath, containerTaskFile})
+	}
+
+	helperLocal, err := writeEmbeddedBinary(tmp, guestbin.HelperName)
+	if err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: %w", err)
+	}
+	copies = append(copies, copySpec{helperLocal, guestbin.GuestPath(guestbin.HelperName)})
+	execBins := []string{guestbin.GuestPath(guestbin.HelperName)}
+
+	if includeAsk {
+		askLocal, err := writeEmbeddedBinary(tmp, guestbin.AskName)
+		if err != nil {
+			return copyInputsResult{}, fmt.Errorf("orchestrator: %w", err)
+		}
+		copies = append(copies, copySpec{askLocal, containerAskBinPath})
+		execBins = append(execBins, containerAskBinPath)
+	}
+
+	// `msb copy` writes the destination file but will NOT create a missing parent directory —
+	// it fails with "sandbox fs error: open: No such file or directory". Nothing promises those
+	// parents exist: §8.2's paths (/task, /output, and krayt's own guestbin.GuestRoot) are
+	// "injected by the tool", not part of what an agent image must provide, and even
+	// /usr/local/bin is absent from some Nix-built rootfs. So create every destination's parent
+	// here, derived from the copy table itself rather than a second hand-maintained list that
+	// could drift from it.
+	mkdirs := append(guestParentDirs(copies), containerOutput)
+	if _, err := execCapture(ctx, sb, name, "root", append([]string{"mkdir", "-p"}, mkdirs...)); err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: create guest directories: %w", err)
+	}
+	// /output is the one of those the non-root agent writes to during the run (§8.2), and mkdir
+	// applied root's umask to it. krayt-helper's own finish does the same 0777 chmod for the same
+	// reason; doing it here too is what makes the directory usable BEFORE finish runs.
+	if _, err := execCapture(ctx, sb, name, "root", []string{"chmod", "0777", containerOutput}); err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: chmod %s: %w", containerOutput, err)
+	}
+
+	for _, c := range copies {
+		dst := name + ":" + c.guest
+		if err := sb.Copy(ctx, c.local, dst); err != nil {
+			return copyInputsResult{}, fmt.Errorf("orchestrator: copy %s: %w", dst, err)
+		}
+	}
+	// Defensive: msb copy's mode-preservation is not a pinned contract, so make sure every copied
+	// binary is actually executable before exec-ing it.
+	if _, err := execCapture(ctx, sb, name, "root", append([]string{"chmod", "+x"}, execBins...)); err != nil {
+		return copyInputsResult{}, fmt.Errorf("orchestrator: chmod copied binaries: %w", err)
+	}
+	return result, nil
+}
+
+// helperSetup execs krayt-helper setup as root — §7 step 3, shared by Run and Shell: clones the
+// bundle into /workspace, tags krayt-baseline, snapshots the root-only patch-git, then relaxes
+// /workspace for the agent user (add-krayt-guest-helper.md's privilege-separation ordering).
+// Returns the baseline ref, consumed by finishAndCollect's --baseline flag.
+func helperSetup(ctx context.Context, sb *sandbox.Client, name, user string) (string, error) {
+	out, err := execCapture(ctx, sb, name, "root", []string{
+		guestbin.GuestPath(guestbin.HelperName), "setup",
+		"--bundle", containerBundlePath, "--workspace", containerWorkspace,
+		"--patch-git", containerPatchGit, "--agent-user", user,
+	})
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		Baseline string `json:"baseline"`
+	}
+	if jerr := json.Unmarshal(out, &result); jerr != nil || result.Baseline == "" {
+		return "", fmt.Errorf("orchestrator: parse krayt-helper setup output %q: %v", out, jerr)
+	}
+	return result.Baseline, nil
+}
+
+// finishResult is what finishAndCollect produced: the collected patch (and, if the agent/human
+// committed, a commits bundle), plus its diffstat and any Safety findings.
+type finishResult struct {
+	PatchPath     string
+	CommitsBundle string
+	Patch         *PatchMeta
+	Safety        []string
+}
+
+// finishAndCollect execs krayt-helper finish as root (diff against baseline, assemble /output),
+// copies /output/* out, then runs the host-side diffstat + safety lint + secret-value scan of the
+// collected patch — §7 steps 5-7, shared by Run and Shell (decision 8: "a session produces a
+// patch, same as a run"). None of the host-side scan is an exec; the host already holds the patch
+// bytes and every secret value.
+func finishAndCollect(ctx context.Context, sb *sandbox.Client, name, runDir, baseline string, secretValues map[string]string) (finishResult, error) {
+	if _, err := execCapture(ctx, sb, name, "root", []string{
+		guestbin.GuestPath(guestbin.HelperName), "finish",
+		"--workspace", containerWorkspace, "--patch-git", containerPatchGit,
+		"--baseline", baseline, "--out", containerOutput,
+	}); err != nil {
+		return finishResult{}, fmt.Errorf("krayt-helper finish: %w", err)
+	}
+	if err := collectOutput(ctx, sb, name, runDir); err != nil {
+		return finishResult{}, err
+	}
+
+	res := finishResult{PatchPath: filepath.Join(runDir, "changes.patch")}
+	if cb := filepath.Join(runDir, "commits.bundle"); fileExists(cb) {
+		res.CommitsBundle = cb
+	}
+	if st, serr := patch.Stat(ctx, res.PatchPath); serr == nil {
+		res.Patch = &PatchMeta{Path: st.Path, FilesChanged: st.FilesChanged, Insertions: st.Insertions, Deletions: st.Deletions}
+	}
+	if b, rerr := os.ReadFile(res.PatchPath); rerr == nil {
+		for _, f := range patch.Lint(b) {
+			res.Safety = append(res.Safety, f.Path+": "+f.Reason)
+		}
+	}
+	if len(secretValues) > 0 {
+		if keys, kerr := PatchSecretKeys(res.PatchPath, secretValues); kerr == nil {
+			for _, k := range keys {
+				res.Safety = append(res.Safety, "changes.patch contains the value of secret "+k+" — review before applying")
+			}
+		}
+	}
+	return res, nil
 }
 
 // copySpec is one host-file -> guest-path copy-in. The guest path is kept separate from the
@@ -751,8 +847,10 @@ const transcriptHeadBytes = 1 << 20 // 1 MiB
 // Every failure here is swallowed. A transcript is a diagnostic, and a run that already succeeded
 // must not be reported as failed because an optional artifact could not be fetched; a run that
 // already failed must not have its real error replaced by this one.
-func captureTranscript(ctx context.Context, sb *sandbox.Client, name, guestDir, runDir string, secretValues map[string]string) {
-	if guestDir == "" {
+func captureTranscript(ctx context.Context, sb *sandbox.Client, name, user, guestDir, runDir string, secretValues map[string]string) {
+	// An empty user means the run failed before the sandbox user was resolved, so no sandbox was
+	// ever created to copy from.
+	if guestDir == "" || user == "" {
 		return
 	}
 	// The run's ctx is frequently already dead here — a wall-clock timeout cancels it, and that is
@@ -762,7 +860,7 @@ func captureTranscript(ctx context.Context, sb *sandbox.Client, name, guestDir, 
 	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), transcriptTimeout)
 	defer cancel()
 
-	home := guestHome(tctx, sb, name)
+	home := guestHome(tctx, sb, name, user)
 	if home == "" {
 		return
 	}
@@ -784,29 +882,44 @@ func captureTranscript(ctx context.Context, sb *sandbox.Client, name, guestDir, 
 	}
 }
 
-// guestHome asks the sandbox what $HOME is for the user krayt runs the agent as. Resolved rather
-// than hardcoded because the images disagree — /home/agent for claude-code and krayt-dev,
-// /home/node for gemini-cli — and ExecSpec carries no env for krayt to set one itself.
+// guestHome asks the sandbox what $HOME is for user, the image's own USER. Resolved rather than
+// hardcoded because the images disagree — /home/agent for claude-code and krayt-dev, /home/node
+// for gemini-cli — and ExecSpec carries no env for krayt to set one itself.
+func guestHome(ctx context.Context, sb *sandbox.Client, name, user string) string {
+	return guestBaseDir(ctx, sb, name, user, "")
+}
+
+// guestBaseDir asks the sandbox for a base directory: $HOME when dirEnv is empty, or — when
+// dirEnv is non-empty — that guest env var's value if set and non-empty, else $HOME
+// (seed-agent-first-run-config.md decision 4.1; shared by captureTranscript, via guestHome, and
+// applyConfigSeed). dirEnv must already be validated by the caller against dirEnvNameRE: it is
+// interpolated into the shell script TEXT, not passed as a value, because sh has no
+// positional-argument mechanism for expanding "the variable named by this argument" — only the
+// regex anchor (identifier characters only) keeps that safe.
 //
-// `printf %s "$HOME"` and not `test`/`echo -n`: Exec reports a non-zero exit with no output on
+// `printf %s "..."` and not `test`/`echo -n`: Exec reports a non-zero exit with no output on
 // either stream as ErrMsbFailed rather than as an exit code, so a probe must always emit
 // something. printf also avoids echo's trailing newline without relying on `echo -n`, which is not
 // portable across the shells these images ship.
-func guestHome(ctx context.Context, sb *sandbox.Client, name string) string {
+func guestBaseDir(ctx context.Context, sb *sandbox.Client, name, user, dirEnv string) string {
+	expr := `"$HOME"`
+	if dirEnv != "" {
+		expr = fmt.Sprintf(`"${%s:-$HOME}"`, dirEnv)
+	}
 	var out bytes.Buffer
 	res, err := sb.Exec(ctx, sandbox.ExecSpec{
-		Name: name, User: sandboxAgentUser,
-		Command: []string{"sh", "-c", `printf %s "$HOME"`},
+		Name: name, User: user,
+		Command: []string{"sh", "-c", "printf %s " + expr},
 		Stdout:  &out,
 	})
 	if err != nil || res.ExitCode != 0 {
 		return ""
 	}
-	home := strings.TrimSpace(out.String())
-	if !path.IsAbs(home) {
-		return "" // a relative or empty HOME would make path.Join produce a nonsense guest path
+	dir := strings.TrimSpace(out.String())
+	if !path.IsAbs(dir) {
+		return "" // a relative or empty result would make path.Join produce a nonsense guest path
 	}
-	return home
+	return dir
 }
 
 // writeTranscript moves the staged copy into runDir/logs/transcript, redacting and size-capping
@@ -880,9 +993,10 @@ func elideMiddle(b []byte, maxLen, head int) []byte {
 // (run-tasks-on-microsandbox.md decision 7, replacing the pre-msb guest serial console) — into
 // the run's logs dir, redacted against the task's secrets. Same fail-closed rule as before: if
 // the secret values can't be confirmed, nothing is written rather than risking one in the clear.
-func writeConsoleLog(b []byte, runDir string, secretValues map[string]string) {
+// It reports whether the file was written.
+func writeConsoleLog(b []byte, runDir string, secretValues map[string]string) bool {
 	if len(b) == 0 {
-		return
+		return false
 	}
 	if len(b) > maxConsoleLog {
 		b = b[len(b)-maxConsoleLog:]
@@ -890,7 +1004,7 @@ func writeConsoleLog(b []byte, runDir string, secretValues map[string]string) {
 	if len(secretValues) > 0 {
 		b = secrets.NewRedactor(secrets.Values(secretValues)).Redact(b)
 	}
-	_ = os.WriteFile(ConsoleLogPath(runDir), b, 0o644)
+	return os.WriteFile(ConsoleLogPath(runDir), b, 0o644) == nil
 }
 
 // redactChoices applies r to each choice string, same as a question's prompt — an agent could in
@@ -936,8 +1050,10 @@ func earlyTimeoutResult(runDir string) *Result {
 // no-answer sentinel directly to the bridge — unblocking the sandbox's still-pending Ask call —
 // and records it; Bridge.Answer is itself idempotent-safe (a no-op if the question was already
 // answered by a human first, since the human's answer already consumed the pending channel). For
-// `abort` it also cancels the agent's exec via *streamCancel (a pointer so it can be armed before
-// the agent's own exec has actually started the real context it will cancel).
+// `abort` it also cancels the agent's exec through cancelStream, captured by value: Run creates
+// that context before the bridge goroutine exists, so there is no later write for this closure to
+// race against. A timeout that fires before the exec is reached simply hands Exec an
+// already-cancelled context — the right outcome, and the run fails via aborted.fired() either way.
 // abortLatch records whether a question timeout under the `abort` policy fired, and — the part a
 // bare flag cannot do — makes that decision observable to the goroutine that reads it.
 //
@@ -972,7 +1088,7 @@ func (l *abortLatch) fired() bool {
 	return l.aborted
 }
 
-func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Duration, onTimeout task.QuestionTimeoutAction, aborted *abortLatch, streamCancel *context.CancelFunc) {
+func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Duration, onTimeout task.QuestionTimeoutAction, aborted *abortLatch, cancelStream context.CancelFunc) {
 	time.AfterFunc(to, func() {
 		// Held across the whole body, Answer included: see abortLatch.
 		defer aborted.begin()()
@@ -982,9 +1098,7 @@ func armQuestionTimeout(bridge *askbridge.Bridge, runDir, qid string, to time.Du
 		_ = RecordAnswer(runDir, qid, "", true)
 		if onTimeout == task.OnTimeoutAbort {
 			aborted.set()
-			if cancel := *streamCancel; cancel != nil {
-				cancel()
-			}
+			cancelStream()
 		}
 	})
 }

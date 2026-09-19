@@ -15,6 +15,7 @@ TASK_FILE="${KRAYT_TASK:-/task/prompt.md}"
 # Overridable for the same reason SECRETS_DIR/WORKSPACE/TASK_FILE are: it lets
 # hack/test-entrypoint-credentials.sh exercise this script outside a container.
 OUTPUT_DIR="${KRAYT_OUTPUT:-/output}"
+SHELLENV="${KRAYT_SHELLENV:-/usr/local/bin/krayt-agent-shellenv}"
 SETTINGS_FILE="$HOME/.gemini/settings.json"
 
 # Export exactly one recognized credential from the secrets tmpfs (§6.14). The host adapter
@@ -97,11 +98,10 @@ fi
 
 cd "$WORKSPACE"
 
-# The workspace's .git is owned by root (the guest ingests it as root, then makes the tree
-# writable), so the non-root agent's own git commands would refuse it with "dubious ownership".
-# Mark it safe for this user.
-git config --global --add safe.directory "$WORKSPACE" 2>/dev/null || true
-git config --global --add safe.directory '*' 2>/dev/null || true
+# Setup shared with an interactive `krayt shell` session (§8.2, decision 14) — see that file's
+# own header for what it does and, just as importantly, what it deliberately does NOT do.
+# shellcheck source=krayt-agent-shellenv
+. "$SHELLENV"
 
 # When questions are enabled the adapter sets KRAYT_ASK_SOCKET (§6.13); register the ask_human
 # MCP server so Gemini can ask the human. Gemini CLI configures MCP servers via the top-level

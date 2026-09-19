@@ -503,11 +503,12 @@ func TestCreateSpecReflectsRunResources(t *testing.T) {
 	if _, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, spec, runDir); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	// The only msb call before create is the image-user inspect (resolveSandboxUser).
 	calls := readFakeMsbCalls(t, home)
-	if len(calls) == 0 || calls[0].Args[0] != "create" {
-		t.Fatalf("expected the first call to be create; got %v", calls)
+	if len(calls) < 2 || calls[0].Args[0] != "image" || calls[1].Args[0] != "create" {
+		t.Fatalf("expected image inspect then create as the first two calls; got %v", calls)
 	}
-	create := calls[0].Args
+	create := calls[1].Args
 	for _, want := range [][2]string{
 		// --memory carries an explicit unit and --max-duration is whole seconds: msb accepts
 		// one integer plus one unit and rejects Go's composite "20m0s" outright. Spelled

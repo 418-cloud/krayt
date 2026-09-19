@@ -570,6 +570,80 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// TTYExecSpec carries one `msb exec --tty` invocation — the interactive counterpart to ExecSpec,
+// for `krayt shell` (add-interactive-shell-session.md decision 10). It is a separate type, not a
+// flag on ExecSpec, because the two are mutually exclusive by msb's own clap config (`--stream`
+// and `--tty` cannot both be given) and because ExecTTY's whole reason to exist — inheriting the
+// caller's own terminal — is exactly the exception ExecSpec's doc comment calls out as
+// deliberately never taken ("never the terminal/this process's own stdin"). Keeping it a distinct
+// spec+method pair makes that exception visible at every call site instead of a runtime branch
+// inside Exec.
+type TTYExecSpec struct {
+	Name string // sandbox name
+	User string // --user override; empty means msb's default
+	// Workdir is `--workdir`: the directory the command starts in. Empty means msb's default, the
+	// image's own WORKDIR. msb 0.6.16's agentd ignores a failed chdir in the pty child, so a
+	// directory that doesn't exist leaves the session in that default rather than erroring.
+	Workdir string
+	// Command is optional at this layer: empty omits the trailing `-- <argv>` and leaves what
+	// runs up to msb's own "attaches to the default shell" behavior (its own documented words).
+	// The orchestrator package no longer relies on that for `krayt shell`, though — hardware
+	// verification found it resolves to the image's ENTRYPOINT, not a shell, for any image (every
+	// published krayt agent image included) that sets one without an image-level Shell. See
+	// orchestrator.ttyCommand's doc comment for the caller-side fallback that replaced it.
+	Command []string
+}
+
+// Args renders TTYExecSpec into `msb exec --tty` argv — a pure function, mirroring
+// CreateSpec.Args()/ExecSpec.Args(), so this surface is unit-testable without spawning anything
+// or attaching a real terminal.
+func (s TTYExecSpec) Args() []string {
+	args := []string{"exec", "--tty"}
+	if s.User != "" {
+		args = append(args, "--user", s.User)
+	}
+	if s.Workdir != "" {
+		args = append(args, "--workdir", s.Workdir)
+	}
+	args = append(args, s.Name)
+	if len(s.Command) > 0 {
+		args = append(args, "--")
+		args = append(args, s.Command...)
+	}
+	return args
+}
+
+// ExecTTY runs `msb exec --tty` with THIS PROCESS's own stdin/stdout/stderr inherited by the
+// child — the one deliberate, reviewed exception to the "never the terminal/this process's own
+// stdin" rule Exec's doc comment states and msb_test.go asserts structurally for every other
+// method. It exists for exactly one caller: `krayt shell` (add-interactive-shell-session.md
+// decision 10), a human-driven session where inheriting the real terminal is the entire point —
+// msb owns the pty from there (raw mode, echo, CRLF translation, SIGWINCH), so this method's only
+// job is to get out of the way and not interpose a pipe.
+//
+// Because stdout/stderr go straight to the inherited terminal rather than through this package,
+// Exec's "no output observed on either stream" heuristic for ErrMsbFailed has nothing to observe
+// here: there is no separate signal available to distinguish "msb itself failed to start" from
+// "the shell exited non-zero" the way Exec's countingWriter does. A msb-level failure prints on
+// the inherited terminal directly, in addition to being returned as a non-*exec.ExitError error
+// here — that is the diagnostic path for this method, not ErrMsbFailed.
+func (c *Client) ExecTTY(ctx context.Context, spec TTYExecSpec) (ExecResult, error) {
+	cmd := c.command(ctx, spec.Args()...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+	if err == nil {
+		return ExecResult{ExitCode: 0}, nil
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return ExecResult{}, fmt.Errorf("sandbox: msb exec --tty: %w", err)
+	}
+	return ExecResult{ExitCode: exitErr.ExitCode()}, nil
+}
+
 // Copy runs `msb copy`, using docker-cp syntax: `./local sandbox:/path` and back.
 func (c *Client) Copy(ctx context.Context, from, to string) error {
 	_, stderr, err := c.runCaptured(ctx, []string{"copy", from, to})
@@ -712,6 +786,44 @@ func (c *Client) Pull(ctx context.Context, ref string) error {
 	return nil
 }
 
+// ImageUser returns the USER from ref's OCI image config, as `msb image inspect --format json`
+// reports it ("" when the image sets none, i.e. it would run as root). msb inspects only its local
+// image cache (msb 0.6.16, crates/cli/lib/commands/image.rs's run_inspect), so when the first
+// inspect fails the image is pulled and inspected once more: a cached image costs no network
+// round trip, exactly like `msb create`'s own implicit pull.
+func (c *Client) ImageUser(ctx context.Context, ref string) (string, error) {
+	args := []string{"image", "inspect", "--format", "json", ref}
+	out, _, err := c.runCaptured(ctx, args)
+	if err != nil {
+		if perr := c.Pull(ctx, ref); perr != nil {
+			return "", perr
+		}
+		var stderr []byte
+		out, stderr, err = c.runCaptured(ctx, args)
+		if err != nil {
+			return "", fmt.Errorf("sandbox: msb image inspect %s: %w (%s)", ref, err, firstNonEmpty(stderr))
+		}
+	}
+	return parseImageUser(out)
+}
+
+// parseImageUser reads config.user out of `msb image inspect --format json`. A null config or a
+// null/absent user both mean the image sets no USER.
+func parseImageUser(raw []byte) (string, error) {
+	var v struct {
+		Config *struct {
+			User *string `json:"user"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", fmt.Errorf("sandbox: parse msb image inspect output: %w", err)
+	}
+	if v.Config == nil || v.Config.User == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(*v.Config.User), nil
+}
+
 // ImageInfo is one parsed entry from `msb images --format json` (retire-vm-image-pipeline.md
 // decision 2: `krayt image ls` is a thin render of this). Like ContextInfo, msb's JSON schema
 // here is not pinned by the ADR or its docs, so field extraction is tolerant of a few plausible
@@ -819,4 +931,54 @@ func (c *Client) ImagePrune(ctx context.Context) error {
 		return fmt.Errorf("sandbox: msb image prune: %w (%s)", err, firstNonEmpty(stderr))
 	}
 	return nil
+}
+
+// ListEntry is one parsed entry from `msb ls --format json` — decision 6's orphan check
+// (`krayt doctor` cross-references this against `.krayt/runs/` to name a "krayt-*" sandbox
+// nothing is tracking, add-interactive-shell-session.md). Like ImageInfo/ContextInfo, msb's JSON
+// schema for `ls` is not pinned by anything this package can verify offline, so field extraction
+// is tolerant of a few plausible names and Raw always retains the whole decoded entry.
+type ListEntry struct {
+	Name string
+	Raw  json.RawMessage
+}
+
+// List runs `msb ls --format json` and parses the result — every sandbox msb currently knows
+// about, not filtered to krayt's own; the caller (krayt doctor) is the one that knows which
+// prefix is krayt's.
+func (c *Client) List(ctx context.Context) ([]ListEntry, error) {
+	out, stderr, err := c.runCaptured(ctx, []string{"ls", "--format", "json"})
+	if err != nil {
+		return nil, fmt.Errorf("sandbox: msb ls --format json: %w (%s)", err, firstNonEmpty(stderr, out))
+	}
+	return parseSandboxes(out)
+}
+
+// parseSandboxes reads `msb ls --format json`'s array of sandbox entries, tolerant of a few
+// plausible field names for the sandbox's name — see ListEntry.
+func parseSandboxes(raw []byte) ([]ListEntry, error) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil, fmt.Errorf("sandbox: parse msb ls json: %w", err)
+	}
+	out := make([]ListEntry, 0, len(entries))
+	for _, e := range entries {
+		info := ListEntry{Raw: e}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(e, &m); err == nil {
+			for _, key := range []string{"name", "sandbox", "sandbox_name"} {
+				v, ok := m[key]
+				if !ok {
+					continue
+				}
+				var s string
+				if err := json.Unmarshal(v, &s); err == nil && s != "" {
+					info.Name = s
+					break
+				}
+			}
+		}
+		out = append(out, info)
+	}
+	return out, nil
 }

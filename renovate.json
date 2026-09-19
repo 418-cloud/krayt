@@ -16,7 +16,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: the Go toolchain, fetched as the official release tarball rather than inherited from a golang base image, so the native Dockerfile manager can't see it. Grouped with the gomod `go` directive below so the ARG and go.mod move together — GOTOOLCHAIN=local makes a mismatch a build failure.",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG GO_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "golang-version",
       "packageNameTemplate": "go"
@@ -24,7 +24,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: protoc has no native Dockerfile-manager datasource (fetched as a release zip, not a base image)",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG PROTOC_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "github-releases",
       "packageNameTemplate": "protocolbuffers/protobuf",
@@ -33,7 +33,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: protoc-gen-go, installed via `go install` rather than gomod, so it needs its own manager",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG PROTOC_GEN_GO_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "go",
       "packageNameTemplate": "google.golang.org/protobuf"
@@ -41,7 +41,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: protoc-gen-go-grpc, installed via `go install`",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG PROTOC_GEN_GO_GRPC_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "go",
       "packageNameTemplate": "google.golang.org/grpc/cmd/protoc-gen-go-grpc"
@@ -49,7 +49,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: buf, installed via `go install`",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG BUF_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "go",
       "packageNameTemplate": "github.com/bufbuild/buf"
@@ -57,7 +57,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: oras CLI, installed via `go install`",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG ORAS_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "go",
       "packageNameTemplate": "oras.land/oras"
@@ -65,7 +65,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: golangci-lint, installed via `go install` (v2+ module path)",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG GOLANGCI_LINT_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "go",
       "packageNameTemplate": "github.com/golangci/golangci-lint/v2"
@@ -73,7 +73,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: gh CLI, fetched as a release tarball (no go install story worth relying on)",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG GH_CLI_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "github-releases",
       "packageNameTemplate": "cli/cli",
@@ -82,7 +82,7 @@
     {
       "customType": "regex",
       "description": "hack/krayt-dev/Dockerfile: hadolint, fetched as a release binary (no go install story)",
-      "managerFilePatterns": ["^hack/krayt-dev/Dockerfile$"],
+      "managerFilePatterns": ["/^hack/krayt-dev/Dockerfile$/"],
       "matchStrings": ["ARG HADOLINT_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "github-releases",
       "packageNameTemplate": "hadolint/hadolint",
@@ -91,7 +91,7 @@
     {
       "customType": "regex",
       "description": "images/agents/claude-code/Dockerfile: Claude Code CLI, installed via the native installer (no Dockerfile-manager datasource); the npm package mirrors CLI release versions",
-      "managerFilePatterns": ["^images/agents/claude-code/Dockerfile$"],
+      "managerFilePatterns": ["/^images/agents/claude-code/Dockerfile$/"],
       "matchStrings": ["ARG CLAUDE_CODE_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "npm",
       "packageNameTemplate": "@anthropic-ai/claude-code"
@@ -99,7 +99,7 @@
     {
       "customType": "regex",
       "description": "images/agents/gemini-cli/Dockerfile: Gemini CLI, installed via npm",
-      "managerFilePatterns": ["^images/agents/gemini-cli/Dockerfile$"],
+      "managerFilePatterns": ["/^images/agents/gemini-cli/Dockerfile$/"],
       "matchStrings": ["ARG GEMINI_CLI_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "npm",
       "packageNameTemplate": "@google/gemini-cli"
@@ -107,7 +107,7 @@
     {
       "customType": "regex",
       "description": "images/agents/opencode/Dockerfile: opencode, fetched as a release tarball (self-contained binary, no Dockerfile-manager datasource)",
-      "managerFilePatterns": ["^images/agents/opencode/Dockerfile$"],
+      "managerFilePatterns": ["/^images/agents/opencode/Dockerfile$/"],
       "matchStrings": ["ARG OPENCODE_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "github-releases",
       "packageNameTemplate": "anomalyco/opencode",
@@ -116,7 +116,7 @@
     {
       "customType": "regex",
       "description": "images/agents/*/Dockerfile: rtk (Rust Token Killer), fetched as a release tarball (Rust binary, no Dockerfile-manager datasource; the crates.io `rtk` crate is an unrelated project)",
-      "managerFilePatterns": ["^images/agents/[^/]+/Dockerfile$"],
+      "managerFilePatterns": ["/^images/agents/[^/]+/Dockerfile$/"],
       "matchStrings": ["ARG RTK_VERSION=(?<currentValue>.*?)\\n"],
       "datasourceTemplate": "github-releases",
       "packageNameTemplate": "rtk-ai/rtk",

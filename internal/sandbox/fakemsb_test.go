@@ -47,6 +47,7 @@ var fakeMsbVerbs = map[string]bool{
 	"images":    true,
 	"rmi":       true,
 	"image":     true,
+	"ls":        true,
 }
 
 // testBinPath is this test binary's own path, captured once before m.Run() so tests can point

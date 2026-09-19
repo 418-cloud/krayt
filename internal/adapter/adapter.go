@@ -24,6 +24,33 @@ type Input struct {
 	SecretKeys    []string // names of the per-task secrets
 	QuestionsWait bool     // --on-question=wait: wire the krayt-ask front-end (§6.13)
 	AskSocket     string   // KRAYT_ASK_SOCKET value the container should dial (§6.13, §8.2)
+
+	// Placeholder, when set, returns the non-secret placeholder string a guest process sees in
+	// place of a given secret key's real value (sandbox.SecretPlaceholder — msb's own
+	// substitution stand-in, never the real credential). An adapter uses it to seed first-run
+	// config that must match what the guest actually observes (§6.14 "First-run state", e.g.
+	// claude-code's customApiKeyResponses.approved). This package stays msb-agnostic: it never
+	// imports internal/sandbox itself, only this function. A nil Placeholder means the adapter
+	// omits any placeholder-derived seed.
+	Placeholder func(key string) string
+}
+
+// ConfigSeed declares one first-run config file an adapter wants seeded before the agent (or a
+// human inside `krayt shell`) ever runs it (§6.14 "First-run state",
+// seed-agent-first-run-config.md decision 2) — image-agnostic and entirely host-side. An adapter
+// only describes the state it needs; internal/orchestrator does the guest I/O.
+type ConfigSeed struct {
+	// DirEnv is the guest env var that, when set and non-empty, replaces $HOME as the base
+	// directory Path is resolved against (e.g. CLAUDE_CONFIG_DIR, GEMINI_CLI_HOME). Empty means
+	// always use $HOME.
+	DirEnv string
+	// Path is the seed file's path, relative to the resolved base dir; clean, relative, and
+	// carries no ".." element.
+	Path string
+	// Defaults is the JSON object merged INTO the file, filling in only what isn't already
+	// there (decision 3's fill-in-never-override rule) — never a value that could overwrite an
+	// image author's or a user's own explicit choice.
+	Defaults map[string]any
 }
 
 // Plan is an adapter's host-side contribution to a run: non-secret env additions for the
@@ -36,6 +63,12 @@ type Plan struct {
 	Env        map[string]string
 	Credential string
 	Secrets    []task.SecretSpec
+
+	// ConfigSeeds is the first-run guest config state this adapter wants filled in (§6.14
+	// "First-run state") before the agent — or a human inside `krayt shell` — ever runs. Empty
+	// means the adapter has nothing to seed, which is also what `none` and opencode return: no
+	// first-run step gates an env-var credential for either.
+	ConfigSeeds []ConfigSeed
 
 	// TranscriptDir is where this agent writes its own session transcript, as a path RELATIVE to
 	// the container user's $HOME. Empty means the adapter has no transcript to collect, which is

@@ -66,9 +66,8 @@ krayt run \
 ```
 - `--agent claude-code` runs the host adapter's pre-flight: it validates **exactly one** auth
   credential is in the secrets file, **before any VM boots** (§6.14).
-- `--allow api.anthropic.com` opens the egress allowlist to the model API (§6.6). An
-  **OAuth token** may also need `console.anthropic.com` / `claude.ai`; a scoped **API key**
-  needs only `api.anthropic.com`.
+- `--allow api.anthropic.com` opens the egress allowlist to the model API (§6.6). It's the only
+  host needed with either an **OAuth token** or a scoped **API key**.
 - Add `--detach` to background it ("park and walk away", §6.2).
 - To pick a cheaper model, add `env:\n  ANTHROPIC_MODEL: claude-haiku-4-5` to a `krayt.yaml`
   (container env comes from the config file, §8.1).
