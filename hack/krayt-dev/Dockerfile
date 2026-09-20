@@ -33,7 +33,7 @@ FROM ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226
 # (see proto-direct.sh) when it edits internal/protocol/krayt.proto.
 ARG GO_VERSION=1.26.3
 ARG PROTOC_VERSION=36.1
-ARG PROTOC_GEN_GO_VERSION=v1.36.11
+ARG PROTOC_GEN_GO_VERSION=v1.36.12
 ARG PROTOC_GEN_GO_GRPC_VERSION=v1.6.2
 ARG BUF_VERSION=v1.71.0
 ARG ORAS_VERSION=v1.3.2
