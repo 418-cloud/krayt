@@ -78,7 +78,7 @@ RUN mkdir -p /home/agent/.cache/opencode \
 # (renovate.json). The binary lands at /usr/local/lib/rtk/rtk, deliberately NOT on PATH — the
 # `rtk` wrapper below is what's actually on PATH, so KRAYT_RTK=off (see ./rtk) can't be bypassed
 # by anything resolving `rtk` normally.
-ARG RTK_VERSION=0.45.0
+ARG RTK_VERSION=0.49.0
 RUN set -eu; \
     case "${TARGETARCH}" in \
       amd64) rtk_target=x86_64-unknown-linux-musl ;; \

@@ -32,13 +32,13 @@ FROM ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226
 # *committed* generated code; this toolchain is only for an agent regenerating it mid-run
 # (see proto-direct.sh) when it edits internal/protocol/krayt.proto.
 ARG GO_VERSION=1.26.3
-ARG PROTOC_VERSION=35.1
+ARG PROTOC_VERSION=36.1
 ARG PROTOC_GEN_GO_VERSION=v1.36.12
 ARG PROTOC_GEN_GO_GRPC_VERSION=v1.6.2
 ARG BUF_VERSION=v1.71.0
 ARG ORAS_VERSION=v1.3.2
-ARG GOLANGCI_LINT_VERSION=v2.12.2
-ARG GH_CLI_VERSION=2.96.0
+ARG GOLANGCI_LINT_VERSION=v2.13.2
+ARG GH_CLI_VERSION=2.101.0
 ARG HADOLINT_VERSION=2.15.1
 
 # The base image is debian:trixie-slim + `ca-certificates curl git bash`; these are what krayt's
