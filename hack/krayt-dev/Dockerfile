@@ -31,7 +31,7 @@ FROM ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226
 # independently of the base image tag. `make proto` (Nix) stays the source of truth for the
 # *committed* generated code; this toolchain is only for an agent regenerating it mid-run
 # (see proto-direct.sh) when it edits internal/protocol/krayt.proto.
-ARG GO_VERSION=1.26.3
+ARG GO_VERSION=1.27.1
 ARG PROTOC_VERSION=36.1
 ARG PROTOC_GEN_GO_VERSION=v1.36.12
 ARG PROTOC_GEN_GO_GRPC_VERSION=v1.6.2
