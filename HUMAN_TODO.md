@@ -482,3 +482,43 @@ real `[ -e ]`/exit-3 branch nor the real `umask`-to-`mv` mode behaviour has run 
   `seed-agent-first-run-config.md` checkbox, then delete this entry.
 - **Blocking:** no. Both changes are strictly safer than what they replace — the read path refuses
   to overwrite where it used to clobber, and the write path only ever tightens a mode.
+
+---
+
+## [CI] confirm Renovate types Dockerfile-only updates as `chore:`
+
+`renovate.json`'s `packageRules` now type **every** update found in a `**/Dockerfile` as `chore`,
+not just the ones the native `dockerfile` manager sees. Before this, the `customManagers` (the
+pinned-tool `ARG`s: `OPENCODE_VERSION`, `CLAUDE_CODE_VERSION`, `RTK_VERSION`, `PROTOC_*`,
+`BUF_VERSION`, `ORAS_VERSION`, `GOLANGCI_LINT_VERSION`, `GH_CLI_VERSION`, `HADOLINT_VERSION`,
+`GEMINI_CLI_VERSION`) fell through to the repo default and landed as `deps:` — e.g. #167, #168,
+#169, #175 — which put image tooling under **Dependencies** in the release notes and cut a patch
+release. The images are a convenience, not part of the CLI, so they should be hidden.
+
+The rule matches by `matchFileNames` rather than `matchManagers` because a `custom.regex` manager
+can't be distinguished per-Dockerfile any other way. A later rule re-types the **`go version`**
+group back to `deps` — it bumps go.mod's `go` directive alongside `hack/krayt-dev/Dockerfile`'s
+`ARG GO_VERSION`, so it is a real dependency change and stays visible. Rule order matters there:
+last match wins, so the `deps` exception must stay after the Dockerfile rule.
+
+That exception matches the `gomod` and `custom.regex` managers only — **not** `dockerfile`. The
+probe images (`hack/{ask,net,hardening}-probe/Dockerfile`) use `FROM golang:1.27-alpine`, which the
+native manager also names `golang`; had `dockerfile` stayed in the exception, a digest-only bump of
+that base — a Dockerfile-only change with no `go.mod` in the PR — would have been typed `deps:` and
+cut a release, exactly what this entry is trying to stop.
+
+- **Needed:**
+  1. **Schema-validate the config.** `npx --yes --package renovate renovate-config-validator`
+     (no node/npx in the sandbox — only `JSON.parse`-level validity was checked here).
+  2. **Confirm against a live run.** On the next Renovate PR touching only a Dockerfile — a
+     `FROM` digest bump or any of the `ARG`s above — the commit/PR title must start with `chore:`.
+  3. **Confirm the exception still holds.** The next `go version` PR must still be `deps:` and
+     must still contain both `go.mod` and `hack/krayt-dev/Dockerfile`. If such a PR *also* carries
+     the probe images' `golang` base bump, note which prefix Renovate picked: the group then holds
+     upgrades of both types and the branch takes its prefix from the first upgrade. A `chore:` there
+     is the only known rough edge — re-type it when merging and say so here.
+- **Why the agent can't:** Renovate only runs as a GitHub App against the repo; nothing in the
+  sandbox can resolve a datasource or render a commit message.
+- **Verify success by:** the three checks above on real PRs, then delete this entry. A miss on
+  item 2 is cosmetic and self-correcting — re-type the commit when merging.
+- **Blocking:** no.

@@ -30,7 +30,12 @@ patch, `feat!:`/`BREAKING CHANGE:` → major. `chore:`/`docs:`/`ci:` don't bump 
 `hack/**`/`images/agents/**` Dockerfiles. **Auto-merge is off** — review and merge them yourself.
 Per the commit conventions above, only **Go-module** updates are typed `deps:` (they show up under
 Dependencies in the next release); **Actions / Dockerfile** updates are typed `chore:` (hidden,
-and they don't cut a release).
+and they don't cut a release). The images are a convenience, not part of the CLI, so nothing that
+only touches a `Dockerfile` belongs in the release notes — including the pinned-tool `ARG`s the
+custom regex managers track. The one exception is the **Go toolchain** — go.mod's `go` directive
+and `hack/krayt-dev/Dockerfile`'s `ARG GO_VERSION`, which move together in the **`go version`**
+group: those stay `deps:`. The probe images' `FROM golang:…` base rides that same group but is
+*not* part of the exception — on its own it's an image bump like any other, and stays `chore:`.
 
 Updates are held for **3 days** after a release (`minimumReleaseAge`) — a stability window so a
 yanked or hot-fixed release is caught before Renovate proposes it. **Security fixes bypass this**
