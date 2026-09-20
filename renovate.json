@@ -150,9 +150,9 @@
       "semanticCommitType": "chore"
     },
     {
-      "description": "Exception to the rule above: the `go version` group also bumps go.mod's `go` directive, a real dependency change, so it stays `deps`. Must stay after the Dockerfile rule — later rules win.",
-      "matchManagers": ["dockerfile", "gomod", "custom.regex"],
-      "matchPackageNames": ["golang", "go"],
+      "description": "Exception to the rule above: go.mod's `go` directive and hack/krayt-dev/Dockerfile's `ARG GO_VERSION` (the `custom.regex` manager) are a real toolchain change, so they stay `deps`. The `dockerfile` manager is deliberately NOT listed: the probe images' `FROM golang:...` base is also named `golang`, and a tag/digest bump there touches no Go dependency of the binary — it must stay `chore`. Must stay after the Dockerfile rule — later rules win.",
+      "matchManagers": ["gomod", "custom.regex"],
+      "matchPackageNames": ["go"],
       "semanticCommitType": "deps"
     },
     {

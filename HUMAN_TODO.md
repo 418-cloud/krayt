@@ -501,13 +501,22 @@ group back to `deps` — it bumps go.mod's `go` directive alongside `hack/krayt-
 `ARG GO_VERSION`, so it is a real dependency change and stays visible. Rule order matters there:
 last match wins, so the `deps` exception must stay after the Dockerfile rule.
 
+That exception matches the `gomod` and `custom.regex` managers only — **not** `dockerfile`. The
+probe images (`hack/{ask,net,hardening}-probe/Dockerfile`) use `FROM golang:1.27-alpine`, which the
+native manager also names `golang`; had `dockerfile` stayed in the exception, a digest-only bump of
+that base — a Dockerfile-only change with no `go.mod` in the PR — would have been typed `deps:` and
+cut a release, exactly what this entry is trying to stop.
+
 - **Needed:**
   1. **Schema-validate the config.** `npx --yes --package renovate renovate-config-validator`
      (no node/npx in the sandbox — only `JSON.parse`-level validity was checked here).
   2. **Confirm against a live run.** On the next Renovate PR touching only a Dockerfile — a
      `FROM` digest bump or any of the `ARG`s above — the commit/PR title must start with `chore:`.
   3. **Confirm the exception still holds.** The next `go version` PR must still be `deps:` and
-     must still contain both `go.mod` and `hack/krayt-dev/Dockerfile`.
+     must still contain both `go.mod` and `hack/krayt-dev/Dockerfile`. If such a PR *also* carries
+     the probe images' `golang` base bump, note which prefix Renovate picked: the group then holds
+     upgrades of both types and the branch takes its prefix from the first upgrade. A `chore:` there
+     is the only known rough edge — re-type it when merging and say so here.
 - **Why the agent can't:** Renovate only runs as a GitHub App against the repo; nothing in the
   sandbox can resolve a datasource or render a commit message.
 - **Verify success by:** the three checks above on real PRs, then delete this entry. A miss on
