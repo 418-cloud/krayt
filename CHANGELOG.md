@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.11.0](https://github.com/418-cloud/krayt/compare/v0.10.0...v0.11.0) (2026-09-20)
+
+
+### Features
+
+* Implement shell lifecycle management and enhance user resolution ([#163](https://github.com/418-cloud/krayt/issues/163)) ([24b164f](https://github.com/418-cloud/krayt/commit/24b164fe5c6e854c30e59b57ce2b7a5406984fa2))
+
+
+### Dependencies
+
+* update dependency @anthropic-ai/claude-code to v2.1.273 ([#166](https://github.com/418-cloud/krayt/issues/166)) ([c5b68f6](https://github.com/418-cloud/krayt/commit/c5b68f66bf86786d44470b7b1303ed553057259c))
+* update dependency @anthropic-ai/claude-code to v2.1.278 ([#176](https://github.com/418-cloud/krayt/issues/176)) ([3eac421](https://github.com/418-cloud/krayt/commit/3eac421ca53af100afcabb9d3a0a6025ac00568d))
+* update dependency anomalyco/opencode to v1.18.31 ([#167](https://github.com/418-cloud/krayt/issues/167)) ([5ba298e](https://github.com/418-cloud/krayt/commit/5ba298e245ee2b998324db22557b3b38cffd0ca4))
+* update dependency cli/cli to v2.101.0 ([#171](https://github.com/418-cloud/krayt/issues/171)) ([11898a5](https://github.com/418-cloud/krayt/commit/11898a5dd8961038864837e1a71a825832f96190))
+* update dependency go to v1.27.1 ([#157](https://github.com/418-cloud/krayt/issues/157)) ([5b82794](https://github.com/418-cloud/krayt/commit/5b82794d5c86a73a356b4cfd34ef5d6f8231005e))
+* update dependency protocolbuffers/protobuf to v36 ([#175](https://github.com/418-cloud/krayt/issues/175)) ([2b9862a](https://github.com/418-cloud/krayt/commit/2b9862a437793ab774fcf44bc325ee3b5d50e077))
+* update dependency rtk-ai/rtk to v0.49.0 ([#172](https://github.com/418-cloud/krayt/issues/172)) ([ef0dd58](https://github.com/418-cloud/krayt/commit/ef0dd58d116eee24992315df3c9d17a03b47f983))
+* update gomod non-major dependencies ([#129](https://github.com/418-cloud/krayt/issues/129)) ([4085f9a](https://github.com/418-cloud/krayt/commit/4085f9a405eca45602559f69acaa25b0294cd817))
+* update module github.com/golangci/golangci-lint/v2 to v2.13.2 ([#174](https://github.com/418-cloud/krayt/issues/174)) ([eb4cd30](https://github.com/418-cloud/krayt/commit/eb4cd30ad96e7baf67588feb23cc1153632e67f9))
+* update module google.golang.org/protobuf to v1.36.12 ([#168](https://github.com/418-cloud/krayt/issues/168)) ([85fa45b](https://github.com/418-cloud/krayt/commit/85fa45b2492331822e638b00874713a13ab7dd5b))
+* update module oras.land/oras to v1.3.4 ([#169](https://github.com/418-cloud/krayt/issues/169)) ([c7f8172](https://github.com/418-cloud/krayt/commit/c7f81723585f32c81cb332b297476f1dd8a753bc))
+
 ## [0.10.0](https://github.com/418-cloud/krayt/compare/v0.9.0...v0.10.0) (2026-09-07)
 
 
