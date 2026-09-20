@@ -141,8 +141,19 @@
       "groupSlug": "go-version"
     },
     {
-      "matchManagers": ["github-actions", "dockerfile"],
+      "matchManagers": ["github-actions"],
       "semanticCommitType": "chore"
+    },
+    {
+      "description": "Every Dockerfile update is build/dev tooling, not something the krayt binary depends on — type it `chore` so it stays out of the release notes and doesn't cut a release. Matched by file rather than by manager so it also covers the `customManagers` above (which the `dockerfile` manager can't see).",
+      "matchFileNames": ["**/Dockerfile"],
+      "semanticCommitType": "chore"
+    },
+    {
+      "description": "Exception to the rule above: go.mod's `go` directive and hack/krayt-dev/Dockerfile's `ARG GO_VERSION` (the `custom.regex` manager) are a real toolchain change, so they stay `deps`. The `dockerfile` manager is deliberately NOT listed: the probe images' `FROM golang:...` base is also named `golang`, and a tag/digest bump there touches no Go dependency of the binary — it must stay `chore`. Must stay after the Dockerfile rule — later rules win.",
+      "matchManagers": ["gomod", "custom.regex"],
+      "matchPackageNames": ["go"],
+      "semanticCommitType": "deps"
     },
     {
       "matchPackageNames": ["golangci/golangci-lint"],
