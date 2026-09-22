@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/418-cloud/krayt/internal/reexec"
 )
 
 // signalChildEnv makes the re-exec'd test binary act as a stand-in for main: install exactly
@@ -22,6 +24,10 @@ const signalChildEnv = "KRAYT_TEST_SIGNAL_CHILD"
 
 func TestMain(m *testing.M) {
 	if os.Getenv(signalChildEnv) == "1" {
+		// This process is test scaffolding, and the parent waits for it to exit after each signal.
+		// Under -race that exit would otherwise spend a second in TSan's teardown sleep, once per
+		// signal under test. See internal/reexec.
+		reexec.FastExit()
 		ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals...)
 		defer stop()
 		fmt.Println("ready")

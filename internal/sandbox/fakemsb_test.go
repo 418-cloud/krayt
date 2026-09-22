@@ -27,6 +27,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/418-cloud/krayt/internal/reexec"
 )
 
 // fakeMsbVerbs is the complete set of first-argv-token values the real Client ever issues. Kept
@@ -56,6 +58,10 @@ var testBinPath string
 
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && fakeMsbVerbs[os.Args[1]] {
+		// Under -race, drop TSan's 1s teardown sleep before doing any work: this package spawns
+		// this binary once or twice per test, and that sleep — not its own logic — was the whole
+		// cost of the package. See internal/reexec.
+		reexec.FastExit()
 		os.Exit(runFakeMsb())
 	}
 	if self, err := os.Executable(); err == nil {
@@ -192,6 +198,11 @@ func readFakeScriptOrDefault(home string) fakeScript {
 	return s
 }
 
+// envMap records the child's view of its own environment, which is what makes
+// TestChildEnvAllowlistExact a real observation of childEnv rather than a simulated one. Under
+// -race that view also contains the GORACE reexec.FastExit set on us, which krayt did not send;
+// SanitizeChildEnv drops exactly that, and only when FastExit invented it — a GORACE krayt
+// actually forwarded survives and still fails the allowlist test.
 func envMap(environ []string) map[string]string {
 	m := make(map[string]string, len(environ))
 	for _, kv := range environ {
@@ -201,5 +212,6 @@ func envMap(environ []string) map[string]string {
 		}
 		m[name] = value
 	}
+	reexec.SanitizeChildEnv(m)
 	return m
 }

@@ -202,10 +202,23 @@ func TestTranscriptCapturedOnWallClockTimeout(t *testing.T) {
 	// The wall clock has to outlast sandbox creation, not merely be short: the run's first step
 	// is an `msb image inspect` (resolveSandboxUser), and a budget that expires during it returns
 	// earlyTimeoutResult before any sandbox exists — a timed-out run with nothing to capture
-	// from, which is not the path under test. Every msb call here is a re-exec of this test
-	// binary, so under -race on a loaded runner one round-trip alone can take seconds; seconds of
-	// headroom, not milliseconds.
-	const wallClock = 10 * time.Second
+	// from, which is not the path under test. The test necessarily burns this budget in full (the
+	// fake agent blocks until the deadline kills it), so it is also the single most expensive test
+	// in the package, and worth sizing from a measurement rather than a guess.
+	//
+	// It used to be 10s, because each of the handful of msb round-trips before the agent starts
+	// was a re-exec of this race-instrumented binary paying TSan's ~1s teardown sleep — the
+	// prefix really did cost seconds. reexec.FastExit removed that sleep, and on Linux the prefix
+	// now measures under 50ms (at a 100ms budget this test still passed 5/5 on a loaded 2-core
+	// box; it takes a 1ms budget to make it fail, which it does, loudly).
+	//
+	// Linux is NOT what sizes this, though. Windows spawns processes far more slowly and its CI
+	// job runs without -race, so FastExit buys it nothing: when this test failed there for an
+	// unrelated reason (HUMAN_TODO's PR #163 entry — the fake agent died instead of wedging), a
+	// whole Run — ~8-10 msb spawns — took ~1.6s, putting the pre-agent prefix near a second. 5s is
+	// ~5x that, and ~100x the Linux prefix. Going lower would trade real CI seconds for flakiness
+	// on the slowest platform.
+	const wallClock = 5 * time.Second
 	started := time.Now()
 	res, err := orchestrator.Run(context.Background(), orchestrator.Deps{Sandbox: sb}, task.RunSpec{
 		ID: "run_tr_timeout", ImageRef: "img", RepoPath: newRepo(t, map[string]string{"a.txt": "1\n"}),
