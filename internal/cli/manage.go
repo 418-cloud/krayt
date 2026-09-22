@@ -125,7 +125,7 @@ func newStopCmd() *cobra.Command {
 	var repo string
 	cmd := &cobra.Command{
 		Use:   "stop <run-id>",
-		Short: "Stop a running run, or destroy a kept `krayt shell` sandbox (signals its supervisor to tear the VM down)",
+		Short: "Stop a running run, or destroy a kept `krayt shell`/`krayt code` sandbox (signals its supervisor to tear the VM down)",
 		Args:  cobra.ExactArgs(1),
 		ValidArgsFunction: completeRunIDs(func(rec orchestrator.RunRecord, _ *cobra.Command) bool {
 			return !rec.Terminal() || rec.State == orchestrator.StateKept
@@ -140,12 +140,17 @@ func newStopCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("no such run %q: %w", args[0], err)
 			}
-			// A `krayt shell --keep` session the human has already exited
-			// (add-interactive-shell-session.md decision 3): Shell clears PID on the way to
-			// `kept` because nothing supervises the sandbox any more, so there is no process
-			// left to signal — stop the sandbox directly by name instead.
+			// A `--keep` session the human has already exited — `krayt shell`
+			// (add-interactive-shell-session.md decision 3) or `krayt code`: both clear PID on the
+			// way to `kept` because nothing supervises the sandbox any more, so there is no
+			// process left to signal — stop the sandbox directly by name instead.
 			if rec.State == orchestrator.StateKept {
-				return stopKeptShell(cmd, runDir, args[0], rec)
+				if err := stopKeptSession(cmd, runDir, args[0], rec); err != nil {
+					return err
+				}
+				// The session's ssh alias must stop being offered the moment its sandbox is gone
+				// (`krayt code`); a no-op for a repo that has never run one.
+				return orchestrator.PruneAggregateSSHConfig(sd)
 			}
 			if rec.Terminal() {
 				return fmt.Errorf("run %q already finished (%s)", args[0], rec.State)
@@ -218,14 +223,15 @@ func stopOrphanedRun(cmd *cobra.Command, runDir, id string, rec orchestrator.Run
 	return err
 }
 
-// stopKeptShell destroys a `krayt shell --keep` sandbox directly (msb stop + rm by name) —
+// stopKeptSession destroys a `--keep` session's sandbox directly (msb stop + rm by name) —
 // decision 3's escape hatch, since a kept session has no supervising process left to signal. It
 // updates the run record to `done` rather than leaving a stale `kept` record pointing at a
 // sandbox that no longer exists, which is exactly the confusion `krayt doctor`'s orphan check
-// (decision 6) would otherwise have to explain: `kept` is supposed to mean a live, re-attachable
+// (decision 6) would otherwise have to explain: `kept` is supposed to mean a live, re-enterable
 // sandbox, so a `kept` record with no matching sandbox is itself a bug this command must not leave
-// behind.
-func stopKeptShell(cmd *cobra.Command, runDir, id string, rec orchestrator.RunRecord) error {
+// behind. Kind-agnostic: `krayt shell --keep` and `krayt code --keep` leave the identical state,
+// and the only difference is the word in the message.
+func stopKeptSession(cmd *cobra.Command, runDir, id string, rec orchestrator.RunRecord) error {
 	sb, err := sandbox.NewClient()
 	if err != nil {
 		return err
@@ -241,7 +247,8 @@ func stopKeptShell(cmd *cobra.Command, runDir, id string, rec orchestrator.RunRe
 	if err := orchestrator.WriteRecord(runDir, rec); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "stopped kept shell session %s (sandbox %s)\n", id, rec.SandboxName)
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "stopped kept %s session %s (sandbox %s)\n",
+		rec.EffectiveKind(), id, rec.SandboxName)
 	return err
 }
 
@@ -275,6 +282,10 @@ func newRmCmd() *cobra.Command {
 			if err := os.RemoveAll(runDir); err != nil {
 				return err
 			}
+			// Removing the run dir removes the per-run ssh config the aggregate Includes.
+			if err := orchestrator.PruneAggregateSSHConfig(sd); err != nil {
+				return err
+			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "removed %s\n", args[0])
 			return err
 		},
@@ -288,7 +299,7 @@ func newPatchCmd() *cobra.Command {
 	var repo string
 	cmd := &cobra.Command{
 		Use:               "patch <run-id>",
-		Short:             "Print the path to a run's changes.patch (re-derives it first for a live `krayt shell` session)",
+		Short:             "Print the path to a run's changes.patch (re-derives it first for a live `krayt shell`/`krayt code` session)",
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: completeRunIDs(nil),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -301,15 +312,16 @@ func newPatchCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("no such run %q: %w", args[0], err)
 			}
-			// A live `krayt shell` session (decision 9, add-interactive-shell-session.md): re-run
-			// krayt-helper finish + copy-out on demand against the running sandbox rather than
-			// stat-ing a file that may be stale or may not exist yet. Repeatable and idempotent —
-			// each call re-derives the patch from the current workspace. `running` covers a
-			// session someone is actively attached to right now; `kept` covers one between
-			// attaches. Every other state (an ordinary run, or a shell session that already
-			// exited without --keep) falls through to the plain stat below, byte-for-byte
-			// unchanged from before this task.
-			if rec.EffectiveKind() == orchestrator.KindShell &&
+			// A live human-driven session — `krayt shell` (decision 9,
+			// add-interactive-shell-session.md) or `krayt code`
+			// (add-vscode-remote-ssh-session.md decision 9): re-run krayt-helper finish +
+			// copy-out on demand against the running sandbox rather than stat-ing a file that may
+			// be stale or may not exist yet. Repeatable and idempotent — each call re-derives the
+			// patch from the current workspace. `running` covers a session someone is actively in
+			// right now; `kept` covers one between attaches/connections. Every other state (an
+			// ordinary run, or a session that already exited without --keep) falls through to the
+			// plain stat below, byte-for-byte unchanged.
+			if orchestrator.IsSessionKind(rec.EffectiveKind()) &&
 				(rec.State == orchestrator.StateRunning || rec.State == orchestrator.StateKept) {
 				return patchLiveShell(cmd, runDir, args[0])
 			}

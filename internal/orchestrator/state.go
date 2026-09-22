@@ -26,13 +26,24 @@ const (
 
 // Run kinds (§8.4, add-interactive-shell-session.md decision 7): what a RunRecord describes.
 // KindRun is the headless autonomous path (§7); KindShell is a human-driven `krayt shell`
-// session. A record written before this task carries no `kind` field at all — EffectiveKind
+// session; KindCode is a `krayt code` SSH remote-dev session (add-vscode-remote-ssh-session.md
+// decision 9). A record written before those tasks carries no `kind` field at all — EffectiveKind
 // treats that absence as KindRun, so `krayt ls`/`patch`/the doctor orphan check keep working on
 // every pre-existing run dir with no migration.
 const (
 	KindRun   = "run"
 	KindShell = "shell"
+	KindCode  = "code"
 )
+
+// IsSessionKind reports whether kind names a human-driven session (`krayt shell` or `krayt code`)
+// rather than the headless `krayt run` path. The two differ in how the human reaches the sandbox
+// (a tty attach vs. an SSH channel) and in nothing the management commands care about: both keep a
+// sandbox alive with no supervising agent exec, both can be `--keep`t, and both answer `krayt
+// patch <run-id>` by re-deriving the patch from a live /workspace. Every call site that used to
+// test `== KindShell` for one of those reasons tests this instead, so a third session kind needs
+// one edit rather than a sweep.
+func IsSessionKind(kind string) bool { return kind == KindShell || kind == KindCode }
 
 // RunRecord is the on-disk record of a run at `.krayt/runs/<id>/meta.json` — the source of
 // truth every management command reads, so runs are observable without any in-process handle

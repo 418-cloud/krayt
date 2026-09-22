@@ -645,6 +645,8 @@ afterFlags:
 		return fakeMkdir(root, cmd[1:])
 	case len(cmd) >= 1 && cmd[0] == "chmod":
 		return fakeChmod(root, cmd[1:])
+	case len(cmd) >= 1 && cmd[0] == "chown":
+		return fakeChown(root, cmd[1:])
 	case len(cmd) == 1 && cmd[0] == "/usr/local/bin/krayt-agent-entrypoint":
 		return fakeAgentExec(root, script.Agent)
 	default:
@@ -881,6 +883,35 @@ func fakeChmod(root string, args []string) int {
 			fmt.Fprintln(os.Stderr, "fake-msb chmod:", err)
 			return 1
 		}
+	}
+	return 0
+}
+
+// fakeChown answers `krayt code`'s ownership fix-up on the guest's SSH material
+// (add-vscode-remote-ssh-session.md). It cannot change ownership for real — the test binary is not
+// root and the "guest" is a directory under $HOME — so it verifies what it usefully can: that the
+// paths it was asked about exist, which is what proves the `msb copy` of each file actually landed
+// where the orchestrator thinks it did.
+func fakeChown(root string, args []string) int {
+	seenOwner := false
+	paths := 0
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") { // -R and friends
+			continue
+		}
+		if !seenOwner && !strings.HasPrefix(a, "/") { // the "user:group" operand
+			seenOwner = true
+			continue
+		}
+		if _, err := os.Stat(inSandbox(root, a)); err != nil {
+			fmt.Fprintf(os.Stderr, "fake-msb chown: %v\n", err)
+			return 1
+		}
+		paths++
+	}
+	if paths == 0 {
+		fmt.Fprintln(os.Stderr, "fake-msb chown: no operand")
+		return 1
 	}
 	return 0
 }

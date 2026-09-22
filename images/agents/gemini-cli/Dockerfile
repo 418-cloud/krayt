@@ -14,8 +14,13 @@ FROM node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b2
 # ca-certificates: HTTPS to the model API and npm registry; curl: install-time fetches; git:
 # Gemini CLI shells out to it for repo ops; bash: the entrypoint. Nothing else — extend via
 # `FROM` + `apt-get` (see README).
+#
+# openssh-server + procps: `krayt code` (add-vscode-remote-ssh-session.md decision 15, §8.2). krayt
+# execs `sshd -i` per SSH connection over `msb exec` — nothing SSH-related starts with the image:
+# no service, no entrypoint change, no CMD, and no published port (§6.6). procps because VS Code's
+# remote server shells out to `ps`.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git bash \
+ && apt-get install -y --no-install-recommends ca-certificates curl git bash openssh-server procps \
  && rm -rf /var/lib/apt/lists/*
 
 # CLI version pinned so a run is reproducible; bumped by Renovate's custom regex manager

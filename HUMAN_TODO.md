@@ -44,6 +44,11 @@ rewritten; whoever picks one up needs to re-derive the msb-equivalent steps firs
    manifest check. See the `[tooling]` entry below.
 6. **`seed-agent-first-run-config.md`** — done and verified on hardware; only the `GOOGLE_API_KEY`
    host-scope question remains. See its own `[HUMAN]` entry below.
+7. **`krayt code`** (`add-vscode-remote-ssh-session.md`) — the newest feature and the **least
+   proven**: code, tests and docs are complete and offline-green, but *no* hardware check has run,
+   starting with the one the whole design rests on (does `sshd -i` complete a handshake over
+   `msb exec --stream`?). Its `[HUMAN]` entry below is the first thing to pick up on a Mac; a
+   second entry covers Windows, which is not claimed to work.
 
 (The two `hadolint`-the-{gemini-cli,opencode}-Dockerfile entries formerly here are resolved: this
 task's own Verify step ran `hadolint` against both — clean, same pre-existing warnings as
@@ -381,6 +386,86 @@ that hosted runner doesn't expose (see the intro above), so the hardware needs b
 - **Blocking:** no — Part B's non-hardware criteria (build, vet, unit tests, CI) are all met and
   shippable without this; it closes the loop the way §14 Phase 11's hardware pass did for the msb
   cutover, and the way the linux/arm64 entry above closes it for that platform.
+
+---
+
+## [HUMAN] `krayt code` end-to-end (`add-vscode-remote-ssh-session.md`, `KRAYT_SPEC.md` §14 Phase 13)
+
+`krayt code` landed with code, tests and spec complete and **not one hardware check run**. The
+design's central premise — that OpenSSH's `sshd -i` completes a handshake when its stdin/stdout are
+a pipe through `msb exec --stream` — is reasoned from `sshd -i`'s documented contract and
+`ExecSpec`'s separated pipes, and has never been executed. Everything below needs an Apple-Silicon
+Mac with `msb` ≥ 0.6.16; none of it may be inferred from the offline tests, which use a fake `msb`
+and never run a real sshd.
+
+- **Needed:** on a Mac with `msb`, from a repo checkout:
+  1. **Does `sshd -i` complete an SSH handshake over `msb exec --stream`?** Everything rests on
+     this one answer.
+     ```bash
+     krayt code --image ghcr.io/418-cloud/krayt-agent-claude-code --repo .   # prints the block, then blocks
+     # in a second terminal, using the printed path:
+     ssh -F .krayt/runs/<id>/ssh/config -v krayt-<id> true
+     ```
+     Record the `-v` handshake (key exchange, `Authenticated to … using publickey`, `Exit status 0`).
+     If it fails, `.krayt/runs/<id>/logs/sshd.log` has sshd's own side — that file existing and
+     being non-empty while stdout stayed clean is itself the decision-4 separation confirmed on
+     real bytes.
+  2. **Does VS Code Remote-SSH connect, download its server, and open `/workspace`?** Add the
+     printed `Include <repo>/.krayt/ssh/config` line to `~/.ssh/config` first, then
+     **Remote-SSH: Connect to Host… → `krayt-<id>`** and open `/workspace`. **Record how long the
+     first connect takes** — the ~100MB server download comes through a piped `msb exec`, and if it
+     is slow enough to be unusable that is its own follow-up task (pre-baking the server was
+     considered and rejected, §15).
+  3. **Does the editor allowlist cover the hosts the download really touches?** Decision 14's list
+     (`update.code.visualstudio.com`, `vscode.download.prss.microsoft.com`,
+     `marketplace.visualstudio.com`, `*.vsassets.io`, `*.vscode-unpkg.net`) is **believed, not
+     measured** — nobody has watched a real first connect. Run with `--net allowlist` and no extra
+     `--allow`, capture the denied destinations msb reports, and correct `editorAllowHosts` in
+     `internal/cli/code.go` (and §13's copy of the list) against what was actually observed.
+  4. **Do `sftp`, `scp` and VS Code's port forwarding work** over the same channel?
+     `scp -F .krayt/runs/<id>/ssh/config krayt-<id>:/workspace/README.md /tmp/`, then start an HTTP
+     server inside the sandbox and confirm VS Code's **Ports** panel forwards it to a browser —
+     which, if it works, also confirms `AllowTcpForwarding yes` needs no ingress.
+  5. **Publish and verify the three rebuilt agent images.** They now install `openssh-server` +
+     `procps`. There is no container builder in the agent environment, so **the images have never
+     been built with this change** — only `hadolint` ran (clean, same two pre-existing warnings).
+     Confirm each image builds, still runs as uid 1000 (`id -u` → `1000`), and has
+     `/usr/sbin/sshd` + `/usr/lib/openssh/sftp-server` + `ps`.
+- **Why the agent can't:** no Apple-Silicon Mac, no `msb`, no VS Code, and no container builder in
+  this environment. `msb` must not be faked.
+- **Verify success by:** record each outcome in `KRAYT_SPEC.md` §14 Phase 13's "Done when
+  (hardware)" checkbox with the run id, update `docs/ai-tasks/README.md`'s row, then delete this
+  entry.
+- **Blocking:** no — but `krayt code` should be treated as unproven until item 1 passes. README
+  says so explicitly.
+
+**An open question, not work to do here: is there a published-port fast path?** Piping SSH through
+`msb exec` costs a subprocess and a copy per connection. A direct TCP path would be faster, and
+msb's own published-port and SSH features are named as concepts in
+`docs/adr-microsandbox-sandbox-layer.md` with **no flag, syntax or semantic** anyone has
+established. Whoever has hardware: find out what `msb` actually offers there (`msb create --help`,
+`msb exec --help`, and whatever `--port`/`--publish`/`ssh` surface exists), and record it. Acting on
+the answer means reopening the ingress question deliberately (§6.6, §10) — it is a follow-up task,
+not a patch to this one.
+
+---
+
+## [HUMAN] `krayt code` on Windows — unverified, not claimed to work
+
+The `krayt code` ProxyCommand path is the same Go code on Windows as everywhere else, but nothing
+about it has been exercised there: whether Windows' OpenSSH client invokes `krayt.exe` as a
+`ProxyCommand` correctly (its config parsing and quoting are its own), whether the generated
+`ssh_config`'s double-quoted Windows paths work, and whether file modes — which Windows does not
+have in the unix sense, so `TestSSHMaterialPermissions` skips there — leave `ssh` refusing the
+identity as insecure.
+
+- **Needed:** a Windows 11 host with `msb` and OpenSSH. Run `krayt code`, then
+  `ssh -F <runDir>\ssh\config -v krayt-<id> true`, and report what the client does with the
+  ProxyCommand line and the identity file's ACLs.
+- **Why the agent can't:** no Windows machine in this environment.
+- **Verify success by:** record it in `KRAYT_SPEC.md` §14 Phase 13 and delete this entry. Until
+  then, **do not claim Windows works** — README and the spec both say it is unverified.
+- **Blocking:** no.
 
 ---
 

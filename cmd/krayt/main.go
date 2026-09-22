@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -26,6 +27,13 @@ func main() {
 	defer stop()
 
 	if err := cli.NewRootCmd().ExecuteContext(ctx); err != nil {
+		// A child process's own exit status, propagated verbatim and silently — currently only
+		// `krayt code --stdio`, the ssh ProxyCommand, whose exit status ssh itself interprets and
+		// whose stderr belongs to the SSH connection, not to krayt (internal/cli/code_stdio.go).
+		var exitErr cli.ExitCodeError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.Code)
+		}
 		fmt.Fprintln(os.Stderr, "krayt:", err)
 		os.Exit(1)
 	}

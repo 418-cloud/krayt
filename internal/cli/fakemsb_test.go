@@ -38,6 +38,9 @@ var fakeMsbVerbs = map[string]bool{
 	"ls":     true,
 	"stop":   true,
 	"rm":     true,
+	// `exec` is `krayt code --stdio`'s only invocation (code_stdio.go) — scripted with separate
+	// Stdout/Stderr so the decision-4 separation test has two distinguishable streams to assert on.
+	"exec": true,
 }
 
 // testBinPath is this test binary's own path, captured once before m.Run() so tests can point

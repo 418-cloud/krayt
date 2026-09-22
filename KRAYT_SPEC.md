@@ -309,6 +309,35 @@ create` call can reach:
   inert — but msb's own ingress default is `allow`, and closing it costs one flag now rather than
   becoming a live gap the moment krayt publishes anything.
 
+**`krayt code` reaches into the sandbox without opening ingress** (`add-vscode-remote-ssh-session.md`,
+§6.16). This is the paragraph to read before assuming otherwise, because "an editor connects to it"
+sounds like a published port and is not one.
+
+The standing position two paragraphs up — *krayt publishes no ports* — is **unchanged**, and so is
+every flag this section describes. `krayt code` adds no port field to `sandbox.CreateSpec`, emits no
+publish/expose/forward flag, does not touch `--net-default-ingress`, and does not weaken
+`ValidateNetworkPolicyForMsb`. A test asserts all of that against the real `msb create` argv in all
+three network modes (`TestNoIngressFlagsEmittedByCode`), rather than leaving it to inspection.
+
+What makes that possible is that **there is no verified host→guest TCP path into an msb sandbox at
+all**, so the design never had the option: `--vsock HOST_PATH:PORT` is guest→host and create-time
+only (the *host* listens, the guest dials); ingress is denied in every mode by the rules above;
+`CreateSpec` has no port field; and msb's own published-port and SSH features are named only as
+concepts in `docs/adr-microsandbox-sandbox-layer.md` ("opt-in and off by default") with no flag,
+syntax or semantic anyone has established. `extra_conf` cannot relax it either — probe p8
+(2026-09-05) measured krayt's own `--net-default*` flags fully *replacing* an `extra_conf`'s
+network policy rather than merging with it.
+
+So the SSH session travels the one channel that already exists and is already authorized: `msb
+exec`. `ssh` runs a `ProxyCommand` that runs krayt, which pipes its own stdin/stdout through `msb
+exec --stream` to a `sshd -i` inside the sandbox (§6.16). The sandbox gains no listener, opens no
+socket, and needs no network of its own — the whole mechanism works under `--net none`, which is the
+clearest evidence available that no ingress is involved. VS Code's port forwarding rides that same
+SSH connection, so forwarding a dev server out of the sandbox needs no ingress either. The one
+network change `krayt code` does make is **egress**: a small, printed, opt-out allowlist so VS Code
+Remote-SSH can download its own server (§13, decision 14) — hosts added to `allow`, after the
+`deny@<group>` rules, so the private-range guard applies to them exactly as to every other allow.
+
 **Wildcard suffix entries (`support-wildcard-network-hosts.md`).** `network.allow`,
 `network.passthrough` and a secret's scope (`network.inject[].host`) each accept one leading `*.`
 naming a domain suffix — `allow: ['*.blob.core.windows.net']`. This exists because a per-tenant host
@@ -1196,6 +1225,85 @@ a destructive default; report-only is the safe one. It degrades to reporting not
 failing — when `--repo` is omitted or the repo has no `.krayt/` yet, since it's the first doctor
 check that needs any repo state at all.
 
+### 6.16 SSH remote-dev sessions (`internal/sshsession`, `krayt code`)
+
+`krayt code` (`add-vscode-remote-ssh-session.md`, §13, §14 Phase 13) boots a sandbox exactly as
+`krayt shell` does and then lets a real editor open `/workspace` inside it — VS Code Remote-SSH,
+and for free Cursor, JetBrains Gateway, `ssh`, `scp` and `rsync`, since the mechanism is plain SSH.
+The session's edits come back out through the ordinary `changes.patch` review contract (§6.7).
+
+**The mechanism, in one line:** `ssh` → `ProxyCommand krayt code --stdio <run-id>` → `msb exec
+--stream --user root -- /usr/sbin/sshd -i -e -f /.krayt/ssh/sshd_config`. OpenSSH's `-i` (inetd
+mode) serves exactly one connection on stdin/stdout and exits with it, so krayt's job is to be a
+pipe and nothing else.
+
+**Why this and not a published port.** There is no verified host→guest TCP path into an msb
+sandbox, and krayt's own posture closes the one msb leaves open by default — see §6.6's "`krayt
+code` reaches into the sandbox without opening ingress" for the full evidence. A published-port
+fast path may exist once someone with hardware establishes msb's actual port/SSH flags; that is a
+separate task that must reopen the ingress question deliberately, not a shortcut this one left out.
+
+**This is not the guest daemon §6.13 forbids.** *"No listener inside the sandbox, ever"* still
+holds, literally: nothing listens, nothing is resident, and no socket is opened in the guest.
+`sshd -i` is exec'd per connection, argv-in, reading a config krayt copied in, and it exits when
+the connection closes — the same stateless shape as `krayt-helper` (`cmd/krayt-helper`'s own doc
+comment: a helper that grows a listener would have re-created the guest agent inside someone else's
+sandbox). A second `ssh` is a second `msb exec`, not a second client of a running server.
+
+**The stdout/stderr separation rule.** `sandbox.ExecSpec` has separate `Stdout` and `Stderr` and msb
+keeps the two apart end to end. `krayt code --stdio` puts the SSH protocol on `Stdout` and sshd's
+own diagnostics (it is invoked with `-e`, "log to stderr") on `Stderr`, which is a file —
+`.krayt/runs/<id>/logs/sshd.log`. This is not tidiness: one log line inside the binary stream
+corrupts the connection, every time, so it is asserted by a test
+(`TestStdioRoutesSSHDStderrAwayFromStdout`) rather than left to review. For the same reason the
+transport is `--stream` and **never** `--tty` — the two are mutually exclusive by msb's own clap
+config, and a pty's echo and CRLF translation would mangle the protocol inside the first round trip.
+
+**Privilege.** `sshd` runs as **root** (`ExecSpec.User = "root"`), which krayt already does for
+`krayt-helper setup` (§7 step 3), so this adds no new privilege: root buys OpenSSH its normal
+privilege separation, a correct login shell and environment, and a working sftp subsystem. The
+**login** user is the sandbox's own resolved user (the image's `USER`, §8.2), enforced in the
+generated config by `AllowUsers <user>` + `PermitRootLogin no`.
+
+**`internal/sshsession`** is a pure package — key generation plus renderers, no I/O beyond the run
+dir. Per session it generates two ephemeral ed25519 keys (a client keypair and a guest host key)
+with `crypto/ed25519`, marshalled by `golang.org/x/crypto/ssh` (§9.1) rather than by shelling out to
+`ssh-keygen`, so the whole path is unit-testable with no subprocess. It renders `sshd_config`,
+`authorized_keys`, a pre-pinned `known_hosts`, and a per-run `ssh_config` block; §8.4 lists the
+files and their modes. Three of them (`host_ed25519`, `authorized_keys`, `sshd_config`) are `msb
+copy`'d to `/.krayt/ssh` — under `guestbin.GuestRoot`, deliberately outside `/workspace` and
+`/output`, so none of it can land in `changes.patch` or be collected as an artifact. The client
+private key and `known_hosts` never enter the sandbox at all.
+
+**The alias is per-run (`krayt-<run-id>`), and the host key is pinned before the first
+connection.** A fresh host key each session against a *stable* alias is exactly the shape that
+produces OpenSSH's host-key-changed warning; per-run aliases avoid it. Because krayt generates both
+halves, it writes the host key into the run dir's own `known_hosts` before anyone connects, so
+`StrictHostKeyChecking yes` works on the very first connection with no prompt — strictly better
+than the usual trust-on-first-use dance.
+
+**krayt writes only inside `.krayt/`.** The per-run config is `<runDir>/ssh/config` (usable directly
+as `ssh -F <that file> krayt-<id>`); a stable aggregate at `<stateDir>/ssh/config` `Include`s every
+*live* code session and is rewritten from scratch on each session start and end, so a finished
+session's alias stops being offered. krayt **never** edits `~/.ssh/config` — it prints the one-time
+`Include <stateDir>/ssh/config` line for the human to add, because VS Code Remote-SSH reads the
+user's own config and has no `-F` equivalent. It also never launches an editor: it prints the `ssh`
+command, the `Include` line and a `vscode-remote://ssh-remote+krayt-<id>/workspace` URI, and depends
+on no `code` binary being on `PATH`.
+
+**Lifecycle.** `orchestrator.Code` is `Shell`'s sibling, sharing the same
+`copyInputs`/`helperSetup`/`applyConfigSeeds`/`trustWorkspaceForGit`/`finishAndCollect` spine and
+the same teardown discipline (registered before `Create`, firing on every path except a clean exit
+under `--keep`). Where `Shell` attaches a tty, `Code` installs the SSH material, creates `/run/sshd`
+(sshd's privilege-separation directory — `/run` is typically a tmpfs, so an image cannot provide
+it), re-applies root ownership and `0600` on the host key (sshd refuses a group- or world-readable
+host key regardless of `StrictModes`, and `msb copy`'s mode preservation is not a pinned contract),
+prints the connection block, and then **blocks** until interrupted. Interruption is the *normal* end
+of a code session, not a failure, so `krayt-helper finish` + copy-out run afterwards on a detached
+context — a session ended with Ctrl-C still produces `changes.patch` and `commits.bundle`. No agent
+is ever started: the image's agent CLI is on `PATH` and the human starts it in an editor terminal if
+they want one (§3 principle 2 holds — there is no `krayt code --agent`).
+
 ---
 
 ## 7. Run Lifecycle (Step by Step)
@@ -1373,6 +1481,14 @@ against the run's already-alive sandbox, on demand, without attaching a tty or t
 record's state/PID; the interactive session (wherever it's actually running) owns those. Safe to
 call repeatedly and idempotent, since each call re-derives `changes.patch` from whatever is
 currently in `/workspace`.
+
+**`krayt code` is a third lifecycle on the same spine** (`add-vscode-remote-ssh-session.md`,
+§6.16): `orchestrator.Code` departs from `Run` in the same three ways `Shell` does — no wall-clock
+timeout, no `ask_human` wiring, `--keep`-conditional teardown — and departs from `Shell` in one:
+step 7's tty attach is replaced by copying the session's SSH material into `/.krayt/ssh` and then
+*blocking* until the session is interrupted, with each actual SSH connection arriving later as its
+own `msb exec` from a separate `krayt code --stdio` process. Steps 8-10 run after that interruption,
+on a detached context, because being interrupted is how a code session normally ends.
 
 `krayt stop <run-id>` on a `kept` record is the other side of decision 3: `Shell` clears the
 record's `PID` on the way to `kept` (no process outlives a `--keep` session's own exit), so there
@@ -1721,6 +1837,18 @@ script: `/etc/profile.d/krayt-shellenv.sh` (read by every POSIX login shell) and
 of shell msb's `--tty` attach might invoke (unverified without real hardware which one actually
 fires — `HUMAN_TODO.md`).
 
+**`openssh-server` + `procps`** (`add-vscode-remote-ssh-session.md` decision 15, §6.16) — added to
+the `apt-get install` layer of all three published agent images (`claude-code`, `gemini-cli`,
+`opencode`; `krayt-dev` inherits `claude-code`'s). This is a *contract for the published images*,
+not a requirement this section places on every user image: an image without `openssh-server` simply
+cannot be opened with `krayt code`, exactly as an image without `git` cannot be used by an agent
+that shells out to it. What the images gain is the binaries only — `/usr/sbin/sshd` and
+`/usr/lib/openssh/sftp-server`. Nothing SSH-related *starts* with the image: no service, no
+entrypoint change, no `CMD`, no host key baked in, and no port published (§6.6). krayt execs
+`sshd -i` per connection with a config and an ephemeral host key it copies in per session. `procps`
+is there because VS Code's remote server shells out to `ps`. The non-root `USER` contract above and
+the wrap-don't-fork entrypoint contract are both unchanged.
+
 Scoped deliberately narrow: the credential materialization from `/run/secrets` and the
 `KRAYT_CA_CERT`/CA-bundle blocks that remain inline in each entrypoint are **dead code under
 msb** (this section's own "There is no `/run/secrets` under msb" above) and are **not** ported
@@ -1830,14 +1958,36 @@ Every run produces a self-contained directory the human reviews from:
 ├── meta.json         # machine-readable run record (schema below)
 ├── ask/              # ask_human bridge state under --on-question=wait: ask.sock, control.sock (§6.13)
 ├── questions/        # one <qid>.json per agent question + its answer (§6.13), if any
+├── ssh/              # `krayt code` only (§6.16): this session's ephemeral SSH material, 0700
 └── logs/
     ├── agent.log     # sandbox stdout/stderr (merged, timestamped) — from `msb exec --stream`
     ├── console.log   # msb's boot/system diagnostics (`msb logs --source system --json`,
     │                  #   redacted), replacing the pre-msb guest serial console (§7 step 2)
+    ├── sshd.log      # `krayt code` only: the guest sshd's own stderr, kept OFF the SSH byte
+    │                  #   stream (§6.16's separation rule); appended to per connection
     └── transcript/   # opt-in (`--transcript`): the agent's own session transcript, copied out
                        #   of the guest before teardown — redacted and size-capped. Absent by
                        #   default and whenever the adapter declares no path.
 ```
+
+**`ssh/` (`krayt code` only, `add-vscode-remote-ssh-session.md`).** The directory is `0700` and
+holds one session's worth of material, generated by `internal/sshsession` (§6.16) and reused
+nowhere — `krayt rm <run-id>` deletes the only copy of both private keys:
+
+| File | Mode | What it is |
+|---|---|---|
+| `id_ed25519` / `id_ed25519.pub` | `0600` / `0644` | the client keypair `ssh` logs in with; **never** copied into the sandbox |
+| `host_ed25519` / `host_ed25519.pub` | `0600` / `0644` | the guest sshd's host key; the private half is copied to `/.krayt/ssh` |
+| `authorized_keys` | `0644` | exactly one key — this session's client key. Pointed at by `AuthorizedKeysFile`, so the session leaves nothing in the user's `$HOME` |
+| `known_hosts` | `0644` | the host key pinned against `krayt-<run-id>` *before* the first connection, which is what makes `StrictHostKeyChecking yes` prompt-free |
+| `sshd_config` | `0644` | the per-session server config `sshd -i` reads |
+| `config` | `0644` | the ssh client block: the alias, the identity, the pinned `known_hosts`, and the `ProxyCommand` that is the transport |
+
+The `0600` on the two private keys is load-bearing on the host side too: `ssh` refuses a
+group- or world-readable identity outright. There is a seventh path outside the run dir —
+`<stateDir>/ssh/config`, the stable aggregate `~/.ssh/config` `Include`s (§6.16) — and it is the
+only file `krayt code` writes that is not under `.krayt/runs/<id>/`. It is still under `.krayt/`:
+krayt never edits `~/.ssh/config` itself.
 
 **`logs/transcript/` is opt-in and is the only artifact krayt reads out of the agent's own `$HOME`
 rather than from `/output`.** It exists because `agent.log` is the agent's *stdout*, which for a
@@ -1894,13 +2044,20 @@ directly into `meta.json`'s/`report.md`'s existing `Safety` list (`orchestrator.
 }
 ```
 
-**`kind`** (`add-interactive-shell-session.md` decision 7) — `"run"` (the headless autonomous
-path, §7) or `"shell"` (a human-driven `krayt shell` session, §7 "Shell lifecycle"). `omitempty`:
+**`kind`** (`add-interactive-shell-session.md` decision 7, extended by
+`add-vscode-remote-ssh-session.md` decision 9) — `"run"` (the headless autonomous path, §7),
+`"shell"` (a human-driven `krayt shell` session, §7 "Shell lifecycle"), or `"code"` (a `krayt code`
+SSH remote-dev session, §6.16). `orchestrator.IsSessionKind` is the predicate every reader that
+cares about "a human-driven session with a live sandbox" uses — `krayt patch`'s live re-derive
+branch is the one that actually needed it — rather than each site testing against a growing list of
+kinds. `omitempty`:
 a record written before this task carries no `kind` field at all, and every reader treats that
 absence as `"run"` (`RunRecord.EffectiveKind()`) — no migration, no rewrite of existing run dirs.
 A `krayt shell` session also introduces one new `state` value beyond the five below,
 `"kept"` (deliberately not a terminal state — see §7): the sandbox a `--keep` session left running,
-re-enterable with `krayt shell --attach <run-id>` and destroyed only by `krayt stop`.
+re-enterable with `krayt shell --attach <run-id>` and destroyed only by `krayt stop`. A `krayt code
+--keep` session lands in exactly the same state and is re-entered by simply connecting to its ssh
+alias again (§6.16) — `krayt stop` destroys either one identically.
 
 `provenance` records what source the run was based on (§6.7): `head_sha` is the real, checkoutable
 `git rev-parse HEAD` at bundle time (empty for an unborn HEAD); `bundle_sha` is the commit actually
@@ -2021,6 +2178,7 @@ at implementation time; major versions shown where they matter.)
 | CLI | `github.com/spf13/cobra` (+ `spf13/pflag`) | command surface (§13) |
 | Config | `gopkg.in/yaml.v3` | task config file (§8.1) |
 | `ask_human` MCP server | `github.com/modelcontextprotocol/go-sdk` (v1.2.0, `/mcp`) | stdio MCP server for `krayt-ask --mcp` (§6.13); pulled only by `cmd/krayt-ask` |
+| SSH key marshalling | `golang.org/x/crypto` (v0.53.0, `/ssh`) | `internal/sshsession` only (§6.16, `add-vscode-remote-ssh-session.md` decision 16): `ssh.MarshalPrivateKey`, `ssh.NewPublicKey`, `ssh.MarshalAuthorizedKey` render `crypto/ed25519` keys in OpenSSH's own formats. Chosen over shelling out to `ssh-keygen` so key generation is a pure, unit-testable function with no subprocess — and so `krayt code` works on a host that ships no OpenSSH client tools. krayt implements **no SSH protocol**: it never dials, never serves, and never terminates a connection; the client is the user's own `ssh` and the server is the guest's `sshd`. |
 | Windows named pipes | `github.com/Microsoft/go-winio` (v0.6.2) | `internal/askbridge`'s Windows ask-channel listener only (`listen_windows.go`, `expand-platforms-under-msb.md`) — the stdlib has no named-pipe support; go-winio is the library Docker/containerd/Moby use for the same job. `internal/orchestrator`'s Windows file lock (`climit_windows.go`) and RAM/disk probe (`internal/cli/resources_windows.go`) need no new dependency: `golang.org/x/sys/windows` (already pinned) wraps `LockFileEx`/`GetDiskFreeSpaceEx` directly, and `GlobalMemoryStatusEx` is called raw off `windows.NewLazySystemDLL` since x/sys ships no wrapper for it. |
 
 > **Amended by `expand-platforms-under-msb.md`.** Windows reopens a small OS-specific seam the
@@ -2087,6 +2245,32 @@ never exposed.
   responsible for is narrower and different: emitting a **complete, correct** `msb create` policy
   every time (the never-empty-policy rule, §6.6) — a translation bug there is a config error, not
   a runtime bypass a compromised agent can trigger.
+- **`krayt code`'s SSH session adds no new authorization boundary — it inherits `msb exec`'s**
+  (`add-vscode-remote-ssh-session.md`, §6.16). The honest summary: *anyone who can already run
+  `msb exec` against this sandbox could already run anything in it as root; the SSH session is that
+  same power, with a login user and a key in front of it.* Specifically:
+  - **No ingress, no port, no listener.** The channel is a pipe through `msb exec --stream`, so the
+    sandbox's attack surface from the network is exactly what §6.6 describes and no larger. The
+    session works under `--net none`, which is the cleanest demonstration that nothing is listening.
+    A test asserts the absence of every port/publish/ingress flag in the `msb create` argv.
+  - **The credential is ephemeral and per-session.** Two ed25519 keypairs are generated per session
+    into `<runDir>/ssh/` at `0600` and are reused nowhere: no key in `~/.ssh`, no shared krayt key,
+    no agent forwarding (`ForwardAgent no`), nothing that outlives `krayt rm <run-id>`. The client
+    private key and `known_hosts` never enter the sandbox — only the host key, `authorized_keys` and
+    `sshd_config` do, under `/.krayt/ssh` (outside `/workspace` and `/output`, so none of it can
+    reach a reviewer's `changes.patch`).
+  - **Host identity is pinned, not trusted on first use.** krayt generates both halves, so the host
+    key is in the run dir's `known_hosts` before the first connection; `StrictHostKeyChecking yes`
+    is therefore real rather than a prompt someone dismisses.
+  - **Residual, stated plainly.** `sshd` is exec'd as root and `AllowTcpForwarding yes` is on
+    (VS Code's port forwarding needs it), so a client holding the session key can forward TCP *from
+    inside the sandbox* — i.e. reach whatever that sandbox's own egress policy already allows, and
+    nothing else, since the forwarding rides the SSH connection rather than opening anything. The
+    login user is the image's non-root `USER` (`AllowUsers` + `PermitRootLogin no`), so an SSH login
+    is *less* privileged than the `msb exec --user root` it is carried over. What the session does
+    not change: a compromised agent inside the sandbox could already read `/.krayt/ssh` if it ran as
+    root, and it already can run as the login user — neither is a new capability, and neither
+    reaches the host.
 - **`sandbox.extra_conf` dissolves two boundaries krayt otherwise guarantees, by design, behind an
   explicit `--config` (§8.1).** Full contract in §8.1; the two security claims themselves belong
   here, together, because both are the same shape — an unvalidated msb config reaching past what
@@ -2201,6 +2385,13 @@ anything (§11.3's old caveat, and `docs/macos-linux-builder.md`, are gone with 
 image` (§13) survives as a thin front-end over msb's own image store, not a reimplementation of
 one — see git history for the pre-msb text if the old Nix-based design is ever useful again.
 
+**What is left of an "image contract" lives in §8.2**, and `add-vscode-remote-ssh-session.md`
+changed it once: the three published agent images (`images/agents/{claude-code,gemini-cli,opencode}`)
+now install `openssh-server` and `procps` alongside `ca-certificates curl git bash`, so `krayt code`
+(§6.16) has a `/usr/sbin/sshd` to exec per connection and VS Code's server has a `ps`. Binaries
+only — no service, no entrypoint change, no `CMD`, no baked-in host key, no published port. A user's
+own image is free to omit them; it simply cannot be opened with `krayt code`.
+
 ---
 
 ## 12. macOS & Windows Specifics & Gotchas
@@ -2303,7 +2494,12 @@ krayt shell   [--image] [--task] [--repo] [--config] [--secrets]
                  [--cpus] [--memory] [--disk] [--include-dirty] [--bundle-depth]
                  [--skip-resource-check] [--max-concurrency]
                  [--keep] [--attach <run-id>] [--exec <command>]
-krayt ls                       # list active/recent runs (shows `waiting` runs, and a `krayt shell` session's kind/state)
+krayt code    [--image] [--repo] [--config] [--secrets]
+                 [--net allowlist|full|none] [--allow domain ...]
+                 [--cpus] [--memory] [--disk] [--include-dirty] [--bundle-depth]
+                 [--skip-resource-check] [--max-concurrency]
+                 [--keep] [--no-editor-allow]
+krayt ls                       # list active/recent runs (shows `waiting` runs, and a `krayt shell`/`krayt code` session's kind/state)
 krayt attach  <run-id>         # live-stream a running agent's logs
 krayt logs    <run-id>         # show persisted logs
 krayt questions <run-id> [--pending-only] [--sort asked|pending-first|pending-last]   # list a run's questions + answers (§6.13)
@@ -2364,6 +2560,39 @@ three are exactly what `internal/cli`'s `applyAdapterForShell` applies (replacin
 `Plan.Env` goes through the same `mergeEnv` `run` uses, so a user's own `krayt.yaml` `env:` still
 wins any conflict.
 
+**`code`** (`add-vscode-remote-ssh-session.md`, §6.16) is the third way into a sandbox: a session a
+real editor opens. It boots exactly as `shell` does — same `runFlags`/`applyConfig` precedence path,
+same `--keep` semantics, same `changes.patch` on the way out — then prints an `ssh` alias
+(`krayt-<run-id>`), a one-time `Include` line for `~/.ssh/config`, and a
+`vscode-remote://ssh-remote+krayt-<run-id>/workspace` URI, and blocks until interrupted. It carries
+`shell`'s flag set minus the two that only mean something for a tty (`--attach`, `--exec`), and is
+absent the same flags for the same reasons (`--timeout`, `--detach`, `--on-question*`, `--agent`,
+`--transcript`): a human is sitting in it, no agent is launched, and there is no question channel to
+wire. As in `shell`, `agent.adapter`'s secret-scoping/env/config-seed contribution is still resolved
+host-side (§13's 2026-09-16 amendment applies unchanged).
+
+The name is `code`, not `vscode`, deliberately: the mechanism is SSH, so Cursor, JetBrains Gateway,
+`ssh`, `scp` and `rsync` all work through the same session, and the command must not promise
+VS Code-specific behavior krayt does not have. krayt prints connection information; it never
+launches an editor and depends on no `code` binary being on `PATH`.
+
+Two flags are its own:
+
+- **`--no-editor-allow`** opts out of the built-in editor egress allowlist. VS Code Remote-SSH
+  downloads its own ~100MB server into `~/.vscode-server` on first connect, so under krayt's default
+  `--net allowlist` with no `--allow` the feature would be broken out of the box. `krayt code`
+  therefore adds a small named set — `update.code.visualstudio.com`,
+  `vscode.download.prss.microsoft.com`, `marketplace.visualstudio.com`, `*.vsassets.io`,
+  `*.vscode-unpkg.net` — on top of the user's own `allow` list, and the policy banner names exactly
+  what was added, so nothing is widened silently. Under `--net full` there is nothing to add; under
+  `--net none` nothing is added and krayt warns that Remote-SSH cannot fetch its server. The added
+  hosts render after the `deny@<group>` rules like any other allow, so §6.6's private-range guard
+  applies to them unchanged.
+- **`--stdio <run-id>`** is **hidden and is not a user-facing verb.** It is the `ProxyCommand`
+  entry point the generated `ssh_config` invokes (§6.16): it resolves the run id to a sandbox and
+  pipes `os.Stdin`/`os.Stdout` through one `msb exec`. It is documented here only so the flag's
+  presence in `--help`-adjacent output is not mysterious; nothing should ever type it.
+
 `upgrade` re-verifies the downloaded binary against the target release's published
 `checksums.txt` before installing it — the same check as the manual install path (README's
 "Prebuilt binaries"), automated — and never touches any other command's behavior: it is the only
@@ -2384,7 +2613,9 @@ run's pending `<question-id>`. `image rm` completes `<ref>` from msb's own store
 `--agent`) and `questions --sort` complete their fixed value sets from the same constants that
 validate them; `run`'s `--image`/`--allow` complete from this repo's run history. Untrusted
 agent-originated text (question prompts) is sanitized (§6.13) before appearing in a completion
-description. `shell`'s `--attach` dynamically completes `<run-id>`, alongside the existing
+description. `code` reuses the same `--net`/`--image`/`--allow` completions `shell` does and adds no new dynamic
+source of its own (its `--stdio` is hidden, and nothing should complete it).
+`shell`'s `--attach` dynamically completes `<run-id>`, alongside the existing
 `completeRunIDs` helpers, filtered to LIVE `kind: shell` records — a run id whose sandbox `--keep`
 left running and nothing has re-entered or stopped yet — since a mid-session or already-torn-down
 record has no sandbox left for `--attach` to reach.
@@ -3236,6 +3467,54 @@ wired into both `Run` and `Shell`, never `AttachShell`/`PatchLiveShell`.
   - **With this, every hardware check in this follow-up is met.** The `GOOGLE_API_KEY` host-scope
     question stays open.
 
+### Phase 13 — SSH remote-dev sessions (`add-vscode-remote-ssh-session.md`)
+
+A new top-level `krayt code`: the same sandbox `krayt shell` boots, opened by a real editor instead
+of a terminal. VS Code Remote-SSH, Cursor, JetBrains Gateway, `ssh`, `scp` and `rsync` all work,
+because the mechanism is plain SSH — `sshd -i` reached through an `ssh` `ProxyCommand` that pipes
+bytes over `msb exec --stream`, **publishing no port and opening no ingress** (§6.6, §6.16). Full
+decision record in the task file; this phase records what shipped and what is still hardware-gated.
+
+- [x] `internal/sshsession` (new, pure) — ephemeral ed25519 client + host keys via `crypto/ed25519`
+  and `golang.org/x/crypto/ssh` (§9.1), plus golden-tested renderers for `sshd_config`,
+  `authorized_keys`, `known_hosts`, the per-run `ssh_config` block, the aggregate `Include` file,
+  and the `vscode-remote://` URI. `Write` lays `<runDir>/ssh/` out at `0700`/`0600`/`0644` (§8.4).
+  No subprocess, no `ssh-keygen`, no SSH protocol implemented by krayt.
+- [x] `internal/orchestrator` — `KindCode` + `IsSessionKind` beside `KindRun`/`KindShell`;
+  `Code()` on the same spine as `Shell()` (`copyInputs` → `helperSetup` → `applyConfigSeeds` →
+  `trustWorkspaceForGit` → … → `finishAndCollect`) with the same teardown discipline, installing
+  the SSH material under `/.krayt/ssh`, creating `/run/sshd`, then blocking until interrupted and
+  collecting on a detached context. `RefreshAggregateSSHConfig`/`PruneAggregateSSHConfig` keep
+  `<stateDir>/ssh/config` naming only live sessions.
+- [x] `internal/cli` — `krayt code` (`--config --image --repo --secrets --include-dirty --net
+  --allow --bundle-depth --cpus --memory --disk --max-concurrency --skip-resource-check --keep`,
+  plus `--no-editor-allow` and the hidden `--stdio`), the `code_stdio.go` ProxyCommand path
+  (`--user root`, `--stream`, sshd's stderr to `logs/sshd.log`, the child's exit status propagated
+  via `ExitCodeError`), decision 14's printed editor allowlist, and the `EffectiveKind` audit:
+  `ls`, `stop`, `patch`, `rm` and the doctor orphan check all handle a `code` session.
+- [x] Images — `openssh-server` + `procps` added to the existing `apt-get install` layer of all
+  three published agent images (§8.2, §11). No service, no entrypoint change, no `CMD`.
+- [x] Spec amendments (this change): §6.6, §6.16 (new), §7, §8.2, §8.4, §9.1, §10, §11, §13, this
+  phase, plus `README.md` and `docs/ai-tasks/README.md`.
+- [x] **Done when (offline)** — `TestSSHDExecArgsUseStreamAsRoot`,
+  `TestStdioRoutesSSHDStderrAwayFromStdout`, `TestGenerateSessionKeysAreEd25519`,
+  `TestSSHMaterialPermissions`, `TestRenderSSHDConfigGolden`, `TestRenderSSHConfigGolden`,
+  `TestRenderKnownHostsPinsHostKey`, `TestVSCodeRemoteURI`,
+  `TestEditorAllowlistOrderedAfterDNSBeforeDenyGroups`, `TestEditorAllowlistOmittedWithFlag`,
+  `TestEditorAllowlistOmittedUnderNetNone`, `TestCodeSessionCreatesCopiesSetsUpAndCollects`,
+  `TestKindCodeRoundTripsThroughState`, `TestLsShowsCodeSessions`,
+  `TestStopDestroysKeptCodeSession`, `TestDoctorDoesNotReportCodeSessionAsOrphan`,
+  `TestNoIngressFlagsEmittedByCode` — all green, with `GOOS=darwin/linux/windows go build ./...`,
+  `go vet ./...`, `go test -race ./...` and `golangci-lint run`.
+- [ ] **Done when (hardware)** — needs an Apple-Silicon Mac with `msb` ≥ 0.6.16 and a real VS Code;
+  `HUMAN_TODO.md` carries the entry. (1) `sshd -i` completes a handshake over `msb exec --stream`
+  (`ssh -F <runDir>/ssh/config -v krayt-<id> true`); (2) VS Code Remote-SSH connects, downloads its
+  server and opens `/workspace`, with the first-connect duration recorded; (3) the editor allowlist
+  covers every host that download really touches — decision 14's list is **believed, not measured**;
+  (4) `sftp`/`scp`/port forwarding work over the same channel; (5) the three rebuilt agent images
+  are published and still run as uid 1000. Windows is **not claimed to work** and has its own
+  unverified entry.
+
 ---
 
 ## 15. Open Questions / Future Work
@@ -3307,7 +3586,24 @@ wired into both `Run` and `Shell`, never `AttachShell`/`PatchLiveShell`.
   destroyed only by `krayt stop <run-id>` — the user asking for that leak risk by name. No
   `ask_human` wiring in shell mode (the human is already in the room) and no wall-clock timeout
   (a session a human is sitting in is bounded by them closing it or `krayt stop`, not a clock);
-  §14 Phase 12 has the full record.
+  §14 Phase 12 has the full record. **Extended again 2026-09-22 (`add-vscode-remote-ssh-session.md`,
+  §14 Phase 13):** `krayt code` adds a second standalone session shape — the same sandbox, opened by
+  an editor over SSH instead of a terminal. The bullet's original exclusion is untouched: attaching
+  an editor to a live `krayt run` is still out of scope for exactly the reason above (two actors
+  mutating one `/workspace`), and `krayt code` is its own session, like `krayt shell`.
+- **A published-port fast path for `krayt code`** — deliberately not built
+  (`add-vscode-remote-ssh-session.md`, "Out of scope"). Piping SSH through `msb exec` costs a
+  subprocess and a copy per connection; a direct TCP path would be faster. It is blocked on a
+  question nobody can answer offline — *what are msb's actual published-port and SSH flags, and
+  what do they do to the ingress posture §6.6 currently guarantees?* — so it is a follow-up task
+  that must reopen the ingress question deliberately, with hardware, not an optimization to fold in.
+  `HUMAN_TODO.md` carries it as a question to answer. Three smaller non-goals from the same task,
+  recorded so they are not rediscovered: **`krayt code --attach`** (the ProxyCommand already
+  reconnects to a live session, so attach adds nothing until someone wants a second sandbox shape),
+  **pre-baking the VS Code server into the images** (it would make `--net none` viable but pins a
+  server version against the user's local VS Code — decision 14's printed allowlist is the trade
+  taken instead), and **editor-specific integration** beyond the printed `vscode-remote://` URI
+  (Cursor and JetBrains Gateway work because SSH works; krayt ships nothing per editor).
 - **Artifact signing / provenance** — optionally sign run outputs for auditability.
 - **Removing the guest NIC entirely in `allowlist`/`none`** — since `move-egress-proxy-to-host.md`,
   the VM no longer needs one in those modes (no DNS, no registry egress, no bundle egress), which

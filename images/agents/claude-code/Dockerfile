@@ -18,8 +18,13 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 
 # git: Claude Code shells out to it for repo ops; curl + ca-certificates: install + HTTPS to the
 # model API; bash: the entrypoint. Nothing else — extend via `FROM` + `apt-get` (see README).
+#
+# openssh-server + procps: `krayt code` (add-vscode-remote-ssh-session.md decision 15, §8.2). krayt
+# execs `sshd -i` per SSH connection over `msb exec` — nothing SSH-related starts with the image:
+# no service, no entrypoint change, no CMD, and no published port (§6.6). procps because VS Code's
+# remote server shells out to `ps`.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git bash \
+ && apt-get install -y --no-install-recommends ca-certificates curl git bash openssh-server procps \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root agent user (uid 1000). Any non-root uid satisfies Claude Code (§6.14/§8.2).

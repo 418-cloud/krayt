@@ -208,6 +208,61 @@ on the host in another terminal. That's not a bug — it's the same model `run` 
 it means `changes.patch` is far more likely to conflict with the host tree by the time you
 `krayt apply` it, so review the diff before applying rather than assuming it'll land cleanly.
 
+### Editor sessions (VS Code Remote-SSH, Cursor, `ssh`, `scp`)
+
+`krayt code` is the third way in: the same sandbox `krayt shell` boots, opened by a real editor
+instead of a terminal.
+
+```bash
+krayt code --image ghcr.io/418-cloud/krayt-agent-claude-code --repo . \
+  --secrets ./secrets.env --allow api.anthropic.com
+```
+
+It prints a connection block and then blocks:
+
+```
+code session run_2f9c1a ready — /workspace as agent@krayt-run_2f9c1a
+  ssh:     ssh -F "/path/to/repo/.krayt/runs/run_2f9c1a/ssh/config" krayt-run_2f9c1a
+  one-time setup — add this line to ~/.ssh/config (krayt never edits it):
+      Include /path/to/repo/.krayt/ssh/config
+  then:    ssh krayt-run_2f9c1a   |   VS Code: Remote-SSH → krayt-run_2f9c1a
+  vscode:  vscode-remote://ssh-remote+krayt-run_2f9c1a/workspace
+
+session is live — press Ctrl-C to end it and collect changes.patch
+```
+
+**VS Code setup, once per machine:** add that `Include` line to the top of `~/.ssh/config`. From
+then on every `krayt code` session shows up as a host in **Remote-SSH: Connect to Host…** with no
+further configuration — open the alias, then open the `/workspace` folder. (Cursor works
+identically; JetBrains Gateway and plain `ssh`/`scp`/`rsync` need only the alias.) krayt prints the
+line rather than editing `~/.ssh/config` itself, and writes nothing outside `.krayt/`.
+
+- **No port is published and no ingress is opened** — the SSH connection is piped through
+  `msb exec` by an `ssh` `ProxyCommand`, so nothing listens inside the sandbox and the session even
+  works under `--net none`. VS Code's port forwarding rides that same connection, so forwarding a
+  dev server out of the sandbox needs no ingress either.
+- **Keys are ephemeral and per session.** krayt generates a fresh ed25519 keypair and host key into
+  `.krayt/runs/<id>/ssh/`, pins the host key before the first connection (so there is no
+  "unknown host" prompt), and nothing outlives `krayt rm <run-id>`. Your own `~/.ssh` is not read
+  or written.
+- **The editor allowlist.** VS Code Remote-SSH downloads its own server on first connect, so
+  `krayt code` adds a handful of Microsoft/VS Code hosts on top of your `--net allowlist` policy and
+  **prints exactly which ones**. `--no-editor-allow` removes them; under `--net none` they are not
+  added at all and krayt warns that Remote-SSH will not be able to install itself.
+- **Same session contract as `krayt shell`.** Ctrl-C ends the session and collects
+  `changes.patch` + `commits.bundle`; `--keep` leaves the sandbox running (the alias keeps working)
+  until `krayt stop <run-id>`; `krayt ls` shows it as `kind: code`; `krayt patch <run-id>` re-derives
+  the diff mid-session from another terminal. The snapshot-drift note above applies here too, more
+  so — an editor session tends to be a long one.
+- **No agent is started for you.** The image's agent CLI is on `PATH`; open a terminal in the editor
+  and run `claude` (or whatever) yourself, exactly as in `krayt shell`.
+- **Requires `openssh-server` in the image.** The three published agent images ship it; a custom
+  image needs `openssh-server` and `procps` to be openable this way.
+
+> **Not yet verified on real hardware.** The whole path — `sshd` over `msb exec`, the VS Code
+> server download, `sftp`/`scp`, port forwarding — needs an Apple-Silicon Mac with `msb` to
+> confirm, and has not had one yet; see `HUMAN_TODO.md`. Windows is **not** claimed to work.
+
 ### Egress control
 
 `--net allowlist` (default) — only hosts in `--allow`/`network.allow` are reachable; `--net full`
@@ -467,6 +522,8 @@ See `CHANGELOG.md` for the full release history.
 | 8 — Host-side egress proxy, step 1 | L7 allowlist proxy moved off the guest to a separate host process over a new guest-initiated vsock channel (`move-egress-proxy-to-host.md`) | ✅ offline (superseded, Phase 11) |
 | 11 — Microsandbox migration (ADR option B1) | Replace krayt's own vfkit/Firecracker/guest-agent/proxy stack with a driver for [msb](https://github.com/superradcompany/microsandbox); msb now owns the sandbox and credential substitution (`run-tasks-on-microsandbox.md`, the cut-over) | ✅ cut-over landed — a real end-to-end `krayt run` against real msb on hardware is still outstanding |
 | 12 — Interactive shell sessions | `krayt shell` — a human-driven terminal inside the sandbox, ephemeral by default with `--keep`/`--attach`, patch out on exit and on demand mid-session, `krayt doctor` orphan check (`add-interactive-shell-session.md`) | ✅ done — hardware-verified on an Apple-Silicon Mac (2026-09-16/17); a few terminal/edge checks remain in `HUMAN_TODO.md` |
+
+| 13 — SSH remote-dev sessions | `krayt code` — the same sandbox opened by VS Code Remote-SSH/Cursor/`ssh`/`scp`, via `sshd -i` piped over `msb exec` so **no port is published and no ingress is opened**; ephemeral per-session keys, printed editor egress allowlist, patch out on exit (`add-vscode-remote-ssh-session.md`) | ⚠ code + tests landed offline; **no hardware run yet** — the handshake, the VS Code server download and the allowlist's real host list are all unverified (`HUMAN_TODO.md`) |
 
 The showcase: a real agent, blocked mid-task on a decision only a human could make, paused,
 asked over MCP, got the answer, and continued with it — all inside the sandbox with a live
