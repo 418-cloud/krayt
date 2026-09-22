@@ -25,7 +25,7 @@
 # arrive here (see dev-image.yml's `paths` comment). Renovate's dockerfile manager appends and
 # maintains the digest (`pinDigests: true`, renovate.json) — the line is tag-only until its first
 # PR lands, which is tracked in HUMAN_TODO.md.
-FROM ghcr.io/418-cloud/krayt-agent-claude-code:2.1.226
+FROM ghcr.io/418-cloud/krayt-agent-claude-code:2.1.278
 
 # Tool versions, pinned so Renovate's custom regex manager (renovate.json) can bump them
 # independently of the base image tag. `make proto` (Nix) stays the source of truth for the
