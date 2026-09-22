@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/418-cloud/krayt/internal/reexec"
 )
 
 // fakeMsbVerbs is the complete set of first-argv-token values `krayt image` ever issues.
@@ -44,10 +46,15 @@ var testBinPath string
 
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && fakeMsbVerbs[os.Args[1]] {
+		// Under -race, drop TSan's 1s teardown sleep before doing any work — see internal/reexec.
+		reexec.FastExit()
 		os.Exit(runFakeMsb())
 	}
-	// The same re-exec dispatch, for TestSpawnDetached's detached child (detach_test.go).
+	// The same re-exec dispatch, for TestSpawnDetached's detached child (detach_test.go). It gets
+	// the same treatment: the test waits on the marker file the child writes, so a second of TSan
+	// teardown after that write is a second of test that proves nothing.
 	if len(os.Args) > 1 && os.Args[1] == detachChildArg {
+		reexec.FastExit()
 		os.Exit(runDetachChild())
 	}
 	if self, err := os.Executable(); err == nil {

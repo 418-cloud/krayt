@@ -23,7 +23,7 @@
 # guest env var to its default placeholder itself the moment `network.inject` names it.
 # `task:` is intentionally omitted so you always pass --task per run.
 
-image: ghcr.io/418-cloud/krayt-dev:sha-cbca700
+image: ghcr.io/418-cloud/krayt-dev:sha-d69dc56
 secrets: secrets.env
 
 env:

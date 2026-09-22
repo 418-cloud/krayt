@@ -30,13 +30,15 @@ jobs:
       - run: make guest-bins
       - run: go build ./...
       - run: go vet ./...
-      # -timeout raised off go test's 10m default: internal/orchestrator drives a real
-      # orchestrator.Run per test and every msb call in one is a re-exec of the race-instrumented
-      # test binary, so that single package needs well over 10m on a hosted runner (run
-      # 35231757916 died at `panic: test timed out after 10m0s`, 600.019s, with tests still to go).
-      # The ceiling is there to catch a genuine hang, so it stays finite and well above the real
-      # cost rather than being removed.
-      - run: go test -race -timeout 30m ./...
+      # -timeout is back to go test's 10m default. It was raised to 30m because
+      # internal/orchestrator drives a real orchestrator.Run per test and every msb call in one is
+      # a re-exec of the race-instrumented test binary, which then blew past 10m (run 35231757916
+      # died at `panic: test timed out after 10m0s`, 600.019s, with tests still to go). What
+      # actually cost that time was ThreadSanitizer's 1s atexit_sleep_ms on each of those hundreds
+      # of re-execs, not the tests; internal/reexec removes it, and the package now runs in
+      # seconds. The ceiling is still there to catch a genuine hang, with far more headroom over
+      # the real cost than the old 30m ever had.
+      - run: go test -race -timeout 10m ./...
       # The agent images' entrypoints are shell, so no Go test reaches them — and the one bug that
       # gap hid (every shape-translated run exiting 78 before the agent started) was invisible to a
       # fully green suite. This runs them offline: agent CLIs, git, and the report dir are stubbed,
@@ -119,8 +121,8 @@ jobs:
           cache: true
       - run: make guest-bins
       - run: go build ./...
-      # Same 10m-default overrun as the test job above; see the comment there.
-      - run: go test -race -timeout 30m ./...
+      # Same timeout reasoning as the test job above; see the comment there.
+      - run: go test -race -timeout 10m ./...
 
   # Windows had no path to krayt at all before msb (expand-platforms-under-msb.md); this is the
   # real port's exercise on a native Windows runner. No `-race`: the race detector needs cgo and

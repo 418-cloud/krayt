@@ -522,3 +522,37 @@ cut a release, exactly what this entry is trying to stop.
 - **Verify success by:** the three checks above on real PRs, then delete this entry. A miss on
   item 2 is cosmetic and self-correcting — re-type the commit when merging.
 - **Blocking:** no.
+
+---
+
+## [CI] confirm the `build + test` speed-up on real runners
+
+`internal/reexec` removes ThreadSanitizer's 1s-per-process `atexit_sleep_ms` from the fakes that
+re-exec the test binary as `msb` (hundreds of processes per suite). Measured on a 2-core arm64
+Linux box, `go test -race -count=1 ./...` went **18m20s → 28.7s**, with `internal/orchestrator`
+alone going **1090.9s → 23.4s**. Coverage is unchanged: all 906 `-race` test results from before
+still pass (only the 9 new `internal/reexec` ones are added), and `go tool cover -func` is
+byte-identical across all 392 measurable functions.
+
+That is a local measurement. What it predicts, but does not prove, is the hosted-runner number:
+before this change `build + test (ubuntu-latest)` took ~1173s and `(macos-latest)` ~1320s, of
+which the `go test -race` step was 1118s and 1240s (run `35767509023`).
+
+- **Needed:**
+  1. **Confirm both `build + test` legs on a real run.** The `go test -race` step should drop to
+     roughly a minute, making `make guest-bins` (23-30s) and `go build ./...` (13s) the job's
+     largest steps. Record the new step times here before deleting this entry.
+  2. **Confirm `-timeout 10m` is still comfortable.** `ci.yml` lowers the ceiling from 30m now
+     that the reason for raising it is gone. If any leg ever hits it, that is a genuine hang, not
+     a budget that is too tight — do not raise it without saying what hung.
+  3. **Confirm `build + test (windows/amd64, native)`.** This is the one platform `reexec` is
+     deliberately inert on (no `syscall.Exec`, and that job runs without `-race`), so nothing
+     should change there — but `TestTranscriptCapturedOnWallClockTimeout`'s budget was cut 10s → 5s
+     and Windows is the slowest platform for it (~1.6s per full `Run`, see PR #163's entry above).
+     A failure there means the budget is too tight and should go back up, not that the test is
+     wrong.
+- **Why the agent can't:** the sandbox has no GitHub Actions runner, no macOS host and no Windows
+  host; only a real run produces these numbers.
+- **Verify success by:** a green `ci` run with both `build + test` legs under ~3 minutes, then
+  delete this entry.
+- **Blocking:** no.
