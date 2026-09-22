@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/418-cloud/krayt/internal/askbridge"
+	"github.com/418-cloud/krayt/internal/reexec"
 )
 
 // execMarkerEnv turns a re-exec of this test binary into the real krayt-ask CLI (the repo's
@@ -26,6 +27,9 @@ const execMarkerEnv = "KRAYT_ASK_TEST_EXEC"
 
 func TestMain(m *testing.M) {
 	if os.Getenv(execMarkerEnv) == "1" {
+		// The parent waits on this process's exit code, so TSan's teardown sleep is dead time on
+		// every real-binary round trip. See internal/reexec.
+		reexec.FastExit()
 		main() // os.Exit's itself; never returns
 	}
 	os.Exit(m.Run())

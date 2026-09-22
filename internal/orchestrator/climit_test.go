@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/418-cloud/krayt/internal/orchestrator"
+	"github.com/418-cloud/krayt/internal/reexec"
 )
 
 // Env vars that turn a re-exec of this test binary into a slot-acquiring helper process, so the
@@ -33,6 +34,9 @@ var fakeMsbBinPath string
 // fakeProvider to a scriptable fake msb) — or (3) the test suite itself.
 func TestMain(m *testing.M) {
 	if dir := os.Getenv(slotHelperDir); dir != "" {
+		// Same reason as the fake-msb branch below: this process exists only to hold a slot, and
+		// TestAcquireSlotCrossProcess waits on it, so TSan's teardown sleep is pure dead time.
+		reexec.FastExit()
 		hold, _ := strconv.Atoi(os.Getenv(slotHelperHold))
 		rel, err := orchestrator.AcquireSlot(context.Background(), dir, 1)
 		if err != nil {
@@ -46,6 +50,10 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if len(os.Args) > 1 && fakeMsbVerbs[os.Args[1]] {
+		// Under -race, drop TSan's 1s teardown sleep before doing any work. Every orchestrator.Run
+		// in this package is ~20 of these processes, so that sleep — not any real work — was the
+		// single largest cost in the whole suite. See internal/reexec.
+		reexec.FastExit()
 		os.Exit(runFakeMsb())
 	}
 	if self, err := os.Executable(); err == nil {

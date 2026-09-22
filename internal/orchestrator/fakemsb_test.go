@@ -38,6 +38,7 @@ import (
 
 	"github.com/418-cloud/krayt/internal/askclient"
 	"github.com/418-cloud/krayt/internal/patch"
+	"github.com/418-cloud/krayt/internal/reexec"
 	"github.com/418-cloud/krayt/internal/sandbox"
 )
 
@@ -370,6 +371,10 @@ func readFakeMsbScript(home string) fakeMsbScript {
 	return s
 }
 
+// envMap records the child's view of its own environment, which is what lets tests like
+// TestExtraConfDoesNotAddChildEnv assert on what krayt really forwarded. Under -race that view
+// also contains the GORACE reexec.FastExit set on us; SanitizeChildEnv drops exactly the variables
+// FastExit marked as its own, leaving a truthful record — see internal/reexec.
 func envMap(environ []string) map[string]string {
 	m := make(map[string]string, len(environ))
 	for _, kv := range environ {
@@ -378,6 +383,7 @@ func envMap(environ []string) map[string]string {
 			m[name] = value
 		}
 	}
+	reexec.SanitizeChildEnv(m)
 	return m
 }
 
