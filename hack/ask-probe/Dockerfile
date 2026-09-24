@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1 # renovate: ignore
 # Throwaway agent image that exercises the §6.13 question channel on hardware.
 # Static binary on scratch -> no libc/base-image variables, fewest unknowns.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 WORKDIR /src
 COPY go.mod .
 COPY main.go .
