@@ -3,7 +3,7 @@
 # deliberately root (no USER set -> uid 0). withEnforceNonRoot must reject the run before this
 # container ever starts, so the entrypoint below is not expected to execute; it exists only so
 # the image is a normal runnable container and fails loudly if the fail-closed control regresses.
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/root-probe
 
