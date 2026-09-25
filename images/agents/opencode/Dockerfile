@@ -43,7 +43,7 @@ RUN printf '. /usr/local/bin/krayt-agent-shellenv\n' > /etc/profile.d/krayt-shel
 # exception pattern as hack/krayt-dev's protoc/gh layers. TARGETARCH is buildx's standard
 # per-platform arg; opencode's asset names use "x64" for amd64 (verified against the repo's own
 # opencode.ai/install script, which performs the same translation).
-ARG OPENCODE_VERSION=1.18.31
+ARG OPENCODE_VERSION=1.18.32
 ARG TARGETARCH
 RUN set -eu; \
     case "${TARGETARCH}" in \
