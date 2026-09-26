@@ -53,7 +53,7 @@ RUN printf '. /usr/local/bin/krayt-agent-shellenv\n' > /etc/profile.d/krayt-shel
 # above). Bumped by Renovate's custom regex manager (renovate.json). The binary lands at
 # /usr/local/lib/rtk/rtk, deliberately NOT on PATH — the `rtk` wrapper below is what's actually on
 # PATH, so KRAYT_RTK=off (see ./rtk) can't be bypassed by anything resolving `rtk` normally.
-ARG CLAUDE_CODE_VERSION=2.1.278
+ARG CLAUDE_CODE_VERSION=2.1.281
 ARG RTK_VERSION=0.49.0
 ARG TARGETARCH
 RUN set -eu; \
