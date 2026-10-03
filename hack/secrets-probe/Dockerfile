@@ -5,7 +5,7 @@
 # an ask_human prompt/choice — so the test can assert each is redacted (or, for changes.patch,
 # left byte-exact but flagged) on the host. Alpine gives a small image with a shell + coreutils
 # (same shape as ../krayt-ask-probe).
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 # Non-root user (uid 1000) — matches the §8.2 non-root contract the other probes validate.
 RUN adduser -D -u 1000 agent
