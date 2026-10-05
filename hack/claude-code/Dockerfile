@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e # renovate: ignore
 # A real-world krayt agent image: runs Claude Code headlessly against the task and edits
 # /workspace, which krayt diffs into changes.patch (§6.14, §8.2). This is the image behind the
 # HUMAN_TODO "[Phase 5] Agent adapter end-to-end with live credentials".

@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e # renovate: ignore
 # krayt-agent-opencode — the published, ready-to-run opencode onboarding image. Pulls,
 # `krayt run --agent opencode`, no image building required. Sibling of
 # images/agents/claude-code/ and images/agents/gemini-cli/ (see those images' READMEs for the
