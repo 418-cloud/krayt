@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e # renovate: ignore
 # Throwaway agent image for TestGuestGitConfigInjectionInert (§6.7, §10 finding #2): a NON-ROOT
 # image whose entrypoint writes a git-config/attributes injection into the writable
 # /workspace/.git, attempting the container->guest-root escape that patch.SetupPatchGit's

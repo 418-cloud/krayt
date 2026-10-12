@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e # renovate: ignore
 # Throwaway agent image that exercises the §6.13 question channel on hardware.
 # Static binary on scratch -> no libc/base-image variables, fewest unknowns.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
