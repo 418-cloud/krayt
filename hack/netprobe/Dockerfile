@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e # renovate: ignore
 # Throwaway agent image that proves the §6.6 egress control (L7 allowlist + the nftables L3 lock)
 # on real hardware — the probe behind TestEgressEnforcement (KRAYT_NETPROBE_IMAGE), and the
 # on-hardware regression for security-review finding #1. Static binary on scratch, run as a
