@@ -2,6 +2,7 @@ package orchestrator_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -124,7 +125,11 @@ func TestAttachLive(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	followCancel()
-	<-followDone
+	// FollowLog's only two legitimate exits here are nil (it saw the run go terminal and drained
+	// the log) and the cancel above; a read or write error is a genuine tail failure.
+	if err := <-followDone; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("FollowLog: %v", err)
+	}
 	// Assert the complete content against the raw persisted log rather than the follow buffer:
 	// FollowLog's own EOF-vs-terminal-state check (state.go) has a narrow, pre-existing race
 	// where its one grace read can win against the run's own final write ordering under load —
