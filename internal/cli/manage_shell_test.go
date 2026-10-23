@@ -124,7 +124,13 @@ func TestStopRunningRunStillSignalsSupervisor(t *testing.T) {
 		t.Errorf("stop output = %q, want the signal path's message", out)
 	}
 	select {
-	case <-done:
+	case err := <-done:
+		// `sleep 30` cannot have run out on its own inside this window, so Wait must report the
+		// signal — a clean exit would mean the process ended for some reason other than the
+		// PID-signal path this test is about.
+		if err == nil {
+			t.Error("the supervisor process exited cleanly, want a signal-terminated Wait error")
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the supervisor process was not signalled")
 	}
