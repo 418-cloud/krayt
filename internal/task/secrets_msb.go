@@ -4,7 +4,7 @@ import "fmt"
 
 // SecretSpec is one network-scoped secret under msb (hand-secrets-to-msb.md): the secrets-file
 // key NAME and the hosts msb may substitute its value into. It never carries a value —
-// internal/sandbox.SecretArgs renders it as one `--secret NAME@HOST[,HOST...]` flag (argv, no
+// internal/sandbox.SecretArgs renders it as one `--secret NAME:passthrough=*@HOST[,HOST...]` flag (argv, no
 // value); the value itself travels only in the msb child's env (internal/sandbox.SecretEnv), on
 // whichever invocation actually starts the sandbox (the Timing rule, KRAYT_SPEC.md §6.8).
 type SecretSpec struct {

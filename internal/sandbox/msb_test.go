@@ -73,8 +73,8 @@ func TestCreateSpecArgsStableOrderAndQuoting(t *testing.T) {
 		"--net-rule", "deny@private",
 		"--net-rule", "allow@dns",
 		"--net-rule", "allow@api.anthropic.com",
-		"--secret", "ANTHROPIC_API_KEY@api.anthropic.com",
-		"--secret", "GH_TOKEN@api.github.com,github.com",
+		"--secret", "ANTHROPIC_API_KEY:passthrough=*@api.anthropic.com",
+		"--secret", "GH_TOKEN:passthrough=*@api.github.com,github.com",
 		"--tls-intercept",
 		"--tls-bypass", "passthrough.example.com",
 		"--security", "restricted",
@@ -183,7 +183,7 @@ func TestChildEnvAllowlistExact(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-leak")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "aws-should-not-leak")
 
-	c := newFakeClient(t, home, fakeScript{Default: fakeResponse{ExitCode: 0, Stdout: "msb 0.6.16\n"}})
+	c := newFakeClient(t, home, fakeScript{Default: fakeResponse{ExitCode: 0, Stdout: "msb 0.7.11\n"}})
 	if _, err := c.Version(context.Background()); err != nil {
 		t.Fatalf("Version: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestChildEnvForwardsOptionalKeysWhenSet(t *testing.T) {
 	t.Setenv("MSB_HOME", "/custom/msb-home")
 	t.Setenv("SSL_CERT_FILE", "/etc/ssl/custom.pem")
 
-	c := newFakeClient(t, home, fakeScript{Default: fakeResponse{ExitCode: 0, Stdout: "msb 0.6.16\n"}})
+	c := newFakeClient(t, home, fakeScript{Default: fakeResponse{ExitCode: 0, Stdout: "msb 0.7.11\n"}})
 	if _, err := c.Version(context.Background()); err != nil {
 		t.Fatalf("Version: %v", err)
 	}
@@ -272,9 +272,10 @@ func TestVersionLess(t *testing.T) {
 		a, b Version
 		want bool
 	}{
-		{Version{0, 6, 15, ""}, MinVersion, true},
-		{Version{0, 6, 16, ""}, MinVersion, false},
-		{Version{0, 6, 17, ""}, MinVersion, false},
+		{Version{0, 7, 10, ""}, MinVersion, true},
+		{Version{0, 7, 11, ""}, MinVersion, false},
+		{Version{0, 7, 12, ""}, MinVersion, false},
+		{Version{0, 6, 16, ""}, MinVersion, true},
 		{Version{0, 5, 99, ""}, MinVersion, true},
 		{Version{1, 0, 0, ""}, MinVersion, false},
 	}

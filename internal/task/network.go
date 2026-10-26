@@ -505,7 +505,7 @@ func validateHostPattern(h string) error {
 //     "api.example.com:443" and "a:b" — msb matches the host alone, with no port.
 //
 // One consequence is load-bearing elsewhere: because a comma is refused here,
-// internal/sandbox.SecretArgs can keep rendering `--secret NAME@HOST[,HOST...]` — a comma is msb's
+// internal/sandbox.SecretArgs can keep rendering `--secret NAME:passthrough=*@HOST[,HOST...]` — a comma is msb's
 // own separator there — without an `allow: ["a.example,evil.example"]` entry silently becoming two
 // scoped hosts.
 func validateHostEntry(h string) error {
