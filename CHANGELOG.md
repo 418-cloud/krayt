@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.12.0](https://github.com/418-cloud/krayt/compare/v0.11.0...v0.12.0) (2026-10-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sandbox:** krayt now requires msb >= 0.7.11.
+
+### Bug Fixes
+
+* **sandbox:** support msb 0.7 per-secret placeholder passthrough ([#195](https://github.com/418-cloud/krayt/issues/195)) ([2253a09](https://github.com/418-cloud/krayt/commit/2253a092272645d72835ef9a029031fe5d249a25))
+
 ## [0.11.0](https://github.com/418-cloud/krayt/compare/v0.10.0...v0.11.0) (2026-09-20)
 
 
