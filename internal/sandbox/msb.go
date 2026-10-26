@@ -267,7 +267,7 @@ type VsockRoute struct {
 	Port     uint32
 }
 
-// SecretRef is one `--secret NAME@HOST[,HOST...]` declaration. It never carries a value: msb
+// SecretRef is one `--secret NAME:passthrough=*@HOST[,HOST...]` declaration (see SecretArgs). It never carries a value: msb
 // itself rejects an inline NAME=VALUE@HOST on both `create` and `modify` (the secret's real value
 // travels only in cmd.Env — see hand-secrets-to-msb.md, which owns deciding what belongs here).
 type SecretRef struct {
@@ -275,19 +275,35 @@ type SecretRef struct {
 	Hosts []string
 }
 
-// SecretArgs renders one `--secret NAME@HOST[,HOST...]` flag per spec, deterministically ordered
-// by key regardless of input order — so the same set of secrets always produces byte-identical
-// argv, matching CreateSpec.Args()'s own determinism guarantee. It carries no value, by
-// construction: task.SecretSpec has no field to hold one (hand-secrets-to-msb.md's "What to
-// build") — see SecretEnv for the one channel that does.
+// SecretArgs renders one `--secret NAME:passthrough=*@HOST[,HOST...]` flag per spec,
+// deterministically ordered by key regardless of input order — so the same set of secrets always
+// produces byte-identical argv, matching CreateSpec.Args()'s own determinism guarantee. It carries
+// no value, by construction: task.SecretSpec has no field to hold one (hand-secrets-to-msb.md's
+// "What to build") — see SecretEnv for the one channel that does.
+//
+// `passthrough=*` is krayt's secret-violation policy (KRAYT_SPEC §6.6), which msb >= 0.7 only
+// accepts per secret: the global `--on-secret-violation passthrough` krayt used to emit is gone,
+// and its successor takes blocking actions only. It means a placeholder seen at a host outside the
+// secret's scope is forwarded unchanged instead of blocked — the agent resends its conversation
+// (and any placeholder an `env` put there) to the model API every turn, so blocking would kill the
+// run (run_df87bfc8, run_4125ef2e). It never widens substitution: msb checks the secret's allowed
+// hosts first and a passthrough match only skips the blocking list (new_inner,
+// crates/network/lib/engine/secrets/handler.rs at v0.7.11).
 func SecretArgs(specs []task.SecretSpec) []string {
 	sorted := append([]task.SecretSpec(nil), specs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
 	args := make([]string, 0, len(sorted)*2)
 	for _, s := range sorted {
-		args = append(args, "--secret", s.Key+"@"+strings.Join(s.Hosts, ","))
+		args = append(args, "--secret", secretFlagValue(s.Key, s.Hosts))
 	}
 	return args
+}
+
+// secretFlagValue renders one `--secret` value, `NAME:passthrough=*@HOST[,HOST...]` — the single
+// place both SecretArgs and CreateSpec.Args() take it from, so the passthrough policy cannot be
+// present on one path and missing on the other.
+func secretFlagValue(name string, hosts []string) string {
+	return name + ":passthrough=*@" + strings.Join(hosts, ",")
 }
 
 // SecretEnv returns the KEY=VALUE entries to append to the msb child's environment (Create's
@@ -420,7 +436,7 @@ func (s CreateSpec) Args() []string {
 		args = append(args, "--net-rule", r)
 	}
 	for _, sec := range s.Secrets {
-		args = append(args, "--secret", sec.Name+"@"+strings.Join(sec.Hosts, ","))
+		args = append(args, "--secret", secretFlagValue(sec.Name, sec.Hosts))
 	}
 	if s.TLSIntercept {
 		args = append(args, "--tls-intercept")

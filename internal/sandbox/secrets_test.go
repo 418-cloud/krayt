@@ -21,8 +21,8 @@ func TestSecretArgsGoldenAndDeterministicOrder(t *testing.T) {
 		{Key: "ANTHROPIC_API_KEY", Hosts: []string{"api.anthropic.com"}},
 	}
 	want := []string{
-		"--secret", "ANTHROPIC_API_KEY@api.anthropic.com",
-		"--secret", "GH_TOKEN@api.github.com,github.com",
+		"--secret", "ANTHROPIC_API_KEY:passthrough=*@api.anthropic.com",
+		"--secret", "GH_TOKEN:passthrough=*@api.github.com,github.com",
 	}
 	got := SecretArgs(specs)
 	if !reflect.DeepEqual(got, want) {
@@ -32,6 +32,21 @@ func TestSecretArgsGoldenAndDeterministicOrder(t *testing.T) {
 	reversed := []task.SecretSpec{specs[1], specs[0]}
 	if got2 := SecretArgs(reversed); !reflect.DeepEqual(got2, want) {
 		t.Fatalf("SecretArgs on reversed input = %q, want the same %q", got2, want)
+	}
+}
+
+// TestSecretArgsEverySecretIsPassthrough guards KRAYT_SPEC §6.6's non-blocking violation policy,
+// which msb >= 0.7 only accepts per secret. Dropping `passthrough=*` falls back to msb's blocking
+// default, and the first placeholder in an agent's conversation then blocks every later turn.
+func TestSecretArgsEverySecretIsPassthrough(t *testing.T) {
+	got := SecretArgs([]task.SecretSpec{
+		{Key: "A", Hosts: []string{"a.example"}},
+		{Key: "B", Hosts: []string{"*.b.example", "c.example"}},
+	})
+	for i := 0; i+1 < len(got); i += 2 {
+		if got[i] != "--secret" || !strings.Contains(got[i+1], ":passthrough=*@") {
+			t.Errorf("secret arg %q %q lacks passthrough=*", got[i], got[i+1])
+		}
 	}
 }
 

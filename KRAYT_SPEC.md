@@ -414,8 +414,22 @@ unconditionally the instant any `--secret` is declared (confirmed on hardware,
 `hack/msb-probes/p3-secret-tls-intercept.sh`, 2026-08-29) — emitted anyway to pin that behavior
 explicitly rather than depend on an undocumented builder side effect in a beta tool.
 
-**`--on-secret-violation` is `passthrough`, deliberately, not msb's blocking default.** The flag
-decides what happens when a secret's *placeholder* — never its value — is seen heading to a host
+**The secret-violation policy is `passthrough`, deliberately, not msb's blocking default.** Since
+msb 0.7 it is expressed **per secret**: `internal/sandbox` renders every `--secret` as
+`NAME:passthrough=*@HOST[,HOST...]`. msb 0.7 removed the global `--on-secret-violation` krayt used
+to emit, and its successor `--secret-violation-action` accepts only blocking actions, so
+`task.NetworkArgs` emits no violation flag at all. `passthrough=*` reproduces the old global
+`passthrough` exactly: msb's handler (`new_inner`, `crates/network/lib/engine/secrets/handler.rs`
+at v0.7.11) checks the secret's allowed hosts first, so in-scope substitution is unchanged, and a
+passthrough match only removes the secret from the blocking list. *Confirmed on hardware, msb 0.7.11, 2026-10-26, through real `krayt run`s.* `run_1e2ef427` showed
+that `msb create` accepts the per-secret form and that in-scope substitution works: the agent
+authenticated to `api.anthropic.com` with `CLAUDE_CODE_OAUTH_TOKEN`. `run_34842c5f` showed the
+out-of-scope half. The agent ran `env | grep GH_TOKEN`, which put the `GH_TOKEN` placeholder
+(`$MSB_GH_TOKEN`, scoped to `api.github.com`) into its conversation. Every later turn still
+reached `api.anthropic.com`, and the run finished with exit 0. That is the
+run_df87bfc8/run_4125ef2e failure mode, now surviving. The p7 probe below ran on 0.6.16 and has
+not been adapted to the per-secret form. Its blocking control arm is the only part these runs
+don't cover, and krayt never uses that path. The policy decides what happens when a secret's *placeholder* — never its value — is seen heading to a host
 outside that secret's own scope. Under a blocking action that request dies, and for a coding agent
 that is unrecoverable: msb sets each secret's guest env var to the placeholder itself, so one `env`
 puts the string into the agent's conversation, and the agent resends its conversation to the model
@@ -473,11 +487,11 @@ actually reach msb"; §6.15, §8.1):
 
 | krayt input | Channel | Carries a value? |
 |---|---|---|
-| `krayt.yaml` `network.inject[]` → `task.SecretSpec{Key, Hosts}` | `--secret NAME@host1,host2,...` — one per credential, rendered by `internal/sandbox.SecretArgs` | no — name + hosts only |
+| `krayt.yaml` `network.inject[]` → `task.SecretSpec{Key, Hosts}` | `--secret NAME:passthrough=*@host1,host2,...` — one per credential, rendered by `internal/sandbox.SecretArgs` | no — name + hosts only |
 | `krayt.yaml` `network.allow`/`network.mode` | `--net-rule`/`--net-default*` (`task.NetworkArgs`, §6.6) | no |
 | the secrets file's real values | `cmd.Env` on the spawned `msb create` process only (`internal/sandbox.SecretEnv`) | **yes — this only** |
 
-msb itself enforces the argv half: `--secret` accepts only `NAME@HOST[,HOST...]` and rejects an
+msb itself enforces the argv half: `--secret` accepts only `NAME[:OPTIONS]@HOST[,HOST...]` and rejects an
 inline `NAME=VALUE@HOST` on both `create` and `modify`. The value channel is `exec.Cmd.Env`, never
 `os.Environ()` — `internal/sandbox.Client`'s closed child-env allowlist (§6.15) plus the resolved
 `KEY=VALUE` pairs for exactly the declared keys, appended only to the one `msb create` invocation
@@ -1072,7 +1086,8 @@ OS-agnostic (no build tags) and has no cgo.
 process, killed with the caller's `context.Context` like every other orchestrator-driven
 subprocess (§6.2). `KRAYT_MSB_BIN` overrides the resolved path — the test seam, and the escape
 hatch for a non-`PATH` install. Methods: `Version` (parses `msb --version` against `MinVersion`,
-currently `0.6.16` — the version the ADR was verified against), `Context` (`msb context --format
+currently `0.7.11` — raised from the ADR's `0.6.16` because krayt's per-secret `passthrough=*`
+grammar (§6.6) does not exist earlier), `Context` (`msb context --format
 json`, the backend assertion below), `Create` (`msb create`, argv rendered by `CreateSpec.Args()`,
 a pure function so the whole surface is unit-testable without spawning anything), `Exec` (`msb exec
 --stream`, see below), `ExecTTY` (`msb exec --tty`, `krayt shell`'s interactive attach — see
@@ -1158,12 +1173,12 @@ child's environment on top of the closed allowlist above; every other method (`E
 has no such parameter at all, so the Timing rule (§6.8: a secret's value is set once, on whichever
 invocation starts the sandbox) is structural, not conventional. Two pure functions, next to
 `CreateSpec.Args()`, render the two channels a secret actually travels: `SecretArgs([]task.SecretSpec)
-[]string` renders one `--secret NAME@HOST[,HOST...]` flag per spec, deterministically ordered by
-key; `SecretEnv([]task.SecretSpec, map[string]string) ([]string, error)` returns the `KEY=VALUE`
+[]string` renders one `--secret NAME:passthrough=*@HOST[,HOST...]` flag per spec, deterministically
+ordered by key (`CreateSpec.Args()` renders `SecretRef`s through the same helper); `SecretEnv([]task.SecretSpec, map[string]string) ([]string, error)` returns the `KEY=VALUE`
 entries for `secretEnv`, for exactly the declared keys — erroring on a declared key the secrets
 file lacks, so a misconfigured run refuses pre-flight rather than reaching msb unauthenticated.
 
-**Version floor.** `MinVersion` (`0.6.16`) is enforced by `krayt doctor` (below) — msb is beta and
+**Version floor.** `MinVersion` (`0.7.11`) is enforced by `krayt doctor` (below) — msb is beta and
 has shipped a breaking wire change in a patch release, so a silent version drift below the
 verified floor must be surfaced, not discovered as an outage.
 
@@ -1474,9 +1489,10 @@ right, then explicit non-config CLI flags, `docs/cli/configuration.mdx:93-97`), 
 its security-relevant policy as flags, so it sits above any `extra_conf` regardless of argv order.
 Concretely: an `extra_conf` carrying `network.policy`/`allow`/`deny` is fully replaced by krayt's
 `--net-default*` flags, not merged (msb's `build_network_policy` takes the
-`replaces_configured_policy` branch the moment krayt passes any `--net-default*`); and
-`--on-secret-violation passthrough`, which krayt emits unconditionally (§6.6), can never be
-overridden at the top level by an `extra_conf`'s `on_violation` for the same reason.
+`replaces_configured_policy` branch the moment krayt passes any `--net-default*`). krayt's
+secret-violation policy (§6.6) was a global `--on-secret-violation passthrough` flag under msb 0.6
+and is per-secret `passthrough=*` on each `--secret` since msb 0.7; how that interacts with an
+`extra_conf` secret entry under 0.7 has not been re-probed (p8 below ran on 0.6.16).
 
 **Confirmed on hardware, 2026-09-05, msb 0.6.16** (`hack/msb-probes/p8-extra-conf-precedence.sh`),
 and confirmed *through krayt* rather than through a transcription of its argv: an `extra_conf`
@@ -1518,7 +1534,9 @@ otherwise guarantees, and an operator opting into it must be told, not just allo
   sandbox with `unknown field \`on_violation\`, expected one of \`value\`, \`allow\`, \`inject\`,
   \`require_tls_identity\``. The only per-secret lever `sandbox.extra_conf` actually reaches is
   scope. If the per-host violation signal is ever wanted back, it needs a change in msb, not a
-  krayt config.
+  krayt config. *(All of this is msb 0.6.16. msb 0.7 added per-secret `passthrough=HOST` to the
+  `--secret` grammar and replaced the global flag with a blocking-only `--secret-violation-action`;
+  krayt now uses the former, §6.6.)*
 - An `extra_conf` naming a secret krayt does **not** declare adds no environment variable —
   krayt's child env is a closed allowlist of only what krayt itself declared — so it resolves to an
   unset host variable and cannot exfiltrate anything.

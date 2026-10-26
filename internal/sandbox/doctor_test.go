@@ -38,7 +38,7 @@ func TestDoctorChecksWithFakeMsbHealthy(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv(BinEnv, testBinPath)
 	writeFakeScript(t, home, fakeScript{Responses: map[string]fakeResponse{
-		"--version": {ExitCode: 0, Stdout: "msb 0.6.16\n"},
+		"--version": {ExitCode: 0, Stdout: "msb 0.7.11\n"},
 		"context":   {ExitCode: 0, Stdout: `{"kind":"local","source":"MSB_BACKEND"}`},
 		"doctor":    {ExitCode: 0, Stdout: "all prerequisites met\n"},
 	}})
@@ -65,7 +65,7 @@ func TestDoctorChecksFlagsNonLocalBackend(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv(BinEnv, testBinPath)
 	writeFakeScript(t, home, fakeScript{Responses: map[string]fakeResponse{
-		"--version": {ExitCode: 0, Stdout: "msb 0.6.16\n"},
+		"--version": {ExitCode: 0, Stdout: "msb 0.7.11\n"},
 		"context":   {ExitCode: 0, Stdout: `{"kind":"cloud","source":"MSB_PROFILE"}`},
 		"doctor":    {ExitCode: 0, Stdout: "all prerequisites met\n"},
 	}})
@@ -102,7 +102,7 @@ func TestDoctorChecksAcceptsFallbackBackendKey(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv(BinEnv, testBinPath)
 	writeFakeScript(t, home, fakeScript{Responses: map[string]fakeResponse{
-		"--version": {ExitCode: 0, Stdout: "msb 0.6.16\n"},
+		"--version": {ExitCode: 0, Stdout: "msb 0.7.11\n"},
 		"context":   {ExitCode: 0, Stdout: `{"backend":"local"}`},
 		"doctor":    {ExitCode: 0, Stdout: "all prerequisites met\n"},
 	}})
@@ -124,7 +124,7 @@ func TestDoctorChecksUnrecognisedSchemaShowsRawOutput(t *testing.T) {
 	t.Setenv(BinEnv, testBinPath)
 	const raw = `{"some_future_field":"local"}`
 	writeFakeScript(t, home, fakeScript{Responses: map[string]fakeResponse{
-		"--version": {ExitCode: 0, Stdout: "msb 0.6.16\n"},
+		"--version": {ExitCode: 0, Stdout: "msb 0.7.11\n"},
 		"context":   {ExitCode: 0, Stdout: raw},
 		"doctor":    {ExitCode: 0, Stdout: "all prerequisites met\n"},
 	}})
@@ -146,11 +146,11 @@ func TestDoctorChecksBelowFloorVersion(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv(BinEnv, testBinPath)
 	writeFakeScript(t, home, fakeScript{Responses: map[string]fakeResponse{
-		"--version": {ExitCode: 0, Stdout: "msb 0.6.15\n"},
+		"--version": {ExitCode: 0, Stdout: "msb 0.7.10\n"},
 	}})
 
 	checks := DoctorChecks(context.Background())
 	if checks[1].OK {
-		t.Fatalf("version check OK = true for 0.6.15 < MinVersion %s, want false", MinVersion)
+		t.Fatalf("version check OK = true for 0.7.10 < MinVersion %s, want false", MinVersion)
 	}
 }

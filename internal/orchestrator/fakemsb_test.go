@@ -283,7 +283,7 @@ func runFakeMsb() int {
 
 	switch args[0] {
 	case "--version":
-		_, _ = fmt.Fprintln(os.Stdout, "msb 0.6.16")
+		_, _ = fmt.Fprintln(os.Stdout, "msb 0.7.11")
 		return 0
 	case "context":
 		_, _ = fmt.Fprintln(os.Stdout, `{"backend":"local"}`)
