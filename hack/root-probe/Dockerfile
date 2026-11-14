@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e # renovate: ignore
 # Negative-control image for TestRootImageFailsClosed (§8.2, security-review findings #1/#3):
 # deliberately root (no USER set -> uid 0). withEnforceNonRoot must reject the run before this
 # container ever starts, so the entrypoint below is not expected to execute; it exists only so

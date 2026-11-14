@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e # renovate: ignore
 # Exercises the krayt-ask CLI front-end (§6.13) on hardware: a NON-ROOT image that shells out to
 # the `krayt-ask` binary krayt bind-mounts onto the PATH (/usr/local/bin/krayt-ask), proving both
 # the binary round-trip and the non-root socket-connect fix. Alpine gives a small image with a
