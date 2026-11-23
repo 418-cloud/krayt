@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1 # renovate: ignore
+# syntax=docker/dockerfile:1@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183 # renovate: ignore
 # krayt-dev — the dogfooding agent image: krayt's own dev toolchain layered on the published
 # Claude Code agent image, so an agent running `krayt run --image krayt-dev --agent claude-code`
 # against krayt's own repo can build, test, lint, and regenerate protocol code inside the sandbox
