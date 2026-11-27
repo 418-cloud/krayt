@@ -9,7 +9,7 @@
 # arm64 build needs glibc >= 2.39, which bookworm's 2.36 doesn't clear but trixie's 2.41 does),
 # so the `apt-get` extension story matches the other agent images. 24 is upstream's current
 # Active LTS ("krypton") as of this writing.
-FROM node:24-trixie-slim@sha256:8ec5d7557396cfe32d21c3f9c13072355ceab22b584578ca4bb28af31120cffe
+FROM node:24-trixie-slim@sha256:4d00acb4bcc42c454c4eb801526f7ad7f772ea3bd4fd168c5cc2e384abcbb9d4
 
 # ca-certificates: HTTPS to the model API and npm registry; curl: install-time fetches; git:
 # Gemini CLI shells out to it for repo ops; bash: the entrypoint. Nothing else — extend via
