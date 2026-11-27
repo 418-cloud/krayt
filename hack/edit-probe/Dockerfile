@@ -6,7 +6,7 @@
 # suite can run with zero live LLM credentials. Unlike the security probes it asserts nothing from
 # inside the container; it is the happy-path control that proves a real run captures a patch.
 # Alpine gives a small image with a shell + coreutils (same shape as ../gitconfig-probe).
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 
 # Non-root user (uid 1000) -- matches the other probes and withEnforceNonRoot (§8.2). The run is
 # meant to look like an ordinary least-privilege agent, not a root escape.
